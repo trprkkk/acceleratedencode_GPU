@@ -101,6 +101,125 @@ void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Half-pel planes                                                     */
+/* ------------------------------------------------------------------ */
+/* The three fractional planes are stored with the same geometry as the integer
+ * picture -- origin at picture (0,0), `stride` bytes per row, AEG_PAD rows of
+ * padding above and below -- so a pointer into the integer picture can be
+ * reused on a plane by offsetting from base[0]. */
+
+void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
+{
+    size_t rows = (size_t)h + 2 * AEG_PAD;
+    int i;
+    (void)w;
+    mc->stride = stride;
+    mc->buf = aeg_alloc(3 * (size_t)stride * rows);
+    mc->base[0] = NULL;
+    mc->ready = 0;
+    for (i = 1; i < 4; i++)
+        mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
+                                (size_t)AEG_PAD * stride + AEG_PAD
+                              : NULL;
+}
+
+void aeg_mc_ctx_free(aeg_mc_ctx *mc)
+{
+    aeg_free(mc->buf);
+    mc->buf = NULL;
+    mc->base[0] = NULL;
+    mc->ready = 0;
+}
+
+/* Fill one plane over the region whose filter taps stay inside the padded
+ * integer picture, then replicate the computed border outwards.  Nothing reads
+ * the replicated margin: a motion vector plus a block stays inside the padding
+ * the encoder allocates, and the region filled here covers it. */
+static void fill_plane(uint8_t *pl, int stride, const uint8_t *ref,
+                       int w, int h, int which)
+{
+    int x0 = -AEG_PAD + 2, x1 = w + AEG_PAD - 4;
+    int y0 = -AEG_PAD + 2, y1 = h + AEG_PAD - 4;
+    int x, y;
+
+    for (y = y0; y <= y1; y++) {
+        const uint8_t *rrow = ref + (ptrdiff_t)y * stride;
+        uint8_t *orow = pl + (ptrdiff_t)y * stride;
+        for (x = x0; x <= x1; x++) {
+            const uint8_t *p = rrow + x;
+            int v;
+            if (which == 1)
+                v = hpel_h(p);
+            else if (which == 2)
+                v = hpel_v(p, stride);
+            else
+                v = hpel_hv(p, stride);
+            orow[x] = clip8(v);
+        }
+        for (x = -AEG_PAD; x < x0; x++)
+            orow[x] = orow[x0];
+        for (x = x1 + 1; x < w + AEG_PAD; x++)
+            orow[x] = orow[x1];
+    }
+    for (y = -AEG_PAD; y < y0; y++)
+        memcpy(pl + (ptrdiff_t)y * stride - AEG_PAD,
+               pl + (ptrdiff_t)y0 * stride - AEG_PAD,
+               (size_t)(w + 2 * AEG_PAD));
+    for (y = y1 + 1; y < h + AEG_PAD; y++)
+        memcpy(pl + (ptrdiff_t)y * stride - AEG_PAD,
+               pl + (ptrdiff_t)y1 * stride - AEG_PAD,
+               (size_t)(w + 2 * AEG_PAD));
+}
+
+void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h)
+{
+    int i;
+    mc->base[0] = ref;
+    if (!mc->buf) {
+        mc->ready = 0;
+        return;
+    }
+    for (i = 1; i < 4; i++)
+        fill_plane((uint8_t *)mc->base[i], mc->stride, ref, w, h, i);
+    mc->ready = 1;
+}
+
+/* Plane-based motion compensation: same samples as aeg_mc_luma(), read from the
+ * precomputed planes instead of being filtered per block. */
+void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
+                   const uint8_t *src, int w, int h, int fx, int fy)
+{
+    const ptrdiff_t off = src - mc->base[0];
+    const int idx = (fy << 2) | fx;
+    int x, y;
+
+    if (!fx && !fy) {
+        aeg_mc_luma(dst, dstride, src, mc->stride, w, h, 0, 0);
+        return;
+    }
+    if (!(idx & 5)) {
+        /* exactly a half-pel position: a single plane (the integer plane is
+         * one of the four a quarter-pel position may combine) */
+        const uint8_t *p = mc->base[hpel_ref0[idx]] + off;
+        for (y = 0; y < h; y++)
+            memcpy(dst + (size_t)y * dstride, p + (ptrdiff_t)y * mc->stride,
+                   (size_t)w);
+        return;
+    }
+    {
+        const int pl1 = hpel_ref0[idx], pl2 = hpel_ref1[idx];
+        const int o1y = (fy == 3) ? 1 : 0;
+        const int o2x = (fx == 3) ? 1 : 0;
+        for (y = 0; y < h; y++) {
+            const uint8_t *r1 = mc->base[pl1] + off + (ptrdiff_t)(y + o1y) * mc->stride;
+            const uint8_t *r2 = mc->base[pl2] + off + (ptrdiff_t)y * mc->stride + o2x;
+            for (x = 0; x < w; x++)
+                dst[(size_t)y * dstride + x] = (uint8_t)((r1[x] + r2[x] + 1) >> 1);
+        }
+    }
+}
+
 void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
                    int w, int h, int fx, int fy)
 {
@@ -173,7 +292,7 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
 /* subpel refinement: quarter-pel, SATD driven */
 static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                          int cstride, int bw, int bh, int range,
-                         int *mvx, int *mvy)
+                         const aeg_mc_ctx *mc, int *mvx, int *mvy)
 {
     static const int8_t offs[9][2] = {
         {0,0},{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
@@ -200,8 +319,12 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                     continue;
                 if (nx < -range * 4 || nx > range * 4 || ny < -range * 4 || ny > range * 4)
                     continue;
-                aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw, bh,
-                            nx & 3, ny & 3);
+                if (mc && mc->ready)
+                    aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
+                                  nx & 3, ny & 3);
+                else
+                    aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
+                                bh, nx & 3, ny & 3);
                 cost = aeg_satd(bw, bh, buf, bw, cur, cstride);
                 if (cost < best) { best = cost; bx = nx; by = ny; improved = 1; }
             }
@@ -214,20 +337,29 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
 
 int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                  int cstride, int bw, int bh, int range, int subme,
-                 int pred_x, int pred_y, int *mvx, int *mvy, int *sad_out)
+                 int pred_x, int pred_y, const int seed[2],
+                 const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out)
 {
     int best_sad = 1 << 30, bx = 0, by = 0;
 
-    /* candidate starts: predicted MV, zero, and the integer-rounded
-     * predicted MV.  Evaluating all of them keeps the search robust for
-     * fast motion without the cost of a full search. */
+    /* Candidate starts: predicted MV, zero, and the integer-rounded
+     * predicted MV -- plus `seed`, the best vector a batched search over the
+     * whole frame found for this block (see me_seed_frame() in the encoder;
+     * it is the one part of the motion search that runs as a single GPU
+     * batch).  Evaluating all of them keeps the search robust for fast
+     * motion without the cost of a full search. */
     {
-        int cand[3][2];
-        int i;
+        int cand[4][2];
+        int i, n = 3;
         cand[0][0] = pred_x >> 2; cand[0][1] = pred_y >> 2;
         cand[1][0] = 0;           cand[1][1] = 0;
         cand[2][0] = (pred_x + 2) >> 2; cand[2][1] = (pred_y + 2) >> 2;
-        for (i = 0; i < 3; i++) {
+        if (seed) {
+            cand[3][0] = seed[0];
+            cand[3][1] = seed[1];
+            n = 4;
+        }
+        for (i = 0; i < n; i++) {
             int c;
             if (cand[i][0] < -range || cand[i][0] > range ||
                 cand[i][1] < -range || cand[i][1] > range)
@@ -245,7 +377,8 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
 
     {
         int qx = bx * 4, qy = by * 4;
-        best_sad = subpel_refine(ref, rstride, cur, cstride, bw, bh, range, &qx, &qy);
+        best_sad = subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc,
+                                 &qx, &qy);
         *mvx = qx; *mvy = qy;
     }
     *sad_out = best_sad;

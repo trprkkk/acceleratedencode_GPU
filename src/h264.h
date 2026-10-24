@@ -217,6 +217,38 @@ int  aeg_intra4x4_pred_mode(const aeg_mb *mb_grid, int mb_stride, int mb_x,
  * integer position of the block origin in the padded plane. */
 void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
                  int w, int h, int fx, int fy);
+
+/* Precomputed half-pel planes (half-pel memory optimisation, H.264 8.4.2.2).
+ *
+ * A quarter-pel motion search interpolates the same reference samples over and
+ * over: every candidate position re-runs the 6-tap filter chain for its whole
+ * block. The four luma planes a fractional position is built from -- integer,
+ * horizontal, vertical and both -- are properties of the *reference picture*,
+ * not of the block, so they are computed once per picture and then a fractional
+ * position is just two array reads and an average. The samples are identical to
+ * the ones aeg_mc_luma() computes per block (same filters, same rounding); only
+ * the number of times they are computed changes.
+ *
+ * base[0] is the integer picture itself, base[1..3] the H, V and HV planes.
+ * All four use the same stride and the same origin as the integer picture, so a
+ * pointer into one of them can be turned into a pointer into another by
+ * subtracting base[0]. */
+typedef struct aeg_mc_ctx {
+    const uint8_t *base[4];
+    uint8_t       *buf;
+    int            stride;
+    int            ready;
+} aeg_mc_ctx;
+
+void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride);
+void aeg_mc_ctx_free(aeg_mc_ctx *mc);
+/* Recompute the fractional planes from the reference picture `ref` (padded,
+ * origin and stride as `mc->stride`).  Called once per picture, right after the
+ * picture becomes the reference. */
+void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h);
+/* Plane-aware motion compensation: `src` points into mc->base[0]. */
+void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
+                   const uint8_t *src, int w, int h, int fx, int fy);
 /* chroma: 1/8 pel, fx/in 0..7 */
 void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
                    int w, int h, int fx, int fy);
@@ -224,7 +256,8 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
  * the result is a quarter-pel motion vector. */
 int  aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                   int cstride, int bw, int bh, int range, int subme,
-                  int pred_x, int pred_y, int *mvx, int *mvy, int *sad_out);
+                  int pred_x, int pred_y, const int seed[2],
+                  const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out);
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
                     int mb_x, int mb_y,
                     int *mvx, int *mvy);

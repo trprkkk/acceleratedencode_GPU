@@ -100,6 +100,13 @@ struct aeg_encoder {
 
     int16_t mv_batch[2 * 256];
     int32_t sad_batch[256];
+    /* Whole-frame search seed: 2 ints per macroblock, integer pel.  Filled by
+     * me_seed_frame() with the best of a fixed candidate grid, evaluated as one
+     * batch through the backend (this is the stage the GPU actually runs). */
+    aeg_mc_ctx mc;         /* precomputed fractional-pel planes of refp[0] */
+    int16_t *seed_mv;
+    int16_t *seed_cand;   /* 2 * ME_SEED_CAND per macroblock */
+    int32_t *seed_sad;
     uint8_t pred_l[16 * 16];
     uint8_t pred_c[2][8 * 8];
     int has_ref;
@@ -629,8 +636,12 @@ static void mc_rect_luma(struct aeg_encoder *e, int mbx, int mby,
 {
     const uint8_t *r = e->refp[0] + (mby * 16 + y + (mvy >> 2)) * e->stride[0] +
                        mbx * 16 + x + (mvx >> 2);
-    aeg_mc_luma(e->pred_l + y * 16 + x, 16, r, e->stride[0], w, h,
-                mvx & 3, mvy & 3);
+    if (e->mc.ready)
+        aeg_mc_luma_p(e->pred_l + y * 16 + x, 16, &e->mc, r, w, h,
+                      mvx & 3, mvy & 3);
+    else
+        aeg_mc_luma(e->pred_l + y * 16 + x, 16, r, e->stride[0], w, h,
+                    mvx & 3, mvy & 3);
 }
 
 static void mc_rect_chroma(struct aeg_encoder *e, int mbx, int mby,
@@ -988,9 +999,15 @@ static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
 {
     uint8_t buf[16 * 16];
     int ix = mvx >> 2, iy = mvy >> 2;
-    aeg_mc_luma(buf, geo[2], e->refp[0] + (mby * 16 + geo[1] + iy) * e->stride[0] +
-                mbx * 16 + geo[0] + ix, e->stride[0], geo[2], geo[3],
-                mvx & 3, mvy & 3);
+    {
+        const uint8_t *r = e->refp[0] + (mby * 16 + geo[1] + iy) * e->stride[0] +
+                           mbx * 16 + geo[0] + ix;
+        if (e->mc.ready)
+            aeg_mc_luma_p(buf, geo[2], &e->mc, r, geo[2], geo[3], mvx & 3, mvy & 3);
+        else
+            aeg_mc_luma(buf, geo[2], r, e->stride[0], geo[2], geo[3],
+                        mvx & 3, mvy & 3);
+    }
     return aeg_satd(geo[2], geo[3], buf, geo[2],
                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
                     geo[0], e->stride[0]);
@@ -1011,7 +1028,8 @@ static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, mvx, mvy, sad);
+                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, &e->mc,
+                 mvx, mvy, sad);
     /* Sub-pixel alignment: the integer search leaves the vector on an integer
      * pel.  Rather than repeating the whole quarter-pel search for a 4x4
      * partition, apply the fractional offset the macroblock's 16x16 search
@@ -1171,6 +1189,81 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
     e->mb_ncand = slot + 1;
 }
 
+/* Candidate grid of the whole-frame search seed: 5x5 integer offsets spanning
+ * +/- (range rounded down to a multiple of 4).  25 candidates per macroblock,
+ * every one of them independent of every other -- which is exactly the shape of
+ * work a GPU kernel wants, and the only part of the motion search that is
+ * submitted as a single batch. */
+#define ME_SEED_R (2)
+#define ME_SEED_CAND ((2 * ME_SEED_R + 1) * (2 * ME_SEED_R + 1))
+
+/* Evaluate the seed grid for every macroblock of the current P picture and keep
+ * the best vector per macroblock.  Runs on the GPU when the dispatcher says the
+ * motion-estimation stage is faster there, otherwise on the CPU through the
+ * same batch interface (src/backend.c). */
+static void me_seed_frame(struct aeg_encoder *e)
+{
+    int range = e->p.search_range ? e->p.search_range : 16;
+    int step = range / (2 * ME_SEED_R);
+    int mb, i, j, n = e->mb_count, cnt = 0;
+    int64_t t0 = aeg_now_ns();
+
+    if (step < 1)
+        step = 1;
+    /* Only worth it when the batch really runs on the GPU: on the CPU the
+     * 25 extra SADs per macroblock cost ~10 % of the encode speed and buy a
+     * fraction of a percent of rate, because the hex search from the predicted
+     * vector already finds the same minimum.  A GPU evaluates the whole picture
+     * in one launch, and then the shorter hex walk that follows is a win.
+     * AEG_SEED=1 forces it on so that the path stays covered by the tests. */
+    {
+        const char *ev = getenv("AEG_SEED");
+        int on = ev ? atoi(ev) != 0 : e->d.use_gpu[AEG_STAGE_MOTION_EST];
+        if (!on) {
+            memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
+            return;
+        }
+    }
+    if (!e->has_ref || !e->cur_is_p) {
+        memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
+        return;
+    }
+    for (mb = 0; mb < n; mb++) {
+        for (i = -ME_SEED_R; i <= ME_SEED_R; i++)
+            for (j = -ME_SEED_R; j <= ME_SEED_R; j++) {
+                int k = ((i + ME_SEED_R) * (2 * ME_SEED_R + 1) + (j + ME_SEED_R));
+                e->seed_cand[(mb * ME_SEED_CAND + k) * 2 + 0] = (int16_t)(i * step);
+                e->seed_cand[(mb * ME_SEED_CAND + k) * 2 + 1] = (int16_t)(j * step);
+            }
+        cnt += ME_SEED_CAND;
+    }
+    /* One call for the whole picture.  The batch op works on a single
+     * (cur, ref) pair, so the macroblocks are evaluated one row at a time:
+     * the row's blocks are contiguous in both pictures. */
+    for (j = 0; j < e->mb_h; j++) {
+        const int per_row = e->mb_w * ME_SEED_CAND;
+        e->d.ops.sad_batch(e->d.ops.priv,
+                           e->srcp[0] + (j * 16) * e->stride[0], e->stride[0],
+                           e->refp[0] + (j * 16) * e->stride[0], e->stride[0],
+                           16, 16,
+                           e->seed_cand + j * per_row * 2, per_row,
+                           e->seed_sad + j * per_row);
+        for (mb = j * e->mb_w; mb < (j + 1) * e->mb_w; mb++) {
+            int best = 0, k, bv = 1 << 30;
+            for (k = 0; k < ME_SEED_CAND; k++) {
+                int32_t v = e->seed_sad[mb * ME_SEED_CAND + k];
+                if (v < bv) { bv = v; best = k; }
+            }
+            e->seed_mv[mb * 2 + 0] = e->seed_cand[(mb * ME_SEED_CAND + best) * 2 + 0];
+            e->seed_mv[mb * 2 + 1] = e->seed_cand[(mb * ME_SEED_CAND + best) * 2 + 1];
+        }
+    }
+    t0 = aeg_now_ns() - t0;
+    e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
+    aeg_dispatch_record(&e->d, AEG_STAGE_MOTION_EST,
+                        e->d.ops.backend != AEG_BACKEND_CPU, t0);
+}
+
 /* Fills e->mb_modes[] with the legal Intra_16x16 modes ordered by SAD, runs
  * the motion search and remembers its result.  Nothing is coded here: code_mb()
  * either uses this SAD ranking directly (preset 0) or refines it with a full
@@ -1214,12 +1307,18 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         /* The block to match is the *source* macroblock.  recp still holds the
          * previous picture at this position (nothing has been reconstructed
          * here yet), so searching against it would always favour mv = 0. */
-        aeg_me_block(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
-                     e->stride[0],
-                     e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
-                     e->stride[0], 16, 16,
-                     e->p.search_range ? e->p.search_range : 16,
-                     e->p.subme, e->mb_pmv[0], e->mb_pmv[1], &mvx, &mvy, &sad);
+        {
+            int seed[2];
+            seed[0] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 0];
+            seed[1] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
+            aeg_me_block(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
+                         e->stride[0],
+                         e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
+                         e->stride[0], 16, 16,
+                         e->p.search_range ? e->p.search_range : 16,
+                         e->p.subme, e->mb_pmv[0], e->mb_pmv[1], seed,
+                         &e->mc, &mvx, &mvy, &sad);
+        }
         e->mb_mv[0] = mvx;
         e->mb_mv[1] = mvy;
         e->mb_frac[0] = mvx & 3;
@@ -2027,6 +2126,16 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     }
 
     aq_compute(e);
+    if (is_p && e->p.subme > 0) {
+        /* Build the fractional-pel planes of the reference picture once for the
+         * whole picture (AEG_STAGE_INTER_PRED).  Every subpel candidate of every
+         * macroblock then reads samples from here instead of re-running the
+         * 6-tap chain per block: the same samples, computed ~30x less often. */
+        int64_t t0 = aeg_now_ns();
+        aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
+        e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
+    }
+    me_seed_frame(e);
 
     aeg_bw_init(&bw, e->bs, e->bs_cap, 0);
     /* frame_num counts the pictures since the last IDR (H.264 8.2.1): an IDR
@@ -2292,6 +2401,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         aeg_free(e);
         return NULL;
     }
+    aeg_mc_ctx_init(&e->mc, e->w, e->h, e->stride[0]);
+    e->seed_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
+    e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_SEED_CAND * 2 *
+                                        sizeof(int16_t));
+    e->seed_sad = (int32_t *)aeg_alloc((size_t)e->mb_count * ME_SEED_CAND *
+                                       sizeof(int32_t));
+    if (!e->seed_mv || !e->seed_cand || !e->seed_sad) {
+        aeg_set_last_error("out of memory");
+        aeg_encoder_close(e);
+        return NULL;
+    }
     e->mb_dqp = (int8_t *)aeg_alloc((size_t)e->mb_count);
     if (!e->mb_dqp) {
         aeg_set_last_error("out of memory");
@@ -2426,6 +2546,10 @@ void aeg_encoder_close(aeg_encoder *enc)
     if (!e)
         return;
     aeg_dispatch_destroy(&e->d);
+    aeg_mc_ctx_free(&e->mc);
+    aeg_free(e->seed_mv);
+    aeg_free(e->seed_cand);
+    aeg_free(e->seed_sad);
     aeg_free(e->mb_dqp);
     aeg_free(e->mbs);
     aeg_free(e->src_mem);

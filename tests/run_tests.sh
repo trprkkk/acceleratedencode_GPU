@@ -105,6 +105,11 @@ run_case p8x8_q12     320 192  6 4 -q 12 --partitions 15
 # half-pel-in-both-axes position is the one that is easy to round twice.
 run_case subpel       320 192  8 1 -q 26 --subme 1
 run_case integer_me   320 192  8 1 -q 26 --subme 0
+# The whole-frame search seed (a fixed candidate grid evaluated as one batch,
+# the motion-estimation work the GPU actually runs) is switched on by the
+# dispatcher only when that stage runs on the GPU; AEG_SEED=1 forces it here so
+# the extra candidate start can never break the stream when it is enabled.
+AEG_SEED=1 run_case seed_search  320 192  8 1 -q 26
 # Rate control and adaptive quantisation both change the QP per picture (and,
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.
