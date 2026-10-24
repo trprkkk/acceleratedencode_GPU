@@ -176,6 +176,13 @@ void aeg_itransform_dc2x2(const int16_t in[4], int16_t out[4]);
 void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
                         int qp, const uint8_t *pred, int pred_stride,
                         const int32_t *dc_in);
+/* The same inverse transform without the prediction add and without the clip:
+ * `res` receives the signed residual in int16.  This is the form the batched
+ * device path produces (iq_idct_batch), so it has to be bit-identical to
+ * aeg_idct_add_block()'s arithmetic -- including the int16 truncation of the
+ * dequantised coefficients, the DC rounding before the first pass and the
+ * truncating shift in the second one. */
+void aeg_idct_residual(const int16_t *level, int qp, int16_t *res);
 void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
                    int pred_stride, const int16_t *res, int w, int h);
 

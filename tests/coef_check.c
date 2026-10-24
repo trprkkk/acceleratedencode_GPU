@@ -13,6 +13,16 @@
  * arithmetic, so this test does not depend on the library's own scalar code.
  * Every case also runs with the destination equal to the prediction, and with
  * the strides the encoder really uses (4, 8, 16, picture strides).
+ *
+ * The last part checks the *batched* entry points the device backends
+ * implement (tq_batch, iq_idct_batch, and the residual form of the inverse
+ * transform they share) against the same reference.  Those were the ones with
+ * no such test until now, and both of them were wrong: the reference C
+ * version of iq_idct_batch carried its own copy of the inverse transform that
+ * skipped the int16 truncation, the DC rounding and the truncating second
+ * pass, and the device kernel was checked against that copy -- so the two
+ * agreed with each other and disagreed with the decoder.  Anything that
+ * reconstructs a coefficient block gets compared here.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +30,7 @@
 #include <string.h>
 
 #include "h264.h"
+#include "backend.h"
 
 static int quant_ref(const int16_t *coef, int16_t *level, int qp, int intra)
 {
@@ -36,6 +47,41 @@ static int quant_ref(const int16_t *coef, int16_t *level, int qp, int intra)
             level[y * 4 + x] = (int16_t)(c < 0 ? -lv : lv);
         }
     return 0;
+}
+
+/* The reference decoder's inverse transform, as a signed residual. */
+static void idct_ref_res(const int16_t *level, int qp, int32_t res[16])
+{
+    int32_t d[16], t[16];
+    int i, x, y, sh = qp / 6;
+
+    for (y = 0; y < 4; y++)
+        for (x = 0; x < 4; x++) {
+            const int cls = (x & 1) + (y & 1);
+            const int v = level[x * 4 + y];
+            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] << sh);
+        }
+    d[0] += 1 << 5;
+    for (i = 0; i < 4; i++) {
+        const int32_t s0 = d[i * 4 + 0] + d[i * 4 + 2];
+        const int32_t s1 = d[i * 4 + 0] - d[i * 4 + 2];
+        const int32_t s2 = (d[i * 4 + 1] >> 1) - d[i * 4 + 3];
+        const int32_t s3 = d[i * 4 + 1] + (d[i * 4 + 3] >> 1);
+        t[i * 4 + 0] = (int16_t)(s0 + s3);
+        t[i * 4 + 1] = (int16_t)(s1 + s2);
+        t[i * 4 + 2] = (int16_t)(s1 - s2);
+        t[i * 4 + 3] = (int16_t)(s0 - s3);
+    }
+    for (i = 0; i < 4; i++) {
+        const int32_t s0 = t[0 * 4 + i] + t[2 * 4 + i];
+        const int32_t s1 = t[0 * 4 + i] - t[2 * 4 + i];
+        const int32_t s2 = (t[1 * 4 + i] >> 1) - t[3 * 4 + i];
+        const int32_t s3 = t[1 * 4 + i] + (t[3 * 4 + i] >> 1);
+        res[0 * 4 + i] = (s0 + s3) >> 6;
+        res[1 * 4 + i] = (s1 + s2) >> 6;
+        res[2 * 4 + i] = (s1 - s2) >> 6;
+        res[3 * 4 + i] = (s0 - s3) >> 6;
+    }
 }
 
 static void idct_ref(uint8_t *dst, int stride, const int16_t *level, int qp,
@@ -163,7 +209,98 @@ int main(int argc, char **argv)
                     break;
                 }
     }
+    /* ---- the batched entry points the device backends implement ---- */
+    {
+        aeg_be_ops cpu;
+        int16_t resb[16 * 8], levb[16 * 8], leva[16 * 8];
+        int16_t resa[16 * 8];
+        int32_t nz[8];
+        int q;
+
+        aeg_be_cpu_ops(&cpu);
+        for (q = 0; q < rounds / 4 && bad < 5; q++) {
+            int32_t rres[16];
+            int b, i2;
+            for (i2 = 0; i2 < 16 * 8; i2++) {
+                /* every amplitude class, including the ones that leave int16
+                 * once dequantised (bug 8) and the -32768 corner */
+                switch (q % 6) {
+                case 0: resb[i2] = (int16_t)(rand() % 511 - 255); break;
+                case 1: resb[i2] = (int16_t)(rand() % 9 - 4); break;
+                case 2: resb[i2] = (int16_t)((rand() % 2) ? 0 : rand() % 8191 - 4096); break;
+                case 3: resb[i2] = (int16_t)(q % 12 ? 0 : rand() % 65536 - 32768); break;
+                case 4: resb[i2] = (int16_t)(rand() % 33); break;
+                default: resb[i2] = (int16_t)(rand() % 2 ? -1 : 0); break;
+                }
+            }
+            qp = q % 52;
+            /* forward: transform + quantisation, and the non-zero counts */
+            cpu.tq_batch(cpu.priv, resb, 8, qp, q % 3 == 0, levb, nz);
+            for (b = 0; b < 8; b++) {
+                int16_t coef[16];
+                int n = 0;
+                aeg_transform_4x4(resb + 16 * b, 4, coef);
+                aeg_quant_4x4(coef, leva + 16 * b, qp, q % 3 == 0);
+                for (i2 = 0; i2 < 16; i2++)
+                    n += leva[16 * b + i2] != 0;
+                cases++;
+                if (memcmp(leva + 16 * b, levb + 16 * b, 32) || n != nz[b]) {
+                    printf("   tq_batch: qp %d blk %d: per-block and batch "
+                           "levels differ (nz %d vs %d)\n", qp, b, n, nz[b]);
+                    bad++;
+                    break;
+                }
+            }
+            /* inverse: the residual, then the same through the batch op */
+            cpu.iq_idct_batch(cpu.priv, levb, 8, qp, resa);
+            for (b = 0; b < 8; b++) {
+                int16_t r2[16];
+                aeg_idct_residual(levb + 16 * b, qp, r2);
+                idct_ref_res(levb + 16 * b, qp, rres);
+                cases += 2;
+                for (i2 = 0; i2 < 16; i2++) {
+                    if (resa[16 * b + i2] != (int16_t)rres[i2]) {
+                        printf("   iq_idct_batch: qp %d blk %d coef %d: batch %d, "
+                               "reference %d\n", qp, b, i2,
+                               resa[16 * b + i2], (int)rres[i2]);
+                        bad++;
+                        break;
+                    }
+                    if (r2[i2] != (int16_t)rres[i2]) {
+                        printf("   aeg_idct_residual: qp %d blk %d coef %d: "
+                               "%d vs reference %d\n", qp, b, i2,
+                               r2[i2], (int)rres[i2]);
+                        bad++;
+                        break;
+                    }
+                }
+                /* and the residual has to be what the add path adds */
+                {
+                    uint8_t mid[16], out[16];
+                    int16_t r3[16];
+                    int x2, clipped = 0;
+                    memset(mid, 128, sizeof(mid));
+                    aeg_idct_residual(levb + 16 * b, qp, r3);
+                    aeg_idct_add_block(out, 4, levb + 16 * b, qp, mid, 4, NULL);
+                    for (x2 = 0; x2 < 16; x2++)
+                        if (out[x2] == 0 || out[x2] == 255)
+                            clipped = 1;
+                    if (!clipped) {
+                        cases++;
+                        for (x2 = 0; x2 < 16; x2++)
+                            if ((int)out[x2] - 128 != r3[x2]) {
+                                printf("   idct residual: qp %d blk %d coef %d: "
+                                       "add-path %d, residual %d\n", qp, b, x2,
+                                       (int)out[x2] - 128, r3[x2]);
+                                bad++;
+                                break;
+                            }
+                    }
+                }
+            }
+        }
+    }
     printf("   coef_check: %d cases, %s\n", cases,
-           bad ? "MISMATCH" : "scalar and vector paths bit-exact");
+           bad ? "MISMATCH" : "scalar, vector and batched paths bit-exact");
     return bad != 0;
 }

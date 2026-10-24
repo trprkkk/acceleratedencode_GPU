@@ -70,31 +70,16 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
 {
     int b;
     (void)priv;
-    for (b = 0; b < nblk; b++) {
-        int32_t d[16];
-        int t[16], i;
-        aeg_dequant_4x4(level + 16 * b, d, qp);
-        for (i = 0; i < 4; i++) {
-            int s0 = d[i * 4 + 0] + d[i * 4 + 2];
-            int s1 = d[i * 4 + 0] - d[i * 4 + 2];
-            int s2 = (d[i * 4 + 1] >> 1) - d[i * 4 + 3];
-            int s3 = d[i * 4 + 1] + (d[i * 4 + 3] >> 1);
-            t[i * 4 + 0] = s0 + s3;
-            t[i * 4 + 1] = s1 + s2;
-            t[i * 4 + 2] = s1 - s2;
-            t[i * 4 + 3] = s0 - s3;
-        }
-        for (i = 0; i < 4; i++) {
-            int s0 = t[0 * 4 + i] + t[2 * 4 + i];
-            int s1 = t[0 * 4 + i] - t[2 * 4 + i];
-            int s2 = (t[1 * 4 + i] >> 1) - t[3 * 4 + i];
-            int s3 = t[1 * 4 + i] + (t[3 * 4 + i] >> 1);
-            res[16 * b + 0 * 4 + i] = (int16_t)((s0 + s3 + 32) >> 6);
-            res[16 * b + 1 * 4 + i] = (int16_t)((s1 + s2 + 32) >> 6);
-            res[16 * b + 2 * 4 + i] = (int16_t)((s1 - s2 + 32) >> 6);
-            res[16 * b + 3 * 4 + i] = (int16_t)((s0 - s3 + 32) >> 6);
-        }
-    }
+    /* This used to carry its own copy of the inverse transform, and that copy
+     * was *not* the one the encoder uses: it skipped the int16 truncation of
+     * the dequantised coefficients (bug 8), skipped the DC rounding before the
+     * first pass, and rounded the second pass instead of truncating it.  The
+     * device kernel was checked against this copy, so both agreed and both
+     * disagreed with the reference decoder -- exactly the trap that made the
+     * first SIMD inverse transform look right.  It now calls the same function
+     * the scalar path is built from, so there is one arithmetic to be wrong. */
+    for (b = 0; b < nblk; b++)
+        aeg_idct_residual(level + 16 * b, qp, res + 16 * b);
     return AEG_OK;
 }
 

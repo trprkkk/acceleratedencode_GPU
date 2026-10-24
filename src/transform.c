@@ -595,34 +595,24 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
 }
 #endif
 
-static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
-                            int qp, const uint8_t *pred, int pred_stride,
-                            const int32_t *dc_in)
+/* The scalar inverse transform: dequantise (truncating every coefficient to
+ * int16, as the reference decoder effectively does -- bug 8), round the DC
+ * into the first pass, truncate through the second one.  `res` receives the
+ * signed residual; without a prediction to add it is also what the batched
+ * device path returns, so this is the single definition of the arithmetic. */
+static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
+                      int16_t *res)
 {
     int32_t d[16];
     int t[16];
     int i, x, y, sh = qp / 6;
-    int ac_nonzero = 0;
 
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
             int cls = (x & 1) + (y & 1);
             int v = level[x * 4 + y];   /* level[] is in decoder order */
-            if (v && (x | y))
-                ac_nonzero = 1;
             d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] << sh);
         }
-    if (pred && !ac_nonzero) {
-        /* DC only: every pixel gets (dc + 32) >> 6 */
-        int dc = dc_in ? (int16_t)*dc_in : d[0];
-        int v = (dc + 32) >> 6;
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int p = pred[y * pred_stride + x] + v;
-                dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
-            }
-        return;
-    }
     if (dc_in)
         d[0] = (int16_t)*dc_in;
     /* The reference decoder rounds the DC coefficient into the first pass and
@@ -646,15 +636,52 @@ static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
         int32_t s1 = t[0 * 4 + i] - t[2 * 4 + i];
         int32_t s2 = (t[1 * 4 + i] >> 1) - t[3 * 4 + i];
         int32_t s3 = t[1 * 4 + i] + (t[3 * 4 + i] >> 1);
-        d[0 * 4 + i] = (s0 + s3) >> 6;
-        d[1 * 4 + i] = (s1 + s2) >> 6;
-        d[2 * 4 + i] = (s1 - s2) >> 6;
-        d[3 * 4 + i] = (s0 - s3) >> 6;
+        /* |t| <= 32767, so the result always fits int16 */
+        res[0 * 4 + i] = (int16_t)((s0 + s3) >> 6);
+        res[1 * 4 + i] = (int16_t)((s1 + s2) >> 6);
+        res[2 * 4 + i] = (int16_t)((s1 - s2) >> 6);
+        res[3 * 4 + i] = (int16_t)((s0 - s3) >> 6);
     }
+}
 
+void aeg_idct_residual(const int16_t *level, int qp, int16_t *res)
+{
+    idct_core(level, qp, NULL, res);
+}
+
+static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
+                            int qp, const uint8_t *pred, int pred_stride,
+                            const int32_t *dc_in)
+{
+    int16_t res[16];
+    int x, y, sh = qp / 6;
+    int ac_nonzero = 0;
+
+    if (pred) {
+        for (y = 0; y < 4 && !ac_nonzero; y++)
+            for (x = 0; x < 4; x++)
+                if (level[x * 4 + y] && (x | y)) {
+                    ac_nonzero = 1;
+                    break;
+                }
+    }
+    if (pred && !ac_nonzero) {
+        /* DC only: every pixel gets (dc + 32) >> 6 */
+        int dc = dc_in ? (int16_t)*dc_in
+                       : (int16_t)((int32_t)level[0] *
+                                   aeg_dequant_ls[qp % 6][0] << sh);
+        int v = (dc + 32) >> 6;
+        for (y = 0; y < 4; y++)
+            for (x = 0; x < 4; x++) {
+                int p = pred[y * pred_stride + x] + v;
+                dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+            }
+        return;
+    }
+    idct_core(level, qp, dc_in, res);
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
-            int p = (pred ? pred[y * pred_stride + x] : 0) + (int)d[y * 4 + x];
+            int p = (pred ? pred[y * pred_stride + x] : 0) + (int)res[y * 4 + x];
             dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
         }
 }
