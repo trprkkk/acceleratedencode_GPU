@@ -126,6 +126,14 @@ and `--no-deblock`, `--subme N`, `--range N` override the preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
+* `tests/cabac_check.c 200000 8` round-trips the CABAC arithmetic coder
+  through a decoder written from the spec's decoding process (nine-bit
+  `codIOffset`, bit-by-bit refill) rather than from the encoder: 1.6 M bins
+  over all 460 contexts, every probability state, bypass bins and the
+  end-of-slice flags, with the decoder's contexts required to end up identical
+  to the encoder's.  Conformance cannot catch a CABAC bug -- a wrong coder
+  produces a legal stream that reconstructs a different picture -- so it is
+  checked on its own before any syntax uses it.
 * `tests/coef_check.c 200000` drives the coefficient path (forward
   quantisation, dequantisation, inverse transform, prediction add) with random
   blocks -- uniform, sparse, single-coefficient, DC-only, and amplitudes at

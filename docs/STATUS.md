@@ -33,6 +33,11 @@ Implemented and building without warnings:
   sized to the GOP)
 * CAVLC residual coding (coeff_token, levels, total_zeros, run_before) —
   round-tripped by `tests/cavlc_check.c` (12 000 random blocks, 4 block kinds)
+* the CABAC arithmetic coder and its context tables (`src/cabac.c`) —
+  round-tripped by `tests/cabac_check.c` (1.6 M bins, every probability state,
+  bypass bins, both end-of-slice flags).  **The encoder does not use it yet**:
+  the syntax elements still go through CAVLC, so a stream is Baseline/Main
+  profile apart from the 8x8 transform (see *CABAC* below)
 * forward/inverse 4x4 integer transform, 4x4 and 2x2 DC Hadamard, quantisation
   and dequantisation, including the reference decoder's `int16_t` truncation
 * Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
@@ -437,6 +442,20 @@ Implemented and building without warnings:
     (`--no-deblock`) this bug is invisible, which is why the 30-case I-picture
     matrix was green while `make test` was not.
 
+37. **The end-of-slice `1` is not a normal decision.**  The last
+    `end_of_slice_flag` of a slice is coded against a *fixed two-unit* LPS
+    interval, and the decoder's test is `codIOffset >= range` with the range
+    already reduced by two.  A first version of `aeg_cabac_flush()` did what
+    the bin looks like (`range -= 2; low += range`, i.e. move to the top of the
+    reduced range) and every stream then failed to end: the value it picks is
+    two units *below* the interval the decoder tests for.  The value has to be
+    chosen at `low + range - 2` measured against the range **before** the
+    subtraction, and the last nine bits have to be written on top of that,
+    because the decoder pre-loads nine bits it has not been given yet.  Without
+    them the last few bins of a slice decode from bits that were never written
+    -- which `tests/cabac_check.c` reports as "end_of_slice_flag did not decode
+    as 1", two bins from the end.
+
 ## The coefficient stages as one batch per macroblock
 
 The forward transform + quantisation and the inverse transform of an inter
@@ -555,10 +574,10 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 45 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 45 clip cases
 ```
 
-`make test` runs five things:
+`make test` runs six things:
 
 1. `tests/syntax_check.c` — the two `coded_block_pattern` tables must be exact
    inverses (see bug 11; this is the check that would have caught it).
@@ -576,7 +595,15 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 45 clip cases
    the reference with the same transposing store as the fast path, so both
    agreed while the bitstream changed.  Every failure the SSE2 rebuild had
    (three real ones, listed under bug 8) was found here.
-4. `tests/kernel_check.c` — the device kernel source (`src/kernels.h`) compiled
+4. `tests/cabac_check.c 200000 8` — the arithmetic coder against a decoder
+   written from the decoding process (9.3.3) and from the bit definition of the
+   output: nine-bit `codIOffset`, bit-by-bit refill, no access to the encoder's
+   `low`/`range`/carry machinery.  1.6 M bins across eight seeds, over all 460
+   contexts (initialized from every table at QPs 0..51, then perturbed so that
+   all 128 states and the 0.5 state are visited), mixing context-coded bins,
+   bypass bins, runs of either bin and `end_of_slice_flag = 0` bins, and
+   requiring the decoder's context states to end up identical to the encoder's.
+5. `tests/kernel_check.c` — the device kernel source (`src/kernels.h`) compiled
    as C with the OpenCL qualifiers defined away and `get_global_id()` driven by
    a counter, so the kernels are checked on a machine with no GPU at all.  The
    inverse transform is fed four amplitude classes — the full int16 range,
@@ -586,7 +613,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 45 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-5. `tests/run_tests.sh` — forty-five cases (QP 12/23/26/40, presets 0 and 4,
+6. `tests/run_tests.sh` — forty-five cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -628,6 +655,51 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 # vr.yuv and vd.yuv must be identical
 ```
 
+## CABAC
+
+`src/cabac.c` is the arithmetic coder (`tests/cabac_check.c` checks it against
+a decoder written from 9.3.3 rather than from the encoder).  What is in the
+tree so far is the coder only -- the 460 context initialization tables
+(Table 9-5, Tables 9-12 … 9-33) and the two probability tables (Table 9-44 and
+the transition table).  The binarizations and the context *assignments* of the
+individual syntax elements are not written yet, so nothing in the encoder uses
+it and the conformance suite does not change.
+
+Four things about the coder are worth recording, because each of them is
+invisible until a whole slice decodes:
+
+* **The state is 0..127, not 0..63.**  The stored byte is the spec's
+  preCtxState compressed: bit 0 is the MPS and `state >> 1` is the `rangeTabLPS`
+  row.  That is what makes one table (`aeg_cabac_trans[state][bin]`) serve both
+  MPS and LPS transitions, and it is why the initialization clamps the
+  pre-state to 1..126: the values 0 and 1 (the exactly-0.5 state, whose LPS
+  range is 2) are unreachable and the transition table keeps them that way.
+  The coder still handles them -- `aeg_cabac_renorm()` loops -- which is what
+  lets the test drive all 128 states.
+* **Carry handling is the part that has to be right.**  A decided byte can
+  still be changed by a carry out of the next one, and a run of 0xff bytes can
+  turn into 0x00.  The newest byte is therefore held in `prev` and written only
+  when the next extraction shows whether it needs a carry; 0xff bytes are
+  counted in `outstanding` and written (as 0x00 if the carry comes, 0xff if it
+  does not) at the same moment.
+* **The encoder runs nine bits ahead of its own output.**  A decoder pre-loads
+  nine bits before its first bin, so a byte is only fully decided once nine
+  more bits have gone into the interval.  That is the `queue = -9` of
+  `aeg_cabac_open()`, and it is also why `aeg_cabac_flush()` writes nine extra
+  bits and a stop bit at the end.
+* **`end_of_slice_flag` is present after every macroblock**, 0 for all but the
+  last (9.3.4.4), so the syntax writer needs `aeg_cabac_terminate(c, 0)` per
+  macroblock and exactly one `aeg_cabac_flush()` per slice.
+
+The test encodes 1.6 M bins per `make test` -- context-coded bins over all 460
+contexts from every initialization table at QPs 0..51, bypass bins, runs in
+both directions, and `end_of_slice_flag = 0` bins between them -- decodes them
+with the spec's decoder, requires every bin and every context state to match,
+and then requires the final terminate to decode as 1.  It needs no GPU and no
+external decoder, which is the point: a CABAC bug produces a legal stream that
+reconstructs a different picture, so it has to be caught before an external
+decoder is the only witness.
+
 ## Next
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
@@ -661,8 +733,17 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
 3. Encoder features that need the profile to change: CABAC (~10% of rate at
-   equal quality) is the remaining one -- the 8x8 transform and Intra_8x8 are
-   in (section below).  MB-tree was
+   equal quality) is the remaining one, and it is half in: the arithmetic coder
+   and its context tables are written and round-trip against a decoder built
+   from the spec (section "CABAC"), but no syntax element uses it yet.  What is
+   left is the part that is not arithmetic: the binarization and context
+   assignment of every element (mb_type and sub_mb_type trees, the skip and
+   coded_block_pattern flags, mvd with its Exp-Golomb prefix/suffix split,
+   intra prediction modes, mb_qp_delta, and the residual with
+   significant/last/level-prefix contexts), the slice header's `cabac_init_idc`
+   and the alignment, and a bit-cost model for the rate-distortion pass (the
+   current costs come from `write_block()`'s call into the CAVLC writer, which
+   a byte-oriented coder cannot reuse).  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so
