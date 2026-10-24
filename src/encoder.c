@@ -105,8 +105,10 @@ struct aeg_encoder {
      * batch through the backend (this is the stage the GPU actually runs). */
     aeg_mc_ctx mc;         /* precomputed fractional-pel planes of refp[0] */
     int16_t *seed_mv;
-    int16_t *seed_cand;   /* 2 * ME_SEED_CAND per macroblock */
+    int16_t *seed_cand;   /* 2 * ME_ROUND_CAND per macroblock */
+    int16_t *prev_seed;   /* the same, as of the previous picture  */
     int32_t *seed_sad;
+    int32_t *seed_cost;
     uint8_t pred_l[16 * 16];
     uint8_t pred_c[2][8 * 8];
     int has_ref;
@@ -1189,33 +1191,102 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
     e->mb_ncand = slot + 1;
 }
 
-/* Candidate grid of the whole-frame search seed: 5x5 integer offsets spanning
- * +/- (range rounded down to a multiple of 4).  25 candidates per macroblock,
- * every one of them independent of every other -- which is exactly the shape of
- * work a GPU kernel wants, and the only part of the motion search that is
- * submitted as a single batch. */
-#define ME_SEED_R (2)
-#define ME_SEED_CAND ((2 * ME_SEED_R + 1) * (2 * ME_SEED_R + 1))
+/* ------------------------------------------------------------------ */
+/* Whole-frame parallel motion search                                  */
+/* ------------------------------------------------------------------ */
+/* The motion search is the stage that dominates the encode time, and it is
+ * also the one stage that is completely data parallel: every macroblock can be
+ * searched without looking at any other macroblock of the same picture.  Instead
+ * of walking a hexagon around one macroblock at a time -- a serial loop of
+ * dependent steps that a GPU cannot help with -- the search is expressed as a
+ * fixed number of *rounds*.  In each round every macroblock evaluates the eight
+ * neighbours of its current best vector, the whole picture as one batch of SAD
+ * evaluations, and the round updates all the best vectors at once.  Four rounds
+ * (step 8, 4, 2, 1) therefore do the same work as a hex walk, in four batched
+ * calls: on a GPU that is four kernel launches per picture instead of ~10 000
+ * dependent 16x16 SADs.
+ *
+ * The result is not the final vector -- it is the *start* the per-macroblock
+ * search uses (aeg_me_block() takes it as an extra candidate along with the MV
+ * predictor), so the decision logic and the reconstruction stay exactly where
+ * they were.
+ */
+#define ME_ROUND_CAND 9                     /* eight neighbours + the centre */
 
-/* Evaluate the seed grid for every macroblock of the current P picture and keep
- * the best vector per macroblock.  Runs on the GPU when the dispatcher says the
- * motion-estimation stage is faster there, otherwise on the CPU through the
- * same batch interface (src/backend.c). */
+/* Candidate grid of one round, laid out per macroblock: (dx,dy) relative to the
+ * macroblock origin, so that a single sad_batch() call covers the whole picture
+ * (the backend applies dy through the reference stride). */
+static void me_fill_round(struct aeg_encoder *e, const int16_t *mv, int step,
+                          int range)
+{
+    static const int8_t d[ME_ROUND_CAND][2] = {
+        { 0, 0}, {-1, 0}, { 1, 0}, { 0,-1}, { 0, 1},
+        {-1,-1}, { 1,-1}, {-1, 1}, { 1, 1}
+    };
+    int mb, k;
+    for (mb = 0; mb < e->mb_count; mb++) {
+        int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
+        int cx = mv[mb * 2 + 0], cy = mv[mb * 2 + 1];
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int nx = cx + d[k][0] * step, ny = cy + d[k][1] * step;
+            if (nx < -range || nx > range || ny < -range || ny > range) {
+                nx = cx;    /* outside the window: repeat the centre */
+                ny = cy;
+            }
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 0] = (int16_t)(ox + nx);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 1] = (int16_t)(oy + ny);
+        }
+    }
+}
+
+/* One batched SAD round over the whole picture; returns the number of
+ * macroblocks whose winner changed shape. */
+static int me_run_round(struct aeg_encoder *e, int16_t *best, int32_t *cost)
+{
+    int mb, k, improved = 0;
+    e->d.ops.sad_batch(e->d.ops.priv, e->srcp[0], e->stride[0],
+                       e->refp[0], e->stride[0], 16, 16,
+                       e->seed_cand, e->mb_count * ME_ROUND_CAND, e->seed_sad);
+    for (mb = 0; mb < e->mb_count; mb++) {
+        int bestk = 0, bv = cost[mb];
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int32_t v = e->seed_sad[mb * ME_ROUND_CAND + k];
+            if (v < bv) { bv = v; bestk = k; }
+        }
+        if (bv < cost[mb]) {
+            cost[mb] = bv;
+            best[mb * 2 + 0] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 2 + 0] -
+                                         (mb % e->mb_w) * 16);
+            best[mb * 2 + 1] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 2 + 1] -
+                                         (mb / e->mb_w) * 16);
+            improved++;
+        }
+    }
+    return improved;
+}
+
+/* Search every macroblock of the current P picture in parallel and remember the
+ * resulting integer vectors in e->seed_mv[].  Runs on the GPU when the
+ * dispatcher puts motion estimation there and on the CPU otherwise -- the same
+ * batch interface either way (src/backend.c), so the vectors are identical. */
 static void me_seed_frame(struct aeg_encoder *e)
 {
     int range = e->p.search_range ? e->p.search_range : 16;
-    int step = range / (2 * ME_SEED_R);
-    int mb, i, j, n = e->mb_count, cnt = 0;
-    int64_t t0 = aeg_now_ns();
+    int mb, n = e->mb_count;
+    int step;
+    int64_t t0;
 
-    if (step < 1)
-        step = 1;
-    /* Only worth it when the batch really runs on the GPU: on the CPU the
-     * 25 extra SADs per macroblock cost ~10 % of the encode speed and buy a
-     * fraction of a percent of rate, because the hex search from the predicted
-     * vector already finds the same minimum.  A GPU evaluates the whole picture
-     * in one launch, and then the shorter hex walk that follows is a win.
-     * AEG_SEED=1 forces it on so that the path stays covered by the tests. */
+    if (!e->has_ref || !e->cur_is_p || e->p.subme <= 0) {
+        memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
+        return;
+    }
+    /* On a GPU the rounds are a handful of launches, so they shorten the hex
+     * walks for free.  On the CPU they cost about what they save (measured:
+     * neutral at --subme 1, ~8% of the motion stage better integer-only), so
+     * they follow the dispatcher's vote for the motion-estimation stage; a GPU
+     * that is faster there for motion estimation gets them, a CPU picture does
+     * not.  AEG_SEED=1/0 forces the decision either way, which is what the
+     * seed_search conformance case does. */
     {
         const char *ev = getenv("AEG_SEED");
         int on = ev ? atoi(ev) != 0 : e->d.use_gpu[AEG_STAGE_MOTION_EST];
@@ -1224,40 +1295,37 @@ static void me_seed_frame(struct aeg_encoder *e)
             return;
         }
     }
-    if (!e->has_ref || !e->cur_is_p) {
-        memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
-        return;
-    }
+    /* the vectors of the previous picture are the temporal predictor of this
+     * one; e->seed_mv still holds them, so copy before overwriting */
+    memcpy(e->prev_seed, e->seed_mv, (size_t)n * 2 * sizeof(int16_t));
+    t0 = aeg_now_ns();
+
+    /* round 0: the predictor candidates, zero and the previous picture's vector
+     * at the same macroblock (rounded to integer pel) */
     for (mb = 0; mb < n; mb++) {
-        for (i = -ME_SEED_R; i <= ME_SEED_R; i++)
-            for (j = -ME_SEED_R; j <= ME_SEED_R; j++) {
-                int k = ((i + ME_SEED_R) * (2 * ME_SEED_R + 1) + (j + ME_SEED_R));
-                e->seed_cand[(mb * ME_SEED_CAND + k) * 2 + 0] = (int16_t)(i * step);
-                e->seed_cand[(mb * ME_SEED_CAND + k) * 2 + 1] = (int16_t)(j * step);
-            }
-        cnt += ME_SEED_CAND;
-    }
-    /* One call for the whole picture.  The batch op works on a single
-     * (cur, ref) pair, so the macroblocks are evaluated one row at a time:
-     * the row's blocks are contiguous in both pictures. */
-    for (j = 0; j < e->mb_h; j++) {
-        const int per_row = e->mb_w * ME_SEED_CAND;
-        e->d.ops.sad_batch(e->d.ops.priv,
-                           e->srcp[0] + (j * 16) * e->stride[0], e->stride[0],
-                           e->refp[0] + (j * 16) * e->stride[0], e->stride[0],
-                           16, 16,
-                           e->seed_cand + j * per_row * 2, per_row,
-                           e->seed_sad + j * per_row);
-        for (mb = j * e->mb_w; mb < (j + 1) * e->mb_w; mb++) {
-            int best = 0, k, bv = 1 << 30;
-            for (k = 0; k < ME_SEED_CAND; k++) {
-                int32_t v = e->seed_sad[mb * ME_SEED_CAND + k];
-                if (v < bv) { bv = v; best = k; }
-            }
-            e->seed_mv[mb * 2 + 0] = e->seed_cand[(mb * ME_SEED_CAND + best) * 2 + 0];
-            e->seed_mv[mb * 2 + 1] = e->seed_cand[(mb * ME_SEED_CAND + best) * 2 + 1];
+        int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
+        int tx = (e->prev_seed[mb * 2 + 0] + 2) >> 2;
+        int ty = (e->prev_seed[mb * 2 + 1] + 2) >> 2;
+        int k;
+        if (tx < -range || tx > range) tx = 0;
+        if (ty < -range || ty > range) ty = 0;
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int dx = (k == 1) ? tx : 0, dy = (k == 1) ? ty : 0;
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 0] = (int16_t)(ox + dx);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 1] = (int16_t)(oy + dy);
         }
+        e->seed_mv[mb * 2 + 0] = 0;
+        e->seed_mv[mb * 2 + 1] = 0;
+        e->seed_cost[mb] = 1 << 30;
     }
+    me_run_round(e, e->seed_mv, e->seed_cost);
+
+    for (step = range / 2; step >= 1; step /= 2) {
+        me_fill_round(e, e->seed_mv, step, range);
+        if (!me_run_round(e, e->seed_mv, e->seed_cost))
+            break;      /* nothing improved: the walk has converged */
+    }
+
     t0 = aeg_now_ns() - t0;
     e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
     aeg_dispatch_record(&e->d, AEG_STAGE_MOTION_EST,
@@ -2403,11 +2471,14 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     aeg_mc_ctx_init(&e->mc, e->w, e->h, e->stride[0]);
     e->seed_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
-    e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_SEED_CAND * 2 *
+    e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 2 *
                                         sizeof(int16_t));
-    e->seed_sad = (int32_t *)aeg_alloc((size_t)e->mb_count * ME_SEED_CAND *
+    e->prev_seed = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
+    e->seed_sad = (int32_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND *
                                        sizeof(int32_t));
-    if (!e->seed_mv || !e->seed_cand || !e->seed_sad) {
+    e->seed_cost = (int32_t *)aeg_alloc((size_t)e->mb_count * sizeof(int32_t));
+    if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
+        !e->prev_seed) {
         aeg_set_last_error("out of memory");
         aeg_encoder_close(e);
         return NULL;
@@ -2549,7 +2620,9 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_mc_ctx_free(&e->mc);
     aeg_free(e->seed_mv);
     aeg_free(e->seed_cand);
+    aeg_free(e->prev_seed);
     aeg_free(e->seed_sad);
+    aeg_free(e->seed_cost);
     aeg_free(e->mb_dqp);
     aeg_free(e->mbs);
     aeg_free(e->src_mem);

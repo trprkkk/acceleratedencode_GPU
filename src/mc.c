@@ -302,9 +302,17 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
         {0,0},{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
     };
     uint8_t buf[16 * 16];
-    int best = 1 << 30, bx = *mvx, by = *mvy;
+    int best, bx = *mvx, by = *mvy;
     int i, pass;
     int cx = *mvx, cy = *mvy;
+
+    /* The cost of the position the walk starts from -- the centre candidate of
+     * every iteration -- is the block at the integer position, which needs no
+     * interpolation, so evaluate it once here and skip the centre from then on:
+     * it can never improve on itself, and it is 1 of the 9 candidates of every
+     * step of every pass. */
+    best = aeg_satd(bw, bh, cur, cstride,
+                    ref + (cy >> 2) * rstride + (cx >> 2), rstride);
 
     /* Two passes: half-pel then quarter-pel steps.  Each pass walks until it
      * stops improving, but at most `iters` steps: past the second step the
@@ -316,7 +324,7 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
         int improved = 1, iters = 0;
         while (improved && iters++ < AEG_SUBPEL_ITERS) {
             improved = 0;
-            for (i = 0; i < 9; i++) {
+            for (i = 1; i < 9; i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;
                 int ix = nx >> 2, iy = ny >> 2, cost;
                 if (ix < -range || ix > range || iy < -range || iy > range)
