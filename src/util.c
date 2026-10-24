@@ -93,6 +93,9 @@ void aeg_params_default(aeg_params *p)
     p->qp = 23;
     p->rc_mode = AEG_RC_CQP;
     p->gop_size = 250;
+    /* 0 would mean "off"; a scene change is common enough that the default is
+     * on, with a threshold that ignores ordinary motion */
+    p->scenecut = 120;
     p->preset = AEG_PRESET_MEDIUM;
     p->backend = AEG_BACKEND_AUTO;
     for (i = 0; i < AEG_STAGE_COUNT; i++)

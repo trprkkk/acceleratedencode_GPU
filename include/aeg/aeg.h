@@ -106,6 +106,11 @@ typedef struct aeg_params {
     int vbv_maxrate_kbps;     /* R: channel rate, 0 = off               */
     int vbv_bufsize_kbits;    /* B: buffer size, 0 = off                */
     int gop_size;             /* keyframe interval, 0 = only first      */
+    /* Scene-cut detection: insert an IDR when a picture's inter prediction is
+     * worse than its intra prediction by more than `scenecut` percent (0 = off).
+     * A scene change is exactly where a P picture costs more than the IDR it
+     * would replace, and it is the one place where a fixed GOP is measurable. */
+    int scenecut;
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
     int slices;               /* slices per picture, 0/1 = one           */
@@ -153,6 +158,7 @@ typedef struct aeg_stats {
     double  vbv_min_fill_bits;
     int64_t vbv_underflows;
     int64_t vbv_size_clamps;    /* pictures whose QP the buffer raised */
+    int64_t scene_cuts;         /* IDR pictures inserted by scenecut  */
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

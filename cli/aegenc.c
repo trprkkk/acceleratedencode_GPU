@@ -25,6 +25,8 @@ static void usage(void)
 "  -q <int>         QP 0..51 (default 23)\n"
 "  -f <int>         frame rate (default 30)\n"
 "  -g <int>         GOP size, 0 = only the first frame is IDR (default 250)\n"
+"  --scenecut <pct> insert an IDR when a scene change is detected (0 = off,\n"
+"                   default 120: inter prediction 20%% worse than intra)\n"
 "  -n <int>         encode at most n frames\n"
 "  -b <backend>     auto | cpu | opencl | cuda (default auto)\n"
 "  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
@@ -126,6 +128,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--slices")) p.slices = atoi(argv[++i]);
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
             p.threads = atoi(argv[++i]);
+        else if (!strcmp(a, "--scenecut")) p.scenecut = atoi(argv[++i]);
         else if (!strcmp(a, "--vbv-maxrate"))
             p.vbv_maxrate_kbps = atoi(argv[++i]);
         else if (!strcmp(a, "--vbv-bufsize"))
@@ -282,6 +285,9 @@ int main(int argc, char **argv)
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0
                        : 0.0,
                    fps, st.psnr_avg);
+            if (st.scene_cuts)
+                printf("scenecut: %" PRId64 " IDR picture(s) inserted\n",
+                       st.scene_cuts);
             if (st.vbv_min_fill_bits > 0.0 || st.vbv_underflows)
                 printf("vbv: buffer low water %.1f kbit, %" PRId64
                        " underflow(s), %" PRId64 " picture(s) raised to fit\n",

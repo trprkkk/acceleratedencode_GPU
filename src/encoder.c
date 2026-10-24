@@ -96,6 +96,8 @@ struct aeg_encoder {
 
     aeg_dispatcher d;
     int frame_count;         /* total pictures encoded                  */
+    int last_idr_frame;      /* frame_count of the last IDR picture     */
+    int scene_cuts;          /* IDR pictures inserted by scenecut       */
     int frame_num;           /* frame_num of the current picture (8.2.1) */
     int idr_pic_id;
     int last_qp;
@@ -2630,6 +2632,83 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
     (void)is_idr;
 }
 
+/* Scene-cut detection.
+ *
+ * A P picture predicts from the previous reconstructed picture; when the scene
+ * changes, that prediction is worthless and the P picture spends a whole frame's
+ * worth of bits predicting something that is not there, at poor quality.  The
+ * signal is a comparison of the two ways the picture could be coded:
+ *
+ *   inter: |cur - ref| at zero motion.  Every real motion field is at least as
+ *          good as "no motion", so this is an upper bound on the inter cost.
+ *   intra: the AC energy of the picture (|cur - block mean| per 16x16
+ *          macroblock), which is what Intra_16x16 DC prediction has to code.
+ *
+ * The ratio is what separates the two cases: on the panning test clip it is
+ * 0.7-0.75 for ordinary motion (the frame correlation dominates) and 2.9 at a
+ * cut between two unrelated clips, so `p_sad > scenecut/100 * ac` (default 1.2)
+ * is a wide margin either way.  Note that the first version of this compared
+ * inter against the picture's *vertical gradient* instead, which is not an
+ * intra cost at all: fast motion made every ordinary frame look like a cut.
+ *
+ * A cut also has to respect a minimum distance to the previous IDR (a tenth of
+ * the GOP, clamped to [8, 32]): a flash or a hard pan would otherwise turn
+ * every picture into a keyframe. */
+static int is_scene_cut(struct aeg_encoder *e, int is_idr)
+{
+    const uint8_t *cur = e->srcp[0], *ref = e->refp[0];
+    int stride = e->stride[0];
+    int64_t ac = 0, p_sad = 0;
+    int bx, by, x, y;
+
+    if (e->p.scenecut <= 0 || is_idr || !e->has_ref || e->frame_count < 2)
+        return 0;
+    {
+        int min_gop = e->p.gop_size > 0 ? e->p.gop_size / 10 : 8;
+
+        if (min_gop < 8) min_gop = 8;
+        if (min_gop > 32) min_gop = 32;
+        if (e->frame_count - e->last_idr_frame < min_gop)
+            return 0;
+    }
+    /* every other sample in both directions: the ratio of two sums over a
+     * quarter of the picture is within a percent or two of the whole one */
+    for (by = 0; by + 16 <= e->h; by += 16) {
+        for (bx = 0; bx + 16 <= e->w; bx += 16) {
+            int64_t sum = 0, n = 0, dev = 0;
+            int mean;
+
+            for (y = by; y < by + 16; y += 2)
+                for (x = bx; x < bx + 16; x += 2) {
+                    sum += cur[(ptrdiff_t)y * stride + x];
+                    n++;
+                }
+            mean = (int)(sum / (n ? n : 1));
+            for (y = by; y < by + 16; y += 2)
+                for (x = bx; x < bx + 16; x += 2) {
+                    int d = (int)cur[(ptrdiff_t)y * stride + x] - mean;
+
+                    dev += d < 0 ? -d : d;
+                }
+            ac += dev;
+        }
+    }
+    for (y = 0; y < e->h; y += 2)
+        for (x = 0; x < e->w; x += 2) {
+            int d = (int)cur[(ptrdiff_t)y * stride + x] -
+                    (int)ref[(ptrdiff_t)y * stride + x];
+
+            p_sad += d < 0 ? -d : d;
+        }
+    if (getenv("AEG_SCDBG"))
+        fprintf(stderr, "SCD frame %d ac %lld p_sad %lld ratio %.3f\n",
+                e->frame_count, (long long)ac, (long long)p_sad,
+                ac ? (double)p_sad / (double)ac : 0.0);
+    if (ac <= 0)
+        return p_sad > 0;
+    return p_sad * 100 > ac * (int64_t)e->p.scenecut;
+}
+
 /* One slice of the current picture: macroblock rows `first_row` to `last_row`
  * (inclusive), written as a complete NAL payload (RBSP) of its own.
  *
@@ -3338,6 +3417,13 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
 
     is_idr = e->frame_count == 0 ||
              (e->p.gop_size > 0 && (e->frame_count % e->p.gop_size) == 0);
+    if (is_scene_cut(e, is_idr)) {
+        is_idr = 1;
+        e->scene_cuts++;
+        aeg_log(2, "aeg: scene cut at frame %d -> IDR", e->frame_count);
+    }
+    if (is_idr)
+        e->last_idr_frame = e->frame_count;
     return encode_frame(e, is_idr, pts, pkt);
 }
 
@@ -3365,6 +3451,7 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->vbv_min_fill_bits = e->vbv_active ? e->vbv_min_full : 0.0;
     out->vbv_underflows = e->vbv_underflows;
     out->vbv_size_clamps = e->vbv_clamps;
+    out->scene_cuts = e->scene_cuts;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         out->stage_use_gpu[i] = e->d.use_gpu[i];
         out->stage_cpu_ns[i] = e->d.cpu_ns[i][1];

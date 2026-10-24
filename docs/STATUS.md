@@ -20,7 +20,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | slices (`--slices 2 … 12`, including uneven row counts) | 320x192, 320x208, 64x64 | 22 … 26 | 0, 1, 4 | 4 … 8 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs forty-one encoded clip cases
+fails (non-zero exit) on any mismatch; it runs forty-two encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -45,6 +45,10 @@ Implemented and building without warnings:
   sub-macroblock picks its own `sub_mb_type`: 8x8, 8x4, 4x8 or 4x4.
 * P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
   the picture
+* scene-cut detection (`--scenecut`, on by default): an IDR picture is inserted
+  where the inter prediction stops being better than the intra one, instead of
+  spending a whole frame's bits predicting a scene that is no longer there (see
+  *Scene cuts* below)
 * multiple slices per picture (`--slices N`): the picture is cut into N row
   ranges, each an independent NAL with its own slice header and
   `first_mb_in_slice`, and every neighbour outside the current slice is
@@ -116,7 +120,8 @@ Implemented and building without warnings:
     reference the `interp_plane` device kernel is checked against, so its
     output has to stay byte-identical; `kernel_check` still passes.
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`,
-  `--slices N` and `-t N` (slice threads)
+  `--slices N`, `-t N` (slice threads), `--scenecut`, `--vbv-maxrate`/
+  `--vbv-bufsize`
 
 ## Bugs found by the bit-exactness work (do not reintroduce)
 
@@ -593,6 +598,42 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    lookahead), and the VBV model tracks the buffer level between pictures
    rather than the coded-picture removal times a full HRD also signals
    (`cpb_removal_delay` in the SPS VUI).
+
+## Scene cuts
+
+A fixed GOP puts a keyframe every N pictures, wherever the content happens to be.
+A scene cut is the one place where that is measurably the wrong choice: the P
+picture after a cut has nothing to predict from, so it costs a full frame of
+residual at poor quality, while an I picture of the same frame is a normal,
+well-predicted intra frame.  Detection runs before the picture is coded, using
+only the current source picture and the previous reconstruction:
+
+| measure | what it is |
+|---|---|
+| `p_sad` | `sum |cur - ref|` at zero motion -- an upper bound on the inter cost, because every real motion field is at least as good as "no motion" |
+| `ac` | `sum |cur - block mean|` per 16x16 block -- what Intra_16x16 DC prediction has to code |
+
+Both sums use every other sample in both directions (a quarter of the picture;
+the ratio of two such sums is within a percent or two of the whole one).  A cut
+is `p_sad > scenecut/100 * ac`, default `scenecut = 120`.
+
+Measured on the 60-frame clip that is two unrelated 30-frame clips back to back:
+the ratio is 0.67-0.75 on every ordinary picture and 2.92 exactly at the join, so
+the margin is wide in both directions, and the test suite checks both: the join
+gets its IDR, 120 frames of ordinary motion get none.  The first version of this
+compared `p_sad` against the picture's *vertical gradient*, which is not an intra
+cost at all -- fast motion makes even an ordinary frame look uncorrelated -- and
+fired on a quarter of the frames of the panning clip.  That is the bug this
+section exists to record.
+
+Inserting the IDR is rate-neutral on this synthetic pair (56 308 B with the cut
+detected against 56 444 B predicting through it at the same QP, quality within
+0.07 dB): both clips are texture, so coding one as intra is no cheaper than
+coding it as a P picture that predicts badly.  On real content, where a cut is a
+different picture entirely, the P picture is the expensive choice -- the
+mechanism is the standard one and is what makes the feature worth having, but
+this environment cannot demonstrate the gain, so the default threshold is
+deliberately conservative.
 
 ## Slices
 

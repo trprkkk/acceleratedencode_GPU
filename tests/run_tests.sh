@@ -182,6 +182,60 @@ for tag in ('h264_320x192.recon', 'h264_320x192.dec'):
     print("   %-22s %.2f dB" % (tag, 99.0 if s == 0 else 10 * math.log10(255 * 255 / s)))
 PY
 
+echo "== scene cuts"
+# Two unrelated clips back to back: the picture at the join has nothing to
+# predict from, so the encoder has to spend an IDR on it -- and only on it.  The
+# NAL count is checked directly, because a scene-cut detector that never fires
+# and one that fires on everything both "work" otherwise.
+"$BUILD/genyuv" 320 192 30 "$TMP/cutA.yuv" 0 >/dev/null
+"$BUILD/genyuv" 320 192 30 "$TMP/cutB.yuv" 4 >/dev/null
+cat "$TMP/cutA.yuv" "$TMP/cutB.yuv" > "$TMP/cut.yuv"
+./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+    -o "$TMP/cut.264" -g 250 --dump-recon "$TMP/cut.recon" >"$TMP/cut.log" 2>&1 \
+    || { echo "   cut clip: encode failed"; FAIL=1; }
+./$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
+    -o "$TMP/nocut.264" -g 250 >/dev/null 2>&1
+if ! command -v "$FF" >/dev/null 2>&1; then
+    echo "   scenecut: skipped (no ffmpeg)"
+else
+    "$FF" -v error -y -i "$TMP/cut.264" -f rawvideo -pix_fmt yuv420p \
+        "$TMP/cut.dec" 2>"$TMP/cut.decerr"
+    if [ -s "$TMP/cut.decerr" ]; then
+        echo "   cut clip: decoder reported problems:"
+        sed 's/^/     /' "$TMP/cut.decerr" | head -3
+        FAIL=1
+    fi
+    python3 "$TMP/cmp.py" "$TMP/cut.recon" "$TMP/cut.dec" 320 192 60 cut || FAIL=1
+fi
+python3 - "$TMP/cut.264" "$TMP/nocut.264" <<'PY2' || FAIL=1
+import sys
+
+def idr_count(path):
+    d = open(path, 'rb').read()
+    n, i = 0, 0
+    while True:
+        j = d.find(b'\x00\x00\x01', i)
+        if j < 0:
+            return n
+        if j + 3 < len(d) and (d[j + 3] & 0x1f) == 5:
+            n += 1
+        i = j + 3
+
+cut = idr_count(sys.argv[1])
+plain = idr_count(sys.argv[2])
+ok = True
+if cut != 2:
+    print("   60 frame clip with one scene cut: %d IDR NALs, wanted 2  FAIL" % cut)
+    ok = False
+if plain != 1:
+    print("   120 frame clip of ordinary motion: %d IDR NALs, wanted 1  FAIL"
+          % plain)
+    ok = False
+if ok:
+    print("   one cut -> 2 IDR NALs, ordinary motion -> 1 (no false positives)")
+sys.exit(0 if ok else 1)
+PY2
+
 echo "== rate"
 sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
 
