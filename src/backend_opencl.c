@@ -45,6 +45,13 @@ typedef intptr_t cl_context_properties;
 #define CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
 #define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
 
+/* The OpenCL entry points are resolved at run time so that the encoder keeps
+ * building (and running on the CPU) on machines without an OpenCL loader. */
+static void ocl_load_error(const char *name)
+{
+    aeg_log(2, "aeg: OpenCL loader is missing %s", name);
+}
+
 #define OCL_SYMS(X) \
     X(cl_int, clGetPlatformIDs, (cl_uint, cl_platform_id *, cl_uint *)) \
     X(cl_int, clGetDeviceIDs, (cl_platform_id, cl_uint, cl_uint, cl_device_id *, cl_uint *)) \
@@ -84,8 +91,8 @@ typedef struct ocl_ctx {
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
-    char name[192];
-    char vendor[96];
+    char name[96];
+    char vendor[48];
     uint64_t mem;
     int cus;
 } ocl_ctx;
@@ -332,10 +339,10 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     cl_int st;
     size_t got;
 
-#define LOAD(name) do { \
+#define LOAD(ret, name, args) do { \
         *(void **)(&p_##name) = dlsym(lib, #name); \
-        if (!p_##name) { dlclose(lib); return AEG_EBACKEND; } \
-    } while (0)
+        if (!p_##name) { ocl_load_error(#name); dlclose(lib); return AEG_EBACKEND; } \
+    } while (0);
 
     if (ocl_load(&lib) != AEG_OK)
         return AEG_EBACKEND;
@@ -410,7 +417,7 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     ops->sse_batch = ocl_sse_batch;
     ops->sync = ocl_sync;
     ops->destroy = ocl_destroy;
-    snprintf(ops->desc, sizeof(ops->desc), "%s %s (%d CUs, %s)",
+    snprintf(ops->desc, sizeof(ops->desc), "%.48s %.96s (%d CUs, %s)",
              o->vendor, o->name, o->cus, o->is_gpu ? "GPU" : "CPU device");
     return AEG_OK;
 }
