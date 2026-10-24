@@ -1310,20 +1310,25 @@ baseline profile.**  Measured on the genyuv mode-4 clip (320x240, 8 frames),
 BD-rate over QP 22/25/28/31/34/37, our stream against `libx264 -preset medium
 -qp N`:
 
-| x264 medium with | ours, bits at matched PSNR |
+| x264, `-preset medium`, with | ours, bits at matched PSNR |
 |---|---|
-| `cabac=0:8x8dct=0:trellis=0:aq-mode=0` | 47.7% fewer |
-| `cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 8.7% more |
-| `cabac=1:8x8dct=1:trellis=1:aq-mode=0` | 12.3% more |
-| (preset defaults: + AQ, psy-rd) | 12.3% more |
+| `-profile:v baseline -x264-params cabac=0:8x8dct=0` | 35.8% fewer |
+| `-x264-params cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 9.1% more |
+| (preset defaults: CABAC, 8x8, trellis, AQ, psy-rd) | 12.6% more |
 
-So CABAC and the 8x8 transform together are what used to be the whole gap
-against x264 *baseline* (1-8%, table below, which predates CABAC); against the
-*default* preset what is left is 12% on this clip -- 3.6 points of it trellis
-quantisation, the rest the motion search and the rate-distortion refinement of
-it.  On the two-quadrant clip (mode 2, the one that exists to make 16x8 and
-8x16 partitions pay) the gap is 24%, i.e. partitioning is where a faster search
-and a real sub-partition RD pass would buy the most.
+CABAC and the 8x8 transform together are what used to be the whole gap against
+x264 *baseline*, and with both in the encoder is now **35.8% ahead** of a
+baseline-profile x264 on this clip (same script, `-profile:v baseline
+-x264-params cabac=0:8x8dct=0`).  Against the *default* preset what is left is
+12% on this clip, and the split is measurable: x264 with `cabac=1:8x8dct=1` but
+`trellis=0:aq-mode=0` is 9.1% ahead of us, i.e. ~3.5 points of the 12.6 is
+trellis quantisation (level selection inside each block) and the rest is the
+motion search and the rate-distortion refinement of it -- both of which this
+encoder does with cheaper heuristics, and both of which are the compute the
+GPU port is for.  On the two-quadrant clip (mode 2, the one that exists to make
+16x8 and 8x16 partitions pay) the gap is 21%, and on the still clip the encoder
+is 11% *ahead* of x264 medium -- the spread across three clips is what the
+decision pass can and cannot see.
 
 What the decision pass prices a candidate *with* matters more than any of the
 knobs tried before it.  Until this round the rate term was CAVLC-priced (the
@@ -1353,11 +1358,24 @@ BD-rate -- the encoder now spends 11% *fewer* bits than x264 medium there
 instead of 6% more.
 
 Lambda itself did not need to move once the price was right: the scale on
-lambda that was tried as a *stand-in* for the coder's model was re-measured
-with the real one (0.7 / 0.85 / 1.0 of `0.85 * 2^((QP-12)/3)`) and 1.0 is the
-best of the three on all three clips -- 0.7 costs 1.3 points on one and 11
-points on the still clip -- so the calibration `AEG_LAMBDA` uses is the right
-one for CABAC-priced bits too.
+lambda that was tried earlier as a *stand-in* for the coder's model was
+re-measured with the real one (0.7 / 0.85 / 1.0 of `0.85 * 2^((QP-12)/3)`) and
+1.0 is the best of the three on all three clips -- 0.7 costs 1.3 points on one
+and 11 points on the still clip.
+
+The scale a *measurement* of the coder suggests was tried for the same reason
+and is *not* in either.  The rate term of the candidate comparison is still
+CAVLC-priced wherever it comes from `aeg_cavlc_block_cost()`, and CABAC spends
+0.65 of that (55 271 bytes against 84 901 at QP 28 on the panning clip), so
+lambda should arguably be 0.65 of the standard value.  It gains 1.5 points on
+the four-quadrant clip and 0.4 on the two-quadrant one, and **loses 11.6 points
+on the still clip**: a smaller lambda makes a macroblock with a near-zero
+residual code that residual instead of skipping it, and on a still picture the
+skip is the whole picture.  That is the same per-element bias as the earlier
+experiment, now measured with the right rate on the other side of the
+comparison, and it is the reason the honest fix is a per-syntax CABAC cost
+model (a price per bin and per syntax element, `aeg_cabac_bin_cost[]` extended
+into the candidate comparison) rather than any single factor.
 
 The two changes together cost 15% of the encode time at this size (320x192,
 30 frames, preset 2: 86 -> 73 fps), which is the price of running
