@@ -9,7 +9,11 @@
 #
 CC      ?= gcc
 NVCC    ?= nvcc
-CFLAGS  ?= -O2 -g
+# -O3 rather than -O2: the encoder is integer-only, so the aggressive
+# vectoriser cannot change its output (verified byte-identical on every clip in
+# tests/run_tests.sh and tools/sweep.sh), and it is worth ~13% of the overall
+# speed -- 79.4 -> 89.4 fps at 320x192, QP 24, 60 frames, preset 2.
+CFLAGS  ?= -O3 -g
 CFLAGS  += -std=c11 -Wall -Wextra -Iinclude -Isrc -MMD -MP
 LDFLAGS +=
 LDLIBS  += -lm -ldl -lpthread
