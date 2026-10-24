@@ -100,6 +100,19 @@ struct aeg_encoder {
 
     int16_t mv_batch[2 * 256];
     int32_t sad_batch[256];
+    /* Batched coefficient pass (AEG_STAGE_TRANSFORM / AEG_STAGE_IQUANT_IDCT).
+     * The sixteen luma blocks of an inter candidate are independent -- their
+     * prediction comes from the reference picture, not from the block above or
+     * to the left -- so they can be gathered into one call of tq_batch() and
+     * one of iq_idct_batch() instead of sixteen of each.  On the CPU that is
+     * the same arithmetic with a little more copying; on a device it is what
+     * makes the stage a kernel launch rather than 1.9 M calls per hundred
+     * pictures.  coef_batch says whether the dispatcher wants it. */
+    int coef_batch;
+    int16_t coef_res[16 * 16];
+    int16_t coef_lev[16 * 16];
+    int16_t coef_rec[16 * 16];
+    int32_t coef_nz[16];
     /* Whole-frame search seed: 2 ints per macroblock, integer pel.  Filled by
      * me_seed_frame() with the best of a fixed candidate grid, evaluated as one
      * batch through the backend (this is the stage the GPU actually runs). */
@@ -466,6 +479,62 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     const uint8_t *pred = e->pred_l;
     int blk, i, x, y, luma_cbp = 0;
     int qp = c->qp;
+
+    if (e->coef_batch) {
+        /* Gather the sixteen residuals, run the device kernels over the whole
+         * macroblock, then reconstruct block by block: the prediction add and
+         * the SSE are cheap and they are what the RD cost needs. */
+        int64_t t0 = aeg_now_ns();
+        for (blk = 0; blk < 16; blk++) {
+            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+            int16_t *r = e->coef_res + 16 * blk;
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++)
+                    r[y * 4 + x] = (int16_t)((int)src[(by + y) * e->stride[0] + bx + x] -
+                                             (int)pred[(by + y) * 16 + bx + x]);
+        }
+        e->d.ops.tq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
+                          e->coef_lev, e->coef_nz);
+        aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM, 1, aeg_now_ns() - t0);
+        for (blk = 0; blk < 16; blk++)
+            memcpy(c->level[blk], e->coef_lev + 16 * blk, 16 * sizeof(int16_t));
+        t0 = aeg_now_ns();
+        e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
+        aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT, 1, aeg_now_ns() - t0);
+        for (blk = 0; blk < 16; blk++) {
+            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+            uint8_t *r = dst + by * e->stride[0] + bx;
+            const uint8_t *pr = pred + by * 16 + bx;
+            const int16_t *rr = e->coef_rec + 16 * blk;
+            int nz = e->coef_nz[blk];
+            c->nz[blk] = (int8_t)nz;
+            if (nz)
+                luma_cbp |= 1 << blk_group(blk);
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++) {
+                    int p = (int)pr[y * 16 + x] + (int)rr[y * 4 + x];
+                    int d;
+                    r[y * e->stride[0] + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+                    d = (int)r[y * e->stride[0] + x] -
+                        (int)src[(by + y) * e->stride[0] + bx + x];
+                    c->sse += (int64_t)d * d;
+                }
+        }
+        c->cbp = (c->cbp & 0x30) | luma_cbp;
+        {
+            int g, k;
+            for (g = 0; g < 4; g++) {
+                if (!(c->cbp & (1 << g)))
+                    continue;
+                for (k = 0; k < 4; k++) {
+                    int b = group_blk[g][k];
+                    c->bits += aeg_cavlc_block_cost(c->level[b],
+                                                    luma_nc(e, mbx, mby, c, b), 0);
+                }
+            }
+        }
+        return;
+    }
 
     for (blk = 0; blk < 16; blk++) {
         int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
@@ -2660,6 +2729,21 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->pic.plane[2] = e->recp[2];
 
     aeg_dispatch_init(&e->d, e->p.backend, &e->p);
+    /* Both halves of the coefficient pipeline have to be on the device: an
+     * inter candidate cannot transform on one and reconstruct on the other
+     * without a round trip in the middle of its RD cost.  AEG_COEF_BATCH=1/0
+     * forces the choice, which is how the CPU reference runs the batched code
+     * path in the conformance tests (it has to produce the same bitstream). */
+    {
+        const char *ev = getenv("AEG_COEF_BATCH");
+        if (ev)
+            e->coef_batch = atoi(ev) != 0;
+        else
+            e->coef_batch = e->d.ops.backend != AEG_BACKEND_CPU &&
+                            e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
+                            e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
+                            e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
+    }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
     return e;

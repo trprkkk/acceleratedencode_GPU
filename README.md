@@ -46,10 +46,11 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Fractional refinement as rounds (8 quarter/half-pel neighbours of every macroblock, up to three rounds at each step) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | each round is independent across macroblocks; replaces the per-macroblock subpel walk outright |
 | Fractional-pel planes (the four luma planes a quarter-pel position is built from) | GPU (`interp_plane`, one launch per plane) when the dispatcher assigns `inter`, CPU reference otherwise | every output sample independent; removes the per-candidate 6-tap filters |
 | Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
-| Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
-| Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
+| Forward transform (4x4 DCT) + forward quantisation | GPU (`tq_batch`, one launch per inter candidate: sixteen blocks) | per-block, no dependencies |
+| Inverse quantisation + inverse transform | GPU (`iq_idct_batch`, same sixteen blocks) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
 | Distortion metrics on the CPU reference (`aeg_sad`, 4x4 Hadamard `aeg_satd`) | CPU, SSE2 | exact integer sums, so a 13x / 2.2x faster vector path cannot change a decision |
+| Chroma and Intra_16x16 coefficient blocks | CPU | their DC coefficients are replaced by the 4x4 / 2x2 Hadamard of the neighbouring DCs, so they are not independent blocks |
 | The scalar fallbacks of the quantiser and the inverse transform (`aeg_quant_4x4`, `aeg_idct_add_block`) | CPU, SSE2 | same reason: integer in, integer out, bit-identical to the scalar loop the GPU kernels are checked against |
 | Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
 | Intra_4x4 mode analysis (9 predictors x 16 blocks per MB) | CPU for now; the 16 blocks of a macroblock are independent once the neighbours exist | the candidate that dominates I-picture cost |

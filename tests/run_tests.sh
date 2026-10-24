@@ -114,6 +114,13 @@ AEG_SEED=1 run_case seed_search  320 192  8 1 -q 26
 # in quarter-pel rounds (AEG_PARFULL=1) instead of the per-block walk; same
 # conformance requirement.
 AEG_SEED=1 AEG_PARFULL=1 run_case par_subpel 320 192 8 1 -q 26
+# The batched coefficient pass (tq_batch + iq_idct_batch over the sixteen luma
+# blocks of one inter candidate) is normally only taken when the dispatcher
+# puts both coefficient stages on a device; AEG_COEF_BATCH=1 runs the same code
+# path against the CPU reference ops, which has to produce the same stream as
+# the per-block path it replaces.
+AEG_COEF_BATCH=1 run_case coef_batch  320 192  8 1 -q 26 --partitions 15
+AEG_COEF_BATCH=1 run_case coef_batch4 320 192  6 4 -q 22
 # Rate control and adaptive quantisation both change the QP per picture (and,
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.

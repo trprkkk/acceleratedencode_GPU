@@ -302,7 +302,58 @@ Implemented and building without warnings:
     arguments are *positions* can be silently fed displacements and the CPU
     reference implementation will happily agree.
 
+31. **The batched inverse transform was checked against a wrong reference.**
+    `cpu_iq_idct_batch()` -- the C fallback of the `iq_idct_batch` device
+    kernel, and the thing `tests/kernel_check.c` compares the kernel against --
+    carried its own copy of the inverse transform, and that copy had lost all
+    three properties of the real one: it skipped the int16 truncation of the
+    dequantised coefficients (bug 8), it skipped the `+ 1 << 5` DC rounding
+    before the first pass (bug 7), and it rounded the second pass with
+    `(x + 32) >> 6` instead of truncating.  Comparing a kernel against it is
+    comparing against nothing: 31% of the samples of a random block came out
+    different from the encoder's own reconstruction, by 5 or more at QP 20, and
+    `kernel_check` would have called that a pass.  There is now one definition
+    of the arithmetic (`aeg_idct_residual()`), the scalar add path is a wrapper
+    around it, and `tests/coef_check.c` drives the batched entry points against
+    a *third* transcription of the reference.  The rule this is an instance of:
+    a fast path must never be validated against another copy of itself.
+
+## The coefficient stages as one batch per macroblock
+
+The forward transform + quantisation and the inverse transform of an inter
+macroblock are 1.9 M block calls per hundred pictures at preset 2, which is
+what makes them a stage worth moving: not that any single block is expensive
+(it is 50 ns on the CPU now) but that there are thirty-two independent calls
+per macroblock and 240 macroblocks per picture.  The sixteen luma blocks of an
+inter candidate are independent of each other -- their prediction comes from
+the reference picture, not from the block above or to the left -- so
+`code_luma_inter()` gathers the sixteen residuals and issues
+
+```c
+tq_batch(res, 16, qp, 0, level, nz);        /* forward  + quantise  */
+iq_idct_batch(level, 16, qp, rec);          /* dequant + inverse   */
+```
+
+one call each instead of sixteen, and then does the prediction add, the clip
+and the SSE per block (those are cheap and they are what the RD cost needs).
+`coef_batch` is set when the dispatcher has *both* `AEG_STAGE_TRANSFORM` and
+`AEG_STAGE_IQUANT_IDCT` on the device: an inter candidate cannot transform on
+one and reconstruct on the other without a round trip in the middle of its RD
+cost.  `AEG_COEF_BATCH=1` forces the code path against the CPU reference ops,
+which is how the conformance suite covers it without a GPU -- and it has to
+produce the same bitstream as the per-block path, which it does on every case
+in `tests/run_tests.sh`.  On the CPU the forced path is ~20% slower in the
+transform stage (scalar add/clip/SSE instead of the SSE2 `aeg_idct_add_block`,
+plus the gather); on a device it is two launches instead of thirty-two calls.
+
+Two things deliberately stay per block:
+
+* Intra_16x16, because its DC coefficient is replaced by the 4x4 Hadamard of
+  the sixteen DCs, and the batch API has no per-block override;
+* chroma, for the same reason (the 2x2 chroma DC Hadamard).
+
 ## Verification
+
 
 ```sh
 make -j2
@@ -316,7 +367,8 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
 3. `tests/coef_check.c 200000` — the coefficient path against an independently
-   written reference: random blocks (uniform, sparse, single-coefficient,
+   written reference, including the batched entry points the device backends
+   implement (`tq_batch`, `iq_idct_batch`, `aeg_idct_residual`): random blocks (uniform, sparse, single-coefficient,
    DC-only, and amplitudes at both int16/dispatch extremes) at QPs 0…51 and
    block strides 4, 8, 16, 20, 24 and 384, through the scalar quantiser and
    inverse transform, the SSE2 dispatcher, and the in-place case
@@ -328,7 +380,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    (three real ones, listed under bug 8) was found here.
 4. `tests/kernel_check.c` — the OpenCL device kernels against the same scalar
    reference, when a device is present.
-5. `tests/run_tests.sh` — twenty-eight clips (QP 12/23/26/40, presets 0 and 4,
+5. `tests/run_tests.sh` — twenty-eight cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -373,20 +425,18 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
    would recover a little more (it picks a slightly too fine shape on some
    macroblocks).
-2. GPU: the stage profile now says where the next kernel goes -- motion
-   estimation (41% of the encode; the integer SAD walk and the subpel SATD are
-   its two halves, both already batched), then the coefficient pipeline (48%:
-   forward transform, quantisation and reconstruction of every candidate).  The
-   plane build is already a kernel (`interp_plane`), both halves of the search
-   now run as rounds through `sad_batch` and `satd_batch`, and
-   `tests/kernel_check.c` cross-checks six kernels (`sad_batch`, `tq_batch`,
-   `iq_idct_batch`, `sse_batch`, `interp_plane`, `satd_batch`).  What is still
-   missing is the coefficient pipeline's *batch* form: `tq_batch`,
-   `iq_idct_batch` and `sse_batch` exist as operations but the encoder still
-   calls the transform per candidate, because the rate-distortion decision is
-   taken from the result.  Batching it means splitting each picture into a
-   "produce every candidate" pass and a "decide" pass, which is the largest
-   remaining restructure.  The dispatcher's
+2. GPU: every stage that can be batched is now wired to its kernel.  The plane
+   build is `interp_plane`, both halves of the search are rounds through
+   `sad_batch` and `satd_batch`, and the coefficient stages of an inter
+   macroblock are one `tq_batch` + one `iq_idct_batch` per candidate (see the
+   section above); `tests/kernel_check.c` cross-checks all six kernels against
+   the CPU reference.  What is *not* batched: the RD decision itself, which
+   reads each candidate's cost and is therefore serial per macroblock, and
+   chroma / Intra_16x16 (their DC Hadamards need a per-block override).  Going
+   further means splitting the picture into "produce every candidate" and
+   "decide" passes so a whole picture's candidates share one launch; that is
+   the largest remaining restructure and it cannot be measured here.  The
+   dispatcher's
    calibration has never run against real hardware in this environment (there
    is no GPU here), so the crossover points are still the CPU-model ones; the
    dispatcher also only ever measures the path it chose, so a stage is switched
