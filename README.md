@@ -14,13 +14,16 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 25 clip cases and *fails* on any mismatch.  What
+> `make test` asserts it over 26 clip cases and *fails* on any mismatch.  What
 > is *not* finished is speed and the last few percent of efficiency: at
 > matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 3–7 %
 > fewer bits on the inter test clips and is level with it on all-intra, where
-> it used to be 25–50 % ahead.  Speed is the real gap: 27 fps against x264's
-> ~148 fps on two cores at 320x192, because the reference path is portable C
-> with no SIMD.  That is what the GPU backends exist for.  The GPU backends sit behind a measured
+> it used to be 25–50 % ahead.  Speed is the real gap: 49 fps against x264's
+> 187 fps (`--preset medium`, no asm) on two cores at 320x192, because the
+> reference path is portable C with no SIMD.  Caching the fractional-pel
+> planes of the reference picture (see `docs/STATUS.md`) closed 1.6x of it;
+> the remaining gap is the integer SAD walk of the motion search.  That is what
+> the GPU backends exist for.  The GPU backends sit behind a measured
 > dispatcher, and the kernels are checked against the CPU reference by
 > `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
 > environment (there is no GPU available).  See
@@ -36,6 +39,8 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Stage | Where it runs | Why |
 |---|---|---|
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
+| Whole-frame search seed (5x5 candidate grid per macroblock) | GPU (`sad_batch`, one launch per picture row) | every candidate independent; the search start it produces removes hex-search steps |
+| Fractional-pel planes (the four luma planes a quarter-pel position is built from) | CPU today, GPU-ready: one data-parallel pass per reference picture | output sample independent of every other; removes the per-candidate 6-tap filters |
 | Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
 | Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
@@ -111,9 +116,10 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes twenty-five synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes twenty-six synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
+  integer-only and quarter-pel search, the forced whole-frame search seed,
   all-intra and short GOPs, ABR and AQ), decodes them
   with ffmpeg and requires the encoder's own reconstruction to be
   **bit-identical** on every frame; it exits non-zero otherwise.
@@ -127,7 +133,7 @@ src/h264.h          internal data structures and prototypes
 src/tables.c        all constant tables (quantiser, deblock, CAVLC, zigzag, QP map)
 src/transform.c     forward/inverse 4x4 transform, DC Hadamard, quantisation
 src/intra.c         Intra_4x4 (9 modes) / Intra_16x16 / chroma prediction
-src/mc.c            motion estimation and quarter-pel motion compensation
+src/mc.c            motion estimation, quarter-pel MC, fractional-pel plane cache
 src/deblock.c       in-loop deblocking filter
 src/cavlc.c         CAVLC entropy coding of residual blocks
 src/bitstream.c     NAL, SPS, PPS, slice headers, bit writer

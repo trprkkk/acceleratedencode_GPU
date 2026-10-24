@@ -19,7 +19,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs twenty-five encoded clip cases
+fails (non-zero exit) on any mismatch; it runs twenty-six encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -268,11 +268,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — twenty-four clips (QP 12/23/26/40, presets 0 and 4,
+3. `tests/run_tests.sh` — twenty-six clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
-   quarter-pel motion search, all-intra and 3-frame GOPs, the RD Intra_4x4
-   decision of the slow presets, P_Skip, ABR and AQ)
+   quarter-pel motion search, the forced whole-frame search seed, all-intra
+   and 3-frame GOPs, the RD Intra_4x4 decision of the slow presets, P_Skip,
+   ABR and AQ)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -529,14 +530,46 @@ this sandbox):
 
 | encoder | fps | bytes |
 |---|---|---|
-| ours, preset 0 | 246 | 1194196 |
-| ours, preset 2 / 4 | 51 / 55 | 1194023 |
-| x264 baseline (no asm) | 109 | 1206202 |
+| ours, preset 0 | 384 | 163386 |
+| ours, preset 2 / 4 | 49.0 / 47.9 | 78457 / 78265 |
+| x264 baseline (no asm) | 187 | 78 400 |
 
-Intra_4x4 costs ~22% (preset 2: 75.5 → 58.5 fps with the previous quantiser
-bias) because a macroblock candidate now runs sixteen predictors, sixteen
-transforms and sixteen quantisers.  That is
-also why the stage profile has shifted: `transform` (forward/inverse transform,
-quantisation and reconstruction of every candidate) is now ~80% of the encode
-time, motion estimation ~12%, deblocking ~2% — i.e. the stage that a GPU should
-take over is no longer the motion search but the coefficient pipeline.
+The `fractional-pel planes` cache below took preset 2 from 30.3 to 49.0 fps
+(1.62x) and preset 4 from 30.0 to 47.9 fps (1.60x) with *identical* output
+bytes.  Preset 0 is unchanged: it never interpolates.
+
+Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
+497 ms, fractional-pel planes 41 ms, transform 262 ms, deblocking 4 ms of
+816 ms — motion estimation is still ~66% of the encode even after the six-fold
+reduction in interpolation work, because what remains is the integer SAD walk
+(hex search over hundreds of candidates per macroblock).  That is the stage a
+GPU should take: it is a plain batch of independent SAD evaluations.  The
+whole-frame search seed (`me_seed_frame()`) already goes through
+`aeg_be_ops.sad_batch`, so on hardware where the dispatcher puts motion
+estimation on the GPU the search starts from a 5x5 candidate grid evaluated in
+one launch rather than from the predictor alone.
+
+## Fractional-pel planes (the interpolation cache)
+
+A quarter-pel motion search interpolates enormous numbers of samples: every
+candidate position re-runs the 6-tap filter chain for its whole block, so a
+macroblock at preset 2 interpolates ~8000 samples per subpel pass, and the
+picture repeats that 240 times.  The samples themselves are *not* a property of
+the candidate: the four luma planes a fractional position is built from --
+integer, horizontal, vertical and both (H.264 8.4.2.2.1's half-pel memory
+optimisation) -- are a property of the *reference picture*.
+
+`aeg_mc_ctx` (`src/mc.c`) therefore holds the three fractional planes, stored
+with the same stride and the same origin as the integer picture, so a pointer
+into the integer picture becomes a pointer into plane *k* by offsetting from
+`base[0]`.  `aeg_mc_ctx_refresh()` fills them once per P picture (timed as
+`AEG_STAGE_INTER_PRED`), and `aeg_mc_luma_p()` then computes a fractional block
+as two array reads and an average per sample.  The samples are bit-identical to
+what `aeg_mc_luma()` filters per block; the only change is how often the filter
+runs (per picture instead of per candidate, ~30x fewer times at preset 2).
+
+That one change is the largest speed win since the encoder became conformant,
+and it also cleans up the GPU story: building the planes is one data-parallel
+pass over the picture with no dependence between output samples, i.e. exactly
+the shape of kernel `sad_batch`/`tq_batch` already have, whereas the old
+per-block filtering was a scatter of tiny launches.
