@@ -77,6 +77,10 @@ run_case highqp       320 192  6 0 -q 40
 run_case nodeblock    320 192  6 0 -q 23 --no-deblock
 run_case preset0      320 192  6 0 -q 23 -p 0
 run_case preset4      320 192  6 0 -q 23 -p 4
+# Preset 3/4 choose the Intra_4x4 mode by exact rate-distortion (quantise,
+# reconstruct, count the real bits), which is a different code path from the
+# SATD approximation the faster presets use.
+run_case preset3_intra 320 192  4 1 -q 26 -p 3 -g 1
 run_case odd_208      320 208  4 0 -q 26
 run_case small_64     64  64   6 0 -q 23
 run_case cpu_only     320 192  4 0 -q 23 -b cpu

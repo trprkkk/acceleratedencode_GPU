@@ -1509,10 +1509,42 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
             m = modes[k];
             aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
                                   left_avail, top_avail && left_avail);
+            if (e->p.preset >= 3) {
+                /* True rate-distortion choice: quantise the residual, add it
+                 * back, and weigh the exact SSE against the exact bits the
+                 * block will cost.  The SATD approximation below is much
+                 * cheaper but it cannot see that a mode which predicts
+                 * better can still cost more after quantisation. */
+                int16_t res[16], coef[16], lev[16];
+                uint8_t rb_rec[16];
+                const uint8_t *pr = pred;
+                int64_t sse = 0;
+                int nzz = 0, i;
+                for (y = 0; y < 4; y++)
+                    for (x = 0; x < 4; x++)
+                        res[y * 4 + x] = (int16_t)((int)sb[y * s + x] -
+                                                   (int)pr[y * 4 + x]);
+                aeg_transform_4x4(res, 4, coef);
+                aeg_quant_4x4(coef, lev, t->qp, 1);
+                for (i = 0; i < 16; i++)
+                    nzz += lev[i] != 0;
+                for (i = 0; i < 16; i++)
+                    rb_rec[i] = pr[i];
+                aeg_idct_add_block(rb_rec, 4, lev, t->qp, pr, 4, NULL);
+                for (y = 0; y < 4; y++)
+                    for (x = 0; x < 4; x++) {
+                        int d = (int)rb_rec[y * 4 + x] - (int)sb[y * s + x];
+                        sse += (int64_t)d * d;
+                    }
+                cost = (int)(sse + lambda * (double)(nzz ?
+                           aeg_cavlc_block_cost(lev, luma_nc(e, mbx, mby, t, rb),
+                                                0) : 0));
+            } else {
+                cost = 2 * aeg_satd_4x4(pred, 4, sb, s);
+            }
             /* The mode costs one bit when it matches the predictor and four
-             * otherwise, so weigh it into the SAD comparison. */
-            cost = 2 * aeg_satd_4x4(pred, 4, sb, s) +
-                   bits_scale * (m == pmode ? 1 : 4);
+             * otherwise, so weigh it into the comparison. */
+            cost += bits_scale * (m == pmode ? 1 : 4);
             if (cost < best_cost) {
                 best_cost = cost;
                 best = m;

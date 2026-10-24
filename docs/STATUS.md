@@ -19,7 +19,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs twenty-four encoded clip cases
+fails (non-zero exit) on any mismatch; it runs twenty-five encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -271,7 +271,8 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
 3. `tests/run_tests.sh` — twenty-four clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
-   quarter-pel motion search, all-intra and 3-frame GOPs, P_Skip, ABR and AQ)
+   quarter-pel motion search, all-intra and 3-frame GOPs, the RD Intra_4x4
+   decision of the slow presets, P_Skip, ABR and AQ)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -468,11 +469,20 @@ SIMD; we use one reference, none of those, and portable C, and are 5x slower
 spend the same number of bits for the same PSNR: QP 26 gives 46 555 B /
 Y 44.10 dB against x264's 48 039 B / Y 44.23 dB.
 
-Intra-only (a 60-frame all-intra encode, `-g 1`) is still behind: at QP 24 we
-spend 69 350 B / Y 45.16 dB where x264 spends 80 735 B / Y 46.38 dB, i.e. ~1.2 dB
-at matched rate.  That is the Intra_4x4 mode decision (per-block SAD, no
-rate-distortion mode search) and the absence of any intra prediction refinement;
-it is the clearest remaining quality target.
+All-intra (`-g 1`, every picture an IDR) is at the same parity, on both clips:
+at Y 42.4 dB we spend 96 150 B where x264 spends 100 480 B, and at Y 43.7 dB
+109 638 B against 111 173 B.  Comparing the two encoders at a matched *QP*
+suggests a ~1 dB deficit, but that is an artefact of the QP index: at QP 28 we
+spend 109 496 B / Y 42.70 dB and x264 spends 127 287 B / Y 43.94 dB, i.e. it is
+simply buying a better picture with more bits.  (This also explains why the
+earlier "~1 dB behind" statements in this file were withdrawn: the rate-matched
+comparison is the only one that means anything.)
+
+An exact rate-distortion choice of the Intra_4x4 mode (quantise each candidate
+residual, reconstruct, weigh the real SSE against the block's CAVLC bits)
+replaces the SATD approximation at preset 3 and above.  It is worth ~1.5 % of
+the bits on all-intra content and ~0.04 dB on inter content, for a 2x slowdown
+on intra macroblocks, so it stays on the slow presets only.
 
 The quantiser now retains coefficients 1.5x more eagerly than the reference
 rounding offset (`quant_bias()` in `src/transform.c`).  Without trellis, the
