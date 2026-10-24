@@ -116,6 +116,17 @@ static int cpu_sse_batch(void *priv, const uint8_t *a, int sa,
     return AEG_OK;
 }
 
+/* One fractional-pel plane of the reference picture: the same function the
+ * encoder's plane cache uses when the stage stays on the CPU, so the two
+ * implementations of the operation cannot drift apart. */
+static int cpu_interp_plane(void *priv, const uint8_t *ref, int rstride,
+                            int w, int h, int which, uint8_t *dst, int dstride)
+{
+    (void)priv;
+    aeg_hpel_plane_fill(dst, dstride, ref, rstride, w, h, which);
+    return AEG_OK;
+}
+
 void aeg_be_cpu_ops(aeg_be_ops *ops)
 {
     memset(ops, 0, sizeof(*ops));
@@ -124,6 +135,7 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->tq_batch = cpu_tq_batch;
     ops->iq_idct_batch = cpu_iq_idct_batch;
     ops->sse_batch = cpu_sse_batch;
+    ops->interp_plane = cpu_interp_plane;
     snprintf(ops->desc, sizeof(ops->desc), "cpu");
 }
 

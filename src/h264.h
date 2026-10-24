@@ -246,6 +246,14 @@ void aeg_mc_ctx_free(aeg_mc_ctx *mc);
  * origin and stride as `mc->stride`).  Called once per picture, right after the
  * picture becomes the reference. */
 void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h);
+/* Register the reference picture without filling the planes: used when a
+ * backend fills them (aeg_be_ops.interp_plane). */
+void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const uint8_t *ref);
+/* Fill one fractional plane (`which` 1 = horizontal, 2 = vertical, 3 = both) of
+ * the padded reference picture into `pl`.  CPU reference implementation of the
+ * `interp_plane` backend operation. */
+void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
+                         int rstride, int w, int h, int which);
 /* Plane-aware motion compensation: `src` points into mc->base[0]. */
 void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
                    const uint8_t *src, int w, int h, int fx, int fy);

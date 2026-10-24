@@ -2200,7 +2200,25 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
          * macroblock then reads samples from here instead of re-running the
          * 6-tap chain per block: the same samples, computed ~30x less often. */
         int64_t t0 = aeg_now_ns();
-        aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
+        if (e->d.use_gpu[AEG_STAGE_INTER_PRED] && e->d.ops.interp_plane &&
+            e->d.ops.backend != AEG_BACKEND_CPU) {
+            /* the planes are what the GPU stage is for: one launch per plane,
+             * every output sample independent, and the kernel is checked
+             * against aeg_hpel_plane_fill() by tests/kernel_check.c */
+            int i;
+            aeg_mc_ctx_setref(&e->mc, e->refp[0]);
+            for (i = 1; i < 4; i++)
+                e->d.ops.interp_plane(e->d.ops.priv, e->refp[0], e->stride[0],
+                                      e->w, e->h, i,
+                                      (uint8_t *)e->mc.base[i], e->mc.stride);
+            e->mc.ready = 1;
+        } else {
+            aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
+        }
+        aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,
+                            e->d.use_gpu[AEG_STAGE_INTER_PRED] &&
+                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_now_ns() - t0);
         e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
     }
     me_seed_frame(e);

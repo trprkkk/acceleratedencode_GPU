@@ -39,8 +39,8 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Stage | Where it runs | Why |
 |---|---|---|
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
-| Whole-frame search seed (5x5 candidate grid per macroblock) | GPU (`sad_batch`, one launch per picture row) | every candidate independent; the search start it produces removes hex-search steps |
-| Fractional-pel planes (the four luma planes a quarter-pel position is built from) | CPU today, GPU-ready: one data-parallel pass per reference picture | output sample independent of every other; removes the per-candidate 6-tap filters |
+| Whole-frame parallel search rounds (8 neighbours of every macroblock's best vector, four rounds) | GPU (`sad_batch`, one launch per round) | a whole picture's search as four batched calls instead of a serial hex walk per macroblock |
+| Fractional-pel planes (the four luma planes a quarter-pel position is built from) | GPU (`interp_plane`, one launch per plane) when the dispatcher assigns `inter`, CPU reference otherwise | every output sample independent; removes the per-candidate 6-tap filters |
 | Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
 | Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
@@ -139,7 +139,7 @@ src/cavlc.c         CAVLC entropy coding of residual blocks
 src/bitstream.c     NAL, SPS, PPS, slice headers, bit writer
 src/encoder.c       the encoder itself (analysis, RD decision, reconstruction)
 src/backend.c       CPU kernels, dispatch model, device query, calibration
-src/backend_opencl.c OpenCL backend (dlopen, cached buffers, 4 kernels)
+src/backend_opencl.c OpenCL backend (dlopen, cached buffers, 5 kernels)
 src/backend_cuda.c  CUDA backend (driver API + NVRTC, both dlopen()ed)
 src/kernels.h       the shared kernel source string (OpenCL C / CUDA C)
 tests/kernel_check.c cross-checks every GPU kernel against the CPU reference

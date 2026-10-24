@@ -95,7 +95,7 @@ typedef struct cuda_ctx {
     CUdevice device;
     CUcontext ctx;
     CUmodule mod;
-    CUfunction k_sad, k_tq, k_iq, k_sse;
+    CUfunction k_sad, k_tq, k_iq, k_sse, k_intp;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -279,6 +279,33 @@ static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b
     return AEG_OK;
 }
 
+/* One fractional-pel plane of the reference picture (see kernels.h). */
+static int cuda_interp_plane(void *priv, const uint8_t *ref, int rstride,
+                             int w, int h, int which, uint8_t *dst, int dstride)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    CUdeviceptr dref, ddst;
+    size_t rows = (size_t)h + 2 * AEG_PAD;
+    size_t count = (size_t)(w + 2 * AEG_PAD) * rows;
+    size_t rbytes = (size_t)rstride * rows, dbytes = (size_t)dstride * rows;
+    int pad = AEG_PAD;
+    void *args[8];
+    int st;
+
+    dref = cuda_buf(o, 0, rbytes);
+    ddst = cuda_buf(o, 1, dbytes);
+    if (!dref || !ddst)
+        return AEG_EBACKEND;
+    p_cuMemcpyHtoD_v2(dref, ref, rbytes);
+    args[0] = &dref; args[1] = &rstride; args[2] = &w; args[3] = &h;
+    args[4] = &pad;  args[5] = &which;   args[6] = &ddst; args[7] = &dstride;
+    st = cuda_launch(o->k_intp, (int)count, args);
+    if (st != AEG_OK)
+        return st;
+    p_cuMemcpyDtoH_v2(dst, ddst, dbytes);
+    return AEG_OK;
+}
+
 static void cuda_sync(void *priv)
 {
     (void)priv;
@@ -402,7 +429,8 @@ static int cuda_build_module(cuda_ctx *o)
     if (p_cuModuleGetFunction(&o->k_sad, o->mod, "sad_batch") != CUDA_SUCCESS ||
         p_cuModuleGetFunction(&o->k_tq, o->mod, "tq_batch") != CUDA_SUCCESS ||
         p_cuModuleGetFunction(&o->k_iq, o->mod, "iq_idct_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_sse, o->mod, "sse_batch") != CUDA_SUCCESS)
+        p_cuModuleGetFunction(&o->k_sse, o->mod, "sse_batch") != CUDA_SUCCESS ||
+        p_cuModuleGetFunction(&o->k_intp, o->mod, "interp_plane") != CUDA_SUCCESS)
         return AEG_EBACKEND;
     return AEG_OK;
 }
@@ -477,6 +505,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     ops->tq_batch = cuda_tq_batch;
     ops->iq_idct_batch = cuda_iq_idct_batch;
     ops->sse_batch = cuda_sse_batch;
+    ops->interp_plane = cuda_interp_plane;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
     snprintf(ops->desc, sizeof(ops->desc), "CUDA %.48s (%d SMs)", o->name,

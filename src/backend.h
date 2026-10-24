@@ -33,7 +33,14 @@ typedef struct aeg_be_ops {
     int (*iq_idct_batch)(void *priv, const int16_t *level, int nblk, int qp,
                          int16_t *res);
 
-    /* Sum of squared differences over a rectangle, in 8x8 tiles. */
+    /* One fractional-pel plane of a reference picture (H.264 8.4.2.2.1),
+     * `which` 1 = horizontal, 2 = vertical, 3 = both.  `ref` points at picture
+     * (0,0) in a padded buffer (AEG_PAD samples of edge replication on every
+     * side); `dst` receives the same geometry, filled exactly as
+     * aeg_hpel_plane_fill() does.  This is the per-picture interpolation pass
+     * the motion search reads all its subpel candidates from. */
+    int (*interp_plane)(void *priv, const uint8_t *ref, int rstride,
+                        int w, int h, int which, uint8_t *dst, int dstride);
     int (*sse_batch)(void *priv, const uint8_t *a, int sa, const uint8_t *b,
                      int sb, int w, int h, uint64_t *out);
 

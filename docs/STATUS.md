@@ -313,14 +313,20 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
    would recover a little more (it picks a slightly too fine shape on some
    macroblocks).
-2. GPU: the profile above says where to spend the next kernel — the coefficient
-   pipeline (forward transform + quantisation + inverse quantisation + inverse
-   transform + reconstruction) is now ~80% of the encode time, and the
-   Intra_4x4 mode analysis is a per-block batch that only needs the
-   neighbours.  Both GPU backends exist and are checked against the CPU
-   reference by `tests/kernel_check.c`, but the dispatcher's calibration has
-   never run against real hardware in this environment (there is no GPU
-   here), so the measured crossover points are still the CPU-model ones.
+2. GPU: the stage profile now says where the next kernel goes — motion
+   estimation (~66% of the encode, of which the integer SAD walk and the
+   subpel SATD are the two halves), then the coefficient pipeline (forward
+   transform + quantisation + inverse transform of every candidate).  The
+   plane build is already a kernel (`interp_plane`), and the search rounds
+   already run through `sad_batch`; what is missing is the same round structure
+   for the *whole* integer search and a SATD kernel so that the subpel walk can
+   run as a batch too.  Both GPU backends exist and are checked against the CPU
+   reference by `tests/kernel_check.c` (5 kernels), but the dispatcher's
+   calibration has never run against real hardware in this environment (there
+   is no GPU here), so the crossover points are still the CPU-model ones; the
+   dispatcher also only ever measures the path it chose, so a stage is switched
+   by its forced override (`-s stage=backend`) or, on hardware, after both
+   paths have been probed.
 3. Multi-slice and multi-threaded slice encoding are not implemented yet, and
    rate control is picture-level only (no VBV/HRD model, no macroblock-tree
    lookahead).
@@ -573,3 +579,30 @@ and it also cleans up the GPU story: building the planes is one data-parallel
 pass over the picture with no dependence between output samples, i.e. exactly
 the shape of kernel `sad_batch`/`tq_batch` already have, whereas the old
 per-block filtering was a scatter of tiny launches.
+
+It is therefore also the fifth backend operation: `aeg_be_ops.interp_plane`
+(`interp_plane` in `src/kernels.h`, one work item per output sample) fills a
+plane on the device, and the encoder uses it only when the dispatcher has
+assigned the `inter` stage to the GPU (`-s inter=cuda` / `-s inter=opencl`
+forces it).  The CPU implementation of the operation *is* the code the encoder
+runs when the stage stays on the CPU -- `aeg_hpel_plane_fill()` in `src/mc.c` --
+so a stage that moves between the two cannot drift: `tests/kernel_check.c`
+compiles the kernel source as C and compares the three planes sample by sample
+against it (5 kernels, all bit-exact).
+
+## Whole-frame parallel search
+
+The motion search is the one stage that is completely data parallel across
+macroblock boundaries, so `me_seed_frame()` runs it as rounds: round 0 evaluates
+zero and the previous picture's vector at every macroblock, then four rounds
+evaluate the eight neighbours of every macroblock's current best vector at step
+8, 4, 2, 1 -- each round is *one* `sad_batch()` call over the whole picture, i.e.
+five launches per picture instead of ~10 000 dependent 16x16 SADs.  The vectors
+that come out are used as an extra candidate start by the per-macroblock search
+(which keeps its serial hex walk, so the decision logic does not move).
+
+Measured: with `--subme 0`, the rounds shorten the hex walks enough to be 8%
+faster with byte-identical output; at `--subme 1` they are neutral in quality and
+~3% slower on this CPU-only machine, so they follow the dispatcher's vote for
+`AEG_STAGE_MOTION_EST` (a GPU that wins that stage gets them) and `AEG_SEED=1/0`
+forces either way.  `tests/run_tests.sh` encodes one case with them forced on.

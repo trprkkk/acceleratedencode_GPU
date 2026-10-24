@@ -90,6 +90,21 @@ static void call_sad(int i)
 }
 
 /* ------------------------------------------------------------------ */
+/* interp_plane                                                        */
+/* ------------------------------------------------------------------ */
+static const uchar *g_pref;
+static int g_rstride, g_pw, g_ph, g_pwhich;
+static uchar *g_pdst;
+static int g_pdstride;
+
+static void call_intp(int i)
+{
+    (void)i;
+    interp_plane(g_pref, g_rstride, g_pw, g_ph, 32, g_pwhich,
+                 g_pdst, g_pdstride);
+}
+
+/* ------------------------------------------------------------------ */
 /* sse_batch                                                           */
 /* ------------------------------------------------------------------ */
 static const uchar *g_a, *g_b;
@@ -258,7 +273,60 @@ int main(void)
         free(ref_sse);
     }
 
+    /* ---- fractional-pel planes of a reference picture ---------------- */
+    {
+        int w = 96, h = 64, pad = 32, which, x, y;
+        size_t stride = (size_t)w + 2 * pad, rows = (size_t)h + 2 * pad;
+        uchar *padded = (uchar *)calloc(stride * rows, 1);
+        uchar *dst = (uchar *)calloc(stride * rows, 1);
+        /* the reference picture as the encoder keeps it: `pad` samples of edge
+         * replication on every side, origin `pad` in from the allocation */
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                padded[(size_t)(y + pad) * stride + pad + x] = (uchar)rnd(256);
+        for (y = 0; y < (int)rows; y++)
+            for (x = 0; x < (int)stride; x++) {
+                int sy = y - pad, sx = x - pad;
+                if (sy < 0) sy = 0;
+                if (sy > h - 1) sy = h - 1;
+                if (sx < 0) sx = 0;
+                if (sx > w - 1) sx = w - 1;
+                padded[(size_t)y * stride + x] =
+                    padded[(size_t)(sy + pad) * stride + pad + sx];
+            }
+        g_pref = padded + (size_t)pad * stride + pad;
+        g_rstride = (int)stride;
+        g_pw = w;
+        g_ph = h;
+        g_pdstride = (int)stride;
+        g_pdst = dst + (size_t)pad * stride + pad;
+        for (which = 1; which <= 3; which++) {
+            int count = (w + 2 * pad) * (h + 2 * pad);
+            uchar *exp = (uchar *)calloc(stride * rows, 1);
+            g_pwhich = which;
+            memset(dst, 0, stride * rows);
+            /* reference: the CPU implementation the encoder uses when the
+             * stage stays on the CPU, into its own buffer so that the padded
+             * picture stays intact for the next plane */
+            cpu.interp_plane(cpu.priv, g_pref, (int)stride, w, h, which,
+                             exp + (size_t)pad * stride + pad, (int)stride);
+            run_items(count, call_intp);
+            if (memcmp(dst, exp, stride * rows)) {
+                int ndiff = 0;
+                for (y = 0; y < (int)(stride * rows); y++)
+                    if (dst[y] != exp[y])
+                        ndiff++;
+                printf("   kernel_check: interp_plane %d: %d samples differ\n",
+                       which, ndiff);
+                fail = 1;
+            }
+            free(exp);
+        }
+        free(padded);
+        free(dst);
+    }
+
     if (!fail)
-        printf("   kernel_check: 4 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 5 kernels agree with the CPU reference\n");
     return fail;
 }

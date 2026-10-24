@@ -135,26 +135,31 @@ void aeg_mc_ctx_free(aeg_mc_ctx *mc)
 /* Fill one plane over the region whose filter taps stay inside the padded
  * integer picture, then replicate the computed border outwards.  Nothing reads
  * the replicated margin: a motion vector plus a block stays inside the padding
- * the encoder allocates, and the region filled here covers it. */
-static void fill_plane(uint8_t *pl, int stride, const uint8_t *ref,
-                       int w, int h, int which)
+ * the encoder allocates, and the region filled here covers it.
+ *
+ * This is also the CPU reference implementation of the `interp_plane` backend
+ * operation: the GPU kernel computes the same samples for the same region and
+ * fills the margin the same way, so the buffer it produces is byte-identical
+ * and the two paths can be cross-checked (tests/kernel_check.c). */
+void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
+                         int rstride, int w, int h, int which)
 {
     int x0 = -AEG_PAD + 2, x1 = w + AEG_PAD - 4;
     int y0 = -AEG_PAD + 2, y1 = h + AEG_PAD - 4;
     int x, y;
 
     for (y = y0; y <= y1; y++) {
-        const uint8_t *rrow = ref + (ptrdiff_t)y * stride;
-        uint8_t *orow = pl + (ptrdiff_t)y * stride;
+        const uint8_t *rrow = ref + (ptrdiff_t)y * rstride;
+        uint8_t *orow = pl + (ptrdiff_t)y * dstride;
         for (x = x0; x <= x1; x++) {
             const uint8_t *p = rrow + x;
             int v;
             if (which == 1)
                 v = hpel_h(p);
             else if (which == 2)
-                v = hpel_v(p, stride);
+                v = hpel_v(p, rstride);
             else
-                v = hpel_hv(p, stride);
+                v = hpel_hv(p, rstride);
             orow[x] = clip8(v);
         }
         for (x = -AEG_PAD; x < x0; x++)
@@ -163,13 +168,18 @@ static void fill_plane(uint8_t *pl, int stride, const uint8_t *ref,
             orow[x] = orow[x1];
     }
     for (y = -AEG_PAD; y < y0; y++)
-        memcpy(pl + (ptrdiff_t)y * stride - AEG_PAD,
-               pl + (ptrdiff_t)y0 * stride - AEG_PAD,
+        memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
+               pl + (ptrdiff_t)y0 * dstride - AEG_PAD,
                (size_t)(w + 2 * AEG_PAD));
     for (y = y1 + 1; y < h + AEG_PAD; y++)
-        memcpy(pl + (ptrdiff_t)y * stride - AEG_PAD,
-               pl + (ptrdiff_t)y1 * stride - AEG_PAD,
+        memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
+               pl + (ptrdiff_t)y1 * dstride - AEG_PAD,
                (size_t)(w + 2 * AEG_PAD));
+}
+
+void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const uint8_t *ref)
+{
+    mc->base[0] = ref;
 }
 
 void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h)
@@ -181,7 +191,8 @@ void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h)
         return;
     }
     for (i = 1; i < 4; i++)
-        fill_plane((uint8_t *)mc->base[i], mc->stride, ref, w, h, i);
+        aeg_hpel_plane_fill((uint8_t *)mc->base[i], mc->stride, ref, mc->stride,
+                            w, h, i);
     mc->ready = 1;
 }
 
