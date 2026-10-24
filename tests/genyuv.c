@@ -7,7 +7,9 @@
  * vector; mode 1 moves the top and the bottom half in opposite directions and
  * mode 2 does the same left/right, which is what makes 16x8 and 8x16 inter
  * partitions worth coding; mode 3 keeps the picture still after the first
- * frame so that P_Skip macroblocks get exercised.
+ * frame so that P_Skip macroblocks get exercised; mode 4 moves the four
+ * quadrants in four directions, which is what makes P_8x8 (one motion vector
+ * per 8x8 block) worth coding.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +38,10 @@ int main(int argc, char **argv)
                     else           { cx = x - t * 3; cy = y - t * 2; }
                 } else if (mode == 3) {
                     cx = x; cy = y;
+                } else if (mode == 4) {
+                    int sx = x < w / 2 ? 1 : -1, sy = y < h / 2 ? 1 : -1;
+                    cx = x + sx * t * 3;
+                    cy = y + sy * t * 2;
                 }
                 int v = 90 + (int)(60 * sin(cx * 0.09)) + (int)(40 * sin(cy * 0.13)) +
                         ((cx / 24 + cy / 24) & 1) * 30;

@@ -86,6 +86,14 @@ run_case part16x8     320 192  8 1 -q 26 --partitions 7
 run_case part8x16     320 192  8 2 -q 26 --partitions 7
 run_case part_none    320 192  8 1 -q 26 --partitions 1
 run_case pskip        320 192  8 3 -q 26
+# P_8x8: four quadrants moving in four directions, so the macroblock needs one
+# motion vector per 8x8 block; part8x8only makes that the only partition shape.
+run_case part8x8      320 192  8 4 -q 26 --partitions 15
+run_case part8x8only  320 192  8 4 -q 26 --partitions 8
+# Intra_4x4 in every picture, and IDR pictures after P pictures (gop > 1),
+# which is where the mode prediction and the reference handling meet.
+run_case all_intra    320 192  6 1 -q 26 -g 1
+run_case gop3         320 192 10 1 -q 26 -g 3
 
 echo "== PSNR"
 python3 - "$TMP" "320" "192" "10" <<'PY'

@@ -31,8 +31,8 @@ typedef struct mbenc {
     int64_t  sse;
     int64_t  cost;
     /* inter partitioning: one predicted MV per partition (1/4 pel), in the
-     * order the bitstream carries them. */
-    int16_t  pmv[2][2];
+     * order the bitstream carries them.  P_8x8 has four. */
+    int16_t  pmv[4][2];
     uint8_t  nparts;
 } mbenc;
 
@@ -58,15 +58,15 @@ struct aeg_encoder {
     int mb_inter_sad;
     int mb_mv[2];
     int mb_pmv[2];
-    /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8 and
-     * 8x16.  Each carries the per-partition MVs and their predictors, which is
-     * exactly what the bitstream has to transmit. */
+    /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8,
+     * 8x16 and P_8x8.  Each carries the per-partition MVs and their
+     * predictors, which is exactly what the bitstream has to transmit. */
     struct {
         int  type;
         int  nparts;
-        int  mv[2][2];
-        int  pmv[2][2];
-    } mb_cand[3];
+        int  mv[4][2];
+        int  pmv[4][2];
+    } mb_cand[4];
     int mb_ncand;
 
     aeg_dispatcher d;
@@ -110,6 +110,8 @@ static int is_inter_type(int t)
 /* Number of partitions of an inter macroblock type. */
 static int part_count(int type)
 {
+    if (type == AEG_MB_P8x8)
+        return 4;
     return (type == AEG_MB_P16x8 || type == AEG_MB_P8x16) ? 2 : 1;
 }
 
@@ -126,6 +128,13 @@ static void part_geom(int type, int p, int geo[4], int *blk0)
         geo[0] = p ? 8 : 0; geo[1] = 0; geo[2] = 8; geo[3] = 16;
         *blk0 = p ? 2 : 0;
         break;
+    case AEG_MB_P8x8:
+        /* Four 8x8 sub-macroblock partitions, coded in raster order; their
+         * first 4x4 blocks are 0, 2, 8 and 10. */
+        geo[0] = (p & 1) ? 8 : 0; geo[1] = (p & 2) ? 8 : 0;
+        geo[2] = 8; geo[3] = 8;
+        *blk0 = ((p & 2) ? 8 : 0) + ((p & 1) ? 2 : 0);
+        break;
     default:
         geo[0] = 0; geo[1] = 0; geo[2] = 16; geo[3] = 16;
         *blk0 = 0;
@@ -136,6 +145,8 @@ static void part_geom(int type, int p, int geo[4], int *blk0)
 /* mb_type code of an inter macroblock (H.264 table 7-13, P slices). */
 static int inter_mb_type_code(int type)
 {
+    if (type == AEG_MB_P8x8)
+        return 3;
     return type == AEG_MB_P16x8 ? 1 : (type == AEG_MB_P8x16 ? 2 : 0);
 }
 
@@ -630,9 +641,14 @@ static void predict_part_mv(struct aeg_encoder *e, int mbx, int mby,
     nb_mv A, B, C;
     int bx = 0, by = 0, pw = 4, match;
 
-    if (type == AEG_MB_P16x8) {
+    if (type == AEG_MB_P8x8) {
+        /* 8x8 sub-macroblock partition, block coordinates from part_geom() */
+        bx = (p & 1) ? 2 : 0;
+        by = (p & 2) ? 2 : 0;
+        pw = 2;
+    } else if (type == AEG_MB_P16x8) {
         by = p ? 2 : 0;
-    } else {
+    } else if (type == AEG_MB_P8x16) {
         bx = p ? 2 : 0;
         pw = 2;
     }
@@ -668,6 +684,12 @@ static void predict_part_mv(struct aeg_encoder *e, int mbx, int mby,
         if (cy >= 0) {
             if (cx <= 3)
                 nb_set(&C, NB_OK, cur[(cy << 2) + cx][0], cur[(cy << 2) + cx][1]);
+            else if (bx > 0)
+                /* Beyond the macroblock to the right, which the decoder has
+                 * not reached yet: it substitutes the block left of the
+                 * partition's above neighbour. */
+                nb_set(&C, NB_OK, cur[(cy << 2) + bx - 1][0],
+                       cur[(cy << 2) + bx - 1][1]);
             else
                 nb_set(&C, NB_NOTUSED, 0, 0);
         } else if (cx <= 3) {
@@ -704,6 +726,9 @@ static void predict_part_mv(struct aeg_encoder *e, int mbx, int mby,
             *pmvx = A.mvx; *pmvy = A.mvy;
             return;
         }
+    } else if (type == AEG_MB_P8x8) {
+        /* Sub-macroblock partitions have no short-circuit of their own: the
+         * reference decoder runs the ordinary three-neighbour process. */
     } else {
         if (p == 0 && A.ref == NB_OK) {
             *pmvx = A.mvx; *pmvy = A.mvy;
@@ -936,6 +961,8 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 me_candidate(e, mbx, mby, AEG_MB_P16x8);
             if (e->p.partitions & 4)
                 me_candidate(e, mbx, mby, AEG_MB_P8x16);
+            if (e->p.partitions & 8)
+                me_candidate(e, mbx, mby, AEG_MB_P8x8);
         }
     }
 
@@ -999,6 +1026,10 @@ static int mb_type_bits(const mbenc *c, int is_p)
 static int inter_hdr_bits(const mbenc *c)
 {
     int p, bits = mb_type_bits(c, 1);
+    /* P_8x8 carries a sub_mb_type per 8x8 partition, all of them ue(v) = 0
+     * here (every partition stays 8x8). */
+    if (c->type == AEG_MB_P8x8)
+        bits += 4 * aeg_ue_bits(0);
     for (p = 0; p < c->nparts; p++) {
         int geo[4], b0;
         part_geom(c->type, p, geo, &b0);
@@ -1415,6 +1446,10 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
          * picture, so ref_idx_l0 is omitted. */
         int p;
         aeg_bw_ue(bw, (uint32_t)inter_mb_type_code(c->type));
+        if (c->type == AEG_MB_P8x8)
+            /* sub_mb_type: 0 = 8x8, four times, before any mvd (7.3.5.2). */
+            for (p = 0; p < 4; p++)
+                aeg_bw_ue(bw, 0);
         for (p = 0; p < c->nparts; p++) {
             int geo[4], b0;
             part_geom(c->type, p, geo, &b0);

@@ -8,18 +8,21 @@ ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
 > **Status: conformant encoder core (I and P pictures, Intra_16x16 and
-> Intra_4x4, 16x16/16x8/8x16 inter partitioning and P_Skip), quality work in
-> progress.**
+> Intra_4x4, 16x16/16x8/8x16/P_8x8 inter partitioning and P_Skip), quality work
+> in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
-> frame, not just the IDR) on 16x16 – 320x208 content, QP 12–40, presets
-> 0–4, with and without deblocking.  `make test` asserts it and *fails* on any
-> mismatch.  What is *not* finished is rate-distortion efficiency: at matched QP
-> the bitrate is already below x264 baseline (~5% less) but the PSNR is ~1.5 dB
-> lower, i.e. x264 is still ~15–20% more efficient (SATD+λ mode decision, no
-> trellis quantisation, no 8x8 sub-partitions or 8x8 DCT).  The GPU backends sit
-> behind a measured dispatcher but have only been compile-checked in this
-> environment (no GPU available).  See [`docs/STATUS.md`](docs/STATUS.md).
+> frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
+> every partition mask, `-g 1` and `-g 3`, with and without deblocking.
+> `make test` asserts it over 17 clip cases and *fails* on any mismatch.  What
+> is *not* finished is rate-distortion efficiency: with P_8x8 in place x264
+> baseline still spends ~14–28 % fewer bits for the same PSNR on the inter test
+> clips (SATD+λ mode decision, no trellis quantisation, no 8x4/4x8/4x4
+> sub-partitions, no 8x8 DCT).  The GPU backends sit behind a measured
+> dispatcher, and the kernels are checked against the CPU reference by
+> `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
+> environment (there is no GPU available).  See
+> [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Why this design
 
@@ -31,6 +34,7 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Stage | Where it runs | Why |
 |---|---|---|
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
+| Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
 | Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
@@ -82,7 +86,8 @@ without a GPU simply reports no CUDA device at run time.
 `-b cpu|opencl|cuda|auto` selects the backend, `-p 0..4` is the speed/quality
 preset (it scales the search range and the subpel refinement), `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
-16x16 + 16x8 + 8x16), `--dump-recon` writes what the encoder itself
+16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
+default), `--dump-recon` writes what the encoder itself
 reconstructed (this is what a decoder must produce, so it is the primary
 conformance check), and `--no-deblock`, `--subme N`, `--range N` override the
 preset.
@@ -100,11 +105,11 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes thirteen synthetic cases (QP 12/23/26/40,
-  presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8 and
-  8x16 partitioning, P_Skip), decodes them with ffmpeg and requires the
-  encoder's own reconstruction to be **bit-identical** on every frame; it exits
-  non-zero otherwise.
+* `tests/run_tests.sh` encodes seventeen synthetic cases (QP 12/23/26/40,
+  presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
+  8x16 and P_8x8 partitioning, P_Skip, all-intra and short GOPs), decodes them
+  with ffmpeg and requires the encoder's own reconstruction to be
+  **bit-identical** on every frame; it exits non-zero otherwise.
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
 
 ## Layout

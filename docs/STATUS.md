@@ -15,9 +15,12 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | translated noise / gradient clips | 96x96 | 23, 32 | 0, 2 | 3 |
 | odd frame sizes (13 MB rows, 11 MB rows) | 320x208, 320x176 | 23 … 28 | 2, 3 | 3 … 4 |
 | Intra_4x4 probes (random 16x16, 32x16 gradient) | 16x16, 32x16 | 24 … 33 | 2, 4 | 1 … 2 |
+| P_8x8 (four quadrants moving apart) | 320x192 | 20, 26, 34 | 2 | 8 |
+| IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it checks all nine clips frame by frame.
+fails (non-zero exit) on any mismatch; it runs seventeen encoded clip cases
+frame by frame, plus a 156-case sweep of the partition and GOP options.
 
 Implemented and building without warnings:
 
@@ -32,9 +35,10 @@ Implemented and building without warnings:
   block order, `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` and the
   per-block mode decision), chroma (all four modes)
 * half/quarter-pel motion estimation and compensation, MV prediction, skip runs
-* P inter partitioning: 16x16, 16x8 and 8x16, each partition with its own
-  motion search, its own MV predictor and its own `mvd` (8x8 sub-partitions are
-  still missing)
+* P inter partitioning: 16x16, 16x8, 8x16 and **P_8x8** (four 8x8 sub-macroblock
+  partitions, one motion vector and one `mvd` each, `sub_mb_type` 0).  Every
+  partition gets its own motion search and its own MV predictor, including the
+  sub-macroblock rules of 8.4.1.3.1
 * P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
   the picture
 * presets scale the integer search range (8/16/24/32/48) and the subpel
@@ -188,12 +192,32 @@ Implemented and building without warnings:
     is affected, so it looked like an RD problem: QP 16/22/28 lost 6 … 12 dB
     against their neighbours while QP 18/24/30 were fine.  Bit-exactness does
     not catch it — the decoder does not see the table, only our levels.
+26. **The top-right samples of an Intra_4x4 block are only available if they
+    were *coded* already.**  Modes 3 (diagonal down-left) and 7 (vertical-left)
+    read `p[4..7][-1]`.  For the blocks at `(x,y) = (4,4)` and `(4,12)` those
+    samples belong to the blocks at `(8,0)` and `(8,8)`, which Figure 6-8 codes
+    *later*, so the reference decoder replaces them with `p[3][-1]`; using the
+    real pixels desynchronises the reconstruction.  Verified by forcing mode 3
+    there with the real samples: the stream still parses, the frames no longer
+    match.  The blocks in the last block column (`x = 12`) do take their
+    samples from the macroblock above/to the above-right, and that case *is*
+    accepted by the decoder (also verified by forcing it), so
+    `code_luma_i4x4()` distinguishes the two instead of rejecting all of them.
+27. **P_8x8 has no MV-predictor short-circuit, and its "C" neighbour falls
+    back differently.**  16x8 and 8x16 partitions short-circuit to a single
+    neighbour in the reference decoder, so they need their own rule; the 8x8
+    sub-macroblock partitions use the plain three-neighbour process.  Their
+    "above-right" neighbour sits at block `(x+2, y-1)`, and when that is beyond
+    the macroblock's right edge (sub-partitions 2 and 3) the decoder does *not*
+    treat the slot as dead — it substitutes the block left of the above
+    neighbour, `(x+1, y-1)`.  Getting either wrong does not break parsing, it
+    silently reconstructs different motion vectors.
 
 ## Verification
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc round-trip + 9 clips
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 17 clip cases
 ```
 
 `make test` runs three things:
@@ -226,9 +250,9 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 ## Next
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
-   the last non-zero coefficient), then 8x8 sub-partitions and 8x8 DCT (the
-   latter needs a High-profile SPS).  That is where the remaining ~0.6-0.9 dB
-   of inter and ~1.5-2 dB of intra-only efficiency sits.
+   the last non-zero coefficient), then the 8x4/4x8/4x4 `sub_mb_type` shapes
+   and the 8x8 DCT (the latter needs a High-profile SPS).  That is where the
+   remaining ~0.6-1.0 dB of inter and ~1.5-2 dB of intra-only efficiency sits.
 2. GPU: the profile above says where to spend the next kernel — the coefficient
    pipeline (forward transform + quantisation + inverse quantisation + inverse
    transform + reconstruction) is now ~80% of the encode time, and the
@@ -238,6 +262,30 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    never run against real hardware in this environment (there is no GPU
    here), so the measured crossover points are still the CPU-model ones.
 3. Multi-slice / rate control are not implemented yet.
+
+## P_8x8 sub-macroblock partitions
+
+P_8x8 (mb_type 3) splits the macroblock into four 8x8 partitions, each with its
+own motion search, its own MV predictor and its own `mvd`; `sub_mb_type` stays
+0 (8x8) for all four for now.  Measured on the four synthetic 320x192 clips
+(`genyuv` modes 0 … 4, 24 frames, QP 24), the default mask is now
+`1|2|4|8` = 15:
+
+| clip | 16x16/16x8/8x16 (mask 7) | + P_8x8 (mask 15) | change |
+|---|---|---|---|
+| global pan | 27 487 B, Y 45.07 dB | 21 976 B, Y 45.36 dB | −20.0 % |
+| halves moving in opposite directions | 51 344 B, Y 44.34 dB | 42 395 B, Y 44.80 dB | −17.4 % |
+| left/right halves | 41 166 B, Y 44.91 dB | 36 269 B, Y 45.17 dB | −11.9 % |
+| four quadrants moving apart | 52 320 B, Y 44.44 dB | 44 871 B, Y 44.82 dB | −14.2 % |
+
+Lower rate *and* higher PSNR at the same QP: the extra candidate only wins where
+the finer motion field pays for its header, because the decision is a real
+`SSD + lambda * bits` comparison that includes the four `sub_mb_type` symbols.
+It costs about 8 % of the encode speed (four more 8x8 motion searches per
+macroblock).  `x264` (master, baseline, no asm) on the same clips at QP 24:
+18 841 B / 46.14 dB, 33 003 B / 45.83 dB, 31 897 B / 45.83 dB, 35 074 B /
+45.43 dB, so the remaining inter gap is ~14-28 % of the rate, down from
+~29-56 % before P_8x8.
 
 ## Quality against a reference CPU encoder
 
