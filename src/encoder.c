@@ -988,6 +988,24 @@ static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
     (void)type; (void)p;
 }
 
+/* Sum of absolute transformed differences of one partition at a given motion
+ * vector.  The motion search itself is SAD driven (it has to look at hundreds
+ * of candidates), but the *decision* between partition shapes is made on SATD:
+ * SAD happily prefers a wrongly aligned block whose DC error happens to be
+ * small, which is exactly the mistake a sub-partition decision cannot afford. */
+static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
+                     int mvx, int mvy)
+{
+    uint8_t buf[16 * 16];
+    int ix = mvx >> 2, iy = mvy >> 2;
+    aeg_mc_luma(buf, geo[2], e->refp[0] + (mby * 16 + geo[1] + iy) * e->stride[0] +
+                mbx * 16 + geo[0] + ix, e->stride[0], geo[2], geo[3],
+                mvx & 3, mvy & 3);
+    return aeg_satd(geo[2], geo[3], buf, geo[2],
+                    e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+                    geo[0], e->stride[0]);
+}
+
 /* Motion search for one partitioned candidate (16x8 or 8x16): every partition
  * gets its own search centred on its own MV predictor, and the MVs decided so
  * far are visible to the following partitions of the same macroblock. */
@@ -1062,7 +1080,7 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
         for (s = 0; s < 4; s++) {
             int16_t trial[16][2];
             uint8_t tavail[16];
-            int geo[4][4], b0, n = sub_cnt[s], sad_sum = 0, bits, mv[4][2],
+            int geo[4][4], b0, n = sub_cnt[s], satd_sum = 0, bits, mv[4][2],
                 pmv[4][2];
             memcpy(trial, cur, sizeof(trial));
             memcpy(tavail, avail, sizeof(tavail));
@@ -1075,7 +1093,7 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                               &pmv[k][1]);
                 me_partition(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmv[k][0],
                              pmv[k][1], &mv[k][0], &mv[k][1], &sad);
-                sad_sum += sad;
+                satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
                 me_publish(trial, geo[k], mv[k][0], mv[k][1]);
                 avail_publish(tavail, geo[k]);
             }
@@ -1083,10 +1101,13 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
             for (k = 0; k < n; k++)
                 bits += aeg_mvd_bits(mv[k][0] - pmv[k][0],
                                      mv[k][1] - pmv[k][1]);
-            /* 8 SAD units per bit, the same trade the preset-0 decision in
-             * analyse_mb() makes; the final RD pass has the last word. */
-            if (sad_sum + 8 * bits < best_cost) {
-                best_cost = sad_sum + 8 * bits;
+            /* The shape decision compares SATD (not SAD: on a sub-partition
+             * scale a small DC error can make a badly aligned 4x4 look good)
+             * against the partition's own header cost.  The weight was swept
+             * over 4, 8 and 16 on two clips at three rates; 8 is the best.
+             * The macroblock-level RD pass still has the last word. */
+            if (satd_sum + 8 * bits < best_cost) {
+                best_cost = satd_sum + 8 * bits;
                 best_st = s;
                 memcpy(best_geo, geo, sizeof(geo));
                 memcpy(best_mv, mv, sizeof(mv));

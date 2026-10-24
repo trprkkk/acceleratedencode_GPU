@@ -303,10 +303,16 @@ P_8x8 (mb_type 3) splits the macroblock into four 8x8 partitions, each with its
 own motion search, its own MV predictor and its own `mvd`, and each 8x8
 sub-macroblock independently picks its `sub_mb_type`: 0 = 8x8, 1 = two 8x4,
 2 = two 4x8, 3 = four 4x4 (table 7-17).  The shape is chosen per sub-macroblock
-by `SAD + 8 * bits` over the shapes' own `sub_mb_type`, `mvd` and (for the
+by `SATD + 8 * bits` over the shapes' own `sub_mb_type`, `mvd` and (for the
 finer shapes) 4x4 vector costs; the macroblock as a whole is then compared
 against 16x16/16x8/8x16 by the usual `SSD + lambda * bits` RD pass, so a finer
-shape only reaches the bitstream if it pays for its header.
+shape only reaches the bitstream if it pays for its header.  The decision uses
+SATD rather than SAD: at 4x4 scale a small DC error can make a badly aligned
+block look cheap in SAD, and the measurement agrees -- switching the decision
+metric from SAD to SATD is worth +0.4 dB at 300 kb/s and +0.2 dB at 500 kb/s on
+the quadrant clip and +0.2 dB at 300 kb/s on the panning one, for ~3 % of the
+encode speed.  The `SAD + w * bits` weight was swept over 4, 8, 16 at three
+rates; 8 is the best of the three.
 
 Measured on the four synthetic 320x192 clips (`genyuv` modes 0 … 4, 24 frames,
 QP 24), default mask `1|2|4|8` = 15:
@@ -386,6 +392,30 @@ when the macroblock carries a coded residual, so a macroblock with an all-zero
 falls back to the previous QP for such macroblocks (the reconstruction is the
 prediction either way, but the deblocking filter reads the QP).  Getting that
 wrong desynchronises the deblocking on the very first flat macroblock.
+
+## Tried and rejected: per-block RD level tuning ("last non-zero coefficient")
+
+The obvious cheap relative of trellis quantisation is to let each 4x4 block
+drop its highest-frequency non-zero coefficient (or empty the block entirely)
+when `sse + lambda * bits` says so, measuring both terms exactly: inverse
+transform and SSE for the distortion, and the real CAVLC writer for the bits.
+It is implemented, conformance-clean and *not worth it on this content* -- at a
+fixed rate it is PSNR-neutral while costing 5-8 % of the encode speed:
+
+| variant | 300 kb/s | 500 kb/s |
+|---|---|---|
+| no tuning | Y 41.38 dB | Y 46.05 dB |
+| drop last coefficient, lambda x1 | 41.45 | 45.87 |
+| drop last coefficient, lambda x0.25 | 41.39 | 46.04 |
+| drop last coefficient, lambda x2 | 40.54 | 45.59 |
+| allow emptying the block, lambda x1 | 41.20 | 45.83 |
+
+The reason is that on this synthetic texture the last coefficient of a block is
+rarely "free" enough: dropping it removes real detail, and the bits it saves are
+already recovered by the macroblock-level RD pass choosing a coarser partition.
+A full trellis (every coefficient, every level, with the cbp and neighbour
+context costs carried through the whole 4x4 block) is the version that pays in
+x264, and that is a bigger piece of work than this shortcut.
 
 ## Quality against a reference CPU encoder
 
