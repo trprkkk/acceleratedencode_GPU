@@ -171,6 +171,11 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
                    int pred_stride, const int16_t *res, int w, int h);
 
 /* forward quantisation of a 4x4 block, writes `level` (raster order) */
+/* Rounding offset of the forward quantiser for `1 << qbits` and the reference
+ * denominator (3 intra, 6 inter), shared with the GPU kernels so that both
+ * paths produce the same levels. */
+int aeg_quant_bias(int qbits, int den);
+
 void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra);
 void aeg_quant_4x4_dc(const int16_t *coef, int16_t *level, int qp, int intra);
 void aeg_quant_2x2_dc(const int16_t *coef, int16_t *level, int qp, int intra);

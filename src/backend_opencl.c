@@ -179,7 +179,7 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     size_t bytes = (size_t)nblk * 16 * 2;
     size_t nthreads = (size_t)nblk;
     int qbits = 15 + qp / 6;
-    int f = intra ? (1 << qbits) / 3 : (1 << qbits) / 6;
+    int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     int mf0 = aeg_quant_mf[qp % 6][0], mf1 = aeg_quant_mf[qp % 6][1],
         mf2 = aeg_quant_mf[qp % 6][2];
     cl_int st;

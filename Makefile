@@ -3,7 +3,8 @@
 #   make                  CPU build (no external dependencies)
 #   make OPENCL=1         also build the OpenCL backend (loaded with dlopen,
 #                         so no OpenCL headers or link-time library needed)
-#   make CUDA=1           also build the CUDA backend (requires nvcc)
+#   make CUDA=1           also build the CUDA backend (driver API + NVRTC,
+#                         both loaded with dlopen -- no toolkit needed)
 #   make test             encode a synthetic clip and verify the bitstream
 #
 CC      ?= gcc
@@ -29,11 +30,8 @@ endif
 
 ifeq ($(CUDA),1)
 CFLAGS  += -DAEG_HAVE_CUDA
-LDLIBS  += -lcudart -lnvrtc
-SRC     += src/backend_cuda.cu
+SRC     += src/backend_cuda.c
 OBJ     += $(BUILD)/backend_cuda.o
-$(BUILD)/backend_cuda.o: src/backend_cuda.cu
-	$(NVCC) -O2 -c $< -o $@
 endif
 
 all: $(BIN)
@@ -65,12 +63,25 @@ $(BUILD)/cavlc_check: tests/cavlc_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/syntax_check: tests/syntax_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
-# `make test` runs the table consistency check, the CAVLC round-trip check
-# (both without external dependencies) and the end-to-end clip check (needs an
-# ffmpeg binary; set FFMPEG=... ).
-test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check
+# The device kernels are a string that only the OpenCL runtime / NVRTC ever
+# compiles.  Dump that string into a C file, then compile and *run* it against
+# the CPU reference so a drifting kernel cannot hide.
+$(BUILD)/kernel_gen: tests/kernel_gen.c src/kernels.h | $(BUILD)
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+$(BUILD)/kernels_gen.c: $(BUILD)/kernel_gen src/kernels.h
+	./$(BUILD)/kernel_gen > $@
+
+$(BUILD)/kernel_check: tests/kernel_check.c $(BUILD)/kernels_gen.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) -I$(BUILD) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+# `make test` runs the table consistency check, the CAVLC round-trip check and
+# the device-kernel cross-check (none of them need external dependencies), then
+# the end-to-end clip check (needs an ffmpeg binary; set FFMPEG=... ).
+test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check $(BUILD)/kernel_check
 	./$(BUILD)/syntax_check
 	./$(BUILD)/cavlc_check 2000
+	./$(BUILD)/kernel_check
 	sh tests/run_tests.sh
 
 clean:

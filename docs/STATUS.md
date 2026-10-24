@@ -40,7 +40,15 @@ Implemented and building without warnings:
 * presets scale the integer search range (8/16/24/32/48) and the subpel
   refinement
 * deblocking filter (all edges, normative order, alpha/beta/tc0 tables)
-* CPU + OpenCL backends behind a measured dispatcher, device query, calibration
+* CPU + OpenCL + CUDA backends behind a measured dispatcher, device query,
+  calibration.  The CUDA backend is plain C: `libcuda.so.1` (driver API) and
+  `libnvrtc.so` are both `dlopen()`ed and the kernels come from the same
+  `src/kernels.h` string, compiled at run time for the device's compute
+  capability -- so `make CUDA=1` needs no toolkit and no `nvcc`.
+* `tests/kernel_check.c` compiles the kernel source string as ordinary C
+  (with `__kernel`/`__global`/`get_global_id` macros) and runs every kernel
+  work item against the CPU reference, so kernel regressions are caught on a
+  machine with no GPU.
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`
 
 ## Bugs found by the bit-exactness work (do not reintroduce)
@@ -225,9 +233,10 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    pipeline (forward transform + quantisation + inverse quantisation + inverse
    transform + reconstruction) is now ~80% of the encode time, and the
    Intra_4x4 mode analysis is a per-block batch that only needs the
-   neighbours.  `src/backend_cuda.cu` still has to be written for `CUDA=1`
-   (see item 2 of the previous list), and the dispatcher's calibration has
-   never run against real hardware in this environment.
+   neighbours.  Both GPU backends exist and are checked against the CPU
+   reference by `tests/kernel_check.c`, but the dispatcher's calibration has
+   never run against real hardware in this environment (there is no GPU
+   here), so the measured crossover points are still the CPU-model ones.
 3. Multi-slice / rate control are not implemented yet.
 
 ## Quality against a reference CPU encoder

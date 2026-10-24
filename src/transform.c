@@ -139,7 +139,7 @@ void aeg_itransform_dc2x2(const int16_t in[4], int16_t out[4])
 #define QUANT_BIAS_NUM 3
 #define QUANT_BIAS_DEN 2
 
-static inline int quant_bias(int qbits, int den)
+int aeg_quant_bias(int qbits, int den)
 {
     return (int)(((int64_t)(1 << qbits) * QUANT_BIAS_NUM) /
                  (den * QUANT_BIAS_DEN));
@@ -150,7 +150,7 @@ static inline int quant_coef(int32_t coef, int qp, int cls, int bias_num,
 {
     const int qbits = 15 + (qp / 6);
     const int mf = aeg_quant_mf[qp % 6][cls];
-    const int f = quant_bias(qbits, bias_den) * bias_num;
+    const int f = aeg_quant_bias(qbits, bias_den) * bias_num;
     int abs = coef < 0 ? -coef : coef;
     int level = (int)(((int64_t)abs * mf + f) >> qbits);
     return coef < 0 ? -level : level;
@@ -182,7 +182,7 @@ void aeg_quant_4x4_dc(const int16_t *coef, int16_t *level, int qp, int intra)
      * which leaves two more bits of shift than for an AC block. */
     const int qbits = 17 + (qp / 6);
     const int mf = aeg_quant_mf[qp % 6][0];
-    const int f = quant_bias(qbits, intra ? 3 : 6);
+    const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     int i;
     for (i = 0; i < 16; i++) {
         int abs = coef[i] < 0 ? -coef[i] : coef[i];
@@ -197,7 +197,7 @@ void aeg_quant_2x2_dc(const int16_t *coef, int16_t *level, int qp, int intra)
      * inverse normalises by one bit less than the luma one. */
     const int qbits = 16 + (qp / 6);
     const int mf = aeg_quant_mf[qp % 6][0];
-    const int f = quant_bias(qbits, intra ? 3 : 6);
+    const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     int i;
     for (i = 0; i < 4; i++) {
         int abs = coef[i] < 0 ? -coef[i] : coef[i];

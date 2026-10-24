@@ -58,13 +58,17 @@ why every kernel is an integer operation and the reference implementation in
 ```sh
 make                 # CPU only (default, no OpenCL/CUDA required)
 make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
-make CUDA=1          # + CUDA backend (needs the CUDA toolkit; not yet written)
+make CUDA=1          # + CUDA backend (driver API + NVRTC, both dlopen()ed)
 make test            # table + CAVLC checks, then bit-exactness of 13 clips
 ```
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
 resolves `libOpenCL.so` with `dlopen()` so a CPU-only machine can still build
-the tree.
+the tree.  `make CUDA=1` works the same way: `src/backend_cuda.c` is plain C
+that opens `libcuda.so.1` (driver API -- no `cuda.h` needed) and `libnvrtc.so`
+(NVRTC compiles `src/kernels.h` at run time for the device's compute
+capability), so no CUDA toolkit or `nvcc` is required to build, and a machine
+without a GPU simply reports no CUDA device at run time.
 
 ## Usage
 
@@ -118,7 +122,9 @@ src/bitstream.c     NAL, SPS, PPS, slice headers, bit writer
 src/encoder.c       the encoder itself (analysis, RD decision, reconstruction)
 src/backend.c       CPU kernels, dispatch model, device query, calibration
 src/backend_opencl.c OpenCL backend (dlopen, cached buffers, 4 kernels)
+src/backend_cuda.c  CUDA backend (driver API + NVRTC, both dlopen()ed)
 src/kernels.h       the shared kernel source string (OpenCL C / CUDA C)
+tests/kernel_check.c cross-checks every GPU kernel against the CPU reference
 cli/aegenc.c        command line front end
 tests/              synthetic clip generator, single-MB probe, test runner
 ```
