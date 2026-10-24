@@ -7,15 +7,16 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: work in progress, not yet a usable encoder.**
-> See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is validated and what
-> is still broken.  The short version: the entropy coder, transforms,
-> dequantisation, intra prediction and motion compensation are implemented and
-> individually verified against a reference decoder, and the encoder core
-> reconstructs to 38 dB on a smooth clip at QP 23 — but the bitstream it emits
-> is **not yet decodable by an external decoder**, because of a residual bug in
-> multi-coefficient CAVLC level coding.  Do not use this to encode anything you
-> care about yet.
+> **Status: conformant encoder core, quality work in progress.**
+> The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
+> reproduces the encoder's reconstruction **exactly** (max abs diff 0) on
+> 16x16 – 640x368 content, QP 10–51, with every GOP length from all-intra to a
+> single IDR, with and without deblocking.  `make test` asserts it.
+> What is *not* finished is rate-distortion efficiency: per-QP PSNR is within
+> ~0.5 dB of x264 baseline, but at roughly twice the bitrate (SAD-only mode
+> decision, no Intra_4x4, no trellis).  The GPU backends are implemented behind
+> a measured dispatcher but have only been compile-verified in this
+> environment (no GPU available).  See [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Why this design
 
