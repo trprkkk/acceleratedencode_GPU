@@ -650,6 +650,10 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
    fails it.  `tests/genyuv.c` takes a mode argument so that the partitioning
    cases really move the two halves of the picture in opposite directions —
    the default clip pans as one block and can never make a partition pay.
+   The script also asserts the skip statistics on a still clip (74% of its
+   macroblocks, 85% of the P ones, must be skips), because a mode decision that
+   stops finding `P_Skip` produces a conformant stream that is 45% larger, and
+   no bit-exactness check can see that.
 
 `reconstruction vs decode` must be `max abs diff 0`.
 

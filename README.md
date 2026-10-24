@@ -160,14 +160,20 @@ preset.
   independent decode.  Run it on the machine that has the GPU; on a CPU-only
   machine everything passes trivially, because the batch entry points fall back
   to the reference ops.
-* `tests/run_tests.sh` encodes forty-five synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes forty-seven synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   integer-only and quarter-pel search, the forced whole-frame search seed,
   all-intra and short GOPs, ABR and AQ), decodes them
   with ffmpeg and requires the encoder's own reconstruction to be
-  **bit-identical** on every frame; it exits non-zero otherwise.
+  **bit-identical** on every frame; it exits non-zero otherwise.  It also
+  checks the skip statistics the encoder reports on a still clip, which is the
+  cheapest macroblock the standard has and the one the mode decision used to
+  miss entirely (see *The skip candidate* in `docs/STATUS.md`).
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
+* `-v 1` (the default) also prints how many macroblocks of the stream are
+  skips, which is the quickest way to see whether the mode decision is finding
+  the cheapest macroblock the standard has.
 
 ## Layout
 

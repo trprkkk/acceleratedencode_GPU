@@ -168,6 +168,10 @@ typedef struct aeg_stats {
     int64_t vbv_underflows;
     int64_t vbv_size_clamps;    /* pictures whose QP the buffer raised */
     int64_t scene_cuts;         /* IDR pictures inserted by scenecut  */
+    /* Macroblock statistics, cumulative over the encode: how many macroblocks
+     * were written and how many of them as a skip. */
+    int64_t macroblocks;
+    int64_t skipped;
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

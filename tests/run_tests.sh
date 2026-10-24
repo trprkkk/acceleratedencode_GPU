@@ -190,6 +190,32 @@ for tag in ('h264_320x192.recon', 'h264_320x192.dec'):
     print("   %-22s %.2f dB" % (tag, 99.0 if s == 0 else 10 * math.log10(255 * 255 / s)))
 PY
 
+echo "== skip coding"
+# A still clip has to be coded almost entirely of skips: P_Skip is one
+# context-coded flag, and it is only reachable because the search adds the
+# vector the skip rule derives as a candidate of its own.  Before that
+# the encoder skips 74% of this clip's macroblocks (85% of the P ones -- the
+# rest is the IDR picture, which cannot skip at all); the guard is 65%, well
+# below that, so it fails only if the skip path breaks rather than when the
+# mode decision shifts.
+"$BUILD/genyuv" 320 192 8 "$TMP/still.yuv" 3 >/dev/null
+./$BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/still.yuv" -o "$TMP/still.264" \
+    -q 26 >"$TMP/still.log" 2>&1
+python3 -c '
+import re, sys
+log = open(sys.argv[1]).read()
+m = re.search(r"(\d+) skip of (\d+)", log)
+if not m:
+    print("   skip coding: no macroblock statistics in the encoder output")
+    sys.exit(1)
+skip, total = int(m.group(1)), int(m.group(2))
+frac = 100.0 * skip / total
+ok = frac >= 65.0
+print("   still clip: %.0f%% skip (%d of %d)%s" % (frac, skip, total,
+      "" if ok else "  FAIL"))
+sys.exit(0 if ok else 1)
+' "$TMP/still.log" || FAIL=1
+
 echo "== scene cuts"
 # Two unrelated clips back to back: the picture at the join has nothing to
 # predict from, so the encoder has to spend an IDR on it -- and only on it.  The

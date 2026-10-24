@@ -437,6 +437,12 @@ int main(int argc, char **argv)
                    n, secs, secs > 0 ? n / secs : 0.0, st.bytes);
             /* the stream's rate is a property of the file and the frame rate,
              * not of how fast this machine happened to encode it */
+            if (st.macroblocks > 0)
+                printf("macroblock types: %" PRId64 " skip of %" PRId64
+                       " (%.0f%%), %" PRId64 " coded\n",
+                       st.skipped, st.macroblocks,
+                       100.0 * (double)st.skipped / (double)st.macroblocks,
+                       st.macroblocks - st.skipped);
             printf("bitrate %.1f kb/s at %d fps, PSNR %.2f dB (Y+U+V average)\n",
                    st.frames > 0
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0

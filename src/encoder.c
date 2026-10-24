@@ -112,6 +112,12 @@ struct aeg_encoder {
     int frame_count;         /* total pictures encoded                  */
     int last_idr_frame;      /* frame_count of the last IDR picture     */
     int scene_cuts;          /* IDR pictures inserted by scenecut       */
+    /* Coding statistics: how many macroblocks were coded and how many of them
+     * as a skip.  A skip is the cheapest macroblock the standard has, so the
+     * fraction is the quickest check that the decision pass is doing its job
+     * on still content (it is also what the pskip_still case asserts). */
+    int64_t stat_mbs;
+    int64_t stat_skipped;
     int frame_num;           /* frame_num of the current picture (8.2.1) */
     int idr_pic_id;
     int last_qp;
@@ -3941,6 +3947,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                         skipped = 1;
                 }
                 m->skip = (uint8_t)skipped;
+                e->stat_mbs++;
+                e->stat_skipped += skipped;
                 /* A skipped macroblock carries no mb_qp_delta, so the decoder
                  * forgets the previous delta's value: the next macroblock tests
                  * its first bin against context 60, not 61 (9.3.2.7). */
@@ -4021,6 +4029,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     if (tmp->mv[0][0] == pmvx && tmp->mv[0][1] == pmvy)
                         skipped = 1;
                 }
+                e->stat_mbs++;
+                e->stat_skipped += skipped;
                 if (skipped)
                     skip_run++;
                 else {
@@ -4671,6 +4681,8 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->vbv_underflows = e->vbv_underflows;
     out->vbv_size_clamps = e->vbv_clamps;
     out->scene_cuts = e->scene_cuts;
+    out->macroblocks = e->stat_mbs;
+    out->skipped = e->stat_skipped;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         out->stage_use_gpu[i] = e->d.use_gpu[i];
         out->stage_cpu_ns[i] = e->d.cpu_ns[i][1];
