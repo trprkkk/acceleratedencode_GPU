@@ -651,12 +651,12 @@ this sandbox), best of three runs:
 
 | encoder | fps | bytes | Y-PSNR |
 |---|---|---|---|
-| ours, preset 0 | 638 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 90.2 / 82.6 | 78502 / 78468 | 45.12 / 45.12 |
-| x264 baseline (no asm) | 169.5 | 78 664 | 45.16 |
+| ours, preset 0 | 708 | 163386 | 42.30 |
+| ours, preset 2 / 4 | 91.6 / 89.5 | 78502 / 78468 | 45.12 / 45.12 |
+| x264 baseline (no asm) | 175 | 78 664 | 45.16 |
 
 At a matched QP the two encoders land within 0.2% of each other in rate and
-0.04 dB in quality, and x264 is 1.9x faster (it was 3.4x two rounds ago).
+0.04 dB in quality, and x264 is 1.85x faster (it was 3.4x three rounds ago).
 Absolute numbers move a few percent between runs; the `--frames 60`,
 single-thread, same-QP comparison is the one to repeat.
 
@@ -683,16 +683,34 @@ the picture.  The machine is noisy (the same binary measures anywhere between
 alternating runs rather than a precision result.
 
 Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
-221 ms, fractional-pel planes 42 ms, transform 260 ms, deblocking 4 ms of
-538 ms (motion estimation was 433 ms of 783 ms before the SIMD kernels).
-Motion estimation is 41% of the encode now and the *transform* stage is the
-largest single block at 48% -- but that stage is the whole of `code_mb()`, i.e.
-the rate-distortion pass: forward transform, quantisation and reconstruction of
-every candidate, plus the bitstream, not one 4x4 transform.  The GPU story is
-unchanged and sharper: the search's two halves are pure batches of independent
-evaluations (`sad_batch`, `satd_batch`) and the plane build has its kernel
-(`interp_plane`); the coefficient pipeline is the one that still needs its
-batch form (see *Next*).
+178 ms, fractional-pel planes 43 ms, transform 214 ms, deblocking 4 ms of
+444 ms (motion estimation was 433 ms of 783 ms before the SIMD kernels).
+Motion estimation is 40% of the encode and the *transform* stage is the largest
+single block at 48% -- but that stage is the whole of `code_mb()`, i.e. the
+rate-distortion pass: forward transform, quantisation and reconstruction of
+every candidate, plus the bitstream, not one 4x4 transform.  Its cost is
+therefore a *call count*, and that is what the batch form fixes (see *The
+coefficient stages as one batch per macroblock*): 1.9 M block calls per hundred
+pictures become 32 calls per macroblock, launched as two kernels.
+
+What the profile says is left on the CPU, and why it stays there:
+
+| function | share | note |
+|---|---|---|
+| `aeg_mc_luma_p` | 14% | already `pavgb`, 16 samples an instruction; it is bandwidth, not instructions |
+| `aeg_quant_4x4` | 11% | scalar int64 divisions; SSE2 path exists (2.5x) but the call count dominates |
+| `code_luma_inter` | 11% | residual gather + SSE of sixteen blocks; the batch path replaces the middle of it |
+| `code_luma_i16` | 11% | Intra_16x16 RD: serial by construction (the DC Hadamard) |
+| `aeg_sad` | 8.6% | already SSE2; the search evaluates a fixed candidate grid |
+| `aeg_idct_add_block` | 8.6% | SSE2, 3x the scalar loop |
+| `aeg_hpel_plane_fill` | 8.6% | the interpolation pass; a kernel (`interp_plane`) when the stage is on a device |
+| `aeg_transform_4x4` | 5.7% | scalar; the batch path moves it |
+| `write_block` | 5.7% | CAVLC, serial by definition |
+
+Trimming the RD search itself (fewer intra modes, SATD-first inter partitions)
+was measured at +10-19% speed for -0.1 to -0.2 dB, and on this machine the
+speed part is inside the noise; it was not taken.  Multi-threading is the
+remaining structural option and it is not implemented.
 
 ## Fractional-pel planes (the interpolation cache)
 

@@ -19,14 +19,14 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > is *not* finished is speed and the last few percent of efficiency: at
 > matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
 > fewer bits on the inter test clips and is level with it on all-intra, where
-> it used to be 25–50 % ahead.  Speed is the real gap: 90 fps against x264's
-> 170 fps (`--preset medium`, no asm) on two cores at 320x192 QP 24, so it is
-> now 1.9x behind instead of 3.4x.  What closed that: caching the
-> fractional-pel planes of the reference picture (1.6x), then exact-integer
-> SSE2 kernels for SAD, the 4x4 SATD, the quantiser, the inverse transform and
-> its prediction add, plus `-O3`.  What is left is the integer SAD walk of the
-> motion search, 57 % of the encode time, and that is what the GPU backends
-> exist for.  The GPU backends sit behind a measured
+> it used to be 25–50 % ahead.  Speed is the real gap: 92 fps against x264's
+> 175 fps (`--profile baseline`, no asm) on two cores at 320x192 QP 24, so it
+> is now 1.85x behind instead of 3.4x.  What closed that: caching the
+> fractional-pel planes of the reference picture (1.6x), exact-integer SSE2
+> kernels for SAD, the 4x4 SATD, the quantiser, the inverse transform and its
+> prediction add, plus `-O3`.  What is left is the motion search and the
+> rate-distortion pass, at 40 % and 48 % of the encode time, and those are what
+> the GPU backends exist for.  The GPU backends sit behind a measured
 > dispatcher, and the kernels are checked against the CPU reference by
 > `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
 > environment (there is no GPU available).  See
