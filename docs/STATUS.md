@@ -15,12 +15,13 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | translated noise / gradient clips | 96x96 | 23, 32 | 0, 2 | 3 |
 | odd frame sizes (13 MB rows, 11 MB rows) | 320x208, 320x176 | 23 … 28 | 2, 3 | 3 … 4 |
 | Intra_4x4 probes (random 16x16, 32x16 gradient) | 16x16, 32x16 | 24 … 33 | 2, 4 | 1 … 2 |
-| P_8x8 (four quadrants moving apart) | 320x192 | 20, 26, 34 | 2 | 8 |
+| P_8x8 (four quadrants moving apart, all four `sub_mb_type` shapes) | 320x192, 96x64, 48x32 | 12, 20, 26, 34 | 2 | 6 … 8 |
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs seventeen encoded clip cases
-frame by frame, plus a 156-case sweep of the partition and GOP options.
+fails (non-zero exit) on any mismatch; it runs nineteen encoded clip cases
+frame by frame, plus a 372-case sweep of the partition, QP and GOP options
+(`/tmp/sweep.sh`) and a 240-case matrix over `--partitions 1|3|7|15`.
 
 Implemented and building without warnings:
 
@@ -36,9 +37,10 @@ Implemented and building without warnings:
   per-block mode decision), chroma (all four modes)
 * half/quarter-pel motion estimation and compensation, MV prediction, skip runs
 * P inter partitioning: 16x16, 16x8, 8x16 and **P_8x8** (four 8x8 sub-macroblock
-  partitions, one motion vector and one `mvd` each, `sub_mb_type` 0).  Every
-  partition gets its own motion search and its own MV predictor, including the
-  sub-macroblock rules of 8.4.1.3.1
+  partitions, one motion vector and one `mvd` each).  Every partition gets its
+  own motion search and its own MV predictor, including the sub-macroblock
+  rules of 8.4.1.3.1 and the per-partition availability rule (bug 27).  Each 8x8
+  sub-macroblock picks its own `sub_mb_type`: 8x8, 8x4, 4x8 or 4x4.
 * P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
   the picture
 * presets scale the integer search range (8/16/24/32/48) and the subpel
@@ -203,21 +205,33 @@ Implemented and building without warnings:
     samples from the macroblock above/to the above-right, and that case *is*
     accepted by the decoder (also verified by forcing it), so
     `code_luma_i4x4()` distinguishes the two instead of rejecting all of them.
-27. **P_8x8 has no MV-predictor short-circuit, and its "C" neighbour falls
-    back differently.**  16x8 and 8x16 partitions short-circuit to a single
-    neighbour in the reference decoder, so they need their own rule; the 8x8
-    sub-macroblock partitions use the plain three-neighbour process.  Their
-    "above-right" neighbour sits at block `(x+2, y-1)`, and when that is beyond
-    the macroblock's right edge (sub-partitions 2 and 3) the decoder does *not*
-    treat the slot as dead — it substitutes the block left of the above
-    neighbour, `(x+1, y-1)`.  Getting either wrong does not break parsing, it
-    silently reconstructs different motion vectors.
+27. **P_8x8 has no MV-predictor short-circuit, and a 4x4 block only counts as
+    a neighbour once its own partition has been decoded.**  16x8 and 8x16
+    partitions short-circuit to a single neighbour in the reference decoder, so
+    they need their own rule; the 8x8 sub-macroblock partitions use the plain
+    three-neighbour process.  Their "above-right" neighbour ("C") sits at
+    block `(x+pw, y-1)`; when it is unavailable the decoder substitutes the
+    block above-left of the partition, `(x-1, y-1)` — and when this crosses the
+    macroblock edge it is `(3, y-1)` of the left macroblock, or for the top row
+    of blocks `(x-1, 3)` of the macroblock above (`(3,3)` of the above-left
+    macroblock for `x == 0`).  The subtle part: the decoder fills its 4x4
+    neighbour cache partition by partition, so a block that belongs to a
+    *later* sub-macroblock or a later sub-partition is `PART_NOT_AVAILABLE`, not
+    the vector of the previous frame's decision.  For a 4x4 sub-partition the
+    above-right block of the sub-macroblock's bottom-right corner is in the
+    *next* sub-macroblock, so this fires on ordinary content — that was the
+    last remaining desync (320x192 quadrants, from the third frame on, one
+    macroblock, 38 luma samples).  Found by instrumenting the reference
+    decoder to print the per-partition MV predictor and diffing it against
+    `AEG_MBDBG=1 ./build/aegenc ...`; the encoder now keeps an `avail[16]`
+    map that `avail_publish()` fills exactly where `me_publish()` fills the
+    MV, and `predict_mv_at()` consults both.
 
 ## Verification
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 17 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
 ```
 
 `make test` runs three things:
@@ -226,9 +240,10 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 17 clip cases
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — thirteen clips (QP 12/23/26/40, presets 0 and 4,
-   deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16
-   partitioning, P_Skip) encoded, decoded with ffmpeg and compared **frame by
+3. `tests/run_tests.sh` — nineteen clips (QP 12/23/26/40, presets 0 and 4,
+   deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
+   partitioning with all four `sub_mb_type` shapes, all-intra and 3-frame GOPs,
+   P_Skip) encoded, decoded with ffmpeg and compared **frame by
    frame**: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
    fails it.  `tests/genyuv.c` takes a mode argument so that the partitioning
@@ -238,6 +253,17 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 17 clip cases
 `reconstruction vs decode` must be `max abs diff 0`.  A nonzero diff means the
 encoder and the decoder disagree about samples, which drifts on every
 following P picture.
+
+When a diff *is* nonzero, the fastest way to localise it is to compare motion
+vectors, not pixels: `AEG_MBDBG=1 ./build/aegenc ...` prints one line per coded
+P_8x8 macroblock (`F<frame> MB x,y st <sub_mb_type x4> [b<block> mv dx,dy pmv
+dx,dy]...`), and a throw-away FFmpeg build with two lines of `fprintf` in
+`decode_mb_cavlc()` prints the predictor/length pair it derived for the same
+sub-partitions.  Diffing the two listings pinpoints the neighbour that is being
+read differently (bug 27 was found exactly that way, in one run, after the
+pixel-level symptoms had been narrowed to a single macroblock).  The FFmpeg
+instrumentation is deliberately *not* in this repository; only the encoder-side
+side `AEG_MBDBG` hook is.  `tools/mvdec_probe.md` records the exact recipe.
 
 Manual single-macroblock probe (used to isolate transform/quantisation bugs):
 
@@ -250,9 +276,12 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 ## Next
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
-   the last non-zero coefficient), then the 8x4/4x8/4x4 `sub_mb_type` shapes
-   and the 8x8 DCT (the latter needs a High-profile SPS).  That is where the
-   remaining ~0.6-1.0 dB of inter and ~1.5-2 dB of intra-only efficiency sits.
+   the last non-zero coefficient), then the 8x8 DCT (the latter needs a
+   High-profile SPS).  That is where the remaining ~0.6-1.0 dB of inter and
+   ~1.5-2 dB of intra-only efficiency sits.  The sub-partition *shape* choice
+   is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
+   would recover a little more (it picks a slightly too fine shape on some
+   macroblocks).
 2. GPU: the profile above says where to spend the next kernel — the coefficient
    pipeline (forward transform + quantisation + inverse quantisation + inverse
    transform + reconstruction) is now ~80% of the encode time, and the
@@ -266,26 +295,41 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 ## P_8x8 sub-macroblock partitions
 
 P_8x8 (mb_type 3) splits the macroblock into four 8x8 partitions, each with its
-own motion search, its own MV predictor and its own `mvd`; `sub_mb_type` stays
-0 (8x8) for all four for now.  Measured on the four synthetic 320x192 clips
-(`genyuv` modes 0 … 4, 24 frames, QP 24), the default mask is now
-`1|2|4|8` = 15:
+own motion search, its own MV predictor and its own `mvd`, and each 8x8
+sub-macroblock independently picks its `sub_mb_type`: 0 = 8x8, 1 = two 8x4,
+2 = two 4x8, 3 = four 4x4 (table 7-17).  The shape is chosen per sub-macroblock
+by `SAD + 8 * bits` over the shapes' own `sub_mb_type`, `mvd` and (for the
+finer shapes) 4x4 vector costs; the macroblock as a whole is then compared
+against 16x16/16x8/8x16 by the usual `SSD + lambda * bits` RD pass, so a finer
+shape only reaches the bitstream if it pays for its header.
 
-| clip | 16x16/16x8/8x16 (mask 7) | + P_8x8 (mask 15) | change |
+Measured on the four synthetic 320x192 clips (`genyuv` modes 0 … 4, 24 frames,
+QP 24), default mask `1|2|4|8` = 15:
+
+| clip | mask 7 (16x16/16x8/8x16) | mask 15, 8x8 only\* | mask 15, all shapes |
 |---|---|---|---|
-| global pan | 27 487 B, Y 45.07 dB | 21 976 B, Y 45.36 dB | −20.0 % |
-| halves moving in opposite directions | 51 344 B, Y 44.34 dB | 42 395 B, Y 44.80 dB | −17.4 % |
-| left/right halves | 41 166 B, Y 44.91 dB | 36 269 B, Y 45.17 dB | −11.9 % |
-| four quadrants moving apart | 52 320 B, Y 44.44 dB | 44 871 B, Y 44.82 dB | −14.2 % |
+| global pan | 27 487 B, Y 45.07 dB | 21 976 B, Y 45.36 dB | 22 723 B, Y 45.32 dB |
+| halves moving apart | 51 344 B, Y 44.34 dB | 42 395 B, Y 44.80 dB | 41 183 B, Y 44.82 dB |
+| left/right halves | 41 166 B, Y 44.91 dB | 36 269 B, Y 45.17 dB | 35 200 B, Y 45.18 dB |
+| four quadrants moving apart | 52 320 B, Y 44.44 dB | 44 871 B, Y 44.82 dB | 43 707 B, Y 44.82 dB |
+
+\* the middle column was measured before the sub-shapes landed; it cannot be
+reproduced with the current binary.  8x4/4x8/4x4 add ~3 % on the clips whose
+motion is uniform per 8x8 block (there the 8x8 shape already wins) and cost
+nothing measurable in PSNR; on the multi-directional clips they take a further
+1-3 %.  The per-sub-macroblock
+weight `w` in `SAD + w * bits` was swept over 4, 8, 16, 32, 48, 64 at QP 18,
+24 and 32 — 8 is the best or within 0.3 % of it everywhere, so it stays.
 
 Lower rate *and* higher PSNR at the same QP: the extra candidate only wins where
 the finer motion field pays for its header, because the decision is a real
 `SSD + lambda * bits` comparison that includes the four `sub_mb_type` symbols.
-It costs about 8 % of the encode speed (four more 8x8 motion searches per
-macroblock).  `x264` (master, baseline, no asm) on the same clips at QP 24:
+It costs about 30 % of the encode speed over mask 7 (124 -> 87 fps on the
+320x192 clips, two cores), because the 4x4 shape runs sixteen motion searches
+per macroblock and all four shapes are searched per sub-macroblock.  `x264` (master, baseline, no asm) on the same clips at QP 24:
 18 841 B / 46.14 dB, 33 003 B / 45.83 dB, 31 897 B / 45.83 dB, 35 074 B /
-45.43 dB, so the remaining inter gap is ~14-28 % of the rate, down from
-~29-56 % before P_8x8.
+45.43 dB, so the remaining inter gap is ~8-25 % of the rate at ~1 dB lower Y
+PSNR.
 
 ## Quality against a reference CPU encoder
 

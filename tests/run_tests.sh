@@ -90,6 +90,11 @@ run_case pskip        320 192  8 3 -q 26
 # motion vector per 8x8 block; part8x8only makes that the only partition shape.
 run_case part8x8      320 192  8 4 -q 26 --partitions 15
 run_case part8x8only  320 192  8 4 -q 26 --partitions 8
+# Mixed sub-macroblock shapes across P pictures: the predictor of a 4x4/8x4
+# partition may only use the sub-blocks the decoder has already filled in, so
+# this case exercises the availability rule (it desynced before that fix).
+run_case p8x8_gop2    320 192  8 4 -q 26 --partitions 15 -g 2
+run_case p8x8_q12     320 192  6 4 -q 12 --partitions 15
 # Intra_4x4 in every picture, and IDR pictures after P pictures (gop > 1),
 # which is where the mode prediction and the reference handling meet.
 run_case all_intra    320 192  6 1 -q 26 -g 1

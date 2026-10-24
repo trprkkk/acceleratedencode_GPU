@@ -8,17 +8,18 @@ ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
 > **Status: conformant encoder core (I and P pictures, Intra_16x16 and
-> Intra_4x4, 16x16/16x8/8x16/P_8x8 inter partitioning and P_Skip), quality work
-> in progress.**
+> Intra_4x4, 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions
+> and P_Skip), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 17 clip cases and *fails* on any mismatch.  What
-> is *not* finished is rate-distortion efficiency: with P_8x8 in place x264
-> baseline still spends ~14–28 % fewer bits for the same PSNR on the inter test
-> clips (SATD+λ mode decision, no trellis quantisation, no 8x4/4x8/4x4
-> sub-partitions, no 8x8 DCT).  The GPU backends sit behind a measured
+> `make test` asserts it over 19 clip cases and *fails* on any mismatch.  What
+> is *not* finished is rate-distortion efficiency: with P_8x8 (including the
+> 8x4/4x8/4x4 `sub_mb_type` shapes) in place, x264 baseline still spends
+> ~10–20 % fewer bits at 0.6–1.0 dB higher Y PSNR on the inter test clips
+> (SATD+λ mode decision, no trellis quantisation, no 8x8 DCT).  Finer
+> partitioning alone was worth 17–20 % of the rate.  The GPU backends sit behind a measured
 > dispatcher, and the kernels are checked against the CPU reference by
 > `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
 > environment (there is no GPU available).  See
@@ -105,9 +106,10 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes seventeen synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes nineteen synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
-  8x16 and P_8x8 partitioning, P_Skip, all-intra and short GOPs), decodes them
+  8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
+  all-intra and short GOPs), decodes them
   with ffmpeg and requires the encoder's own reconstruction to be
   **bit-identical** on every frame; it exits non-zero otherwise.
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.

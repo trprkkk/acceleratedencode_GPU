@@ -104,9 +104,9 @@ void aeg_params_default(aeg_params *p)
     p->deblock_beta = 0;
     p->chroma_me = 1;
     /* Inter partitioning mask: bit 0 = 16x16, bit 1 = 16x8, bit 2 = 8x16,
-     * bit 3 = P_8x8 (four 8x8 partitions with a motion vector each).  The mask
-     * must not be zero, otherwise analyse_mb() treats every picture as
-     * all-intra. */
+     * bit 3 = P_8x8 (four 8x8 sub-macroblocks with a motion vector each, each
+     * of which may further split into 8x4, 4x8 or 4x4).  The mask must not be
+     * zero, otherwise analyse_mb() treats every picture as all-intra. */
     p->partitions = 1 | 2 | 4 | 8;
     p->verbose = 1;
 }
