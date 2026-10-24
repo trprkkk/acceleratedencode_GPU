@@ -183,15 +183,42 @@ int main(void)
                 run_items(g_nblk, call_iq);
                 {
                     int16_t *ref_res = (int16_t *)malloc((size_t)g_nblk * 16 * 2);
-                    cpu.iq_idct_batch(cpu.priv, g_qlevel, g_nblk, qp, ref_res);
-                    bad = 0;
-                    for (i = 0; i < g_nblk * 16; i++)
-                        if (g_iqres[i] != ref_res[i])
-                            bad++;
-                    if (bad) {
-                        printf("   kernel_check: iq_idct_batch qp %d %d of %d "
-                               "samples differ\n", qp, bad, g_nblk * 16);
-                        fail = 1;
+                    int cls;
+                    /* Four amplitude classes, because the interesting cases of
+                     * this kernel are not the ones the quantiser normally
+                     * produces: at high QP a dequantised coefficient leaves
+                     * int16 and the reference decoder wraps there (bug 8), the
+                     * DC rounding happens only in the first pass (bug 7), and
+                     * the second pass truncates instead of rounding.  The
+                     * kernel that ignored all three agreed with a C reference
+                     * that ignored them too (bug 31); class 0 is the one that
+                     * shows it. */
+                    for (cls = 0; cls < 4; cls++) {
+                        for (i = 0; i < g_nblk * 16; i++) {
+                            int16_t v;
+                            switch (cls) {
+                            case 0: v = (int16_t)(rnd(65536) - 32768); break;
+                            case 1: v = (int16_t)(rnd(4) ? 0 :
+                                                  (rnd(2) ? 32767 : -32767)); break;
+                            case 2: v = (int16_t)(i % 16 ? 0 : (rnd(2) ? 32767 : -32768));
+                                    break;
+                            default: v = (int16_t)(rnd(7) - 3); break;
+                            }
+                            ((int16_t *)g_qlevel)[i] = v;
+                        }
+                        run_items(g_nblk, call_iq);
+                        cpu.iq_idct_batch(cpu.priv, g_qlevel, g_nblk, qp,
+                                          ref_res);
+                        bad = 0;
+                        for (i = 0; i < g_nblk * 16; i++)
+                            if (g_iqres[i] != ref_res[i])
+                                bad++;
+                        if (bad) {
+                            printf("   kernel_check: iq_idct_batch qp %d class "
+                                   "%d %d of %d samples differ\n", qp, cls, bad,
+                                   g_nblk * 16);
+                            fail = 1;
+                        }
                     }
                     free(ref_res);
                 }

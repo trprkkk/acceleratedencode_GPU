@@ -378,8 +378,16 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    the reference with the same transposing store as the fast path, so both
    agreed while the bitstream changed.  Every failure the SSE2 rebuild had
    (three real ones, listed under bug 8) was found here.
-4. `tests/kernel_check.c` — the OpenCL device kernels against the same scalar
-   reference, when a device is present.
+4. `tests/kernel_check.c` — the device kernel source (`src/kernels.h`) compiled
+   as C with the OpenCL qualifiers defined away and `get_global_id()` driven by
+   a counter, so the kernels are checked on a machine with no GPU at all.  The
+   inverse transform is fed four amplitude classes — the full int16 range,
+   sparse extremes, DC-only at the int16 bounds, and +-3 — because the parts of
+   it that are easy to get wrong (the int16 wrap of a dequantised coefficient,
+   the DC rounding in the first pass only, the truncating second pass) do not
+   show up at the amplitudes a quantiser normally produces.  Removing any of
+   the three from the kernel makes this test fail; it is the check that would
+   have caught bug 31 before the encoder ever ran on a device.
 5. `tests/run_tests.sh` — twenty-eight cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
