@@ -25,8 +25,8 @@ const uint16_t aeg_quant_mf[6][3] = {
     { 11916,  7490,  4660 },
     { 10082,  6554,  4194 },
     {  9362,  5825,  3647 },
-    {  8192,  5243,  4559 },
-    {  7282,  4559,  3355 }
+    {  8192,  5243,  3355 },
+    {  7282,  4559,  2893 }
 };
 
 /* Dequantiser level scales, indexed [qp % 6][position class]. */
@@ -365,6 +365,17 @@ const uint8_t aeg_cbp_codenum[48] = {
      0,  2,  3,  7,  4,  8, 17, 13,  5, 18,  9, 14, 10, 15, 16, 11,
      1, 32, 33, 36, 34, 37, 44, 40, 35, 45, 38, 41, 39, 42, 43, 19,
      6, 24, 25, 20, 26, 21, 46, 28, 27, 47, 22, 29, 23, 30, 31, 12
+};
+
+
+/* Intra_4x4 uses a different coded_block_pattern codeNum mapping than the
+ * inter types (H.264 Table 9-4): the same pattern has a different code
+ * number.  This is the inverse of the reference decoder's
+ * golomb_to_intra4x4_cbp table. */
+const uint8_t aeg_cbp_codenum_i4x4[48] = {
+      3, 29, 30, 17, 31, 18, 37,   8, 32, 38, 19,   9, 20, 10, 11,   2,
+    16, 33, 34, 21, 35, 22, 39,   4, 36, 40, 23,   5, 24,   6,   7,   1,
+    41, 42, 43, 25, 44, 26, 46, 12, 45, 47, 27, 13, 28, 14, 15,   0,
 };
 
 /* ------------------------------------------------------------------ */

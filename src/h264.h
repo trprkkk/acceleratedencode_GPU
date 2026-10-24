@@ -69,6 +69,7 @@ extern const uint8_t  aeg_run_before_len[7][16];
 extern const uint8_t  aeg_run_before_bits[7][16];
 extern const uint8_t  aeg_cbp_code_num[48];
 extern const uint8_t  aeg_cbp_codenum[48];
+extern const uint8_t  aeg_cbp_codenum_i4x4[48];
 
 
 /* Sub-block scan index helpers: raster position of 4x4 block n */

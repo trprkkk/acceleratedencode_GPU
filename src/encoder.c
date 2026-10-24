@@ -22,6 +22,7 @@ typedef struct mbenc {
     int16_t  mv[16][2];             /* per 4x4 block, 1/4 pel               */
     int      type;                  /* AEG_MB_*                             */
     int      i16_mode;              /* 0=V 1=H 2=DC 3=Plane                 */
+    uint8_t  intra4[16];            /* Intra_4x4 modes, Figure 6-8 order    */
     int      chroma_mode;           /* 0=DC 1=H 2=V 3=Plane                 */
     int      cbp;
     int      qp;
@@ -85,6 +86,7 @@ struct aeg_encoder {
     uint8_t pred_l[16 * 16];
     uint8_t pred_c[2][8 * 8];
     int has_ref;
+    int cur_is_p;           /* the picture being coded is a P slice */
 };
 
 static inline int clip255(int v)
@@ -899,10 +901,10 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     e->mb_ncand = 0;
     e->mb_mv[0] = e->mb_mv[1] = 0;
     e->mb_pmv[0] = e->mb_pmv[1] = 0;
-    /* `has_ref` alone decides: gop_size == 0 means "one IDR, then all P"
-     * (see the is_idr test in aeg_encoder_encode), so it must not gate the
-     * motion search as well. */
-    if (e->p.partitions != 0 && c->qp >= 0 && e->has_ref) {
+    /* The motion search needs a reference picture *and* a P slice: an IDR
+     * picture is always an I slice, so inter candidates there could never be
+     * coded (writing them as an I macroblock desynchronises the decoder). */
+    if (e->p.partitions != 0 && c->qp >= 0 && e->has_ref && e->cur_is_p) {
         int mvx, mvy, sad;
         aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby,
                        &e->mb_pmv[0], &e->mb_pmv[1]);
@@ -981,6 +983,8 @@ static int luma_cbp_on(const mbenc *c)
  * chroma prediction mode and the coded block pattern that mb_type carries). */
 static int mb_type_bits(const mbenc *c, int is_p)
 {
+    if (c->type == AEG_MB_I4x4)
+        return aeg_ue_bits(is_p ? 5u : 0u);
     if (!is_p)
         return aeg_ue_bits((uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
                                       12 * (luma_cbp_on(c) ? 1 : 0)));
@@ -1048,6 +1052,206 @@ static void restore_chroma(struct aeg_encoder *e, int mbx, int mby, const uint8_
         for (y = 0; y < 8; y++)
             memcpy(p + y * e->stride[1], b + y * 8, 8);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Intra_4x4                                                           */
+/* ------------------------------------------------------------------ */
+/* The prediction modes a block may use given the available neighbours.  A mode
+ * that reads a missing side must not be signalled: the reference decoder
+ * remaps the modes of the macroblocks on the picture edges (DC becomes a
+ * one-sided DC and the directional modes are rejected), so a mode that needs
+ * the missing side would be reconstructed with a different predictor than the
+ * encoder assumed.  DC itself is always legal -- the predictor resolves it
+ * against whichever sides are available. */
+static int intra4_mode_list(int top_avail, int left_avail, int *modes)
+{
+    int n = 0;
+    if (top_avail)
+        modes[n++] = 0;                 /* vertical            */
+    if (left_avail)
+        modes[n++] = 1;                 /* horizontal          */
+    modes[n++] = 2;                     /* DC                  */
+    if (top_avail) {
+        modes[n++] = 3;                 /* diagonal down-left  */
+        modes[n++] = 7;                 /* vertical-left       */
+    }
+    if (top_avail && left_avail) {
+        modes[n++] = 4;                 /* diagonal down-right */
+        modes[n++] = 5;                 /* vertical-right      */
+        modes[n++] = 6;                 /* horizontal-down     */
+    }
+    if (left_avail)
+        modes[n++] = 8;                 /* horizontal-up       */
+    return n;
+}
+
+/* H.264 codes the sixteen Intra_4x4 blocks in the order of Figure 6-8, which
+ * is not raster order: each 8x8 group is coded before the next one.  The index
+ * below converts a raster position inside the macroblock to that order (and
+ * back, further down).  The order guarantees that both the prediction samples
+ * and the mode neighbours of a block are already coded when its turn comes. */
+static int intra4_idx(int bx, int by)
+{
+    return ((by & 2) << 2) | ((bx & 2) << 1) | ((by & 1) << 1) | (bx & 1);
+}
+
+/* H.264 8.3.1.1: the Intra_4x4 mode predictor is the smaller of the modes of
+ * the left and the above neighbouring blocks, where a neighbour that is not
+ * Intra_4x4-coded counts as DC and one outside the picture makes the whole
+ * prediction DC.  `cur` holds the modes decided so far, in coding order. */
+static int intra4_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
+                            const uint8_t *cur, int bx, int by)
+{
+    int a, b;
+    if (bx > 0) {
+        a = cur[intra4_idx(bx - 1, by)];
+    } else if (mbx > 0) {
+        const aeg_mb *m = &e->mbs[mby * e->mb_w + mbx - 1];
+        a = m->type == AEG_MB_I4x4 ? m->intra4[intra4_idx(3, by)] : 2;
+    } else {
+        a = -1;
+    }
+    if (by > 0) {
+        b = cur[intra4_idx(bx, by - 1)];
+    } else if (mby > 0) {
+        const aeg_mb *m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+        b = m->type == AEG_MB_I4x4 ? m->intra4[intra4_idx(bx, 3)] : 2;
+    } else {
+        b = -1;
+    }
+    if (a < 0 || b < 0)
+        return 2;
+    return a < b ? a : b;
+}
+
+/* Intra_4x4 luma: one prediction mode per 4x4 block, decided and coded in the
+ * block order of Figure 6-8 (see intra4_idx), because every block predicts
+ * from the reconstruction of the blocks above and to the left of it --
+ * including the ones of the same macroblock. */
+static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                           double lambda)
+{
+    const int s = e->stride[0];
+    const uint8_t *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    uint8_t *dst = e->recp[0] + mby * 16 * s + mbx * 16;
+    int bits_scale = (int)(lambda * 0.5 + 0.5);
+    int blk, k, x, y, g, mode_bits = 0;
+
+    t->type = AEG_MB_I4x4;
+    t->cbp &= 0x30;                     /* keep the chroma pattern */
+    memset(t->intra4, 0, sizeof(t->intra4));
+
+    for (blk = 0; blk < 16; blk++) {
+        int rx = ((blk >> 2) & 1) * 2 + (blk & 1);
+        int ry = ((blk >> 3) & 1) * 2 + ((blk >> 1) & 1);
+        int bx = rx * 4, by = ry * 4;
+        int rb = ry * 4 + rx;           /* raster index of the block */
+        int top_avail = mby > 0 || by > 0;
+        int left_avail = mbx > 0 || bx > 0;
+        /* The four samples p[4..7][-1] continue to the right of the block.
+         * Inside the macroblock they belong to the block one column right in
+         * the block row above, and that block is only decoded in time for the
+         * Figure 6-8 order when it comes earlier -- false for the blocks at
+         * (rx, ry) = (1, odd).  Blocks in the last block column need the
+         * macroblock to the right (not decoded yet), while a block in the
+         * first block row takes them from the macroblock above, or from the
+         * one above-right when bx == 12. */
+        int tr_avail;
+        if (by)
+            tr_avail = bx < 12 && !((rx & 1) && (ry & 1));
+        else
+            tr_avail = mby > 0 && (bx < 12 || mbx + 1 < e->mb_w);
+        uint8_t top[8], left[4], pred[16];
+        const uint8_t *sb = src + by * s + bx;
+        uint8_t *db = dst + by * s + bx;
+        int tl, nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
+
+        if (top_avail) {
+            const uint8_t *tr = by ? dst + (by - 1) * s + bx : dst - s + bx;
+            for (k = 0; k < 4; k++)
+                top[k] = tr[k];
+            for (k = 4; k < 8; k++)
+                top[k] = tr_avail ? tr[k] : top[3];
+        } else {
+            for (k = 0; k < 8; k++)
+                top[k] = 128;
+        }
+        if (left_avail) {
+            for (k = 0; k < 4; k++)
+                left[k] = db[k * s - 1];
+        } else {
+            for (k = 0; k < 4; k++)
+                left[k] = 128;
+        }
+        tl = (top_avail && left_avail) ? db[-s - 1] : 128;
+
+        pmode = intra4_pred_mode(e, mbx, mby, t->intra4, rx, ry);
+        nmodes = intra4_mode_list(top_avail, left_avail, modes);
+        for (k = 0; k < nmodes; k++) {
+            int cost;
+            m = modes[k];
+            aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
+                                  left_avail, top_avail && left_avail);
+            /* The mode costs one bit when it matches the predictor and four
+             * otherwise, so weigh it into the SAD comparison. */
+            cost = 2 * aeg_satd_4x4(pred, 4, sb, s) +
+                   bits_scale * (m == pmode ? 1 : 4);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = m;
+            }
+        }
+        t->intra4[blk] = (uint8_t)best;
+        mode_bits += (best == pmode) ? 1 : 4;
+
+        aeg_intra_predict_4x4(pred, 4, top, left, tl, best, top_avail,
+                              left_avail, top_avail && left_avail);
+        {
+            int16_t res[16], coef[16];
+            int nz = 0;
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++)
+                    res[y * 4 + x] = (int16_t)((int)sb[y * s + x] -
+                                               (int)pred[y * 4 + x]);
+            aeg_transform_4x4(res, 4, coef);
+            aeg_quant_4x4(coef, t->level[rb], t->qp, 1);
+            for (k = 0; k < 16; k++)
+                nz += t->level[rb][k] != 0;
+            t->nz[rb] = (int8_t)nz;
+            if (nz)
+                t->cbp |= 1 << ((rb >> 3) * 2 + ((rb & 3) >> 1));
+        }
+        aeg_idct_add_block(db, s, t->level[rb], t->qp, pred, 4, NULL);
+        for (y = 0; y < 4; y++)
+            for (x = 0; x < 4; x++) {
+                int d = (int)db[y * s + x] - (int)sb[y * s + x];
+                t->sse += (int64_t)d * d;
+            }
+    }
+
+    t->bits += mode_bits;
+    /* The blocks of every coded 8x8 group are coded, in the order the group
+     * table lists them; the context of a block comes from its neighbours. */
+    for (g = 0; g < 4; g++) {
+        if (!(t->cbp & (1 << g)))
+            continue;
+        for (k = 0; k < 4; k++) {
+            int b = group_blk[g][k];
+            if (t->nz[b])
+                t->bits += aeg_cavlc_block_cost(t->level[b],
+                                                luma_nc(e, mbx, mby, t, b), 0);
+        }
+    }
+}
+
+static int64_t rd_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                            int qp, double lambda)
+{
+    reset_mb_enc(t, qp);
+    code_luma_i4x4(e, mbx, mby, t, lambda);
+    t->cost = t->sse + (int64_t)(lambda * t->bits + 0.5);
+    return t->cost;
 }
 
 /* Code the luma part of one candidate into `t` and return its RD cost.  The
@@ -1142,6 +1346,21 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             snap_luma(e, mbx, mby, snap_l);
         }
     }
+    /* Intra_4x4: its own mode decision per block, so it is a candidate of its
+     * own rather than one of the Intra_16x16 prediction modes.  It costs a
+     * lot more than Intra_16x16 (sixteen predictions, sixteen transforms and
+     * the per-block mode bits), so it is skipped when the motion search found
+     * a match that is already twice as good as the best Intra_16x16
+     * prediction: sixteen mode decisions cannot turn that around, and this is
+     * where most of the encode time of the candidate goes. */
+    if (!(e->mb_inter_ok && e->mb_inter_sad * 2 < e->mb_sad)) {
+        int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
+    }
     restore_luma(e, mbx, mby, snap_l);
     inter = is_inter_type(best.type);
 
@@ -1185,8 +1404,11 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
 {
     int blk;
     if (!is_p) {
-        aeg_bw_ue(bw, (uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
-                                 12 * (luma_cbp_on(c) ? 1 : 0)));
+        if (c->type == AEG_MB_I4x4)
+            aeg_bw_ue(bw, 0);           /* I_NxN */
+        else
+            aeg_bw_ue(bw, (uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
+                                     12 * (luma_cbp_on(c) ? 1 : 0)));
     } else if (is_inter_type(c->type)) {
         /* P_L0_16x16 / P_L0_16x8 / P_L0_8x16: one mvd pair per partition, all
          * of them before the coded block pattern.  There is a single reference
@@ -1201,12 +1423,36 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
         }
         aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum[(c->cbp & 0x0f) |
                                                 (chroma_cbp(c) << 4)]);
+    } else if (c->type == AEG_MB_I4x4) {
+        aeg_bw_ue(bw, 5);               /* P slice: I_NxN */
     } else {
         aeg_bw_ue(bw, (uint32_t)(6 + c->i16_mode + 4 * chroma_cbp(c) +
                                  12 * (luma_cbp_on(c) ? 1 : 0)));
     }
-    if (is_intra_type(c->type))
+    if (c->type == AEG_MB_I4x4) {
+        int b;
+        /* One prev_intra4x4_pred_mode_flag per block (raster order), followed
+         * by rem_intra4x4_pred_mode when the mode is not the predicted one.
+         * The remainder is coded with the predicted value skipped, so it is
+         * (mode < pred) ? mode : mode - 1. */
+        for (b = 0; b < 16; b++) {
+            int rx = ((b >> 2) & 1) * 2 + (b & 1);
+            int ry = ((b >> 3) & 1) * 2 + ((b >> 1) & 1);
+            int pm = intra4_pred_mode(e, mbx, mby, c->intra4, rx, ry);
+            int mode = c->intra4[b];
+            if (mode == pm) {
+                aeg_bw_put(bw, 1, 1);
+            } else {
+                aeg_bw_put(bw, 1, 0);
+                aeg_bw_put(bw, 3, (uint32_t)(mode < pm ? mode : mode - 1));
+            }
+        }
         aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
+        aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum_i4x4[(c->cbp & 0x0f) |
+                                                     (chroma_cbp(c) << 4)]);
+    } else if (is_intra_type(c->type)) {
+        aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
+    }
     /* mb_qp_delta: only present when the picture actually carries a coded
      * block pattern (H.264 7.3.5.2); emitting it unconditionally desynchronises
      * the decoder on the first all-zero macroblock. */
@@ -1310,6 +1556,7 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                            e->p.qp - 26, 0, 0,
                            e->p.deblock ? 0 : 1);
     e->last_qp = e->p.qp;
+    e->cur_is_p = is_p;
 
     for (mby = 0; mby < e->mb_h; mby++) {
         for (mbx = 0; mbx < e->mb_w; mbx++) {
@@ -1320,11 +1567,6 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                 analyse_mb(e, mbx, mby, &tmp);
                 e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
 
-                if (is_p && tmp.type == AEG_MB_P16x16) {
-                    int pmvx, pmvy;
-                    aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, &pmvx, &pmvy);
-                    (void)pmvx; (void)pmvy;
-                }
                 t0 = aeg_now_ns();
                 code_mb(e, mbx, mby, &tmp);
                 e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
@@ -1339,6 +1581,8 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                     m->chroma_mode = (uint8_t)tmp.chroma_mode;
                     m->cbp = (uint8_t)tmp.cbp;
                     m->qp = (int8_t)tmp.qp;
+                    for (i = 0; i < 16; i++)
+                        m->intra4[i] = tmp.intra4[i];
                     for (i = 0; i < AEG_BLK_COUNT; i++)
                         m->nz[i] = tmp.nz[i];
                     for (i = 0; i < 16; i++) {

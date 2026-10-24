@@ -1,6 +1,6 @@
 # Status and engineering notes
 
-Date: 2026-10-24.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
+Date: 2026-10-25.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
 
 ## Where the project stands
 
@@ -14,6 +14,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | moving synthetic texture (inter, heavy AC) | 320x192, 320x176, 320x208 | 12, 18, 23, 26, 28, 32, 40 | 0 … 4 | 1 … 60 |
 | translated noise / gradient clips | 96x96 | 23, 32 | 0, 2 | 3 |
 | odd frame sizes (13 MB rows, 11 MB rows) | 320x208, 320x176 | 23 … 28 | 2, 3 | 3 … 4 |
+| Intra_4x4 probes (random 16x16, 32x16 gradient) | 16x16, 32x16 | 24 … 33 | 2, 4 | 1 … 2 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
 fails (non-zero exit) on any mismatch; it checks all nine clips frame by frame.
@@ -27,7 +28,9 @@ Implemented and building without warnings:
   round-tripped by `tests/cavlc_check.c` (12 000 random blocks, 4 block kinds)
 * forward/inverse 4x4 integer transform, 4x4 and 2x2 DC Hadamard, quantisation
   and dequantisation, including the reference decoder's `int16_t` truncation
-* Intra_16x16 (all four modes), chroma (all four modes)
+* Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
+  block order, `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` and the
+  per-block mode decision), chroma (all four modes)
 * half/quarter-pel motion estimation and compensation, MV prediction, skip runs
 * P inter partitioning: 16x16, 16x8 and 8x16, each partition with its own
   motion search, its own MV predictor and its own `mvd` (8x8 sub-partitions are
@@ -137,6 +140,46 @@ Implemented and building without warnings:
     `PAD` bytes past the plane; the chroma plane offset must be
     `ls*lh + cs*ch`, not `plane[1] + cs*ch` (which also drops its top
     padding).
+20. **Intra_4x4 top-right samples.**  `p[4..7][-1]` is only available when the
+    4x4 block that holds it was *already coded*.  Inside a macroblock that is
+    the block one column to the right in the block row above, so it is missing
+    for the blocks at `(rx, ry) = (1, odd)` — i.e. the third and the eleventh
+    block of the Figure 6-8 order — and for the whole last block column; in
+    the first block row it comes from the macroblock above (or from the one
+    above-right for `bx == 12`).  Replicating `p[3][-1]` in all those cases is
+    correct; *not* replicating it in the `(1, odd)` case reads the stale
+    picture buffer (the 4x4 block there has not been reconstructed yet) and
+    gives the modes 3 and 7 a prediction the decoder cannot reproduce.  The
+    symptom is small: a one-sample error in the last row of the block above,
+    which the modes that read `t4..t7` then spread over the rest of the
+    macroblock.
+21. **Intra_4x4 `coded_block_pattern` codeNum.**  Table 9-4 of the spec has
+    two different orderings of the same 48 patterns: the Intra_4x4 one (which
+    is what `I_NxN` uses) differs from the inter / Intra_16x16 one at codeNum
+    1 … 15.  Reusing `aeg_cbp_codenum` writes a pattern with the *same number*
+    of coded groups, exactly like bug 11, but the wrong quadrant.
+22. **Intra_4x4 mode 4 (diagonal down-right) taps.**  The spec indexes the top
+    row two samples to the left of the block, so for `x > y` the taps are
+    `p[x-y-2][-1], p[x-y-1][-1], p[x-y][-1]`; using `x-y-1 … x-y+1` shifts the
+    predictor by one sample.
+23. **A 4x4 mode whose side is unavailable must not be signalled.**  The
+    reference decoder rewrites the modes of the macroblocks on the picture
+    edges (DC becomes one-sided, the directional modes the missing side needs
+    are rejected as an error), so the encoder has to restrict the candidate
+    list to the modes it can actually predict — see `intra4_mode_list()`.
+24. **IDR pictures must not use inter candidates.**  `analyse_mb()` gated the
+    motion search on *"is there a reference picture"* rather than *"is this a P
+    slice"*.  From the second IDR on (i.e. at every GOP boundary, and for every
+    picture with `-g 1`) the analysis could pick an inter `mb_type` in a
+    picture whose slice header says *I*, which the decoder reads as `I_NxN`
+    plus garbage — FFmpeg reports `top block unavailable for requested intra
+    mode` and the frame is lost.
+25. **Two rows of the forward quantiser table.**  `aeg_quant_mf[4][2]` and
+    `[5][2]` were `4559` and `3355` instead of `3355` and `2893` (the last two
+    entries had been shifted up by one).  Only `QP % 6 == 4` (and, mildly, 5)
+    is affected, so it looked like an RD problem: QP 16/22/28 lost 6 … 12 dB
+    against their neighbours while QP 18/24/30 were fine.  Bit-exactness does
+    not catch it — the decoder does not see the table, only our levels.
 
 ## Verification
 
@@ -174,9 +217,10 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 
 ## Next
 
-1. Quality/RD: `Intra_4x4` is the single biggest remaining win (the IDR frame
-   is 4.1 dB behind x264 while spending *fewer* bits), then 8x8
-   sub-partitions, trellis quantisation and a better lambda.
+1. Quality/RD: the IDR frame is still ~3.5 dB behind x264 at the same QP
+   (Intra_4x4 helped, but the mode decision is SATD-based and the quantiser has
+   no trellis), then 8x8 sub-partitions / 8x8 DCT (needs a High profile SPS),
+   trellis quantisation and a better lambda.
 2. `src/backend_cuda.cu` for the `CUDA=1` build (the Makefile expects it, the
    tree does not have it yet), plus more GPU kernels (intra prediction, SAD,
    transform/quantisation) and dispatcher calibration on real hardware.
@@ -188,10 +232,30 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 the same 60-frame 320x192 synthetic texture, both streams decoded and compared
 with the source:
 
-| QP | ours (kbps / PSNR) | x264 (kbps / PSNR) |
+| QP | ours (kbps / PSNR Y, all) | x264 (kbps / PSNR Y, all) |
 |---|---|---|
-| 24 | 4592 / 37.19 dB | 4825 / 38.99 dB |
-| 32 | 2497 / 30.23 dB | 2672 / 31.73 dB |
+| 24 | 4592 / 36.15, 37.20 dB | 4825 / 38.09, 38.99 dB |
+| 32 | 2497 / 28.76, 30.23 dB | 2672 / 30.36, 31.73 dB |
+
+We spend ~5% *fewer* bits at the same QP and get ~1.5–1.8 dB less, i.e. x264 is
+still ~15–20% more efficient.  The residual gap is rate-distortion efficiency,
+not correctness: the mode decision compares inter against Intra_16x16 /
+Intra_4x4 with a lambda estimate and a SATD-based per-block mode choice, and
+the quantiser has no trellis or last-coefficient optimisation.
+
+The `QP % 6 == 4` rows of the forward quantiser table were wrong until bug 25
+was fixed, which made half a dozen QPs look like an RD problem.  Same clip, one
+IDR frame, Y-PSNR:
+
+| QP | before | after |
+|---|---|---|
+| 16 (`%6 == 4`) | 33.79 dB | 45.69 dB |
+| 22 (`%6 == 4`) | 33.38 dB | 39.73 dB |
+| 28 (`%6 == 4`) | 31.63 dB | 33.84 dB |
+
+Intra only (one IDR, `-g 1` on a 10-frame clip, QP 24): 37.62 dB at 295.9 kB
+against x264's 41.75 dB at 386.4 kB — Intra_4x4 is worth its keep on the IDR but
+leaves most of that gap open.
 
 Inter prediction is worth roughly a 2x bitrate cut on this clip (the earlier
 all-intra rows — 8930 kbps at QP 24 — came from `partitions == 0`, bug 14).
@@ -208,12 +272,21 @@ same QP 26, 8 frames:
 
 P_Skip collapses a still picture into a handful of bits per frame: the first
 frame of the `genyuv … 3` clip costs 4148 bytes, each following frame 8 bytes.
-Today we spend ~5% *fewer* bits than x264 at the same QP and get ~1.5–1.8 dB
-less PSNR, i.e. x264 is still ~15–20% more efficient.  The gap is
-rate-distortion efficiency, not correctness: the mode decision compares 16x16
-inter against Intra_16x16 with a lambda estimate, only Intra_16x16 is
-implemented (no Intra_4x4 / I_PCM / 8x8 partitions), and the quantiser has no
-trellis or last-coefficient optimisation.  Those items are the next quality
-work; they do not affect conformance (any mode decision is decodable, and the
-recon still has to match the decoder exactly — re-run `make test` after
-touching them).
+
+## Speed
+
+60 frames of 320x192 at QP 24, single thread, CPU backend (2 cores, no GPU in
+this sandbox):
+
+| encoder | fps | bytes |
+|---|---|---|
+| ours, preset 0 | 250 | 1148272 |
+| ours, preset 2 / 4 | 58 / 59 | 1147968 |
+| x264 baseline (no asm) | 109 | 1206202 |
+
+Intra_4x4 costs ~22% (preset 2: 75.5 → 58.5 fps) because a macroblock candidate
+now runs sixteen predictors, sixteen transforms and sixteen quantisers.  That is
+also why the stage profile has shifted: `transform` (forward/inverse transform,
+quantisation and reconstruction of every candidate) is now ~80% of the encode
+time, motion estimation ~12%, deblocking ~2% — i.e. the stage that a GPU should
+take over is no longer the motion search but the coefficient pipeline.

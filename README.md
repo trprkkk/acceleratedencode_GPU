@@ -7,16 +7,17 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: conformant encoder core (I and P pictures, 16x16/16x8/8x16 inter
-> partitioning and P_Skip), quality work in progress.**
+> **Status: conformant encoder core (I and P pictures, Intra_16x16 and
+> Intra_4x4, 16x16/16x8/8x16 inter partitioning and P_Skip), quality work in
+> progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 12–40, presets
 > 0–4, with and without deblocking.  `make test` asserts it and *fails* on any
 > mismatch.  What is *not* finished is rate-distortion efficiency: at matched QP
 > the bitrate is already below x264 baseline (~5% less) but the PSNR is ~1.5 dB
-> lower, i.e. x264 is still ~15–20% more efficient (SAD+λ mode decision, no
-> Intra_4x4, no trellis, no 8x8 sub-partitions).  The GPU backends sit
+> lower, i.e. x264 is still ~15–20% more efficient (SATD+λ mode decision, no
+> trellis quantisation, no 8x8 sub-partitions or 8x8 DCT).  The GPU backends sit
 > behind a measured dispatcher but have only been compile-checked in this
 > environment (no GPU available).  See [`docs/STATUS.md`](docs/STATUS.md).
 
@@ -34,6 +35,7 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
 | Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
+| Intra_4x4 mode analysis (9 predictors x 16 blocks per MB) | CPU for now; the 16 blocks of a macroblock are independent once the neighbours exist | the candidate that dominates I-picture cost |
 | Deblocking filter | CPU | pinned: serial in MB order, communication cost dominates |
 | CAVLC entropy coding | CPU | inherently serial (nC context depends on previous blocks) |
 | Bitstream assembly / rate decisions | CPU | serial |
@@ -108,7 +110,7 @@ include/aeg/aeg.h   public API
 src/h264.h          internal data structures and prototypes
 src/tables.c        all constant tables (quantiser, deblock, CAVLC, zigzag, QP map)
 src/transform.c     forward/inverse 4x4 transform, DC Hadamard, quantisation
-src/intra.c         Intra_4x4 / Intra_16x16 / chroma prediction
+src/intra.c         Intra_4x4 (9 modes) / Intra_16x16 / chroma prediction
 src/mc.c            motion estimation and quarter-pel motion compensation
 src/deblock.c       in-loop deblocking filter
 src/cavlc.c         CAVLC entropy coding of residual blocks

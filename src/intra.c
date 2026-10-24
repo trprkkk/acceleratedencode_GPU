@@ -218,12 +218,14 @@ void aeg_intra_predict_4x4(uint8_t *pred, int stride, const uint8_t *top,
                 pred[y * stride + x] = (uint8_t)v;
             }
         break;
-    case 4: /* diagonal down-right */
+    case 4: /* diagonal down-right: the spec indexes the top row two samples
+             * to the left of the block, so for x > y the taps are
+             * x-y-2, x-y-1 and x-y (8.3.3.4). */
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++) {
                 int v;
                 if (x > y)
-                    v = (T(x - y - 1) + 2 * T(x - y) + T(x - y + 1) + 2) >> 2;
+                    v = (T(x - y - 2) + 2 * T(x - y - 1) + T(x - y) + 2) >> 2;
                 else if (x == y)
                     v = (L(0) + 2 * topleft + T(0) + 2) >> 2;
                 else if (x == y - 1)
