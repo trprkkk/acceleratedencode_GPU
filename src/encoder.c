@@ -57,7 +57,10 @@ typedef struct mbenc {
 /* One inter partitioning candidate gathered by analyse_mb(): the shape, its
  * sub_macroblock types and, per 4x4 block, the motion vector, plus the
  * predictor of every partition (indexed by its first 4x4 block). */
-#define AEG_MB_CAND_MAX 4
+/* P candidates per macroblock: the searched P16x16, the skip vector, and the
+ * three partitioned types (16x8, 8x16, P_8x8).  The batched RD path stores one
+ * residual per candidate, so this is also its array bound. */
+#define AEG_MB_CAND_MAX 5
 
 /* Upper bound on the slices a picture may be cut into.  Slice threads use one
  * thread per slice, so this also bounds the thread count. */
@@ -1906,11 +1909,11 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 sc->type = AEG_MB_P16x16;
                 sc->nparts = 1;
                 for (b = 0; b < 16; b++) {
-                    sc->mv[b][0] = (int16_t)sx;
-                    sc->mv[b][1] = (int16_t)sy;
+                    sc->mv[b][0] = sx;
+                    sc->mv[b][1] = sy;
                 }
-                sc->pmv[0][0] = (int16_t)e->mb_pmv[0];
-                sc->pmv[0][1] = (int16_t)e->mb_pmv[1];
+                sc->pmv[0][0] = e->mb_pmv[0];
+                sc->pmv[0][1] = e->mb_pmv[1];
                 e->mb_ncand++;
             }
         }

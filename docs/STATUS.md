@@ -1101,6 +1101,21 @@ prices it as one flag.  On a still clip (mode 3, 320x192, QP 32, 30 frames) the
 stream drops from 6 165 to 4 201 bytes at the same PSNR (39.97 dB) -- 32% of
 the bits, for one more candidate per macroblock.
 
+One thing the extra candidate exposed: the candidate array was bounded by
+four, exactly the number of inter partitionings, so the skip candidate silently
+pushed P_8x8 out of the list.  The bound is now the real count (five) and the
+macroblock carries a comment saying what they are; P_8x8 wins on none of the
+clips here, so putting it back changes no measured number, but a dropped
+candidate is not a decision the encoder made.
+
+The median predictor as a candidate of its own (mv = the neighbour median, so
+no mvd at all) was tried next and is *not* in: it is the same idea as the skip
+vector, but the search already starts from that vector and only leaves it when
+SATD says so, and pricing both costs 2.3% more bits on the two-quadrant clip at
+a fixed QP (the extra candidate wins some macroblocks the estimate said were
+worse, which means the mvd-free advantage is not what the price model thinks it
+is).
+
 This is also where the coder-priced decision pass pays off twice: the same
 candidate priced by the CAVLC estimate is still worth coding (the estimate
 charges *more* for the residual than the coder does, so it prefers the skip
