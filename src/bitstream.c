@@ -17,38 +17,8 @@ void aeg_bw_init(aeg_bitwriter *bw, uint8_t *buf, size_t cap, int emu)
     bw->zeros = 0;
 }
 
-static inline void bw_byte(aeg_bitwriter *bw, uint8_t b)
-{
-    if (bw->count_only) { bw->len++; return; }
-    if (bw->len >= bw->cap) { bw->err = 1; return; }
-    if (bw->enable_emu) {
-        if (bw->zeros >= 2 && b <= 3) {
-            if (bw->len >= bw->cap) { bw->err = 1; return; }
-            bw->buf[bw->len++] = 0x03;
-            bw->zeros = 0;
-            if (bw->len >= bw->cap) { bw->err = 1; return; }
-        }
-        bw->zeros = (b == 0) ? bw->zeros + 1 : 0;
-    }
-    bw->buf[bw->len++] = b;
-}
-
-void aeg_bw_put(aeg_bitwriter *bw, int n, uint32_t val)
-{
-    if (n <= 0)
-        return;
-    if (n >= 32) {
-        aeg_bw_put(bw, n - 16, val >> 16);
-        n = 16;
-    }
-    bw->cache = (bw->cache << n) | (val & ((1u << n) - 1));
-    bw->bits += n;
-    while (bw->bits >= 8) {
-        bw->bits -= 8;
-        bw_byte(bw, (uint8_t)((bw->cache >> bw->bits) & 0xff));
-    }
-    bw->cache &= (1u << bw->bits) - 1;
-}
+/* aeg_bw_put() and the byte writer live in h264.h: they are inline because the
+ * RD cost calls them millions of times. */
 
 void aeg_bw_align_zero(aeg_bitwriter *bw)
 {

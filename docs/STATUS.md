@@ -901,11 +901,12 @@ this sandbox), best of three runs:
 | encoder | fps | bytes | Y-PSNR |
 |---|---|---|---|
 | ours, preset 0 | 708 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 100 / 96 | 78502 / 78468 | 45.12 / 45.12 |
+| ours, preset 2 / 4 | 105 / 102 | 78502 / 78468 | 45.12 / 45.12 |
 | x264 baseline (no asm) | 175 | 78 664 | 45.16 |
 
 At a matched QP the two encoders land within 0.2% of each other in rate and
-0.04 dB in quality, and x264 is 1.85x faster (it was 3.4x three rounds ago).
+0.04 dB in quality, and x264 is 1.66x faster (it was 3.4x four rounds ago, 1.85x
+one round ago; this round's +15% is four bit-exact changes, listed below).
 Absolute numbers move a few percent between runs; the `--frames 60`,
 single-thread, same-QP comparison is the one to repeat.
 
@@ -925,6 +926,7 @@ can move a decision):
 | SSE2 4x4 forward transform (3.2x per call) | 92.6 | 117 974 |
 | SSE2 inverse transform for the RD residual (`idct_core`, 784 k calls / 60 fr) | 97.4 | 117 974 |
 | SSE2 half-pel planes (all three, 3.3x: 1.06 -> 0.32 ms per picture) | ~100 | 117 974 |
+| the bit writer's inner loop inlined (7.5 M calls / 90 pictures) | 105 | 117 974 |
 
 The two newest rows are 90-frame runs of the panning texture at QP 24 (the
 older rows are 40-frame runs, hence the different byte count); both are

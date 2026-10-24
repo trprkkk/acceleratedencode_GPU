@@ -137,7 +137,44 @@ typedef struct aeg_bitwriter {
 } aeg_bitwriter;
 
 void aeg_bw_init(aeg_bitwriter *bw, uint8_t *buf, size_t cap, int emu);
-void aeg_bw_put(aeg_bitwriter *bw, int n, uint32_t val);
+
+/* The bit writer's inner loop, in the header because it is called 7.5 M times
+ * per 90 pictures -- once per coefficient and run_before of every candidate the
+ * rate-distortion pass measures -- and the call itself was 6% of the encode.
+ * `count_only` writers (the RD cost) only touch `len`, so the cost measurement
+ * never reaches the emulation-prevention path. */
+static inline void aeg_bw_byte(aeg_bitwriter *bw, uint8_t b)
+{
+    if (bw->count_only) { bw->len++; return; }
+    if (bw->len >= bw->cap) { bw->err = 1; return; }
+    if (bw->enable_emu) {
+        if (bw->zeros >= 2 && b <= 3) {
+            if (bw->len >= bw->cap) { bw->err = 1; return; }
+            bw->buf[bw->len++] = 0x03;
+            bw->zeros = 0;
+            if (bw->len >= bw->cap) { bw->err = 1; return; }
+        }
+        bw->zeros = (b == 0) ? bw->zeros + 1 : 0;
+    }
+    bw->buf[bw->len++] = b;
+}
+
+static inline void aeg_bw_put(aeg_bitwriter *bw, int n, uint32_t val)
+{
+    if (n <= 0)
+        return;
+    if (n >= 32) {
+        aeg_bw_put(bw, n - 16, val >> 16);
+        n = 16;
+    }
+    bw->cache = (bw->cache << n) | (val & ((1u << n) - 1));
+    bw->bits += n;
+    while (bw->bits >= 8) {
+        bw->bits -= 8;
+        aeg_bw_byte(bw, (uint8_t)((bw->cache >> bw->bits) & 0xff));
+    }
+    bw->cache &= (1u << bw->bits) - 1;
+}
 void aeg_bw_align_zero(aeg_bitwriter *bw);
 void aeg_bw_align_one(aeg_bitwriter *bw);
 void aeg_bw_ue(aeg_bitwriter *bw, uint32_t val);
