@@ -104,7 +104,12 @@ struct aeg_encoder {
      * me_seed_frame() with the best of a fixed candidate grid, evaluated as one
      * batch through the backend (this is the stage the GPU actually runs). */
     aeg_mc_ctx mc;         /* precomputed fractional-pel planes of refp[0] */
-    int16_t *seed_mv;
+    int16_t *seed_mv;      /* integer vectors of the parallel rounds      */
+    int16_t *par_pos;      /* 4 int16 per candidate for satd_batch       */
+    int16_t *par_mv;       /* quarter-pel result per macroblock          */
+    int32_t *par_cost;
+    int      par_valid;
+    int      par_full;
     int16_t *seed_cand;   /* 2 * ME_ROUND_CAND per macroblock */
     int16_t *prev_seed;   /* the same, as of the previous picture  */
     int32_t *seed_sad;
@@ -1245,8 +1250,11 @@ static void me_fill_round(struct aeg_encoder *e, const int16_t *mv, int step,
                 nx = cx;    /* outside the window: repeat the centre */
                 ny = cy;
             }
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 0] = (int16_t)(ox + nx);
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 1] = (int16_t)(oy + ny);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
+            /* the op takes the two block positions, not a relative vector */
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)(ox + nx);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)(oy + ny);
         }
     }
 }
@@ -1267,14 +1275,91 @@ static int me_run_round(struct aeg_encoder *e, int16_t *best, int32_t *cost)
         }
         if (bv < cost[mb]) {
             cost[mb] = bv;
-            best[mb * 2 + 0] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 2 + 0] -
+            best[mb * 2 + 0] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 4 + 2] -
                                          (mb % e->mb_w) * 16);
-            best[mb * 2 + 1] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 2 + 1] -
+            best[mb * 2 + 1] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 4 + 3] -
                                          (mb / e->mb_w) * 16);
             improved++;
         }
     }
     return improved;
+}
+
+/* One batched SATD round: every macroblock evaluates the nine candidates of
+ * e->par_pos[] and keeps the best one.  `mode` selects what the candidates mean
+ * (0 = the centre only, used to establish the cost of the current vector). */
+static void me_satd_round(struct aeg_encoder *e, int step, int range4,
+                          int centre_only)
+{
+    static const int8_t d[ME_ROUND_CAND][2] = {
+        { 0, 0}, {-1, 0}, { 1, 0}, { 0,-1}, { 0, 1},
+        {-1,-1}, { 1,-1}, {-1, 1}, { 1, 1}
+    };
+    int mb;
+    for (mb = 0; mb < e->mb_count; mb++) {
+        const int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
+        const int cx = e->par_mv[mb * 2 + 0], cy = e->par_mv[mb * 2 + 1];
+        int k;
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int nx = cx + (centre_only ? 0 : d[k][0] * step);
+            int ny = cy + (centre_only ? 0 : d[k][1] * step);
+            if (nx < -range4 || nx > range4 || ny < -range4 || ny > range4) {
+                nx = cx;
+                ny = cy;
+            }
+            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
+            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
+            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)nx;
+            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)ny;
+        }
+    }
+    e->d.ops.satd_batch(e->d.ops.priv, e->srcp[0], e->stride[0], 16, 16,
+                        e->par_pos, e->mb_count * ME_ROUND_CAND, e->seed_sad);
+    for (mb = 0; mb < e->mb_count; mb++) {
+        int bestk = -1, bv = e->par_cost[mb], k;
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int32_t v = e->seed_sad[mb * ME_ROUND_CAND + k];
+            if (v < bv) { bv = v; bestk = k; }
+        }
+        if (bestk >= 0) {
+            e->par_cost[mb] = bv;
+            e->par_mv[mb * 2 + 0] = e->par_pos[(mb * ME_ROUND_CAND + bestk) * 4 + 2];
+            e->par_mv[mb * 2 + 1] = e->par_pos[(mb * ME_ROUND_CAND + bestk) * 4 + 3];
+        }
+    }
+}
+
+/* Fractional-pel refinement of the whole picture, as two sets of batched rounds
+ * (half-pel steps, then quarter-pel steps) instead of a serial walk per
+ * macroblock.  This is the second half of the motion search and, like the
+ * integer rounds, it is one launch per round on a GPU. */
+static void me_par_subpel(struct aeg_encoder *e, int range4)
+{
+    int pass, mb;
+
+    for (mb = 0; mb < e->mb_count; mb++) {
+        e->par_mv[mb * 2 + 0] = (int16_t)(e->seed_mv[mb * 2 + 0] * 4);
+        e->par_mv[mb * 2 + 1] = (int16_t)(e->seed_mv[mb * 2 + 1] * 4);
+        e->par_cost[mb] = 1 << 30;
+    }
+    me_satd_round(e, 1, range4, 1);      /* cost of the integer position */
+
+    for (pass = 0; pass < 2; pass++) {
+        const int step = pass ? 1 : 2;
+        int iters = 0, improved = 1;
+        while (improved && iters++ < AEG_SUBPEL_ITERS) {
+            int32_t before = 0;
+            for (mb = 0; mb < e->mb_count; mb++)
+                before += e->par_cost[mb];
+            me_satd_round(e, step, range4, 0);
+            {
+                int32_t after = 0;
+                for (mb = 0; mb < e->mb_count; mb++)
+                    after += e->par_cost[mb];
+                improved = after < before;
+            }
+        }
+    }
 }
 
 /* Search every macroblock of the current P picture in parallel and remember the
@@ -1288,6 +1373,8 @@ static void me_seed_frame(struct aeg_encoder *e)
     int step;
     int64_t t0;
 
+    e->par_valid = 0;
+    e->par_full = 0;
     if (!e->has_ref || !e->cur_is_p || e->p.subme <= 0) {
         memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
         return;
@@ -1306,6 +1393,12 @@ static void me_seed_frame(struct aeg_encoder *e)
             memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
             return;
         }
+        /* The fractional half of the search is the same idea -- all
+         * macroblocks refine in quarter-pel rounds, one launch per round -- and
+         * replaces the per-macroblock walk outright.  Same gate (a GPU that
+         * wins the motion stage runs it), AEG_PARFULL=1/0 for the tests. */
+        ev = getenv("AEG_PARFULL");
+        e->par_full = ev ? atoi(ev) != 0 : e->d.use_gpu[AEG_STAGE_MOTION_EST];
     }
     /* the vectors of the previous picture are the temporal predictor of this
      * one; e->seed_mv still holds them, so copy before overwriting */
@@ -1316,15 +1409,18 @@ static void me_seed_frame(struct aeg_encoder *e)
      * at the same macroblock (rounded to integer pel) */
     for (mb = 0; mb < n; mb++) {
         int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
-        int tx = (e->prev_seed[mb * 2 + 0] + 2) >> 2;
-        int ty = (e->prev_seed[mb * 2 + 1] + 2) >> 2;
+        /* the previous picture's rounded vector, in whole samples */
+        int tx = e->prev_seed[mb * 2 + 0];
+        int ty = e->prev_seed[mb * 2 + 1];
         int k;
         if (tx < -range || tx > range) tx = 0;
         if (ty < -range || ty > range) ty = 0;
         for (k = 0; k < ME_ROUND_CAND; k++) {
             int dx = (k == 1) ? tx : 0, dy = (k == 1) ? ty : 0;
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 0] = (int16_t)(ox + dx);
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 2 + 1] = (int16_t)(oy + dy);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)(ox + dx);
+            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)(oy + dy);
         }
         e->seed_mv[mb * 2 + 0] = 0;
         e->seed_mv[mb * 2 + 1] = 0;
@@ -1336,6 +1432,16 @@ static void me_seed_frame(struct aeg_encoder *e)
         me_fill_round(e, e->seed_mv, step, range);
         if (!me_run_round(e, e->seed_mv, e->seed_cost))
             break;      /* nothing improved: the walk has converged */
+    }
+
+    /* The fractional half of the search, as rounds too -- but only where a
+     * satd_batch() backend can work from the registered reference: the CPU
+     * operation and both GPU backends provide it, and the vectors it produces
+     * are the same samples the serial walk sees. */
+    if (e->par_full && e->d.ops.satd_batch && e->d.ops.ref_upload && e->mc.ready) {
+        e->d.ops.ref_upload(e->d.ops.priv, e->mc.base, e->mc.stride, e->w, e->h);
+        me_par_subpel(e, range * 4);
+        e->par_valid = 1;
     }
 
     t0 = aeg_now_ns() - t0;
@@ -1387,7 +1493,14 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         /* The block to match is the *source* macroblock.  recp still holds the
          * previous picture at this position (nothing has been reconstructed
          * here yet), so searching against it would always favour mv = 0. */
-        {
+        if (e->par_valid && e->par_full) {
+            /* the whole-frame rounds already produced this macroblock's
+             * quarter-pel vector (and its SATD) */
+            const int idx = mby * e->mb_w + mbx;
+            mvx = e->par_mv[idx * 2 + 0];
+            mvy = e->par_mv[idx * 2 + 1];
+            sad = e->par_cost[idx];
+        } else {
             int seed[2];
             seed[0] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 0];
             seed[1] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
@@ -2501,14 +2614,24 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     aeg_mc_ctx_init(&e->mc, e->w, e->h, e->stride[0]);
     e->seed_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
-    e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 2 *
+    e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 4 *
                                         sizeof(int16_t));
     e->prev_seed = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
     e->seed_sad = (int32_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND *
                                        sizeof(int32_t));
     e->seed_cost = (int32_t *)aeg_alloc((size_t)e->mb_count * sizeof(int32_t));
+    e->par_pos = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 4 *
+                                      sizeof(int16_t));
+    e->par_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
+    e->par_cost = (int32_t *)aeg_alloc((size_t)e->mb_count * sizeof(int32_t));
+    if (e->seed_mv)
+        memset(e->seed_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    if (e->prev_seed)
+        memset(e->prev_seed, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    if (e->par_mv)
+        memset(e->par_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
-        !e->prev_seed) {
+        !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost) {
         aeg_set_last_error("out of memory");
         aeg_encoder_close(e);
         return NULL;
@@ -2653,6 +2776,9 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->prev_seed);
     aeg_free(e->seed_sad);
     aeg_free(e->seed_cost);
+    aeg_free(e->par_pos);
+    aeg_free(e->par_mv);
+    aeg_free(e->par_cost);
     aeg_free(e->mb_dqp);
     aeg_free(e->mbs);
     aeg_free(e->src_mem);

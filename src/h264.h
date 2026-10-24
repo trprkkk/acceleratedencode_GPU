@@ -16,6 +16,11 @@
 /* Geometry                                                            */
 /* ------------------------------------------------------------------ */
 #define AEG_PAD 32              /* border padding around each picture      */
+/* Steps per subpel pass of the motion search: past the third step the walk has
+ * almost always converged (see src/mc.c). */
+#ifndef AEG_SUBPEL_ITERS
+#define AEG_SUBPEL_ITERS 3
+#endif
 #define AEG_MAX_MB_W 512
 #define AEG_MAX_MB_H 512
 #define AEG_MAX_MBS  (AEG_MAX_MB_W * AEG_MAX_MB_H)

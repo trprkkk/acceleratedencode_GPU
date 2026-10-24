@@ -78,7 +78,7 @@ static void ocl_load_error(const char *name)
 OCL_SYMS(DECL)
 #undef DECL
 
-#define NBUF 8
+#define NBUF 12
 
 typedef struct ocl_ctx {
     void *lib;
@@ -87,10 +87,12 @@ typedef struct ocl_ctx {
     cl_context ctx;
     cl_command_queue queue;
     cl_program prog;
-    cl_kernel k_sad, k_tq, k_iq, k_sse, k_intp;
+    cl_kernel k_sad, k_tq, k_iq, k_sse, k_intp, k_satd;
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
+    /* the registered reference picture (see ref_upload) */
+    int ref_stride, ref_w, ref_h, ref_valid;
     char name[96];
     char vendor[48];
     uint64_t mem;
@@ -129,7 +131,7 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
 
     mcur = ocl_buf(o, 0, cur_sz, CL_MEM_READ_ONLY);
     mref = ocl_buf(o, 1, ref_sz, CL_MEM_READ_ONLY);
-    mmv = ocl_buf(o, 2, (size_t)count * 4, CL_MEM_READ_ONLY);
+    mmv = ocl_buf(o, 2, (size_t)count * 8, CL_MEM_READ_ONLY);
     mout = ocl_buf(o, 3, (size_t)count * 4, CL_MEM_WRITE_ONLY);
     if (!mcur || !mref || !mmv || !mout)
         return AEG_EBACKEND;
@@ -151,7 +153,7 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
         p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cur_sz, tmp, 0, NULL, NULL);
     }
     p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, ref_sz, ref, 0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mmv, CL_TRUE, 0, (size_t)count * 4, mv, 0, NULL, NULL);
+    p_clEnqueueWriteBuffer(o->queue, mmv, CL_TRUE, 0, (size_t)count * 8, mv, 0, NULL, NULL);
 
     p_clSetKernelArg(o->k_sad, 0, sizeof(cl_mem), &mcur);
     p_clSetKernelArg(o->k_sad, 1, sizeof(int), &bw);
@@ -323,6 +325,79 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
     return AEG_OK;
 }
 
+/* Register the reference picture: its four planes go to device memory once and
+ * stay there for every satd_batch() of the picture (slots 4..7, which no other
+ * operation touches). */
+static int ocl_ref_upload(void *priv, const uint8_t *const planes[4],
+                          int pstride, int w, int h)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    size_t rows = (size_t)h + 2 * AEG_PAD;
+    size_t bytes = (size_t)pstride * rows;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        cl_mem m = ocl_buf(o, 4 + k, bytes, CL_MEM_READ_ONLY);
+        if (!m)
+            return AEG_EBACKEND;
+        p_clEnqueueWriteBuffer(o->queue, m, CL_TRUE, 0, bytes,
+                               planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
+                               0, NULL, NULL);
+    }
+    o->ref_stride = pstride;
+    o->ref_w = w;
+    o->ref_h = h;
+    o->ref_valid = 1;
+    return AEG_OK;
+}
+
+static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+                          int bh, const int16_t *pos, int count, int32_t *out)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mcur, mpos, mout, mref[4];
+    size_t rows = (size_t)(o->ref_valid ? o->ref_h : 0) + 2 * AEG_PAD;
+    size_t cbytes = (size_t)cstride * rows;
+    int pad = AEG_PAD, k;
+    cl_int st;
+
+    if (!o->ref_valid || !count)
+        return AEG_EBACKEND;
+    mcur = ocl_buf(o, 0, cbytes, CL_MEM_READ_ONLY);
+    mpos = ocl_buf(o, 1, (size_t)count * 8, CL_MEM_READ_ONLY);
+    mout = ocl_buf(o, 2, (size_t)count * 4, CL_MEM_WRITE_ONLY);
+    if (!mcur || !mpos || !mout)
+        return AEG_EBACKEND;
+    for (k = 0; k < 4; k++)
+        mref[k] = o->buf[4 + k];
+    p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cbytes,
+                           cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD,
+                           0, NULL, NULL);
+    p_clEnqueueWriteBuffer(o->queue, mpos, CL_TRUE, 0, (size_t)count * 8, pos,
+                           0, NULL, NULL);
+    p_clSetKernelArg(o->k_satd, 0, sizeof(cl_mem), &mcur);
+    p_clSetKernelArg(o->k_satd, 1, sizeof(int), &cstride);
+    for (k = 0; k < 4; k++)
+        p_clSetKernelArg(o->k_satd, 2 + k, sizeof(cl_mem), &mref[k]);
+    p_clSetKernelArg(o->k_satd, 6, sizeof(int), &o->ref_stride);
+    p_clSetKernelArg(o->k_satd, 7, sizeof(int), &pad);
+    p_clSetKernelArg(o->k_satd, 8, sizeof(int), &bw);
+    p_clSetKernelArg(o->k_satd, 9, sizeof(int), &bh);
+    p_clSetKernelArg(o->k_satd, 10, sizeof(cl_mem), &mpos);
+    p_clSetKernelArg(o->k_satd, 11, sizeof(int), &count);
+    p_clSetKernelArg(o->k_satd, 12, sizeof(cl_mem), &mout);
+    {
+        size_t n = (size_t)count;
+        st = p_clEnqueueNDRangeKernel(o->queue, o->k_satd, 1, NULL, &n, NULL,
+                                      0, NULL, NULL);
+    }
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4, out,
+                          0, NULL, NULL);
+    return AEG_OK;
+}
+
 static void ocl_sync(void *priv)
 {
     ocl_ctx *o = (ocl_ctx *)priv;
@@ -439,7 +514,9 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     o->k_iq = p_clCreateKernel(o->prog, "iq_idct_batch", &st);
     o->k_sse = p_clCreateKernel(o->prog, "sse_batch", &st);
     o->k_intp = p_clCreateKernel(o->prog, "interp_plane", &st);
-    if (!o->k_sad || !o->k_tq || !o->k_iq || !o->k_sse || !o->k_intp) {
+    o->k_satd = p_clCreateKernel(o->prog, "satd_batch", &st);
+    if (!o->k_sad || !o->k_tq || !o->k_iq || !o->k_sse || !o->k_intp ||
+        !o->k_satd) {
         ocl_destroy(o);
         return AEG_EBACKEND;
     }
@@ -452,6 +529,8 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     ops->iq_idct_batch = ocl_iq_idct_batch;
     ops->sse_batch = ocl_sse_batch;
     ops->interp_plane = ocl_interp_plane;
+    ops->ref_upload = ocl_ref_upload;
+    ops->satd_batch = ocl_satd_batch;
     ops->sync = ocl_sync;
     ops->destroy = ocl_destroy;
     snprintf(ops->desc, sizeof(ops->desc), "%.48s %.96s (%d CUs, %s)",

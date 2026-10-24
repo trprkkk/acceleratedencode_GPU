@@ -110,6 +110,10 @@ run_case integer_me   320 192  8 1 -q 26 --subme 0
 # dispatcher only when that stage runs on the GPU; AEG_SEED=1 forces it here so
 # the extra candidate start can never break the stream when it is enabled.
 AEG_SEED=1 run_case seed_search  320 192  8 1 -q 26
+# The second level of that path refines all macroblocks of a picture together
+# in quarter-pel rounds (AEG_PARFULL=1) instead of the per-block walk; same
+# conformance requirement.
+AEG_SEED=1 AEG_PARFULL=1 run_case par_subpel 320 192 8 1 -q 26
 # Rate control and adaptive quantisation both change the QP per picture (and,
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.

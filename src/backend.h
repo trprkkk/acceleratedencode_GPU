@@ -17,8 +17,13 @@ typedef struct aeg_be_ops {
     int   backend;          /* AEG_BACKEND_* actually in use             */
     char  desc[192];
 
-    /* SAD of `count` candidate blocks.
-     * mv[] holds (x,y) integer-pel offsets, out[] receives the SADs. */
+    /* SAD of `count` block pairs.
+     * mv[] holds four int16 per candidate: the source block position (cx, cy)
+     * in `cur` and the displacement of the reference block (dx, dy) in `ref` --
+     * both relative to the passed pointers.  out[] receives the SADs.  The
+     * source position has to be part of the candidate because a batch covers
+     * many macroblocks: a whole picture's search is one call, so `cur` is the
+     * picture and not one block. */
     int (*sad_batch)(void *priv, const uint8_t *cur, int cstride,
                      const uint8_t *ref, int rstride, int bw, int bh,
                      const int16_t *mv, int count, int32_t *out);
@@ -43,6 +48,22 @@ typedef struct aeg_be_ops {
                         int w, int h, int which, uint8_t *dst, int dstride);
     int (*sse_batch)(void *priv, const uint8_t *a, int sa, const uint8_t *b,
                      int sb, int w, int h, uint64_t *out);
+
+    /* Register the reference picture for the calls below: planes[0] is the
+     * integer picture, planes[1..3] the horizontal / vertical / both-axes
+     * fractional planes (aeg_mc_ctx).  A GPU keeps them resident for the whole
+     * picture, which is why this is a separate call and not an argument of
+     * every batch. */
+    int (*ref_upload)(void *priv, const uint8_t *const planes[4], int pstride,
+                      int w, int h);
+
+    /* SATD of a batch of fractional-pel candidates against `cur`.
+     * pos holds four int16 per candidate: block x, block y (picture
+     * coordinates of the block origin) and the quarter-pel motion vector
+     * (mvx, mvy).  The samples come from the registered reference and its
+     * planes, i.e. this is exactly aeg_mc_luma_p() followed by aeg_satd(). */
+    int (*satd_batch)(void *priv, const uint8_t *cur, int cstride, int bw,
+                      int bh, const int16_t *pos, int count, int32_t *out);
 
     void (*sync)(void *priv);
     void (*destroy)(void *priv);

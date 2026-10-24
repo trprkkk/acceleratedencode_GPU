@@ -105,6 +105,21 @@ static void call_intp(int i)
 }
 
 /* ------------------------------------------------------------------ */
+/* satd_batch                                                          */
+/* ------------------------------------------------------------------ */
+static const uchar *g_scur, *g_s0, *g_s1, *g_s2, *g_s3;
+static int g_scstride, g_srstride, g_spad, g_sbw, g_sbh, g_scount;
+static const short *g_spos;
+static int *g_satd;
+
+static void call_satd(int i)
+{
+    (void)i;
+    satd_batch(g_scur, g_scstride, g_s0, g_s1, g_s2, g_s3, g_srstride, g_spad,
+               g_sbw, g_sbh, g_spos, g_scount, g_satd);
+}
+
+/* ------------------------------------------------------------------ */
 /* sse_batch                                                           */
 /* ------------------------------------------------------------------ */
 static const uchar *g_a, *g_b;
@@ -191,28 +206,35 @@ int main(void)
         (void)t;
     }
 
-    /* ---- SAD over a batch of 16x16 blocks ----------------------------- */
+    /* ---- SAD over a batch of block pairs ------------------------------ */
+    /* The candidates carry both the source block position and the reference
+     * displacement: a real batch is a whole picture's search, so the source
+     * block differs per candidate (a candidate that ignored the source position
+     * would compare every macroblock against the first one's block -- that bug
+     * made the parallel search pick vectors that did not match anything). */
     {
         int bw = 16, bh = 16, count = 8, i, bad = 0;
         g_bw = bw;
         g_bh = bh;
         g_count = count;
-        g_cstride = bw;
+        g_cstride = 72;
         g_rstride = 64;
-        g_cur = (const uchar *)malloc((size_t)bw * bh);
+        g_cur = (const uchar *)malloc((size_t)g_cstride * (bh + 32));
         g_ref = (const uchar *)malloc((size_t)g_rstride * (bh + 32));
-        g_mv = (short *)malloc((size_t)count * 2 * sizeof(short));
+        g_mv = (short *)malloc((size_t)count * 4 * sizeof(short));
         g_sad = (int *)malloc((size_t)count * 4);
         {
             int *ref_sad = (int *)malloc((size_t)count * 4);
             int j;
-            for (j = 0; j < bw * bh; j++)
+            for (j = 0; j < g_cstride * (bh + 32); j++)
                 ((uchar *)g_cur)[j] = (uchar)rnd(256);
             for (j = 0; j < g_rstride * (bh + 32); j++)
                 ((uchar *)g_ref)[j] = (uchar)rnd(256);
             for (j = 0; j < count; j++) {
-                ((short *)g_mv)[2 * j + 0] = (short)rnd(24);
-                ((short *)g_mv)[2 * j + 1] = (short)rnd(24);
+                ((short *)g_mv)[4 * j + 0] = (short)rnd(16);
+                ((short *)g_mv)[4 * j + 1] = (short)rnd(16);
+                ((short *)g_mv)[4 * j + 2] = (short)rnd(24);
+                ((short *)g_mv)[4 * j + 3] = (short)rnd(24);
             }
             run_items(count, call_sad);
             cpu.sad_batch(cpu.priv, g_cur, g_cstride, g_ref, g_rstride, bw, bh,
@@ -326,7 +348,81 @@ int main(void)
         free(dst);
     }
 
+    /* ---- SATD of fractional-pel candidates --------------------------- */
+    {
+        int w = 96, h = 64, pad = 32, t, bad = 0;
+        size_t stride = (size_t)w + 2 * pad, rows = (size_t)h + 2 * pad;
+        uchar *padded = (uchar *)calloc(stride * rows, 1);
+        uchar *plane[3];
+        uchar *cur = (uchar *)calloc(stride * rows, 1);
+        const uchar *base[4];
+        int *ref_satd;
+        short *pos;
+        const int sizes[2][2] = { {16, 16}, {8, 8} };
+
+        for (t = 0; t < 3; t++)
+            plane[t] = (uchar *)calloc(stride * rows, 1);
+        for (t = 0; t < (int)(stride * rows); t++) {
+            padded[t] = (uchar)rnd(256);
+            cur[t] = (uchar)rnd(256);
+        }
+        base[0] = padded + (size_t)pad * stride + pad;
+        for (t = 0; t < 3; t++)
+            base[t + 1] = plane[t] + (size_t)pad * stride + pad;
+        for (t = 1; t <= 3; t++)
+            cpu.interp_plane(cpu.priv, base[0], (int)stride, w, h, t,
+                             (uchar *)base[t], (int)stride);
+        cpu.ref_upload(cpu.priv, base, (int)stride, w, h);
+
+        /* the kernel takes whole padded allocations (the backends transfer
+         * them in one piece and the kernel shifts by `pad`); the CPU operation
+         * takes the picture origin of each.  Both describe the same picture. */
+        g_s0 = padded; g_s1 = plane[0]; g_s2 = plane[1]; g_s3 = plane[2];
+        g_srstride = (int)stride;
+        g_spad = pad;
+        g_scur = cur;
+        g_scstride = (int)stride;
+        for (t = 0; t < 2; t++) {
+            int n = 400, i;
+            g_sbw = sizes[t][0];
+            g_sbh = sizes[t][1];
+            g_scount = n;
+            bad = 0;
+            pos = (short *)malloc((size_t)n * 8);
+            g_satd = (int *)malloc((size_t)n * 4);
+            ref_satd = (int *)malloc((size_t)n * 4);
+            for (i = 0; i < n; i++) {
+                int bx = rnd(w - g_sbw + 1), by = rnd(h - g_sbh + 1);
+                pos[4 * i + 0] = (short)bx;
+                pos[4 * i + 1] = (short)by;
+                /* quarter-pel within +-6 samples, both axes and all phases */
+                pos[4 * i + 2] = (short)(rnd(25) - 12);
+                pos[4 * i + 3] = (short)(rnd(25) - 12);
+            }
+            g_spos = pos;
+            run_items(n, call_satd);
+            cpu.satd_batch(cpu.priv, g_scur + (size_t)pad * stride + pad,
+                           g_scstride, g_sbw, g_sbh, pos, n, ref_satd);
+            for (i = 0; i < n; i++)
+                if (g_satd[i] != ref_satd[i])
+                    bad++;
+            if (bad) {
+                printf("   kernel_check: satd_batch %dx%d: %d of %d differ "
+                       "(first %d vs %d)\n", g_sbw, g_sbh, bad, n,
+                       g_satd[0], ref_satd[0]);
+                fail = 1;
+            }
+            free(pos);
+            free(g_satd);
+            free(ref_satd);
+        }
+        free(padded);
+        free(cur);
+        for (t = 0; t < 3; t++)
+            free(plane[t]);
+    }
+
     if (!fail)
-        printf("   kernel_check: 5 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 6 kernels agree with the CPU reference\n");
     return fail;
 }

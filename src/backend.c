@@ -31,10 +31,11 @@ static int cpu_sad_batch(void *priv, const uint8_t *cur, int cstride,
     int i;
     (void)priv;
     for (i = 0; i < count; i++) {
-        const uint8_t *r = ref + mv[2 * i + 1] * rstride + mv[2 * i];
+        const uint8_t *c0 = cur + (ptrdiff_t)mv[4 * i + 1] * cstride + mv[4 * i + 0];
+        const uint8_t *r = ref + (ptrdiff_t)mv[4 * i + 3] * rstride + mv[4 * i + 2];
         int x, y, sad = 0;
         for (y = 0; y < bh; y++) {
-            const uint8_t *c = cur + y * cstride;
+            const uint8_t *c = c0 + y * cstride;
             const uint8_t *rr = r + y * rstride;
             for (x = 0; x < bw; x++) {
                 int d = (int)c[x] - (int)rr[x];
@@ -127,6 +128,58 @@ static int cpu_interp_plane(void *priv, const uint8_t *ref, int rstride,
     return AEG_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* Fractional-pel SATD batch (the subpel stage of the motion search)   */
+/* ------------------------------------------------------------------ */
+/* The reference picture and its planes are registered once per picture, like a
+ * GPU would keep them in device memory; the CPU "registration" is the pointer
+ * set itself.  One encoder drives one backend, so a single static is enough. */
+static struct {
+    const uint8_t *base[4];
+    int            stride;
+} g_cpu_ref;
+
+static int cpu_ref_upload(void *priv, const uint8_t *const planes[4],
+                          int pstride, int w, int h)
+{
+    (void)priv; (void)w; (void)h;
+    g_cpu_ref.base[0] = planes[0];
+    g_cpu_ref.base[1] = planes[1];
+    g_cpu_ref.base[2] = planes[2];
+    g_cpu_ref.base[3] = planes[3];
+    g_cpu_ref.stride = pstride;
+    return AEG_OK;
+}
+
+static int cpu_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+                          int bh, const int16_t *pos, int count, int32_t *out)
+{
+    aeg_mc_ctx mc;
+    uint8_t buf[16 * 16];
+    int i;
+    (void)priv;
+    if (bw > 16 || bh > 16)
+        return AEG_EINVAL;
+    mc.base[0] = g_cpu_ref.base[0];
+    mc.base[1] = g_cpu_ref.base[1];
+    mc.base[2] = g_cpu_ref.base[2];
+    mc.base[3] = g_cpu_ref.base[3];
+    mc.buf = NULL;
+    mc.stride = g_cpu_ref.stride;
+    mc.ready = 1;
+    for (i = 0; i < count; i++) {
+        const int bx = pos[4 * i + 0], by = pos[4 * i + 1];
+        const int mvx = pos[4 * i + 2], mvy = pos[4 * i + 3];
+        aeg_mc_luma_p(buf, bw, &mc,
+                      g_cpu_ref.base[0] + (ptrdiff_t)(by + (mvy >> 2)) * mc.stride +
+                      bx + (mvx >> 2),
+                      bw, bh, mvx & 3, mvy & 3);
+        out[i] = aeg_satd(bw, bh, buf, bw, cur + (ptrdiff_t)by * cstride + bx,
+                          cstride);
+    }
+    return AEG_OK;
+}
+
 void aeg_be_cpu_ops(aeg_be_ops *ops)
 {
     memset(ops, 0, sizeof(*ops));
@@ -136,6 +189,8 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->iq_idct_batch = cpu_iq_idct_batch;
     ops->sse_batch = cpu_sse_batch;
     ops->interp_plane = cpu_interp_plane;
+    ops->ref_upload = cpu_ref_upload;
+    ops->satd_batch = cpu_satd_batch;
     snprintf(ops->desc, sizeof(ops->desc), "cpu");
 }
 

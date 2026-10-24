@@ -86,7 +86,7 @@ CUDA_SYMS(DECL)
 NVRTC_SYMS(DECL)
 #undef DECL
 
-#define NBUF 8
+#define NBUF 12
 #define AEG_BLOCK 256
 
 typedef struct cuda_ctx {
@@ -95,11 +95,13 @@ typedef struct cuda_ctx {
     CUdevice device;
     CUcontext ctx;
     CUmodule mod;
-    CUfunction k_sad, k_tq, k_iq, k_sse, k_intp;
+    CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
     uint64_t mem;
+    /* the registered reference picture (see ref_upload) */
+    int ref_stride, ref_w, ref_h, ref_valid;
     char name[96];
 } cuda_ctx;
 
@@ -152,7 +154,7 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
 
     dcur = cuda_buf(o, 0, cur_sz);
     dref = cuda_buf(o, 1, ref_sz);
-    dmv = cuda_buf(o, 2, (size_t)count * 4);
+    dmv = cuda_buf(o, 2, (size_t)count * 8);
     dout = cuda_buf(o, 3, (size_t)count * 4);
     if (!dcur || !dref || !dmv || !dout)
         return AEG_EBACKEND;
@@ -170,7 +172,7 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
 
     p_cuMemcpyHtoD_v2(dcur, tmp, cur_sz);
     p_cuMemcpyHtoD_v2(dref, ref, ref_sz);
-    p_cuMemcpyHtoD_v2(dmv, mv, (size_t)count * 4);
+    p_cuMemcpyHtoD_v2(dmv, mv, (size_t)count * 8);
 
     args[0] = &dcur; args[1] = &icur; args[2] = &dref; args[3] = &iref;
     args[4] = &ibw;  args[5] = &ibh;  args[6] = &icount; args[7] = &dmv;
@@ -306,6 +308,63 @@ static int cuda_interp_plane(void *priv, const uint8_t *ref, int rstride,
     return AEG_OK;
 }
 
+/* Register the reference picture (four planes, resident in device memory). */
+static int cuda_ref_upload(void *priv, const uint8_t *const planes[4],
+                           int pstride, int w, int h)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    size_t rows = (size_t)h + 2 * AEG_PAD;
+    size_t bytes = (size_t)pstride * rows;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        CUdeviceptr d = cuda_buf(o, 4 + k, bytes);
+        if (!d)
+            return AEG_EBACKEND;
+        p_cuMemcpyHtoD_v2(d, planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
+                          bytes);
+    }
+    o->ref_stride = pstride;
+    o->ref_w = w;
+    o->ref_h = h;
+    o->ref_valid = 1;
+    return AEG_OK;
+}
+
+static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+                           int bh, const int16_t *pos, int count, int32_t *out)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    CUdeviceptr dcur, dpos, dout, dref[4];
+    size_t rows = (size_t)(o->ref_valid ? o->ref_h : 0) + 2 * AEG_PAD;
+    size_t cbytes = (size_t)cstride * rows;
+    int pad = AEG_PAD, k, st;
+    void *args[13];
+
+    if (!o->ref_valid || !count)
+        return AEG_EBACKEND;
+    dcur = cuda_buf(o, 0, cbytes);
+    dpos = cuda_buf(o, 1, (size_t)count * 8);
+    dout = cuda_buf(o, 2, (size_t)count * 4);
+    if (!dcur || !dpos || !dout)
+        return AEG_EBACKEND;
+    for (k = 0; k < 4; k++)
+        dref[k] = o->buf[4 + k];
+    p_cuMemcpyHtoD_v2(dcur, cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD, cbytes);
+    p_cuMemcpyHtoD_v2(dpos, pos, (size_t)count * 8);
+    args[0] = &dcur;  args[1] = &cstride;
+    for (k = 0; k < 4; k++)
+        args[2 + k] = &dref[k];
+    args[6] = &o->ref_stride; args[7] = &pad;
+    args[8] = &bw;   args[9] = &bh;
+    args[10] = &dpos; args[11] = &count; args[12] = &dout;
+    st = cuda_launch(o->k_satd, count, args);
+    if (st != AEG_OK)
+        return st;
+    p_cuMemcpyDtoH_v2(out, dout, (size_t)count * 4);
+    return AEG_OK;
+}
+
 static void cuda_sync(void *priv)
 {
     (void)priv;
@@ -430,7 +489,8 @@ static int cuda_build_module(cuda_ctx *o)
         p_cuModuleGetFunction(&o->k_tq, o->mod, "tq_batch") != CUDA_SUCCESS ||
         p_cuModuleGetFunction(&o->k_iq, o->mod, "iq_idct_batch") != CUDA_SUCCESS ||
         p_cuModuleGetFunction(&o->k_sse, o->mod, "sse_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_intp, o->mod, "interp_plane") != CUDA_SUCCESS)
+        p_cuModuleGetFunction(&o->k_intp, o->mod, "interp_plane") != CUDA_SUCCESS ||
+        p_cuModuleGetFunction(&o->k_satd, o->mod, "satd_batch") != CUDA_SUCCESS)
         return AEG_EBACKEND;
     return AEG_OK;
 }
@@ -506,6 +566,8 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     ops->iq_idct_batch = cuda_iq_idct_batch;
     ops->sse_batch = cuda_sse_batch;
     ops->interp_plane = cuda_interp_plane;
+    ops->ref_upload = cuda_ref_upload;
+    ops->satd_batch = cuda_satd_batch;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
     snprintf(ops->desc, sizeof(ops->desc), "CUDA %.48s (%d SMs)", o->name,

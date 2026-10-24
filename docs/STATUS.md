@@ -255,6 +255,27 @@ Implemented and building without warnings:
     / Y 43.64 dB to 28 676 B / Y 44.50 dB, and it is what closes most of the
     gap to x264.  It is now on for every preset except ultrafast.
 
+30. **`sad_batch` candidates are two block *positions*, not a position and a
+    vector.**  Every `sad_batch()` candidate is four `int16_t`,
+    `(cx, cy, ref_dx, ref_dy)`, where the reference fields are the block origin
+    *in the reference picture*, not a displacement.  The whole-frame search in
+    `me_seed_frame()` filled in the vector (`nx`, `ny`) and read the winner back
+    without subtracting the macroblock origin, so round 0 asked for the block at
+    `(3, 2)` for *every* macroblock -- i.e. macroblock 0's neighbourhood -- and
+    took round 0's cost as that macroblock's cost.  The first macroblock was
+    then consistent (cost == its own SAD) and every other one was garbage
+    (`mb 1 cost 312 at (19,2) direct 19670`), which is why the symptom looked
+    like an indexing bug: with `AEG_PARDBG` the per-macroblock cost and its
+    vector disagreed, and the fractional rounds then optimised that bogus
+    baseline, running the vectors out to the clamp limits (parallel SATD total
+    2 034 507 against the serial walk's 153 410).  Fixed by writing
+    `ox + nx, oy + ny` and subtracting the origin again when reading the winner
+    back; the integer rounds now total 195 346 SAD over 240 macroblocks (zero-MV
+    baseline 877 272, ~814/macroblock) and the fractional rounds improve it
+    monotonically.  The lesson is the same as bug 22's: a batch interface whose
+    arguments are *positions* can be silently fed displacements and the CPU
+    reference implementation will happily agree.
+
 ## Verification
 
 ```sh
@@ -268,12 +289,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — twenty-six clips (QP 12/23/26/40, presets 0 and 4,
+3. `tests/run_tests.sh` — twenty-eight clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
-   quarter-pel motion search, the forced whole-frame search seed, all-intra
-   and 3-frame GOPs, the RD Intra_4x4 decision of the slow presets, P_Skip,
-   ABR and AQ)
+   quarter-pel motion search, the forced whole-frame search seed *and* the
+   forced whole-frame fractional refinement, all-intra and 3-frame GOPs, the RD
+   Intra_4x4 decision of the slow presets, P_Skip, ABR and AQ)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -317,11 +338,16 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    estimation (~66% of the encode, of which the integer SAD walk and the
    subpel SATD are the two halves), then the coefficient pipeline (forward
    transform + quantisation + inverse transform of every candidate).  The
-   plane build is already a kernel (`interp_plane`), and the search rounds
-   already run through `sad_batch`; what is missing is the same round structure
-   for the *whole* integer search and a SATD kernel so that the subpel walk can
-   run as a batch too.  Both GPU backends exist and are checked against the CPU
-   reference by `tests/kernel_check.c` (5 kernels), but the dispatcher's
+   plane build is already a kernel (`interp_plane`), both halves of the search
+   now run as rounds through `sad_batch` and `satd_batch`, and
+   `tests/kernel_check.c` cross-checks six kernels (`sad_batch`, `tq_batch`,
+   `iq_idct_batch`, `sse_batch`, `interp_plane`, `satd_batch`).  What is still
+   missing is the coefficient pipeline's *batch* form: `tq_batch`,
+   `iq_idct_batch` and `sse_batch` exist as operations but the encoder still
+   calls the transform per candidate, because the rate-distortion decision is
+   taken from the result.  Batching it means splitting each picture into a
+   "produce every candidate" pass and a "decide" pass, which is the largest
+   remaining restructure.  The dispatcher's
    calibration has never run against real hardware in this environment (there
    is no GPU here), so the crossover points are still the CPU-model ones; the
    dispatcher also only ever measures the path it chose, so a stage is switched
@@ -588,7 +614,7 @@ forces it).  The CPU implementation of the operation *is* the code the encoder
 runs when the stage stays on the CPU -- `aeg_hpel_plane_fill()` in `src/mc.c` --
 so a stage that moves between the two cannot drift: `tests/kernel_check.c`
 compiles the kernel source as C and compares the three planes sample by sample
-against it (5 kernels, all bit-exact).
+against it (6 kernels, all bit-exact).
 
 ## Whole-frame parallel search
 
@@ -606,3 +632,24 @@ faster with byte-identical output; at `--subme 1` they are neutral in quality an
 ~3% slower on this CPU-only machine, so they follow the dispatcher's vote for
 `AEG_STAGE_MOTION_EST` (a GPU that wins that stage gets them) and `AEG_SEED=1/0`
 forces either way.  `tests/run_tests.sh` encodes one case with them forced on.
+
+The fractional half of the search runs as rounds too (`me_par_subpel()`): the
+integer winners are refined at step 2 and then step 1, each step evaluating the
+eight neighbours of *every* macroblock through `satd_batch()` until a round
+stops improving (at most `AEG_SUBPEL_ITERS` rounds, three).  The per-macroblock
+walk is then replaced outright -- `analyse_mb()` takes `par_mv`/`par_cost`
+instead of calling `aeg_me_block()` -- so the same two decisions (vector, SATD)
+come out of a fixed number of launches instead of ~240 dependent walks.
+`satd_batch()` carries the picture geometry (`pstride`, `pad`) instead of a
+pointer so that the device side can index its own reference copy; the encoder
+registers that copy once per picture through `ref_upload()`.
+
+That variant follows the same dispatcher gate (`AEG_PARFULL=1/0` forces it, and
+the integer rounds have to be on for it to have a baseline).  On this CPU it is
+a *loss*: three rounds per step is 54 whole-picture SATD passes against the
+walk's ~10-20 dependent evaluations per macroblock, so the 320x192 QP 26 clip
+goes 51.7 -> 43.9 fps for 46 395 -> 46 634 bytes (Y 44.15 -> 44.09 dB) -- a wash
+in quality for 15% more time.  It exists because on a device those 54 passes are
+54 launches over 240 macroblocks each, which is what a GPU is for;
+`tests/run_tests.sh` keeps the path conformant (`par_subpel` case) even though
+this machine always chooses the walk.
