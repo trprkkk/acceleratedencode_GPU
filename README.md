@@ -46,8 +46,8 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Fractional refinement as rounds (8 quarter/half-pel neighbours of every macroblock, up to three rounds at each step) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | each round is independent across macroblocks; replaces the per-macroblock subpel walk outright |
 | Fractional-pel planes (the four luma planes a quarter-pel position is built from) | GPU (`interp_plane`, one launch per plane) when the dispatcher assigns `inter`, CPU reference otherwise | every output sample independent; removes the per-candidate 6-tap filters |
 | Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
-| Forward transform (4x4 DCT) + forward quantisation | GPU (`tq_batch`, one launch per inter candidate: sixteen blocks) | per-block, no dependencies |
-| Inverse quantisation + inverse transform | GPU (`iq_idct_batch`, same sixteen blocks) | per-block, no dependencies |
+| Forward transform (4x4 DCT) + forward quantisation | GPU (`tq_batch`: one launch per inter candidate, or one per macroblock over *all* its candidates, `AEG_RD_BATCH`) | per-block, no dependencies; the candidates of a macroblock are independent of each other |
+| Inverse quantisation + inverse transform | GPU (`iq_idct_batch`, same blocks as above) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
 | Distortion metrics on the CPU reference (`aeg_sad`, 4x4 Hadamard `aeg_satd`) | CPU, SSE2 | exact integer sums, so a 13x / 2.2x faster vector path cannot change a decision |
 | Chroma and Intra_16x16 coefficient blocks | CPU | their DC coefficients are replaced by the 4x4 / 2x2 Hadamard of the neighbouring DCs, so they are not independent blocks |
@@ -133,7 +133,14 @@ preset.
   to get right, because a wrong one produces a *valid* stream that simply
   reconstructs differently; the reference has to be written twice, from the
   spec, to catch it.
-* `tests/run_tests.sh` encodes twenty-eight synthetic cases (QP 12/23/26/40,
+* `tools/gpu_validate.sh clip.yuv W H FRAMES QP` is the hardware check: it
+  encodes with the CPU backend, with the dispatcher free, and with each batched
+  device path forced on, then requires the coefficient paths to be the *same
+  bytes* as the CPU stream and every stream's reconstruction to match an
+  independent decode.  Run it on the machine that has the GPU; on a CPU-only
+  machine everything passes trivially, because the batch entry points fall back
+  to the reference ops.
+* `tests/run_tests.sh` encodes thirty synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   integer-only and quarter-pel search, the forced whole-frame search seed,

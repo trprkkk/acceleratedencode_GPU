@@ -352,6 +352,67 @@ Two things deliberately stay per block:
   the sixteen DCs, and the batch API has no per-block override;
 * chroma, for the same reason (the 2x2 chroma DC Hadamard).
 
+## Rate-distortion batching (provisional)
+
+The per-candidate batch above is one launch pair per candidate.  The next step is
+to put *every* inter candidate of a macroblock in one launch pair:
+
+```
+for each candidate k:                 /* 1. produce */
+    predict candidate k (plane MC)    -> pred_l
+    residual = src - pred_l           -> rd_res[16 blocks * k]
+    save pred_l                       -> rd_pred[k]
+tq_batch(rd_res, 16 * n)              /* one launch for all candidates */
+iq_idct_batch(rd_lev, 16 * n)         /* one launch for all candidates */
+for each candidate k:                 /* 2. decide */
+    finish(k) -> nz, cbp, reconstruction, SSE, CAVLC bits -> cost
+```
+
+`AEG_RD_BATCH=1` selects it; by default it is chosen when the dispatcher has
+both coefficient stages on a device.  It cannot be lifted from a macroblock to
+a picture without changing the bitstream, and that is worth stating precisely
+because it is the obvious next question:
+
+* the motion search predicts every macroblock's vectors from its neighbours'
+  *decided* vectors (H.264 8.4.1.3), so candidate generation is serial in
+  raster order;
+* intra prediction needs the reconstructed samples of the macroblock to the
+  left and above, which only exist once those macroblocks are decided;
+* the rate term of the RD cost comes from `aeg_cavlc_block_cost()` with the
+  neighbour non-zero counts as context, which is serial again.
+
+So "produce every candidate for the whole picture" would have to guess the
+neighbours' decisions, and the stream would no longer be the one the serial
+encoder produces.  A picture-wide version is possible only as a *different
+encoder* (slice-per-thread, or a lookahead/two-pass decision that accepts a
+bounded worst case), not as a bit-exact accelerator.  The batch therefore stops
+at the macroblock, which is where the coefficient work of a decision lives:
+64 blocks per launch instead of 16, two launches per macroblock instead of two
+per candidate.
+
+State of the implementation (this is the provisional part):
+
+* **Verified here**: with the CPU reference ops behind the batch entry points,
+  the stream is byte-identical to the serial candidate loop -- the conformance
+  cases `rd_batch` and `rd_batch4`, the whole 84-case sweep run with
+  `AEG_RD_BATCH=1`, and six clip/preset/QP comparisons.  The arithmetic cannot
+  differ, because `luma_inter_finish()` is the one implementation both paths
+  use; only the order in which the kernels are called changes.
+* **Not verifiable here**: whether two launches per macroblock actually beat
+  thirty-two calls.  On the CPU the forced path costs ~10% of the transform
+  stage (the prediction add, the clip and the SSE are scalar in the batched
+  form, where the serial path uses the SSE2 `aeg_idct_add_block`), so it is
+  correctly kept off there.  A device turns those thirty-two calls into two
+  launches of 64 blocks each; whether that wins depends on the launch cost the
+  dispatcher calibrates, which is what `aeg_backend_calibrate()` exists for.
+* **To be measured on hardware** with `tools/gpu_validate.sh clip.yuv W H
+  FRAMES QP`: it encodes with the CPU backend, with the dispatcher free and
+  with each batched path forced, then checks that the CPU/auto/coef/rd streams
+  are the same bytes and that every stream's reconstruction matches an
+  independent decode.  `search`/`all` are checked by reconstruction instead of
+  by bytes, because the whole-frame search rounds are a different search, not a
+  faster rendering of the same one.
+
 ## Verification
 
 
@@ -388,7 +449,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-5. `tests/run_tests.sh` — twenty-eight cases (QP 12/23/26/40, presets 0 and 4,
+5. `tests/run_tests.sh` — thirty cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -401,7 +462,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    cases really move the two halves of the picture in opposite directions —
    the default clip pans as one block and can never make a partition pay.
 
-`reconstruction vs decode` must be `max abs diff 0`.  A nonzero diff means the
+`reconstruction vs decode` must be `max abs diff 0`.
+
+With a GPU present, `tools/gpu_validate.sh clip.yuv W H FRAMES QP` runs the same
+comparison over every device code path at once (CPU stream against dispatcher
+stream against each forced batched path, byte for byte where the path is the
+same algorithm, by reconstruction where it is not).  A nonzero diff means the
 encoder and the decoder disagree about samples, which drifts on every
 following P picture.
 
@@ -444,6 +510,9 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    further means splitting the picture into "produce every candidate" and
    "decide" passes so a whole picture's candidates share one launch; that is
    the largest remaining restructure and it cannot be measured here.  The
+   per-macroblock form of it is implemented (*Rate-distortion batching
+   (provisional)*); the picture-wide form would change the bitstream, so it is
+   a different encoder rather than an accelerator of this one.  The
    dispatcher's
    calibration has never run against real hardware in this environment (there
    is no GPU here), so the crossover points are still the CPU-model ones; the

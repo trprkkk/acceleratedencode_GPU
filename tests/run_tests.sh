@@ -121,6 +121,12 @@ AEG_SEED=1 AEG_PARFULL=1 run_case par_subpel 320 192 8 1 -q 26
 # the per-block path it replaces.
 AEG_COEF_BATCH=1 run_case coef_batch  320 192  8 1 -q 26 --partitions 15
 AEG_COEF_BATCH=1 run_case coef_batch4 320 192  6 4 -q 22
+# The provisional RD batching puts *all* inter candidates of a macroblock in one
+# pair of kernel launches and decides afterwards.  Forced here against the CPU
+# reference ops it has to produce the same stream as the serial candidate loop,
+# on an all-inter clip (p0/partitions) and on one with intra macroblocks too.
+AEG_RD_BATCH=1 run_case rd_batch    320 192  8 1 -q 26 --partitions 15
+AEG_RD_BATCH=1 run_case rd_batch4   320 192  6 4 -q 22 -g 3
 # Rate control and adaptive quantisation both change the QP per picture (and,
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.

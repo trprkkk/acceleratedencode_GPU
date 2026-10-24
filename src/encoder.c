@@ -43,6 +43,7 @@ typedef struct mbenc {
 /* One inter partitioning candidate gathered by analyse_mb(): the shape, its
  * sub_macroblock types and, per 4x4 block, the motion vector, plus the
  * predictor of every partition (indexed by its first 4x4 block). */
+#define AEG_MB_CAND_MAX 4
 typedef struct {
     int     type;
     int     nparts;
@@ -113,6 +114,17 @@ struct aeg_encoder {
     int16_t coef_lev[16 * 16];
     int16_t coef_rec[16 * 16];
     int32_t coef_nz[16];
+    /* RD batching (provisional, see docs/STATUS.md): every inter candidate of
+     * the macroblock is predicted and its residual gathered first, then one
+     * tq_batch() and one iq_idct_batch() cover all of the candidates at once,
+     * and only then are the costs compared.  Four candidates x sixteen blocks
+     * is the largest batch a macroblock can produce. */
+    int rd_batch;
+    int16_t rd_res[16 * 16 * AEG_MB_CAND_MAX];
+    int16_t rd_lev[16 * 16 * AEG_MB_CAND_MAX];
+    int16_t rd_rec[16 * 16 * AEG_MB_CAND_MAX];
+    int32_t rd_nz[16 * AEG_MB_CAND_MAX];
+    uint8_t rd_pred[16 * 16 * AEG_MB_CAND_MAX];
     /* Whole-frame search seed: 2 ints per macroblock, integer pel.  Filled by
      * me_seed_frame() with the best of a fixed candidate grid, evaluated as one
      * batch through the backend (this is the stage the GPU actually runs). */
@@ -472,94 +484,73 @@ static const uint8_t group_blk[4][4] = {
 /* ------------------------------------------------------------------ */
 /* Luma coding: inter                                                  */
 /* ------------------------------------------------------------------ */
-static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+/* Residual of an inter prediction: the sixteen 4x4 blocks of the macroblock,
+ * contiguous (16 int16 per block, raster order inside the block). */
+static void luma_inter_gather(const struct aeg_encoder *e, const uint8_t *src,
+                              const uint8_t *pred, int16_t *res)
+{
+    int blk, x, y;
+    for (blk = 0; blk < 16; blk++) {
+        int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+        int16_t *r = res + 16 * blk;
+        for (y = 0; y < 4; y++)
+            for (x = 0; x < 4; x++)
+                r[y * 4 + x] = (int16_t)((int)src[(by + y) * e->stride[0] + bx + x] -
+                                         (int)pred[(by + y) * 16 + bx + x]);
+    }
+}
+
+/* Everything an inter candidate needs once its coefficients are known: the
+ * non-zero counts, the coded block pattern, the reconstruction written into
+ * the picture, the SSE and the CAVLC cost of the residual.
+ *
+ * `lev` points at the sixteen quantised blocks (contiguous, 16 int16 each) and
+ * is copied into the candidate's own array.  `nz` carries the non-zero counts
+ * the device kernel produced (NULL: count them here).  `rec` carries the
+ * sixteen reconstructed residual blocks when they come from a batch (NULL:
+ * reconstruct from the levels here, which is the SSE2 per-block path).  Both
+ * forms do the same arithmetic, so a candidate costs the same either way --
+ * that is what lets the batched path be bit-exact to the serial one. */
+static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                              const int16_t *lev, const int32_t *nz,
+                              const int16_t *rec, const uint8_t *pred)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     uint8_t *dst = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
-    const uint8_t *pred = e->pred_l;
-    int blk, i, x, y, luma_cbp = 0;
-    int qp = c->qp;
+    int blk, i, x, y, luma_cbp = 0, qp = c->qp;
 
-    if (e->coef_batch) {
-        /* Gather the sixteen residuals, run the device kernels over the whole
-         * macroblock, then reconstruct block by block: the prediction add and
-         * the SSE are cheap and they are what the RD cost needs. */
-        int64_t t0 = aeg_now_ns();
-        for (blk = 0; blk < 16; blk++) {
-            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
-            int16_t *r = e->coef_res + 16 * blk;
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++)
-                    r[y * 4 + x] = (int16_t)((int)src[(by + y) * e->stride[0] + bx + x] -
-                                             (int)pred[(by + y) * 16 + bx + x]);
-        }
-        e->d.ops.tq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
-                          e->coef_lev, e->coef_nz);
-        aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM, 1, aeg_now_ns() - t0);
-        for (blk = 0; blk < 16; blk++)
-            memcpy(c->level[blk], e->coef_lev + 16 * blk, 16 * sizeof(int16_t));
-        t0 = aeg_now_ns();
-        e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
-        aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT, 1, aeg_now_ns() - t0);
-        for (blk = 0; blk < 16; blk++) {
-            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
-            uint8_t *r = dst + by * e->stride[0] + bx;
-            const uint8_t *pr = pred + by * 16 + bx;
-            const int16_t *rr = e->coef_rec + 16 * blk;
-            int nz = e->coef_nz[blk];
-            c->nz[blk] = (int8_t)nz;
-            if (nz)
-                luma_cbp |= 1 << blk_group(blk);
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++) {
-                    int p = (int)pr[y * 16 + x] + (int)rr[y * 4 + x];
-                    int d;
-                    r[y * e->stride[0] + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
-                    d = (int)r[y * e->stride[0] + x] -
-                        (int)src[(by + y) * e->stride[0] + bx + x];
-                    c->sse += (int64_t)d * d;
-                }
-        }
-        c->cbp = (c->cbp & 0x30) | luma_cbp;
-        {
-            int g, k;
-            for (g = 0; g < 4; g++) {
-                if (!(c->cbp & (1 << g)))
-                    continue;
-                for (k = 0; k < 4; k++) {
-                    int b = group_blk[g][k];
-                    c->bits += aeg_cavlc_block_cost(c->level[b],
-                                                    luma_nc(e, mbx, mby, c, b), 0);
-                }
-            }
-        }
-        return;
-    }
-
-    for (blk = 0; blk < 16; blk++) {
-        int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
-        int16_t res[16], coef[16];
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++)
-                res[y * 4 + x] = (int16_t)((int)src[(by + y) * e->stride[0] + bx + x] -
-                                           (int)pred[(by + y) * 16 + bx + x]);
-        aeg_transform_4x4(res, 4, coef);
-        aeg_quant_4x4(coef, c->level[blk], qp, 0);
-    }
+    if (lev != &c->level[0][0])
+        memcpy(c->level, lev, 16 * 16 * sizeof(int16_t));
     for (blk = 0; blk < 16; blk++) {
         int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
         uint8_t *r = dst + by * e->stride[0] + bx;
         const uint8_t *pr = pred + by * 16 + bx;
-        int nz = 0;
-        for (i = 0; i < 16; i++)
-            nz += c->level[blk][i] != 0;
-        c->nz[blk] = (int8_t)nz;
-        if (nz)
+        int n = 0;
+
+        if (nz) {
+            n = nz[blk];
+        } else {
+            for (i = 0; i < 16; i++)
+                n += c->level[blk][i] != 0;
+        }
+        c->nz[blk] = (int8_t)n;
+        if (n)
             luma_cbp |= 1 << blk_group(blk);
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++)
-                r[y * e->stride[0] + x] = pr[y * 16 + x];
-        aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, r, e->stride[0], NULL);
+        if (rec) {
+            const int16_t *rr = rec + 16 * blk;
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++) {
+                    int p = (int)pr[y * 16 + x] + (int)rr[y * 4 + x];
+                    r[y * e->stride[0] + x] =
+                        (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+                }
+        } else {
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++)
+                    r[y * e->stride[0] + x] = pr[y * 16 + x];
+            aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, r,
+                               e->stride[0], NULL);
+        }
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++) {
                 int d = (int)r[y * e->stride[0] + x] -
@@ -580,6 +571,39 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             }
         }
     }
+}
+
+static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    const uint8_t *pred = e->pred_l;
+    int blk, qp = c->qp;
+
+    luma_inter_gather(e, src, pred, e->coef_res);
+    if (e->coef_batch) {
+        /* One transform+quantise call and one inverse call for the sixteen
+         * blocks instead of sixteen of each. */
+        int64_t t0 = aeg_now_ns();
+        e->d.ops.tq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
+                          e->coef_lev, e->coef_nz);
+        aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM,
+                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_now_ns() - t0);
+        t0 = aeg_now_ns();
+        e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
+        aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_now_ns() - t0);
+        luma_inter_finish(e, mbx, mby, c, e->coef_lev, e->coef_nz, e->coef_rec,
+                          pred);
+        return;
+    }
+    for (blk = 0; blk < 16; blk++) {
+        int16_t coef[16];
+        aeg_transform_4x4(e->coef_res + 16 * blk, 4, coef);
+        aeg_quant_4x4(coef, c->level[blk], qp, 0);
+    }
+    luma_inter_finish(e, mbx, mby, c, &c->level[0][0], NULL, NULL, pred);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1995,6 +2019,91 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
     return t->cost;
 }
 
+/* Fill `t` with one of the inter candidates the motion search produced: the
+ * shape, the sub-macroblock types and, per 4x4 block, the vector and its
+ * predictor.  This is the part of an inter candidate that decides the
+ * bitstream, so it is copied exactly as rd_luma() does it. */
+static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
+{
+    int b;
+    reset_mb_enc(t, qp);
+    t->type = e->mb_cand[cand].type;
+    memcpy(t->sub_type, e->mb_cand[cand].sub_type, sizeof(t->sub_type));
+    t->nparts = (uint8_t)e->mb_cand[cand].nparts;
+    for (b = 0; b < 16; b++) {
+        t->mv[b][0] = (int16_t)e->mb_cand[cand].mv[b][0];
+        t->mv[b][1] = (int16_t)e->mb_cand[cand].mv[b][1];
+        t->pmv[b][0] = (int16_t)e->mb_cand[cand].pmv[b][0];
+        t->pmv[b][1] = (int16_t)e->mb_cand[cand].pmv[b][1];
+    }
+}
+
+/* The rate-distortion comparison of every inter candidate of one macroblock,
+ * with the coefficient work done as one batch.
+ *
+ * This is the provisional form of "produce every candidate, then decide": the
+ * candidates of a macroblock are independent (their prediction comes from the
+ * reference picture), so they are predicted and their residuals gathered
+ * first, then one tq_batch() and one iq_idct_batch() cover all of them at
+ * once, and only then are the costs compared.  That is two kernel launches per
+ * macroblock instead of two per candidate, and the launches grow with the
+ * candidate count (64 blocks instead of 16), which is what a device needs.
+ *
+ * It cannot be lifted to a whole picture without changing the bitstream: the
+ * motion search predicts each macroblock's vectors from its neighbours'
+ * *decided* vectors, intra prediction needs the reconstructed neighbours, and
+ * the CAVLC cost model needs their non-zero counts.  All three are serial in
+ * raster order, so the batch has to stop at the macroblock boundary -- see
+ * docs/STATUS.md, "Rate-distortion batching (provisional)". */
+static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
+                                   mbenc *best, uint8_t *snap_l,
+                                   int64_t best_cost, double lambda, int qp)
+{
+    const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    const int n = e->mb_ncand;
+    int k;
+    int64_t t0;
+
+    /* 1. every candidate's prediction, and its residual in the batch buffer */
+    for (k = 0; k < n; k++) {
+        mbenc c;
+        cand_enc(e, k, qp, &c);
+        inter_predict_typed(e, mbx, mby, &c);
+        luma_inter_gather(e, src, e->pred_l, e->rd_res + 256 * k);
+        memcpy(e->rd_pred + 256 * k, e->pred_l, 256);
+    }
+    /* 2. one launch each for the whole macroblock's candidates */
+    t0 = aeg_now_ns();
+    e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * n, qp, 0, e->rd_lev,
+                      e->rd_nz);
+    aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM,
+                        e->d.ops.backend != AEG_BACKEND_CPU,
+                        aeg_now_ns() - t0);
+    t0 = aeg_now_ns();
+    e->d.ops.iq_idct_batch(e->d.ops.priv, e->rd_lev, 16 * n, qp, e->rd_rec);
+    aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+                        e->d.ops.backend != AEG_BACKEND_CPU,
+                        aeg_now_ns() - t0);
+    /* 3. decide, in the same order and with the same tie-breaking the serial
+     *    loop uses (a later candidate has to be strictly cheaper) */
+    for (k = 0; k < n; k++) {
+        mbenc t;
+        int64_t cost;
+        cand_enc(e, k, qp, &t);
+        luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * k, e->rd_nz + 16 * k,
+                          e->rd_rec + 256 * k, e->rd_pred + 256 * k);
+        t.bits += inter_hdr_bits(&t);
+        cost = t.sse + (int64_t)(lambda * t.bits + 0.5);
+        t.cost = cost;
+        if (cost < best_cost) {
+            best_cost = cost;
+            *best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
+    }
+    return best_cost;
+}
+
 /* Code the chroma of one candidate and return the cost of the chroma part. */
 static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                          int inter, int cmode, double lambda)
@@ -2009,7 +2118,11 @@ static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
 
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
-    uint8_t snap_l[16 * 16], snap_c[2 * 8 * 8];
+    /* Both snapshots are written by the first candidate that is evaluated, and
+     * at least one always is (a preset above 0 with no legal Intra_16x16 mode
+     * returns above), but initialising them keeps the compiler from warning
+     * about every memcpy in the snapshot helpers. */
+    uint8_t snap_l[16 * 16] = { 0 }, snap_c[2 * 8 * 8] = { 0 };
     mbenc best, t;
     int64_t best_cost = INT64_MAX;
     double lambda = AEG_LAMBDA(c->qp);
@@ -2038,13 +2151,18 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             snap_luma(e, mbx, mby, snap_l);
         }
     }
-    for (i = 0; i < e->mb_ncand; i++) {
-        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
-                               lambda, i);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best = t;
-            snap_luma(e, mbx, mby, snap_l);
+    if (e->rd_batch && e->mb_ncand > 0) {
+        best_cost = rd_luma_inter_batch(e, mbx, mby, &best, snap_l, best_cost,
+                                        lambda, c->qp);
+    } else {
+        for (i = 0; i < e->mb_ncand; i++) {
+            int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
+                                   lambda, i);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = t;
+                snap_luma(e, mbx, mby, snap_l);
+            }
         }
     }
     /* Intra_4x4: its own mode decision per block, so it is a candidate of its
@@ -2736,13 +2854,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * path in the conformance tests (it has to produce the same bitstream). */
     {
         const char *ev = getenv("AEG_COEF_BATCH");
-        if (ev)
-            e->coef_batch = atoi(ev) != 0;
-        else
-            e->coef_batch = e->d.ops.backend != AEG_BACKEND_CPU &&
-                            e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
-                            e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
-                            e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
+        int want = e->d.ops.backend != AEG_BACKEND_CPU &&
+                   e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
+                   e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
+                   e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
+        e->coef_batch = ev ? atoi(ev) != 0 : want;
+        /* The RD batching is the same decision one level up: all candidates of
+         * a macroblock in one launch pair instead of one pair per candidate.
+         * AEG_RD_BATCH=1/0 forces it, which is how the conformance cases cover
+         * the code path on a machine with no GPU. */
+        ev = getenv("AEG_RD_BATCH");
+        e->rd_batch = ev ? atoi(ev) != 0 : want;
+        if (e->rd_batch)
+            e->coef_batch = 1;
     }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
