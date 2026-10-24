@@ -123,6 +123,10 @@ typedef struct aeg_params {
      * uses it needs profile_idc 100 (High).  On by default: it is the larger of
      * the two quality tools this encoder implements. */
     int transform_8x8;
+    /* CABAC (context-adaptive binary arithmetic coding).  The alternative is
+     * CAVLC; CABAC codes the same decisions in ~10% fewer bits on typical
+     * content, at a higher cost per macroblock.  On by default. */
+    int cabac;
     int deblock;              /* 0 = off, 1 = on (default on)           */
     int deblock_alpha;        /* slice_alpha_c0_offset_div2, -6..6      */
     int deblock_beta;         /* slice_beta_offset_div2, -6..6          */

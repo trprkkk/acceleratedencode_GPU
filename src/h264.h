@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "aeg/aeg.h"
+#include "cabac.h"
 
 /* ------------------------------------------------------------------ */
 /* Geometry                                                            */
@@ -60,6 +61,9 @@ enum {
 
 /* Zigzag scan (frame coded order) */
 extern const uint8_t aeg_zigzag4x4[16];
+/* The same scan as "scan index -> our stored position" (the block layouts are
+ * transposed relative to the bitstream's, see transform.c). */
+extern const uint8_t aeg_scan4x4[16];
 /* 8x8 coefficient scan (High profile): scan position -> raster position of the
  * 8x8 block, i.e. aeg_zigzag8x8[i] = y * 8 + x. */
 extern const uint8_t aeg_zigzag8x8[64];
@@ -115,6 +119,8 @@ typedef struct aeg_mb {
     int16_t  mv[16][2];       /* per 4x4 MV in 1/4 pel (luma)             */
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
+    uint8_t  skip;            /* P slice: coded as a skip run / flag      */
+    int16_t  mvd[16][2];      /* motion vector difference actually sent   */
     int16_t  coef[AEG_BLK_COUNT][AEG_DCT_SIZE]; /* quantised coefficients  */
     int32_t  cost;            /* chosen RD cost (debug/stats)             */
 } aeg_mb;
@@ -203,11 +209,14 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
                      int long_start_code);
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8);
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8,
+                     int cabac);
+/* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header. */
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
-                              int slice_qp_delta, int deblock_alpha,
-                              int deblock_beta, int deblock_idc, int first_mb);
+                              int cabac_init_idc, int slice_qp_delta,
+                              int deblock_alpha, int deblock_beta,
+                              int deblock_idc, int first_mb);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma

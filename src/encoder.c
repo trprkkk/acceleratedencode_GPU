@@ -112,6 +112,12 @@ struct aeg_encoder {
     int frame_num;           /* frame_num of the current picture (8.2.1) */
     int idr_pic_id;
     int last_qp;
+    /* CABAC state that outlives a macroblock: whether the previous one carried
+     * a non-zero mb_qp_delta (the context of the next one's), and the
+     * cabac_init_idc the slices of this picture are coded with. */
+    int last_dqp;
+    int cabac_init_idc;
+    int dbg_cabac;
 
     /* One RBSP buffer per slice: a slice is its own NAL unit, and with slice
      * threads the slices are written by different threads at the same time.
@@ -804,6 +810,22 @@ static int t8_allowed(const struct aeg_encoder *e, const mbenc *c)
         if (c->sub_type[p] != 0)        /* 0 = 8x8, 1 = 8x4, 2 = 4x8, 3 = 4x4 */
             return 0;
     return 1;
+}
+
+/* The coded value of transform_size_8x8_flag, i.e. the one the neighbours'
+ * context (399 + transform_size_8x8_flag of A + of B) sees.  The flag is only
+ * present in the syntax for Intra_NxN and for an inter macroblock with a luma
+ * pattern, so every other macroblock leaves it zero even if its residual was
+ * transformed in 8x8 blocks internally. */
+static int mb_t8_coded(const struct aeg_encoder *e, const mbenc *c, int skipped)
+{
+    if (skipped || !e->p.transform_8x8)
+        return 0;
+    if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
+        return c->type == AEG_MB_I8x8;
+    if (!is_inter_type(c->type) || !t8_allowed(e, c) || !(c->cbp & 15))
+        return 0;
+    return c->t8 ? 1 : 0;
 }
 
 /* Which transform a macroblock's luma residual should use.  The reference
@@ -1893,6 +1915,15 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 
 /* CodedBlockPatternChroma as coded in the bitstream: 0 none, 1 DC only,
  * 2 AC (DC is then implied). */
+/* The cbp syntax element's chroma half is 0, 1 or 2; the store keeps it as two
+ * bits (chroma DC in 0x10, chroma AC in 0x20). */
+static int packed_chroma_cbp(int cbp)
+{
+    if (cbp & 0x20)
+        return 2;
+    return (cbp & 0x10) ? 1 : 0;
+}
+
 static int chroma_cbp(const mbenc *c)
 {
     if (c->cbp & 0x20)
@@ -2832,6 +2863,532 @@ static void flush_skip_run(aeg_bitwriter *bw, int *run)
     *run = 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* CABAC macroblock syntax (7.3.5, binarizations of 9.3.2)             */
+/* ------------------------------------------------------------------ */
+/* Every syntax element of the macroblock layer has a fixed context index
+ * offset (Table 9-34) plus a context index increment computed from the
+ * neighbours; the residual blocks use the three per-category offsets of
+ * Tables 9-39 to 9-41.  The whole table is spelled out here so that a wrong
+ * context is one number to check rather than an expression at a call site. */
+enum {
+    CAB_I16_NXN     = 3,    /* I slice: I_NxN vs Intra_16x16           */
+    CAB_I16_CBPL    = 6,    /* Intra_16x16: cbp_luma != 0              */
+    CAB_I16_CBPC    = 7,    /* Intra_16x16: chroma cbp, and            */
+    CAB_I16_CBPC2   = 8,    /*   whether it is 2                       */
+    CAB_I16_PRED    = 9,    /* Intra_16x16 prediction mode, two bits   */
+    CAB_SKIP        = 11,   /* P: mb_skip_flag                         */
+    CAB_P_TYPE      = 14,   /* P: intra or not                         */
+    CAB_P_SHAPE     = 15,   /* P: 16x16/8x8 vs 16x8/8x16               */
+    CAB_P_8X8       = 16,   /* P: 8x8                                  */
+    CAB_P_16X8      = 17,   /* P: 16x8 vs 8x16                         */
+    CAB_P_I16       = 17,   /* P: Intra_16x16 fields, offset by 14     */
+    CAB_SUB_TYPE    = 21,   /* P: sub_mb_type                          */
+    CAB_MVD_X       = 40,   /* P: |mvd| horizontal                     */
+    CAB_MVD_Y       = 47,   /* P: |mvd| vertical                       */
+    CAB_QP_DELTA    = 60,   /* mb_qp_delta                             */
+    CAB_CHROMA_PRED = 64,   /* intra_chroma_pred_mode                  */
+    CAB_I4_PREV     = 68,   /* prev_intra_pred_mode_flag               */
+    CAB_I4_REM      = 69,   /* rem_intra_pred_mode                     */
+    CAB_CBP_LUMA    = 73,   /* coded_block_pattern luma                */
+    CAB_CBP_CHROMA  = 77,   /* coded_block_pattern chroma              */
+    CAB_T8          = 399   /* transform_size_8x8_flag                 */
+};
+
+/* Intra_16x16 / I_NxN, which is also the intra suffix of a P macroblock: the
+ * two slices number those contexts differently (they are 14 apart). */
+static const uint8_t cab_i16_ctx_i[6] = { 3, 6, 7, 8, 9, 10 };
+static const uint8_t cab_i16_ctx_p[6] = { 17, 18, 19, 19, 20, 20 };
+
+/* Context base of the coded_block_flag of each residual category (Table 9-40). */
+static const uint16_t cab_cbf[6] = { 85, 89, 93, 97, 101, 460 };
+
+/* coded_block_flag context: which of the two neighbours has coefficients,
+ * with the spec's rule for a neighbour that is not available (outside the
+ * slice): an intra macroblock assumes it is coded, an inter one assumes not. */
+static int cab_cbf_ctx(int cat, int a, int b, int va, int vb, int intra)
+{
+    int na = va ? (a > 0) : intra;
+    int nb = vb ? (b > 0) : intra;
+    return cab_cbf[cat] + na + 2 * nb;
+}
+
+/* Neighbour non-zero counts of luma 4x4 block `blk` (raster order inside the
+ * macroblock), for the coded_block_flag contexts. */
+static void cab_nz4_luma(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
+                         int blk, int *a, int *b, int *va, int *vb)
+{
+    int bx = blk & 3, by = blk >> 2;
+
+    if (bx) { *a = c->nz[blk - 1]; *va = 1; }
+    else if (mbx) {
+        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[4 * by + 3];
+        *va = 1;
+    } else { *a = 0; *va = 0; }
+    if (by) { *b = c->nz[blk - 4]; *vb = 1; }
+    else if (mby > e->top_row) {
+        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[12 + bx];
+        *vb = 1;
+    } else { *b = 0; *vb = 0; }
+}
+
+/* The same for chroma AC block `k` (0..3, raster order) of plane `pl`. */
+static void cab_nz4_chroma(struct aeg_encoder *e, int mbx, int mby,
+                           const mbenc *c, int pl, int k,
+                           int *a, int *b, int *va, int *vb)
+{
+    int base = AEG_BLK_CHROMA_CB + pl * 4;
+    int bx = k & 1, by = k >> 1;
+
+    if (bx) { *a = c->nz[base + k - 1]; *va = 1; }
+    else if (mbx) {
+        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[base + k + 1];
+        *va = 1;
+    } else { *a = 0; *va = 0; }
+    if (by) { *b = c->nz[base + k - 2]; *vb = 1; }
+    else if (mby > e->top_row) {
+        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[base + k + 2];
+        *vb = 1;
+    } else { *b = 0; *vb = 0; }
+}
+
+/* The same for one whole-macroblock block (luma or chroma DC). */
+static void cab_nz_mb(struct aeg_encoder *e, int mbx, int mby, int blk,
+                      int *a, int *b, int *va, int *vb)
+{
+    if (mbx) {
+        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[blk];
+        *va = 1;
+    } else { *a = 0; *va = 0; }
+    if (mby > e->top_row) {
+        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[blk];
+        *vb = 1;
+    } else { *b = 0; *vb = 0; }
+}
+
+
+/* Intra_16x16 or I_NxN.  `ctx` is the six offsets of the slice type and
+ * `cond` the neighbour condition of the first bin (always 0 in a P slice). */
+static void cabac_type_intra(aeg_cabac *cb, const uint8_t *ctx, int cond,
+                             const mbenc *c)
+{
+    int lc = luma_cbp_on(c) ? 1 : 0, cc = chroma_cbp(c);
+
+    if (c->type != AEG_MB_I16x16) {
+        aeg_cabac_decision(cb, ctx[0] + cond, 0);
+        return;
+    }
+    aeg_cabac_decision(cb, ctx[0] + cond, 1);
+    aeg_cabac_terminate(cb, 0);              /* not I_PCM */
+    aeg_cabac_decision(cb, ctx[1], lc);
+    aeg_cabac_decision(cb, ctx[2], cc != 0);
+    if (cc)
+        aeg_cabac_decision(cb, ctx[3], cc == 2);
+    aeg_cabac_decision(cb, ctx[4], (c->i16_mode >> 1) & 1);
+    aeg_cabac_decision(cb, ctx[5], c->i16_mode & 1);
+}
+
+/* prev_intra4x4_pred_mode_flag / rem_intra4x4_pred_mode, which Intra_8x8 uses
+ * as well: the mode is replaced by the predicted one, or sent as three bits
+ * with the predicted value skipped. */
+static void cabac_pred_mode(aeg_cabac *cb, int pred, int mode)
+{
+    if (mode == pred) {
+        aeg_cabac_decision(cb, CAB_I4_PREV, 1);
+        return;
+    }
+    aeg_cabac_decision(cb, CAB_I4_PREV, 0);
+    mode = mode < pred ? mode : mode - 1;
+    aeg_cabac_decision(cb, CAB_I4_REM, mode & 1);
+    aeg_cabac_decision(cb, CAB_I4_REM, (mode >> 1) & 1);
+    aeg_cabac_decision(cb, CAB_I4_REM, (mode >> 2) & 1);
+}
+
+/* intra_chroma_pred_mode: one bin for "not DC", then a two-bit tree. */
+static void cabac_chroma_mode(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                              int mby, const mbenc *c)
+{
+    int ctx = 0, m = c->chroma_mode;
+    int idx = mby * e->mb_w + mbx;
+
+    if (mbx && is_intra_type(e->mbs[idx - 1].type) &&
+        e->mbs[idx - 1].chroma_mode != 0)
+        ctx++;
+    if (mby > e->top_row && is_intra_type(e->mbs[idx - e->mb_w].type) &&
+        e->mbs[idx - e->mb_w].chroma_mode != 0)
+        ctx += 1;
+    aeg_cabac_decision(cb, CAB_CHROMA_PRED + ctx, m != 0);
+    if (m != 0) {
+        aeg_cabac_decision(cb, CAB_CHROMA_PRED + 3, m != 1);
+        if (m != 1)
+            aeg_cabac_decision(cb, CAB_CHROMA_PRED + 3, m != 2);
+    }
+}
+
+/* transform_size_8x8_flag: the context counts the neighbours that used the 8x8
+ * transform, one each (9.3.3.1.1.13). */
+static int cab_t8_ctx(struct aeg_encoder *e, int mbx, int mby)
+{
+    int idx = mby * e->mb_w + mbx, ctx = 0;
+
+    if (mbx && e->mbs[idx - 1].t8)
+        ctx++;
+    if (mby > e->top_row && e->mbs[idx - e->mb_w].t8)
+        ctx++;
+    return CAB_T8 + ctx;
+}
+
+/* One motion vector difference: the |mvd| > 0 flag with its neighbour-based
+ * context, a unary prefix, then the Exp-Golomb escape and the sign. */
+static void cabac_mvd(aeg_cabac *cb, int base, int amvd, int mvd)
+{
+    int abs = mvd < 0 ? -mvd : mvd, i;
+    int ctx = base + (amvd > 2) + (amvd > 32);
+
+    if (!abs) {
+        aeg_cabac_decision(cb, ctx, 0);
+        return;
+    }
+    aeg_cabac_decision(cb, ctx, 1);
+    {
+        int off = 3;
+        for (i = 1; i < 9; i++) {
+            int more = i < abs;
+            aeg_cabac_decision(cb, base + off, more);
+            if (!more)
+                goto sign;
+            if (i < 4)
+                off++;
+        }
+    }
+    {
+        int rest = abs - 9, p = 0;
+        while (rest >= (1 << (3 + p))) {
+            rest -= 1 << (3 + p);
+            p++;
+        }
+        for (i = 0; i < p; i++)
+            aeg_cabac_bypass(cb, 1);
+        aeg_cabac_bypass(cb, 0);
+        for (i = 3 + p - 1; i >= 0; i--)
+            aeg_cabac_bypass(cb, (rest >> i) & 1);
+    }
+sign:
+    aeg_cabac_bypass(cb, mvd < 0);
+}
+
+/* The mvd of every partition of a P macroblock, and the per-4x4-block mvd the
+ * neighbours' contexts are built from. */
+static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                         int mby, mbenc *c)
+{
+    int idx = mby * e->mb_w + mbx;
+    int16_t mvd[16][2];
+    int p;
+
+    memset(mvd, 0, sizeof(mvd));
+    for (p = 0; p < c->nparts; p++) {
+        int geo[4], b0, x, y, ax, ay;
+        int lx = 0, ly = 0, tx = 0, ty = 0;
+        int bx, by;
+
+        mb_part_geom(c, p, geo, &b0);
+        bx = geo[0] / 4;
+        by = geo[1] / 4;
+        if (bx) {
+            lx = mvd[by * 4 + bx - 1][0];
+            ly = mvd[by * 4 + bx - 1][1];
+        } else if (mbx) {
+            lx = e->mbs[idx - 1].mvd[by * 4 + 3][0];
+            ly = e->mbs[idx - 1].mvd[by * 4 + 3][1];
+        }
+        if (by) {
+            tx = mvd[(by - 1) * 4 + bx][0];
+            ty = mvd[(by - 1) * 4 + bx][1];
+        } else if (mby > e->top_row) {
+            tx = e->mbs[idx - e->mb_w].mvd[12 + bx][0];
+            ty = e->mbs[idx - e->mb_w].mvd[12 + bx][1];
+        }
+        ax = (lx < 0 ? -lx : lx) + (tx < 0 ? -tx : tx);
+        ay = (ly < 0 ? -ly : ly) + (ty < 0 ? -ty : ty);
+        cabac_mvd(cb, CAB_MVD_X, ax, c->mv[b0][0] - c->pmv[b0][0]);
+        cabac_mvd(cb, CAB_MVD_Y, ay, c->mv[b0][1] - c->pmv[b0][1]);
+        for (y = geo[1] / 4; y < (geo[1] + geo[3]) / 4; y++)
+            for (x = geo[0] / 4; x < (geo[0] + geo[2]) / 4; x++) {
+                mvd[y * 4 + x][0] = (int16_t)(c->mv[b0][0] - c->pmv[b0][0]);
+                mvd[y * 4 + x][1] = (int16_t)(c->mv[b0][1] - c->pmv[b0][1]);
+            }
+    }
+    memcpy(e->mbs[idx].mvd, mvd, sizeof(mvd));
+}
+
+/* coded_block_pattern, luma half: four 8x8 groups, each conditioned on the
+ * neighbours' patterns (Table 9-39). */
+static void cabac_cbp_luma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                           int mby, const mbenc *c)
+{
+    int idx = mby * e->mb_w + mbx;
+    int a = mbx ? e->mbs[idx - 1].cbp : 0;
+    int b = (mby > e->top_row) ? e->mbs[idx - e->mb_w].cbp : 0;
+    int cbp = c->cbp & 15;
+
+    /* A neighbour outside the slice counts as "all four groups coded" (its
+     * low nibble is 0x0f) whichever kind of macroblock this is. */
+    if (!mbx) a = 0x0f;
+    if (mby <= e->top_row) b = 0x0f;
+    /* Each bin's context reads the groups decoded *so far* on this side, not
+     * the finished pattern (9.3.3.1.1.9): the decoder only knows the lower
+     * groups when it has to pick the context. */
+    {
+        int done = 0, i;
+        for (i = 0; i < 4; i++) {
+            int bit = (cbp >> i) & 1;
+            int ctx;
+            switch (i) {
+            case 0: ctx = !(a & 0x02) + 2 * !(b & 0x04); break;
+            case 1: ctx = !(done & 0x01) + 2 * !(b & 0x08); break;
+            case 2: ctx = !(a & 0x08) + 2 * !(done & 0x01); break;
+            default: ctx = !(done & 0x04) + 2 * !(done & 0x02); break;
+            }
+            aeg_cabac_decision(cb, CAB_CBP_LUMA + ctx, bit);
+            done |= bit << i;
+        }
+    }
+}
+
+static void cabac_cbp_chroma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                             int mby, const mbenc *c)
+{
+    int idx = mby * e->mb_w + mbx;
+    /* The neighbours' cbp is stored as two bits (chroma DC, chroma AC), while
+     * the context derivation wants the syntax element's value 0..2. */
+    int a = mbx ? packed_chroma_cbp(e->mbs[idx - 1].cbp) : 0;
+    int b = (mby > e->top_row) ? packed_chroma_cbp(e->mbs[idx - e->mb_w].cbp) : 0;
+    int cc = chroma_cbp(c);
+
+    /* A neighbour outside the slice counts as having cbp_chroma = 0: the
+     * decoder's stand-in for an unavailable neighbour is 0x7CF (or 0x00F),
+     * whose chroma bits are both clear. */
+    if (!mbx) a = 0;
+    if (mby <= e->top_row) b = 0;
+    aeg_cabac_decision(cb, CAB_CBP_CHROMA + (a > 0) + 2 * (b > 0), cc != 0);
+    if (cc)
+        aeg_cabac_decision(cb, CAB_CBP_CHROMA + 4 + (a == 2) + 2 * (b == 2),
+                           cc == 2);
+}
+
+/* The residual of one macroblock, in the order the spec decodes it: luma
+ * (DC then AC, or 8x8 groups, or 4x4 groups), then chroma DC, then chroma
+ * AC. */
+static void cabac_mb_residual(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                              int mby, mbenc *c)
+{
+    int intra = is_intra_type(c->type);
+    int16_t blk[64];
+    int i, g, k;
+
+    if (c->type == AEG_MB_I16x16) {
+        int a, b, va, vb;
+        for (i = 0; i < 16; i++)
+            blk[i] = c->level[AEG_BLK_LUMA_DC][aeg_scan4x4[i]];
+        cab_nz_mb(e, mbx, mby, AEG_BLK_LUMA_DC, &a, &b, &va, &vb);
+        c->nz[AEG_BLK_LUMA_DC] =
+            (int8_t)aeg_cabac_residual(cb, blk, 16, 0, cab_cbf_ctx(0, a, b, va, vb, 1));
+        if (luma_cbp_on(c)) {
+            for (k = 0; k < 16; k++) {
+                int nb = ac_ord[k];
+                cab_nz4_luma(e, mbx, mby, c, nb, &a, &b, &va, &vb);
+                for (i = 0; i < 15; i++)
+                    blk[i] = c->level[nb][aeg_scan4x4[i + 1]];
+                c->nz[nb] = (int8_t)aeg_cabac_residual(
+                    cb, blk, 15, 1, cab_cbf_ctx(1, a, b, va, vb, intra));
+            }
+        } else {
+            /* The DC block still had its coefficients: only the sixteen AC
+             * counts are zero here. */
+            memset(c->nz + AEG_BLK_LUMA, 0, 16);
+        }
+    } else if (c->t8) {
+        for (g = 0; g < 4; g++) {
+            int cnt = 0;
+            if (c->cbp & (1 << g)) {
+                for (i = 0; i < 64; i++)
+                    blk[i] = c->level8[g][aeg_zigzag8x8[i]];
+                /* No coded_block_flag: the coded block pattern already said
+                 * this group is coded. */
+                cnt = aeg_cabac_residual(cb, blk, 64, 5, -1);
+            }
+            for (k = 0; k < 4; k++)
+                c->nz[group_blk[g][k]] = (int8_t)(cnt ? cnt : 0);
+        }
+    } else {
+        for (g = 0; g < 4; g++) {
+            if (!(c->cbp & (1 << g)))
+                continue;
+            for (k = 0; k < 4; k++) {
+                int nb = group_blk[g][k], a, b, va, vb;
+                cab_nz4_luma(e, mbx, mby, c, nb, &a, &b, &va, &vb);
+                for (i = 0; i < 16; i++)
+                    blk[i] = c->level[nb][aeg_scan4x4[i]];
+                c->nz[nb] = (int8_t)aeg_cabac_residual(
+                    cb, blk, 16, 2, cab_cbf_ctx(2, a, b, va, vb, intra));
+            }
+        }
+    }
+    if (chroma_cbp(c)) {
+        int pl, cc = chroma_cbp(c), a, b, va, vb;
+        for (pl = 0; pl < 2; pl++) {
+            for (i = 0; i < 4; i++)
+                blk[i] = c->level[AEG_BLK_CHROMA_DC + pl][i];
+            cab_nz_mb(e, mbx, mby, AEG_BLK_CHROMA_DC + pl, &a, &b, &va, &vb);
+            c->nz[AEG_BLK_CHROMA_DC + pl] = (int8_t)aeg_cabac_residual(
+                cb, blk, 4, 3, cab_cbf_ctx(3, a, b, va, vb, intra));
+        }
+        if (cc == 2)
+            for (pl = 0; pl < 2; pl++)
+                for (k = 0; k < 4; k++) {
+                    int nb = AEG_BLK_CHROMA_CB + pl * 4 + k;
+                    cab_nz4_chroma(e, mbx, mby, c, pl, k,
+                                   &a, &b, &va, &vb);
+                    for (i = 0; i < 15; i++)
+                        blk[i] = c->level[nb][aeg_scan4x4[i + 1]];
+                    c->nz[nb] = (int8_t)aeg_cabac_residual(
+                        cb, blk, 15, 4, cab_cbf_ctx(4, a, b, va, vb, intra));
+                }
+    }
+}
+
+/* One macroblock of a CABAC slice.  `skip` is the P_Skip conversion of the
+ * bitstream pass: a P_L0_16x16 macroblock with the predicted motion vector and
+ * no residual reconstructs exactly like a skipped one. */
+static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                           int mby, mbenc *c, int is_p, int skip)
+{
+    int idx = mby * e->mb_w + mbx;
+    int intra = is_intra_type(c->type);
+
+    if (is_p) {
+        /* mb_skip_flag: one context per neighbour that was *not* skipped
+         * (9.3.3.1.1.1).  A neighbour outside the slice counts as skipped,
+         * which is why the ternaries default to 1. */
+        int ls = mbx ? e->mbs[idx - 1].skip : 1;
+        int ts = (mby > e->top_row) ? e->mbs[idx - e->mb_w].skip : 1;
+        aeg_cabac_decision(cb, CAB_SKIP + !ls + !ts, skip);
+        if (skip) {
+            /* A skipped macroblock has no residual, and its neighbours' coded
+             * block flags have to see that. */
+            memset(c->nz, 0, sizeof(c->nz));
+            memset(c->nz8, 0, sizeof(c->nz8));
+            return;
+        }
+    }
+    if (is_p) {
+        if (intra) {
+            aeg_cabac_decision(cb, CAB_P_TYPE, 1);
+            cabac_type_intra(cb, cab_i16_ctx_p, 0, c);
+        } else {
+            aeg_cabac_decision(cb, CAB_P_TYPE, 0);
+            if (c->type == AEG_MB_P16x16) {
+                aeg_cabac_decision(cb, CAB_P_SHAPE, 0);
+                aeg_cabac_decision(cb, CAB_P_8X8, 0);
+            } else if (c->type == AEG_MB_P8x8) {
+                aeg_cabac_decision(cb, CAB_P_SHAPE, 0);
+                aeg_cabac_decision(cb, CAB_P_8X8, 1);
+            } else {
+                aeg_cabac_decision(cb, CAB_P_SHAPE, 1);
+                aeg_cabac_decision(cb, CAB_P_16X8,
+                                   c->type == AEG_MB_P16x8 ? 1 : 0);
+            }
+            if (c->type == AEG_MB_P8x8) {
+                int p;
+                for (p = 0; p < 4; p++) {
+                    /* D_L0_8x8 = 0 with a single bin; 8x4, 4x8 and 4x4 use
+                     * two more (Table 9-34). */
+                    if (c->sub_type[p] == 0) {
+                        aeg_cabac_decision(cb, CAB_SUB_TYPE, 1);
+                    } else {
+                        aeg_cabac_decision(cb, CAB_SUB_TYPE, 0);
+                        aeg_cabac_decision(cb, CAB_SUB_TYPE + 1,
+                                           c->sub_type[p] == 1 ? 0 : 1);
+                        if (c->sub_type[p] != 1)
+                            aeg_cabac_decision(cb, CAB_SUB_TYPE + 2,
+                                               c->sub_type[p] == 2 ? 1 : 0);
+                    }
+                }
+            }
+            cabac_mb_mvd(e, cb, mbx, mby, c);
+        }
+    } else {
+        int cond = 0;
+        if (mbx) {
+            int t = e->mbs[idx - 1].type;
+            cond += (t == AEG_MB_I16x16 || t == AEG_MB_IPCM);
+        }
+        if (mby > e->top_row) {
+            int t = e->mbs[idx - e->mb_w].type;
+            cond += (t == AEG_MB_I16x16 || t == AEG_MB_IPCM);
+        }
+        cabac_type_intra(cb, cab_i16_ctx_i, cond, c);
+    }
+    if (intra) {
+        if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8) {
+            if (e->p.transform_8x8)
+                aeg_cabac_decision(cb, cab_t8_ctx(e, mbx, mby),
+                                   c->type == AEG_MB_I8x8);
+            if (c->type == AEG_MB_I8x8) {
+                int b;
+                for (b = 0; b < 4; b++)
+                    cabac_pred_mode(cb,
+                                    intra8_pred_mode(e, mbx, mby, c->intra8,
+                                                     b & 1, b >> 1),
+                                    c->intra8[b]);
+            } else {
+                int b;
+                for (b = 0; b < 16; b++) {
+                    int rx = ((b >> 2) & 1) * 2 + (b & 1);
+                    int ry = ((b >> 3) & 1) * 2 + ((b >> 1) & 1);
+                    cabac_pred_mode(cb,
+                                    intra4_pred_mode(e, mbx, mby, c->intra4,
+                                                     rx, ry),
+                                    c->intra4[b]);
+                }
+            }
+        }
+        cabac_chroma_mode(e, cb, mbx, mby, c);
+    }
+    if (c->type != AEG_MB_I16x16) {
+        cabac_cbp_luma(e, cb, mbx, mby, c);
+        cabac_cbp_chroma(e, cb, mbx, mby, c);
+        /* transform_size_8x8_flag of an inter macroblock comes after the coded
+         * block pattern, and only when the luma pattern is non-zero. */
+        if (is_inter_type(c->type) && t8_allowed(e, c) && (c->cbp & 15))
+            aeg_cabac_decision(cb, cab_t8_ctx(e, mbx, mby),
+                               c->t8 ? 1 : 0);
+    }
+    /* mb_qp_delta: present when the macroblock has a pattern or is
+     * Intra_16x16, whose pattern is carried by mb_type. */
+    if (c->cbp || c->type == AEG_MB_I16x16) {
+        int d = c->qp - e->last_qp;
+        aeg_cabac_decision(cb, CAB_QP_DELTA + (e->last_dqp ? 1 : 0), d != 0);
+        if (d) {
+            /* mb_qp_delta is coded as the unsigned value 2|d| - 1 (d > 0) or
+             * 2|d| (d < 0) in unary (9.3.2.7): v - 1 one-bins followed by a
+             * zero-bin.  Only the first bin uses context 2, every later one
+             * context 3 -- which includes the terminating zero-bin when v is
+             * larger than one. */
+            int v = d > 0 ? 2 * d - 1 : -2 * d, i;
+            for (i = 1; i < v; i++)
+                aeg_cabac_decision(cb, CAB_QP_DELTA + (i == 1 ? 2 : 3), 1);
+            aeg_cabac_decision(cb, CAB_QP_DELTA + (v == 1 ? 2 : 3), 0);
+        }
+        e->last_dqp = d != 0;
+    } else {
+        e->last_dqp = 0;
+    }
+    e->last_qp = c->qp;
+    cabac_mb_residual(e, cb, mbx, mby, c);
+}
+
 static int ensure_buf(uint8_t **buf, size_t *cap, size_t need)
 {
     if (need <= *cap)
@@ -3139,10 +3696,13 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
 
     e->top_row = first_row;
     e->last_qp = e->cur_qp;
+    e->last_dqp = 0;
+    e->dbg_cabac = getenv("AEG_CABAC_TRACE") != NULL;
     aeg_bw_init(&bw, bs, cap, 0);
     aeg_write_slice_header(&bw, is_p ? 5 : 7,
                            e->frame_num & ((1 << e->frame_num_bits) - 1),
                            e->frame_num_bits, is_idr, e->idr_pic_id,
+                           e->p.cabac ? e->cabac_init_idc : -1,
                            e->cur_qp - 26, 0, 0,
                            e->p.deblock ? 0 : 1, first_row * e->mb_w);
 
@@ -3173,7 +3733,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             memset(m, 0, sizeof(*m));
             m->type = (uint8_t)tmp->type;
             m->i16_mode = (uint8_t)tmp->i16_mode;
-            m->t8 = (uint8_t)tmp->t8;
+            m->t8 = (uint8_t)mb_t8_coded(e, tmp, 0);
             m->chroma_mode = (uint8_t)tmp->chroma_mode;
             m->cbp = (uint8_t)tmp->cbp;
             m->qp = (int8_t)tmp->qp;
@@ -3191,6 +3751,95 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             }
             m->cost = (int32_t)tmp->sse;
         }
+    }
+
+    /* ---- bitstream pass, CABAC -----------------------------------------
+     * The same raster order, for the same reason (every context reads the
+     * neighbours), but the coder is arithmetic: the macroblocks are fed to it
+     * one bin at a time and it writes its bytes itself, so the bit writer is
+     * only used for the header and for the trailing bits afterwards. */
+    if (e->p.cabac) {
+        aeg_cabac cab;
+        size_t hdr;
+
+        /* cabac_alignment_one_bit: the arithmetic coder starts on a byte
+         * boundary (7.3.4). */
+        while (bw.bits)
+            aeg_bw_put(&bw, 1, 1);
+        hdr = bw.len;
+        aeg_cabac_open(&cab, hdr < cap ? bs + hdr : bs, hdr < cap ? cap - hdr : 0);
+        cab.trace = e->dbg_cabac;
+        aeg_cabac_set_contexts(&cab, !is_p, e->cur_qp, e->cabac_init_idc);
+        e->last_dqp = 0;
+
+        for (mby = first_row; mby <= last_row; mby++) {
+            for (mbx = 0; mbx < e->mb_w; mbx++) {
+                int idx = mby * e->mb_w + mbx;
+                mbenc *tmp = &e->mb_encs[idx];
+                aeg_mb *m = &e->mbs[idx];
+                int skipped = 0, last = 0, i;
+                int64_t t0 = aeg_now_ns();
+
+                /* A macroblock without a coded block pattern carries no
+                 * mb_qp_delta, so the decoder keeps the QP it has; the
+                 * Intra_16x16 one always carries the delta, and it is zero. */
+                if (tmp->cbp == 0)
+                    tmp->qp = e->last_qp;
+                m->qp = (int8_t)tmp->qp;
+
+                if (is_p && tmp->type == AEG_MB_P16x16 && tmp->cbp == 0) {
+                    int pmvx, pmvy;
+                    pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+                    if (tmp->mv[0][0] == pmvx && tmp->mv[0][1] == pmvy)
+                        skipped = 1;
+                }
+                m->skip = (uint8_t)skipped;
+                /* A skipped macroblock carries no mb_qp_delta, so the decoder
+                 * forgets the previous delta's value: the next macroblock tests
+                 * its first bin against context 60, not 61 (9.3.2.7). */
+                if (skipped)
+                    e->last_dqp = 0;
+                if (skipped) {
+                    m->t8 = 0;
+                    memset(m->mvd, 0, sizeof(m->mvd));
+                    memset(tmp->nz, 0, sizeof(tmp->nz));
+                    memset(tmp->nz8, 0, sizeof(tmp->nz8));
+                }
+                last = (mby == last_row && mbx == e->mb_w - 1);
+                if (e->dbg_cabac) {
+                    int k;
+                    fprintf(stderr, "ENCMB %d,%d type %d cbp %d t8 %d qp %d "
+                            "i16 %d ch %d skip %d i4", mbx, mby, tmp->type,
+                            tmp->cbp, tmp->t8, tmp->qp, tmp->i16_mode,
+                            tmp->chroma_mode, skipped);
+                    for (k = 0; k < 16; k++)
+                        fprintf(stderr, " %d", tmp->intra4[k]);
+                    fprintf(stderr, " i8");
+                    for (k = 0; k < 4; k++)
+                        fprintf(stderr, " %d", tmp->intra8[k]);
+                    fprintf(stderr, " nz");
+                    for (k = 0; k < AEG_BLK_COUNT; k++)
+                        fprintf(stderr, " %d", tmp->nz[k]);
+                    fprintf(stderr, "\n");
+                }
+                write_mb_cabac(e, &cab, mbx, mby, tmp, is_p, skipped);
+                aeg_cabac_terminate(&cab, last);
+
+                /* the decisions the following macroblocks' contexts read */
+                m->t8 = (uint8_t)mb_t8_coded(e, tmp, skipped);
+                for (i = 0; i < AEG_BLK_COUNT; i++)
+                    m->nz[i] = tmp->nz[i];
+                for (i = 0; i < 4; i++)
+                    m->nz8[i] = (int8_t)(tmp->nz8[i] != 0);
+                e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+            }
+        }
+        *rbsp_len = hdr + aeg_cabac_flush(&cab);
+        /* rbsp_slice_trailing_bits (7.3.4.4): the stop bit, so that the last
+         * byte of the slice is never an all-zero one. */
+        if (*rbsp_len + 1 <= cap)
+            bs[(*rbsp_len)++] = 0x80;
+        return AEG_OK;
     }
 
     /* ---- bitstream pass ------------------------------------------------
@@ -3399,7 +4048,8 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         uint8_t sps[256], pps[64];
         size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                                   e->frame_num_bits, e->level_idc);
-        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8);
+        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8,
+                                  e->p.cabac);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 7,
                                  sps, sl, 1);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 8,

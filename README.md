@@ -8,15 +8,16 @@ ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
 > **Status: conformant High-profile encoder core (I and P pictures,
-> Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform,
+> Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
 > 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions and
 > P_Skip), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 45 clip cases, a 200 000-block coefficient
-> cross-check and the device kernels, and *fails* on any mismatch.  What
+> `make test` asserts it over 47 clip cases, two CABAC round-trips, a
+> 200 000-block coefficient cross-check and the device kernels, and *fails* on
+> any mismatch.  What
 > is *not* finished is speed and the last few percent of efficiency: at
 > matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
 > fewer bits on the inter test clips and is level with it on all-intra, where
@@ -56,7 +57,7 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
 | Intra_4x4 mode analysis (9 predictors x 16 blocks per MB) | CPU for now; the 16 blocks of a macroblock are independent once the neighbours exist | the candidate that dominates I-picture cost |
 | Deblocking filter | CPU | pinned: serial in MB order, communication cost dominates |
-| CAVLC entropy coding | CPU | inherently serial (nC context depends on previous blocks) |
+| Entropy coding (CABAC by default, CAVLC with `--no-cabac`) | CPU | inherently serial: every bin depends on the arithmetic coder's state and on context states the previous macroblocks left behind |
 | Bitstream assembly / rate decisions | CPU | serial |
 
 The dispatcher is *measured*, not guessed: each stage is timed per frame in both
@@ -109,9 +110,12 @@ selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
 default), `--dump-recon` writes what the encoder itself
 reconstructed (this is what a decoder must produce, so it is the primary
-conformance check), `--no-8x8dct` falls back to the Baseline profile (4x4 luma
-transforms only, which is how the cost of the High-profile tools was measured),
-and `--no-deblock`, `--subme N`, `--range N` override the preset.
+conformance check), `--no-8x8dct` drops the 8x8 transform and Intra_8x8 (4x4
+luma transforms only, which is how the cost of the High-profile tools was
+measured), `--no-cabac` replaces CABAC with CAVLC (34-36% more bytes at equal
+PSNR; kept as the comparison path and because both coders have to reconstruct
+the same picture), and `--no-deblock`, `--subme N`, `--range N` override the
+preset.
 
 ## What is verified, and how
 
@@ -126,6 +130,12 @@ and `--no-deblock`, `--subme N`, `--range N` override the preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
+* `tests/cabac_mb_check.c` round-trips the CABAC *residual block* syntax
+  through a second transcription of 9.3.2.2: 20 000 random blocks over the six
+  context categories, levels reaching the Exp-Golomb escape, both signs.  This
+  is the check that covers the binarization and the context derivation, which
+  sit above the arithmetic coder and are where all three encoder-side CABAC
+  bugs were.
 * `tests/cabac_check.c 200000 8` round-trips the CABAC arithmetic coder
   through a decoder written from the spec's decoding process (nine-bit
   `codIOffset`, bit-by-bit refill) rather than from the encoder: 1.6 M bins

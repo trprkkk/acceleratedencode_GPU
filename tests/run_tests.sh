@@ -136,6 +136,14 @@ run_case abr          320 192 16 1 -q 24 --bitrate 300
 run_case vbv          320 192 12 1 -q 24 --vbv-maxrate 400 --vbv-bufsize 60
 run_case abr_gop4     320 192 16 4 -q 24 --bitrate 400 -g 4
 run_case aq           320 192  8 4 -q 26 --aq 12
+# AQ is what puts non-zero mb_qp_delta values inside a picture, and the CABAC
+# context that codes the *first* bin of one is selected by the previous
+# macroblock's delta -- which a skipped macroblock clears (9.3.2.7).  Both the
+# unary code of the delta and that reset were wrong until this case existed:
+# mode 3 gives long P_Skip runs for the delta to be forgotten in, and the two
+# QPs give the AQ a reason to move the value both ways.
+run_case aq_skip      320 192 10 3 -q 26 --aq 12 -g 4
+run_case aq_skip_lo   320 192 10 3 -q 16 --aq 16 -g 4
 # Intra_4x4 in every picture, and IDR pictures after P pictures (gop > 1),
 # which is where the mode prediction and the reference handling meet.
 run_case all_intra    320 192  6 1 -q 26 -g 1

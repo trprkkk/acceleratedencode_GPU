@@ -494,6 +494,15 @@ const uint16_t aeg_quant8_mf[6][64] = {
   },
 };
 
+/* The 4x4 scan the bitstream uses, read as "scan position -> position in our
+ * stored block".  The quantiser stores each block transposed (so that the
+ * decoder's inverse transform reconstructs the residual we measured), which
+ * makes the decoder's zig-zag the transpose of aeg_zigzag4x4 when it is applied
+ * to our layout. */
+const uint8_t aeg_scan4x4[16] = {
+     0,  4,  1,  2,  5,  8, 12,  9,  6,  3,  7, 10, 13, 14, 11, 15
+};
+
 /* H.264 Table 8-13: the 8x8 zig-zag, as raster positions.  CAVLC sends an 8x8
  * block as four 4x4 blocks that interleave this sequence -- sub-block k holds
  * scan positions k, k + 4, ... -- which is how the four sub-blocks of an 8x8
@@ -835,4 +844,28 @@ const int8_t aeg_cabac_init_PB[3][460][2] = {
     {  -11,   68}, {    9,   -2}, {   30,  -10}, {   31,   -4}, {   33,   -1}, {   33,    7},
     {   31,   12}, {   37,   23}, {   31,   38}, {   20,   64},
     }
+};
+
+/* ------------------------------------------------------------------ */
+/* CABAC residual contexts for the 8x8 transform (High profile)        */
+/* ------------------------------------------------------------------ */
+/* Context offsets of the significance flag and of the last-coefficient flag
+ * inside a 64-coefficient block, per *scan position* (Table 9-42 and, for the
+ * last-coefficient flag, the 63-entry mapping of 9.3.2.3).  The frequency
+ * layout of an 8x8 block makes the 4x4 neighbourhood rule of the smaller
+ * block sizes wrong, so the spec replaces it with these fixed offsets; the
+ * last position of the scan never carries a significance flag and the last
+ * coefficient position needs no last-coefficient flag, which is why both
+ * tables stop at 63. */
+const uint8_t aeg_cabac_sig8[63] = {
+     0,  1,  2,  3,  4,  5,  5,  4,  4,  3,  3,  4,  4,  4,  5,  5,
+     4,  4,  4,  4,  3,  3,  6,  7,  7,  7,  8,  9, 10,  9,  8,  7,
+     7,  6, 11, 12, 13, 11,  6,  7,  8,  9, 14, 10,  9,  8,  6, 11,
+    12, 13, 11,  6,  9, 14, 10,  9, 11, 12, 13, 11, 14, 10, 12
+};
+const uint8_t aeg_cabac_last8[63] = {
+     0,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+     2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+     3,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  4,
+     5,  5,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8
 };

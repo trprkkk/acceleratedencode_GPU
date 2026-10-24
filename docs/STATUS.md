@@ -21,10 +21,15 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs forty-five encoded clip cases
+fails (non-zero exit) on any mismatch; it runs forty-seven encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
+
+Every case above is coded with **CABAC**, which is the default entropy coder;
+`--no-cabac` codes the same decisions with CAVLC (34-36% more bytes on the
+panning clip at equal PSNR) and is kept because the two coders must produce the
+same reconstruction.
 
 Implemented and building without warnings:
 
@@ -33,11 +38,14 @@ Implemented and building without warnings:
   sized to the GOP)
 * CAVLC residual coding (coeff_token, levels, total_zeros, run_before) —
   round-tripped by `tests/cavlc_check.c` (12 000 random blocks, 4 block kinds)
-* the CABAC arithmetic coder and its context tables (`src/cabac.c`) —
-  round-tripped by `tests/cabac_check.c` (1.6 M bins, every probability state,
-  bypass bins, both end-of-slice flags).  **The encoder does not use it yet**:
-  the syntax elements still go through CAVLC, so a stream is Baseline/Main
-  profile apart from the 8x8 transform (see *CABAC* below)
+* the CABAC arithmetic coder (`src/cabac.c`, `tests/cabac_check.c`: 1.6 M bins,
+  every probability state, bypass bins, both end-of-slice flags) **and the
+  syntax layer that uses it** (`write_mb_cabac()` and the `cabac_*` helpers in
+  `src/encoder.c`): mb_skip_flag, the I and P mb_type trees, sub_mb_type, mvd,
+  the intra 4x4/8x8 and chroma prediction modes, coded_block_pattern,
+  transform_size_8x8_flag, mb_qp_delta, and the residual block of all six
+  categories with its significance/last/level-prefix contexts.  `make test`
+  runs the whole conformance suite through it (see *CABAC* below)
 * forward/inverse 4x4 integer transform, 4x4 and 2x2 DC Hadamard, quantisation
   and dequantisation, including the reference decoder's `int16_t` truncation
 * Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
@@ -574,10 +582,10 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 45 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
 ```
 
-`make test` runs six things:
+`make test` runs seven things:
 
 1. `tests/syntax_check.c` — the two `coded_block_pattern` tables must be exact
    inverses (see bug 11; this is the check that would have caught it).
@@ -603,7 +611,15 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 45 clip cases
    all 128 states and the 0.5 state are visited), mixing context-coded bins,
    bypass bins, runs of either bin and `end_of_slice_flag = 0` bins, and
    requiring the decoder's context states to end up identical to the encoder's.
-5. `tests/kernel_check.c` — the device kernel source (`src/kernels.h`) compiled
+5. `tests/cabac_mb_check.c 20000 1` — the CABAC *residual block* syntax
+   against a second decoder, transcribed from 9.3.2.2 and reading the byte
+   stream bit by bit: 20 000 random blocks over all six `ctxBlockCat`
+   categories, with levels that reach the Exp-Golomb escape (and beyond the
+   unary prefix), the coded_block_flag of the five categories that have one,
+   both signs, and the terminate flag after every block.  `cabac_check.c`
+   proves the coder; this proves the context derivation and the binarization
+   on top of it, which is where the three CABAC bugs in the encoder were.
+6. `tests/kernel_check.c` — the device kernel source (`src/kernels.h`) compiled
    as C with the OpenCL qualifiers defined away and `get_global_id()` driven by
    a counter, so the kernels are checked on a machine with no GPU at all.  The
    inverse transform is fed four amplitude classes — the full int16 range,
@@ -613,13 +629,14 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 45 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-6. `tests/run_tests.sh` — forty-five cases (QP 12/23/26/40, presets 0 and 4,
+7. `tests/run_tests.sh` — forty-seven cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
    forced whole-frame fractional refinement, all-intra and 3-frame GOPs, the RD
-   Intra_4x4 decision of the slow presets, P_Skip, ABR and AQ -- all of them
-   with the 8x8 transform enabled, which is the default)
+   Intra_4x4 decision of the slow presets, P_Skip, ABR, AQ, and AQ over
+   P_Skip runs at two QPs -- all of them with the 8x8 transform and CABAC
+   enabled, which are the defaults)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -657,13 +674,52 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 
 ## CABAC
 
+CABAC is the default entropy coder (`--no-cabac` switches to CAVLC) and it codes
+the whole macroblock layer: the skip flag, both mb_type trees, every
+sub_mb_type, mvd, the intra prediction modes, the chroma mode, the coded block
+pattern (luma and chroma), transform_size_8x8_flag, mb_qp_delta, and the
+residual block in all six categories (Intra_16x16 DC and AC, luma 4x4, chroma
+DC and AC, luma 8x8) with its significant/last/level-prefix contexts.  On the
+panning clip at equal PSNR it costs 34-36% fewer bytes than this encoder's
+CAVLC path.
+
 `src/cabac.c` is the arithmetic coder (`tests/cabac_check.c` checks it against
-a decoder written from 9.3.3 rather than from the encoder).  What is in the
-tree so far is the coder only -- the 460 context initialization tables
-(Table 9-5, Tables 9-12 … 9-33) and the two probability tables (Table 9-44 and
-the transition table).  The binarizations and the context *assignments* of the
-individual syntax elements are not written yet, so nothing in the encoder uses
-it and the conformance suite does not change.
+a decoder written from 9.3.3 rather than from the encoder); the binarizations
+and context assignments live with the syntax writer in `src/encoder.c`
+(`write_mb_cabac()` and the `cabac_*` helpers above it), and
+`tests/cabac_mb_check.c` round-trips the residual block syntax through a second
+independent decoder.
+
+The parts of the *syntax* layer that are easy to get wrong, in the order they
+bite:
+
+* **Context indices are read from the neighbours, so the encoder has to store
+  what it decided, not what it did.**  Three bugs (38, 39, 40) came from
+  storing the internal value instead of the coded one: the chroma pattern of a
+  neighbour is the syntax element's 0/1/2 and not a packed pattern field, the
+  chroma prediction mode context adds *one* per available neighbour, and
+  transform_size_8x8_flag is only non-zero for the macroblock types that
+  actually code it.  In each case the arithmetic coder was right and the
+  macroblock decoded to something else.
+* **`mb_qp_delta` is unary on an unsigned value, and the terminating zero of
+  the unary code is read with context 2 only when the value is 1** (9.3.2.7);
+  every later bin uses context 3.  Coding `2|d| - 1` for a positive delta and
+  `2|d|` for a negative one is the mapping, not `2|d|` and `2|d| - 1`.
+* **A skipped macroblock clears the previous delta's context.**  The decoder
+  resets its "last mb_qp_delta was non-zero" flag on every skipped macroblock,
+  because the syntax element is absent; an encoder that keeps the flag
+  desynchronises the *next* macroblock's first bin.  This was invisible until a
+  clip combined AQ (so the delta is non-zero somewhere) with P_Skip runs -- the
+  `aq_skip` case in `tests/run_tests.sh` exists for it.
+
+The way to find a divergence is not to stare at pixels but to compare the two
+decoders' bin streams: `AEG_CABAC_TRACE=1` makes the encoder print every bin it
+codes (`B <ctx> <bin> <range>`, `Y <bit>` for a bypass bin, `T <flag>` for
+end_of_slice_flag) and one `ENCMB x,y ...` line per macroblock with the
+decisions the contexts are derived from, and a reference decoder instrumented
+at `get_cabac` prints the same `B` lines with the context it read.  Diffing the
+two lists gives the exact bin, the syntax element and the macroblock; bug 40
+was a single context index, 107 173 bins into a 320x240 picture.
 
 Four things about the coder are worth recording, because each of them is
 invisible until a whole slice decodes:
@@ -691,14 +747,45 @@ invisible until a whole slice decodes:
   last (9.3.4.4), so the syntax writer needs `aeg_cabac_terminate(c, 0)` per
   macroblock and exactly one `aeg_cabac_flush()` per slice.
 
-The test encodes 1.6 M bins per `make test` -- context-coded bins over all 460
-contexts from every initialization table at QPs 0..51, bypass bins, runs in
-both directions, and `end_of_slice_flag = 0` bins between them -- decodes them
-with the spec's decoder, requires every bin and every context state to match,
-and then requires the final terminate to decode as 1.  It needs no GPU and no
-external decoder, which is the point: a CABAC bug produces a legal stream that
-reconstructs a different picture, so it has to be caught before an external
-decoder is the only witness.
+`tests/cabac_check.c` encodes 1.6 M bins per `make test` -- context-coded bins
+over all 460 contexts from every initialization table at QPs 0..51, bypass bins,
+runs in both directions, and `end_of_slice_flag = 0` bins between them --
+decodes them with the spec's decoder, requires every bin and every context
+state to match, and then requires the final terminate to decode as 1.
+`tests/cabac_mb_check.c` does the same for one residual block at a time: 20 000
+random blocks over the six categories with levels that reach the Exp-Golomb
+escape, decoded by a second transcription of 9.3.2.2 that reads the byte stream
+itself.  Neither needs a GPU or an external decoder, which is the point: a
+CABAC bug produces a legal stream that reconstructs a different picture, so it
+has to be caught before an external decoder is the only witness.
+
+38. **The chroma coded block pattern a neighbour contributes is the syntax
+    element, not the packed pattern.**  `coded_block_pattern_chroma` is 0, 1 or
+    2, and the context of the next macroblock's chroma pattern is built from
+    those two values.  The macroblock struct stores the *packed* pattern
+    instead (0x10 = chroma DC only, 0x20 = chroma AC), so `(cbp >> 4) & 3` gave
+    3 for a neighbour with AC coefficients: a context the standard never uses,
+    i.e. a probability state that is not the one the decoder is holding.
+    `packed_chroma_cbp()` maps the field back to the element (0x20 -> 2,
+    0x10 -> 1) and the neighbours go through it.
+
+39. **The chroma prediction mode context uses the top neighbour.**  The
+    condition is `(left available && left mode != DC) + (top available &&
+    top mode != DC)` (9.3.2.4), i.e. both neighbours add *one*, giving the
+    three contexts 0..2.  A first version added 2 for the top neighbour (as the
+    luma 4x4 mode coding does for its own context), which walked into context
+    64+3 -- the context of the second bin -- and desynchronised every
+    macroblock that had a coded top neighbour.
+
+40. **`transform_size_8x8_flag` is only non-zero for the macroblock types that
+    code it.**  A macroblock's residual may be transformed in 8x8 blocks
+    internally (Intra_8x8 and inter), but the flag is a syntax element of
+    Intra_NxN and of an inter macroblock with a luma pattern; the neighbour
+    context of the *next* macroblock is the coded flag, not the internal
+    choice.  Keeping the internal value made P16x16 macroblocks look like they
+    had set the flag, which shifted context 399 + 2 entries and flipped a bin
+    107 173 bins into a 320x240 picture.  `mb_t8_coded()` is now the only
+    producer of the value the neighbours see.
 
 ## Next
 
@@ -732,18 +819,17 @@ decoder is the only witness.
    dispatcher also only ever measures the path it chose, so a stage is switched
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
-3. Encoder features that need the profile to change: CABAC (~10% of rate at
-   equal quality) is the remaining one, and it is half in: the arithmetic coder
-   and its context tables are written and round-trip against a decoder built
-   from the spec (section "CABAC"), but no syntax element uses it yet.  What is
-   left is the part that is not arithmetic: the binarization and context
-   assignment of every element (mb_type and sub_mb_type trees, the skip and
-   coded_block_pattern flags, mvd with its Exp-Golomb prefix/suffix split,
-   intra prediction modes, mb_qp_delta, and the residual with
-   significant/last/level-prefix contexts), the slice header's `cabac_init_idc`
-   and the alignment, and a bit-cost model for the rate-distortion pass (the
-   current costs come from `write_block()`'s call into the CAVLC writer, which
-   a byte-oriented coder cannot reuse).  MB-tree was
+3. Encoder features that need the profile to change: none left -- CABAC and the
+   8x8 transform are both in (main profile and High profile respectively), and
+   the encoder emits Main, High or Baseline depending on which tools a stream
+   uses.  What CABAC still does not do is *drive the decisions*: the
+   rate-distortion pass prices a candidate with `write_block()`'s CAVLC bit
+   count, so the mode decision optimises for a coder that is not the one
+   emitting the stream.  The two agree closely enough that the ordering rarely
+   changes (the CAVLC cost is within a few percent of the CABAC one for the same
+   block), but a `aeg_cabac_cost()` that runs the real coder in "count only"
+   mode is the honest fix, and it is also the prerequisite for trellis-style
+   level optimisation further down this list.  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so

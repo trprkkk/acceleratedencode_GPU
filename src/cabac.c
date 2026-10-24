@@ -10,6 +10,7 @@
  * does precisely that, against a decoder written from the decoding process in
  * 9.3.3 rather than from this file.)
  */
+#include <string.h>
 #include "cabac.h"
 
 /* Table 9-44: the LPS subinterval for each of the 64 probability states and
@@ -17,22 +18,70 @@
  * state and is never reached by the initialization tables (they start at
  * preCtxState 1 -> state 2). */
 const uint8_t aeg_cabac_lps_range[64][4] = {
-    {  2,  2,  2,  2}, {  6,  7,  8,  9}, {  6,  7,  9, 10}, {  6,  8,  9, 11},
-    {  7,  8, 10, 11}, {  7,  9, 10, 12}, {  7,  9, 11, 12}, {  8,  9, 11, 13},
-    {  8, 10, 12, 14}, {  9, 11, 12, 14}, {  9, 11, 13, 15}, { 10, 12, 14, 16},
-    { 10, 12, 15, 17}, { 11, 13, 15, 18}, { 11, 14, 16, 19}, { 12, 14, 17, 20},
-    { 12, 15, 18, 21}, { 13, 16, 19, 22}, { 14, 17, 20, 23}, { 14, 18, 21, 24},
-    { 15, 19, 22, 25}, { 16, 20, 23, 27}, { 17, 21, 25, 28}, { 18, 22, 26, 30},
-    { 19, 23, 27, 31}, { 20, 24, 29, 33}, { 21, 26, 30, 35}, { 22, 27, 32, 37},
-    { 23, 28, 33, 39}, { 24, 30, 35, 41}, { 26, 31, 37, 43}, { 27, 33, 39, 45},
-    { 29, 35, 41, 48}, { 30, 37, 43, 50}, { 32, 39, 46, 53}, { 33, 41, 48, 56},
-    { 35, 43, 51, 59}, { 37, 45, 54, 62}, { 39, 48, 56, 65}, { 41, 50, 59, 69},
-    { 43, 53, 63, 72}, { 46, 56, 66, 76}, { 48, 59, 69, 80}, { 51, 62, 73, 85},
-    { 53, 65, 77, 89}, { 56, 69, 81, 94}, { 59, 72, 86, 99}, { 62, 76, 90, 104},
-    { 66, 80, 95, 110}, { 69, 85, 100, 116}, { 73, 89, 105, 122}, { 77, 94, 111, 128},
-    { 81, 99, 117, 135}, { 85, 104, 123, 142}, { 90, 110, 130, 150}, { 95, 116, 137, 158},
-    { 100, 122, 144, 166}, { 105, 128, 152, 175}, { 111, 135, 160, 185}, { 116, 142, 169, 195},
-    { 123, 150, 178, 205}, { 128, 158, 187, 216}, { 128, 167, 197, 227}, { 128, 176, 208, 240},
+    { 128, 176, 208, 240},
+    { 128, 167, 197, 227},
+    { 128, 158, 187, 216},
+    { 123, 150, 178, 205},
+    { 116, 142, 169, 195},
+    { 111, 135, 160, 185},
+    { 105, 128, 152, 175},
+    { 100, 122, 144, 166},
+    {  95, 116, 137, 158},
+    {  90, 110, 130, 150},
+    {  85, 104, 123, 142},
+    {  81,  99, 117, 135},
+    {  77,  94, 111, 128},
+    {  73,  89, 105, 122},
+    {  69,  85, 100, 116},
+    {  66,  80,  95, 110},
+    {  62,  76,  90, 104},
+    {  59,  72,  86,  99},
+    {  56,  69,  81,  94},
+    {  53,  65,  77,  89},
+    {  51,  62,  73,  85},
+    {  48,  59,  69,  80},
+    {  46,  56,  66,  76},
+    {  43,  53,  63,  72},
+    {  41,  50,  59,  69},
+    {  39,  48,  56,  65},
+    {  37,  45,  54,  62},
+    {  35,  43,  51,  59},
+    {  33,  41,  48,  56},
+    {  32,  39,  46,  53},
+    {  30,  37,  43,  50},
+    {  29,  35,  41,  48},
+    {  27,  33,  39,  45},
+    {  26,  31,  37,  43},
+    {  24,  30,  35,  41},
+    {  23,  28,  33,  39},
+    {  22,  27,  32,  37},
+    {  21,  26,  30,  35},
+    {  20,  24,  29,  33},
+    {  19,  23,  27,  31},
+    {  18,  22,  26,  30},
+    {  17,  21,  25,  28},
+    {  16,  20,  23,  27},
+    {  15,  19,  22,  25},
+    {  14,  18,  21,  24},
+    {  14,  17,  20,  23},
+    {  13,  16,  19,  22},
+    {  12,  15,  18,  21},
+    {  12,  14,  17,  20},
+    {  11,  14,  16,  19},
+    {  11,  13,  15,  18},
+    {  10,  12,  15,  17},
+    {  10,  12,  14,  16},
+    {   9,  11,  13,  15},
+    {   9,  11,  12,  14},
+    {   8,  10,  12,  14},
+    {   8,   9,  11,  13},
+    {   7,   9,  11,  12},
+    {   7,   9,  10,  12},
+    {   7,   8,  10,  11},
+    {   6,   8,   9,  11},
+    {   6,   7,   9,  10},
+    {   6,   7,   8,   9},
+    {   2,   2,   2,   2},
 };
 
 /* Tables 9-45/9-46 in one table: aeg_cabac_trans[state][bin] is the next state
@@ -40,38 +89,134 @@ const uint8_t aeg_cabac_lps_range[64][4] = {
  * an MPS bin moves towards the state where the MPS is most likely (row 1), an
  * LPS bin jumps far away from it. */
 const uint8_t aeg_cabac_trans[128][2] = {
-    {  0,  0}, {  1,  1}, {  2, 50}, { 51,  3},
-    {  2, 50}, { 51,  3}, {  4, 52}, { 53,  5},
-    {  6, 52}, { 53,  7}, {  8, 52}, { 53,  9},
-    { 10, 54}, { 55, 11}, { 12, 54}, { 55, 13},
-    { 14, 54}, { 55, 15}, { 16, 56}, { 57, 17},
-    { 18, 56}, { 57, 19}, { 20, 56}, { 57, 21},
-    { 22, 58}, { 59, 23}, { 24, 58}, { 59, 25},
-    { 26, 60}, { 61, 27}, { 28, 60}, { 61, 29},
-    { 30, 60}, { 61, 31}, { 32, 62}, { 63, 33},
-    { 34, 62}, { 63, 35}, { 36, 64}, { 65, 37},
-    { 38, 66}, { 67, 39}, { 40, 66}, { 67, 41},
-    { 42, 66}, { 67, 43}, { 44, 68}, { 69, 45},
-    { 46, 68}, { 69, 47}, { 48, 70}, { 71, 49},
-    { 50, 72}, { 73, 51}, { 52, 72}, { 73, 53},
-    { 54, 74}, { 75, 55}, { 56, 74}, { 75, 57},
-    { 58, 76}, { 77, 59}, { 60, 78}, { 79, 61},
-    { 62, 78}, { 79, 63}, { 64, 80}, { 81, 65},
-    { 66, 82}, { 83, 67}, { 68, 82}, { 83, 69},
-    { 70, 84}, { 85, 71}, { 72, 84}, { 85, 73},
-    { 74, 88}, { 89, 75}, { 76, 88}, { 89, 77},
-    { 78, 90}, { 91, 79}, { 80, 90}, { 91, 81},
-    { 82, 94}, { 95, 83}, { 84, 94}, { 95, 85},
-    { 86, 96}, { 97, 87}, { 88, 96}, { 97, 89},
-    { 90, 100}, { 101, 91}, { 92, 100}, { 101, 93},
-    { 94, 102}, { 103, 95}, { 96, 104}, { 105, 97},
-    { 98, 104}, { 105, 99}, { 100, 108}, { 109, 101},
-    { 102, 108}, { 109, 103}, { 104, 110}, { 111, 105},
-    { 106, 112}, { 113, 107}, { 108, 114}, { 115, 109},
-    { 110, 116}, { 117, 111}, { 112, 118}, { 119, 113},
-    { 114, 118}, { 119, 115}, { 116, 122}, { 123, 117},
-    { 118, 122}, { 123, 119}, { 120, 124}, { 125, 121},
-    { 122, 126}, { 127, 123}, { 124, 127}, { 126, 125},
+    {   2,   1},
+    {   0,   3},
+    {   4,   0},
+    {   1,   5},
+    {   6,   2},
+    {   3,   7},
+    {   8,   4},
+    {   5,   9},
+    {  10,   4},
+    {   5,  11},
+    {  12,   8},
+    {   9,  13},
+    {  14,   8},
+    {   9,  15},
+    {  16,  10},
+    {  11,  17},
+    {  18,  12},
+    {  13,  19},
+    {  20,  14},
+    {  15,  21},
+    {  22,  16},
+    {  17,  23},
+    {  24,  18},
+    {  19,  25},
+    {  26,  18},
+    {  19,  27},
+    {  28,  22},
+    {  23,  29},
+    {  30,  22},
+    {  23,  31},
+    {  32,  24},
+    {  25,  33},
+    {  34,  26},
+    {  27,  35},
+    {  36,  26},
+    {  27,  37},
+    {  38,  30},
+    {  31,  39},
+    {  40,  30},
+    {  31,  41},
+    {  42,  32},
+    {  33,  43},
+    {  44,  32},
+    {  33,  45},
+    {  46,  36},
+    {  37,  47},
+    {  48,  36},
+    {  37,  49},
+    {  50,  38},
+    {  39,  51},
+    {  52,  38},
+    {  39,  53},
+    {  54,  42},
+    {  43,  55},
+    {  56,  42},
+    {  43,  57},
+    {  58,  44},
+    {  45,  59},
+    {  60,  44},
+    {  45,  61},
+    {  62,  46},
+    {  47,  63},
+    {  64,  48},
+    {  49,  65},
+    {  66,  48},
+    {  49,  67},
+    {  68,  50},
+    {  51,  69},
+    {  70,  52},
+    {  53,  71},
+    {  72,  52},
+    {  53,  73},
+    {  74,  54},
+    {  55,  75},
+    {  76,  54},
+    {  55,  77},
+    {  78,  56},
+    {  57,  79},
+    {  80,  58},
+    {  59,  81},
+    {  82,  58},
+    {  59,  83},
+    {  84,  60},
+    {  61,  85},
+    {  86,  60},
+    {  61,  87},
+    {  88,  60},
+    {  61,  89},
+    {  90,  62},
+    {  63,  91},
+    {  92,  64},
+    {  65,  93},
+    {  94,  64},
+    {  65,  95},
+    {  96,  66},
+    {  67,  97},
+    {  98,  66},
+    {  67,  99},
+    { 100,  66},
+    {  67, 101},
+    { 102,  68},
+    {  69, 103},
+    { 104,  68},
+    {  69, 105},
+    { 106,  70},
+    {  71, 107},
+    { 108,  70},
+    {  71, 109},
+    { 110,  70},
+    {  71, 111},
+    { 112,  72},
+    {  73, 113},
+    { 114,  72},
+    {  73, 115},
+    { 116,  72},
+    {  73, 117},
+    { 118,  74},
+    {  75, 119},
+    { 120,  74},
+    {  75, 121},
+    { 122,  74},
+    {  75, 123},
+    { 124,  76},
+    {  77, 125},
+    { 124,  76},
+    {  77, 125},
+    { 126, 126},
+    { 127, 127},
 };
 
 /* How many bits a range needs before it is back in [256, 512), indexed by
@@ -114,17 +259,19 @@ void aeg_cabac_set_contexts(aeg_cabac *c, int intra, int qp, int init_idc)
                                    : aeg_cabac_init_PB[init_idc & 3];
     int i;
     for (i = 0; i < AEG_CABAC_CTX_COUNT; i++) {
-        int pre = ((tab[i][0] * qp) >> 4) + tab[i][1];
-        int p;
-        if (pre < 1)
-            pre = 1;
-        else if (pre > 126)
-            pre = 126;
-        p = pre < 127 - pre ? pre : 127 - pre;
-        /* odd bits: the MPS, taken from the sign of (pre - 63) */
-        c->state[i] = (uint8_t)((p << 1) | (pre >> 6));
+        /* preCtxState (9.3.1.1) folded into one byte: the state is
+         * 2 * pStateIdx + valMPS, and preCtxState and 127 - preCtxState map to
+         * the same pStateIdx with opposite MPS values, so the whole state space
+         * is reached by reflecting the pre-state around 63.5. */
+        int st = 2 * (((tab[i][0] * qp) >> 4) + tab[i][1]) - 127;
+        if (st < 0)
+            st = ~st;                   /* |preCtxState - 63| - 1 */
+        if (st > 124)
+            st = 124 + (st & 1);
+        c->state[i] = (uint8_t)st;
     }
 }
+
 
 /* Extracts one byte from `low` once at least eight bits above the pending ones
  * are known.  `queue` counts the bits shifted in since the last extraction, so
@@ -209,3 +356,117 @@ size_t aeg_cabac_flush(aeg_cabac *c)
     }
     return c->len;
 }
+
+/* ------------------------------------------------------------------ */
+/* Residual block syntax (9.3.2.2)                                     */
+/* ------------------------------------------------------------------ */
+/* The significance map, the last-coefficient flag, the level state machine and
+ * the two escape codes are the largest piece of binarization work, and the
+ * part a decoder either reproduces exactly or turns into noise.  It therefore
+ * lives here with the coder rather than with the macroblock syntax, and
+ * tests/cabac_mb_check.c round-trips it against a transcription of the
+ * reference decoder's residual_block_cabac. */
+/* Residual categories (ctxBlockCat) of a 4:2:0 picture: the three context
+ * offsets each, and the coded_block_flag base (Table 9-40). */
+struct cab_cat_ctx { uint16_t sig, last, level; };
+static const struct cab_cat_ctx cab_cat[6] = {
+    { 105, 166, 227 },  /* 0: Intra_16x16 luma DC */
+    { 120, 181, 237 },  /* 1: Intra_16x16 luma AC */
+    { 134, 195, 247 },  /* 2: luma 4x4            */
+    { 149, 210, 257 },  /* 3: chroma DC           */
+    { 152, 213, 266 },  /* 4: chroma AC           */
+    { 402, 417, 426 }   /* 5: luma 8x8            */
+};
+
+/* The level state machine of 9.3.2.2: from the "node" the previous coefficient
+ * left behind, which context codes the level (1 vs >1) and where the node goes
+ * next. */
+static const uint8_t cab_lvl1[8] = { 1, 2, 3, 4, 0, 0, 0, 0 };
+static const uint8_t cab_gt1[8]  = { 5, 5, 5, 5, 6, 7, 8, 9 };
+static const uint8_t cab_lvl_next[2][8] = {
+    { 1, 2, 3, 3, 4, 5, 6, 7 },     /* after a level of 1     */
+    { 4, 4, 4, 4, 5, 6, 7, 7 }      /* after a level above 1  */
+};
+
+/* One residual block: coded_block_flag (when the category has one), the
+ * significance map with the last-coefficient flag, then the levels backwards
+ * from the last significant coefficient.  `coef[i]` is the coefficient at scan
+ * position i; `n` of them.  Returns the number of non-zero coefficients, which
+ * is what the neighbouring blocks' contexts want. */
+int aeg_cabac_residual(aeg_cabac *cb, const int16_t *coef, int n, int cat,
+                       int cbf_ctx)
+{
+    const struct cab_cat_ctx *k = &cab_cat[cat];
+    int i, last = -1, count = 0;
+
+    for (i = 0; i < n; i++)
+        if (coef[i]) { last = i; count++; }
+    if (cbf_ctx >= 0) {
+        aeg_cabac_decision(cb, cbf_ctx, count != 0);
+        if (!count)
+            return 0;
+    }
+    /* Significance map.  The highest scan position is never signalled -- if the
+     * scan gets there it is the last coefficient by definition -- and a 64
+     * coefficient block indexes its contexts by scan position through the two
+     * tables of 9.3.2.3 instead of the 4x4 neighbourhood rule. */
+    if (n == 64) {
+        for (i = 0; i < 63; i++) {
+            int nz = coef[i] != 0;
+            aeg_cabac_decision(cb, k->sig + aeg_cabac_sig8[i], nz);
+            if (!nz)
+                continue;
+            aeg_cabac_decision(cb, k->last + aeg_cabac_last8[i], i == last);
+            if (i == last)
+                break;
+        }
+    } else {
+        for (i = 0; i < n - 1; i++) {
+            int nz = coef[i] != 0;
+            aeg_cabac_decision(cb, k->sig + i, nz);
+            if (!nz)
+                continue;
+            aeg_cabac_decision(cb, k->last + i, i == last);
+            if (i == last)
+                break;
+        }
+    }
+    /* Levels, from the last coefficient back to the first. */
+    {
+        int node = 0;
+        for (i = last; i >= 0; i--) {
+            int v = coef[i], abs, neg, cnt, ctx;
+            if (!v)
+                continue;
+            neg = v < 0;
+            abs = neg ? -v : v;
+            aeg_cabac_decision(cb, k->level + cab_lvl1[node], abs > 1);
+            if (abs == 1) {
+                node = cab_lvl_next[0][node];
+            } else {
+                ctx = k->level + cab_gt1[node];
+                node = cab_lvl_next[1][node];
+                for (cnt = 2; cnt < 15 && cnt < abs; cnt++)
+                    aeg_cabac_decision(cb, ctx, 1);
+                if (cnt < 15) {
+                    aeg_cabac_decision(cb, ctx, 0);
+                } else {
+                    /* Escape: the level above 14 is sent as an Exp-Golomb code
+                     * with bypass bins, offset by 14. */
+                    int rest = abs - 14, j = 0;
+                    while (rest >= (1 << (j + 1)))
+                        j++;
+                    for (cnt = 0; cnt < j; cnt++)
+                        aeg_cabac_bypass(cb, 1);
+                    aeg_cabac_bypass(cb, 0);
+                    for (cnt = j - 1; cnt >= 0; cnt--)
+                        aeg_cabac_bypass(cb, (rest >> cnt) & 1);
+                }
+            }
+            aeg_cabac_bypass(cb, neg);
+        }
+    }
+    return count;
+}
+
+

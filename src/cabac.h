@@ -5,11 +5,10 @@
  * `low` register whose carry is propagated backwards through the bytes that
  * have already been decided, and one 8-bit probability state per context.
  *
- * The state numbering is the one the spec's Table 9-44 is indexed with in the
- * packed form: `state = (min(s, 127 - s) << 1) | (s >> 6)` for a
- * preCtxState `s` in 1..126, so bit 0 is the MPS and `state >> 1` indexes the
- * `rangeTabLPS` row.  `state` is therefore 0..127 and `aeg_cabac_trans` is the
- * next state for either bin value.
+ * The state numbering is that of the standard: one byte per context holding
+ * `2 * pStateIdx + valMPS`, with `rangeTabLPS` as a 64-row table indexed by
+ * pStateIdx and the range class, and `aeg_cabac_trans[state][bin]` giving the
+ * next state for the bin that was just coded (9.3.2.3).
  *
  * Bytes are held back until their carry cannot change any more: of the bytes
  * extracted so far, the newest one is kept in `prev` and only written when the
@@ -22,6 +21,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* 4:2:0, 8-bit: contexts 0..459 (the extra ones are chroma_format_idc 3) */
 #define AEG_CABAC_CTX_COUNT 460
@@ -39,6 +40,7 @@ typedef struct aeg_cabac {
     uint8_t  prev;             /* last decided byte, not yet written          */
     int      have_prev;
     uint8_t  state[AEG_CABAC_CTX_COUNT];
+    int      trace;            /* per-bin trace to stderr (AEG_CABAC_TRACE) */
 } aeg_cabac;
 
 /* Table 9-44 (`rangeTabLPS`), addressed as [state >> 1][(range >> 6) - 4]. */
@@ -77,6 +79,8 @@ static inline void aeg_cabac_decision(aeg_cabac *c, int ctx, int bin)
         c->low += c->range;
         c->range = (uint32_t)lps;
     }
+    if (c->trace)
+        fprintf(stderr, "B %d %d %u\n", ctx, bin & 1, c->range);
     c->state[ctx] = aeg_cabac_trans[s][bin & 1];
     if (c->range < 0x100)
         aeg_cabac_renorm(c);
@@ -87,6 +91,8 @@ void aeg_cabac_putbyte(aeg_cabac *c);
 
 static inline void aeg_cabac_bypass(aeg_cabac *c, int bin)
 {
+    if (c->trace)
+        fprintf(stderr, "Y %d %u %u q%d\n", bin & 1, c->range, c->low, c->queue);
     c->low <<= 1;
     if (bin)
         c->low += c->range;
@@ -98,15 +104,31 @@ static inline void aeg_cabac_bypass(aeg_cabac *c, int bin)
  * macroblock, 0 everywhere except the last. */
 static inline void aeg_cabac_terminate(aeg_cabac *c, int end)
 {
+    if (c->trace)
+        fprintf(stderr, "T %d\n", end & 1);
+    if (end)
+        return;                 /* aeg_cabac_flush() writes the final flag */
     c->range -= 2;
-    if (!end) {
-        if (c->range < 0x100)
-            aeg_cabac_renorm(c);
-    }
+    if (c->range < 0x100)
+        aeg_cabac_renorm(c);
 }
 
 /* Codes the terminating end_of_slice_flag = 1, writes the last byte and
  * returns the number of bytes written. */
 size_t aeg_cabac_flush(aeg_cabac *c);
+
+/* CABAC context offsets inside a 64-coefficient (8x8) residual block, per scan
+ * position (Table 9-42; the last-coefficient map is 9.3.2.3). */
+extern const uint8_t aeg_cabac_sig8[63];
+extern const uint8_t aeg_cabac_last8[63];
+
+/* One residual block (9.3.2.2): coded_block_flag when `cbf_ctx` is not
+ * negative, the significance map, the last-coefficient flag and the levels,
+ * from the last significant coefficient backwards.  `coef[i]` is the
+ * coefficient at scan position i; `cat` is the ctxBlockCat of 4:2:0 (0 = luma
+ * DC, 1 = luma AC, 2 = luma 4x4, 3 = chroma DC, 4 = chroma AC, 5 = luma 8x8).
+ * Returns the number of non-zero coefficients. */
+int aeg_cabac_residual(aeg_cabac *c, const int16_t *coef, int n, int cat,
+                       int cbf_ctx);
 
 #endif

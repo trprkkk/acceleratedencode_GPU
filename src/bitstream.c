@@ -156,13 +156,15 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                                p->bitrate_kbps);
 
     /* High profile as soon as the 8x8 transform is on -- it is the profile that
-     * introduced transform_size_8x8_flag (the rest of the stream stays inside
-     * the Baseline tool set, so the constraint flags are not set). */
+     * introduced transform_size_8x8_flag.  CABAC without it is Main profile;
+     * only a stream with neither tool is Baseline (the rest of the syntax stays
+     * inside the Baseline tool set, so no further constraints apply). */
     const int high = p->transform_8x8 != 0;
+    const int main = !high && p->cabac;
 
     aeg_bw_init(&bw, rbsp, cap, 0);
-    aeg_bw_put(&bw, 8, high ? 100 : 66); /* profile_idc                     */
-    aeg_bw_put(&bw, 8, high ? 0x00 : 0xc0); /* constraint_set0/1            */
+    aeg_bw_put(&bw, 8, high ? 100 : (main ? 77 : 66)); /* profile_idc         */
+    aeg_bw_put(&bw, 8, (high || main) ? 0x00 : 0xc0); /* constraint_set0/1   */
     aeg_bw_put(&bw, 8, (uint32_t)level_idc);
     aeg_bw_ue(&bw, 0);                   /* seq_parameter_set_id            */
     if (high) {
@@ -194,13 +196,13 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     return aeg_bw_finish(&bw);
 }
 
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8)
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, rbsp, cap, 0);
     aeg_bw_ue(&bw, 0);          /* pic_parameter_set_id                    */
     aeg_bw_ue(&bw, 0);          /* seq_parameter_set_id                    */
-    aeg_bw_put(&bw, 1, 0);      /* entropy_coding_mode_flag = CAVLC        */
+    aeg_bw_put(&bw, 1, cabac ? 1u : 0u); /* entropy_coding_mode_flag        */
     aeg_bw_put(&bw, 1, 0);      /* bottom_field_pic_order_in_frame_present */
     aeg_bw_ue(&bw, 0);          /* num_slice_groups_minus1                 */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l0_default_active_minus1    */
@@ -230,8 +232,9 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8)
  * header without any alignment or trailing bits. */
 void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                             int frame_num_bits, int idr, int idr_pic_id,
-                            int slice_qp_delta, int deblock_alpha,
-                            int deblock_beta, int deblock_idc, int first_mb)
+                            int cabac_init_idc, int slice_qp_delta,
+                            int deblock_alpha, int deblock_beta,
+                            int deblock_idc, int first_mb)
 {
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type);
@@ -249,6 +252,10 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
     } else {
         aeg_bw_put(bw, 1, 0);         /* adaptive_ref_pic_marking_mode_flag */
     }
+    /* cabac_init_idc is present in every CABAC-coded slice that is not an I
+     * slice (7.3.3); it selects the context initialization table. */
+    if (cabac_init_idc >= 0 && slice_type % 5 != 2 && slice_type % 5 != 4)
+        aeg_bw_ue(bw, (uint32_t)cabac_init_idc);
     aeg_bw_se(bw, slice_qp_delta);    /* slice_qp_delta                     */
     aeg_bw_ue(bw, (uint32_t)deblock_idc);
     if (deblock_idc != 1) {
