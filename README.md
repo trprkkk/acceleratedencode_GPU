@@ -16,9 +16,9 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
 > `make test` asserts it over 26 clip cases and *fails* on any mismatch.  What
 > is *not* finished is speed and the last few percent of efficiency: at
-> matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 3–7 %
+> matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
 > fewer bits on the inter test clips and is level with it on all-intra, where
-> it used to be 25–50 % ahead.  Speed is the real gap: 49 fps against x264's
+> it used to be 25–50 % ahead.  Speed is the real gap: 55 fps against x264's
 > 187 fps (`--preset medium`, no asm) on two cores at 320x192, because the
 > reference path is portable C with no SIMD.  Caching the fractional-pel
 > planes of the reference picture (see `docs/STATUS.md`) closed 1.6x of it;

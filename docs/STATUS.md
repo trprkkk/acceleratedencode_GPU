@@ -374,7 +374,7 @@ It costs about 30 % of the encode speed over mask 7 (124 -> 87 fps on the
 per macroblock and all four shapes are searched per sub-macroblock.  `x264` (master, baseline, no asm) on the same clips at QP 24:
 18 841 B / 46.14 dB, 33 003 B / 45.83 dB, 31 897 B / 45.83 dB, 35 074 B /
 45.43 dB.  Those numbers were taken with the quarter-pel stage *off* (bug 29);
-with it on, the gap at matched PSNR is 3-7 % (see "Quality against a reference
+with it on, the gap at matched PSNR is 1-8 % (see "Quality against a reference
 CPU encoder" below).
 
 ## Rate control and adaptive quantisation
@@ -463,18 +463,18 @@ comparable between encoders).
 
 | Y-PSNR | ours | x264 baseline | x264 is |
 |---|---|---|---|
-| 45.00 dB (pan clip) | 46 555 B | 44 991 B | 3.4 % smaller |
-| 45.56 dB (pan clip) | 49 438 B | 48 039 B | 2.8 % smaller |
-| 44.90 dB (quadrants) | 51 127 B | 47 851 B | 6.4 % smaller |
-| 45.25 dB (quadrants) | 52 958 B | 49 367 B | 6.8 % smaller |
+| 45.03 dB (pan clip) | 46 395 B | 45 899 B | 1.1 % smaller |
+| 45.56 dB (pan clip) | 50 083 B | 48 039 B | 4.1 % smaller |
+| 44.89 dB (quadrants) | 50 966 B | 47 980 B | 5.9 % smaller |
+| 45.25 dB (quadrants) | 53 435 B | 49 367 B | 7.6 % smaller |
 
-So the rate penalty is now 3-7 %, against 25-27 % before the quarter-pel fix
+So the rate penalty is now 1-8 %, against 25-27 % before the quarter-pel fix
 (bug 28/29) and ~50 % before P_8x8.  For reference, x264 here uses three
 reference pictures, trellis quantisation, adaptive quantisation and hand-written
-SIMD; we use one reference, none of those, and portable C, and are 5x slower
-(27 fps against ~148 fps on two cores at 320x192).  At a matched QP we now
-spend the same number of bits for the same PSNR: QP 26 gives 46 555 B /
-Y 44.10 dB against x264's 48 039 B / Y 44.23 dB.
+SIMD; we use one reference, none of those, and portable C, and are 3.4x slower
+(55 fps against ~187 fps on two cores at 320x192).  At a matched QP x264 still
+spends more bits for more PSNR: QP 26 gives 46 395 B / Y 45.03 dB against
+x264's 48 039 B / Y 45.56 dB.
 
 All-intra (`-g 1`, every picture an IDR) is at the same parity, on both clips:
 at Y 42.4 dB we spend 96 150 B where x264 spends 100 480 B, and at Y 43.7 dB
@@ -537,23 +537,23 @@ this sandbox):
 | encoder | fps | bytes |
 |---|---|---|
 | ours, preset 0 | 384 | 163386 |
-| ours, preset 2 / 4 | 49.0 / 47.9 | 78457 / 78265 |
+| ours, preset 2 / 4 | 55.2 / 52.9 | 78358 / 78468 |
 | x264 baseline (no asm) | 187 | 78 400 |
 
 The `fractional-pel planes` cache below took preset 2 from 30.3 to 49.0 fps
-(1.62x) and preset 4 from 30.0 to 47.9 fps (1.60x) with *identical* output
-bytes.  Preset 0 is unchanged: it never interpolates.
+(1.62x) with *identical* output bytes; skipping the centre of the subpel walk
+and the exact P_8x8 early exit added another 13% (49.0 -> 55.2 fps, still
+byte-identical).  Preset 0 is unchanged: it never interpolates.
 
 Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
-497 ms, fractional-pel planes 41 ms, transform 262 ms, deblocking 4 ms of
-816 ms — motion estimation is still ~66% of the encode even after the six-fold
+443 ms, fractional-pel planes 47 ms, transform 278 ms, deblocking 4 ms of
+783 ms — motion estimation is still ~57% of the encode even after the six-fold
 reduction in interpolation work, because what remains is the integer SAD walk
-(hex search over hundreds of candidates per macroblock).  That is the stage a
-GPU should take: it is a plain batch of independent SAD evaluations.  The
-whole-frame search seed (`me_seed_frame()`) already goes through
-`aeg_be_ops.sad_batch`, so on hardware where the dispatcher puts motion
-estimation on the GPU the search starts from a 5x5 candidate grid evaluated in
-one launch rather than from the predictor alone.
+(hex search over hundreds of candidates per macroblock) and the SATD of the
+subpel walk.  That is the stage a GPU should take: both halves are plain batches
+of independent evaluations.  The whole-frame search (`me_seed_frame()`) already
+goes through `aeg_be_ops.sad_batch` -- five launches per picture -- and the plane
+build already has its kernel (`interp_plane`).
 
 ## Fractional-pel planes (the interpolation cache)
 
