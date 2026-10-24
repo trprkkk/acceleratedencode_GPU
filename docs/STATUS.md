@@ -93,3 +93,23 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    (intra prediction, SAD, transform/quantisation) and dispatcher calibration
    on real hardware.
 3. Multi-slice / rate control are not implemented yet.
+
+## Quality against a reference CPU encoder
+
+`x264` (master, `--profile baseline --qp N --keyint 250`, built without asm) on
+the same 60-frame 320x192 synthetic texture, both streams decoded and compared
+with the source:
+
+| QP | ours (kbps / PSNR) | x264 (kbps / PSNR) |
+|---|---|---|
+| 24 | 8930 / 38.50 dB | 4825 / 38.99 dB |
+| 32 | 5593 / 31.22 dB | 2672 / 31.73 dB |
+
+So the *per-QP* quality is within ~0.5 dB of x264, but x264 reaches that quality
+at roughly half the bitrate.  The gap is rate-distortion efficiency, not
+correctness: the mode decision here is SAD-only (no `lambda * bits` term), only
+Intra_16x16 is implemented (no Intra_4x4), and the quantiser has no trellis or
+last-coefficient optimisation.  Those three items are the next quality work;
+they do not affect conformance (any mode decision is decodable, and the recon
+still has to match the decoder exactly — re-run `make test` after touching
+them).

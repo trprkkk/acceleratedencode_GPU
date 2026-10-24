@@ -432,15 +432,14 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     /* luma intra 16x16: pick the prediction with the smallest SAD */
     for (mode = 0; mode < 4; mode++) {
         int sad;
-        /* Modes whose reference samples do not exist are simply not allowed;
-         * a macroblock on the top/left edge therefore only uses DC (or the
-         * single available direction). */
-        if (!mbx || !mby) {
-            /* Edge macroblocks: only the DC mode is guaranteed valid for
-             * both predictors, so the search is restricted there. */
-            if (mode != 2)
-                continue;
-        }
+        /* Only predict from samples that exist: vertical needs the row above,
+         * horizontal the column on the left, plane both plus the corner.  A
+         * macroblock on the top/left edge therefore has fewer candidates, and
+         * the one on the top-left corner only DC. */
+        if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && !mby)
+            continue;
+        if ((mode == AEG_MB_I_H || mode == AEG_MB_I_P) && !mbx)
+            continue;
         sad = intra16_sad(e, mbx, mby, mode);
         if (sad < best_sad) { best_sad = sad; best_mode = mode; }
     }
@@ -451,10 +450,11 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         int cm, cbest = 0, csad = 1 << 30;
         for (cm = 0; cm < 4; cm++) {
             int s = 0;
-            if (!mbx || !mby) {
-                if (cm != 0)
-                    continue;
-            }
+            /* same availability rules as luma (1 = HOR, 2 = VERT, 3 = PLANE) */
+            if ((cm == 1 || cm == 3) && !mbx)
+                continue;
+            if ((cm == 2 || cm == 3) && !mby)
+                continue;
             s += chroma_sad(e, mbx, mby, 0, cm);
             s += chroma_sad(e, mbx, mby, 1, cm);
             if (s < csad) { csad = s; cbest = cm; }
