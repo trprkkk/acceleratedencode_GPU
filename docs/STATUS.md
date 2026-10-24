@@ -1208,6 +1208,34 @@ particular, which cannot be measured here).
 
 ## Quality against a reference CPU encoder
 
+**With CABAC in, the reference to beat is x264's default preset, not its
+baseline profile.**  Measured on the genyuv mode-4 clip (320x240, 8 frames),
+BD-rate over QP 22/25/28/31/34/37, our stream against `libx264 -preset medium
+-qp N`:
+
+| x264 medium with | ours, bits at matched PSNR |
+|---|---|
+| `cabac=0:8x8dct=0:trellis=0:aq-mode=0` | 47% fewer |
+| `cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 9.3% more |
+| `cabac=1:8x8dct=1:trellis=1:aq-mode=0` | 12.9% more |
+| (preset defaults: + AQ, psy-rd) | 12.9% more |
+
+So CABAC and the 8x8 transform together are what used to be the whole gap
+against x264 *baseline* (1-8%, table below, which predates CABAC); against the
+*default* preset what is left is 13% on this clip -- 3.6 points of it trellis
+quantisation, the rest the motion search and the rate-distortion refinement of
+it.  On the two-quadrant clip (mode 2, the one that exists to make 16x8 and
+8x16 partitions pay) the gap is 28%, i.e. partitioning is where a faster search
+and a real sub-partition RD pass would buy the most.  A global scale on lambda
+was tried as a stand-in for a CABAC-accurate rate model (the rate term is still
+CAVLC-priced, which over-prices it by the 0.65 the coder actually spends) and
+is *not* in: it gains 0.9-0.5 points on two clips and loses 1.6 on the third
+(skip-heavy), so the model has per-element biases that a single factor cannot
+fix.
+
+The older comparison, against x264's baseline profile, and the history behind
+it:
+
 `x264` (master, `--profile baseline --keyint 250 --qp N`, built without asm) on
 two 60-frame 320x192 clips: the panning synthetic texture (`genyuv` mode 1) and
 the four-quadrants clip (mode 4).  Both streams are decoded and compared with
