@@ -62,9 +62,14 @@ $(BUILD)/genyuv: tests/genyuv.c | $(BUILD)
 $(BUILD)/cavlc_check: tests/cavlc_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
-# `make test` runs the CAVLC round-trip check (no external dependencies) and
-# the end-to-end clip check (needs an ffmpeg binary; set FFMPEG=... ).
-test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check
+$(BUILD)/syntax_check: tests/syntax_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+# `make test` runs the table consistency check, the CAVLC round-trip check
+# (both without external dependencies) and the end-to-end clip check (needs an
+# ffmpeg binary; set FFMPEG=... ).
+test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check
+	./$(BUILD)/syntax_check
 	./$(BUILD)/cavlc_check 2000
 	sh tests/run_tests.sh
 

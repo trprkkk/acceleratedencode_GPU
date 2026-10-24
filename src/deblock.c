@@ -157,6 +157,10 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
 static void edge_bs(const aeg_mb *p, const aeg_mb *q, int vertical, int k,
                     int mb_edge, int bs[4])
 {
+    /* The p side of an internal edge belongs to `q` itself (the macroblock
+     * being filtered); only the macroblock edge at k == 0 reaches into the
+     * neighbouring macroblock `p`. */
+    const aeg_mb *pp = mb_edge ? p : q;
     int j;
     for (j = 0; j < 4; j++) {
         int pa, qa;
@@ -167,7 +171,7 @@ static void edge_bs(const aeg_mb *p, const aeg_mb *q, int vertical, int k,
             pa = (mb_edge ? 3 : k - 1) * 4 + j;
             qa = k * 4 + j;
         }
-        bs[j] = boundary_strength(p, pa, q, qa, mb_edge, 0);
+        bs[j] = boundary_strength(pp, pa, q, qa, mb_edge, 0);
     }
 }
 

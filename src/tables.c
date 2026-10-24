@@ -355,7 +355,16 @@ const uint8_t aeg_run_before_bits[7][16] = {
 const uint8_t aeg_cbp_code_num[48] = {
      0, 16,  1,  2,  4,  8, 32,  3,  5, 10, 12, 15, 47,  7, 11, 13,
     14,  6,  9, 31, 35, 37, 42, 44, 33, 34, 36, 40, 39, 43, 45, 46,
-    17, 18, 20, 24, 19, 21, 26, 28, 23, 25, 27, 29, 30, 22, 38, 41
+    17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41
+};
+
+/* Inverse of the table above: coded block pattern -> codeNum, i.e. what the
+ * encoder has to write for an inter macroblock (Intra_16x16 takes the luma and
+ * chroma patterns from mb_type instead). */
+const uint8_t aeg_cbp_codenum[48] = {
+     0,  2,  3,  7,  4,  8, 17, 13,  5, 18,  9, 14, 10, 15, 16, 11,
+     1, 32, 33, 36, 34, 37, 44, 40, 35, 45, 38, 41, 39, 42, 43, 19,
+     6, 24, 25, 20, 26, 21, 46, 28, 27, 47, 22, 29, 23, 30, 31, 12
 };
 
 /* ------------------------------------------------------------------ */

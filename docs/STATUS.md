@@ -4,16 +4,19 @@ Date: 2026-10-24.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
 
 ## Where the project stands
 
-The encoder is **conformant**: an independent decoder (FFmpeg 7.0.2) reproduces
-the encoder's reconstruction *bit for bit* (`max abs diff 0`, PSNR `inf`) on
+The encoder is **conformant on I *and* P pictures**: an independent decoder
+(FFmpeg 7.0.2) reproduces the encoder's reconstruction *bit for bit*
+(`max abs diff 0`) on every frame, not only the IDR.
 
-| content | sizes | QP | GOP | frames |
+| content | sizes | QP | presets | frames |
 |---|---|---|---|---|
-| 1 MB probe, grids, smooth gradients | 16x16 … 320x192 | 10 … 51 | 1, 2, 3, 5, 10, 250 | 1 … 40 |
-| busy synthetic texture (heavy AC) | 320x192 | 10, 18, 20, 26, 32, 34, 40, 42, 44, 47…51 | 1 … 250 | 1 … 40 |
+| 1 MB probe, grids, smooth gradients | 16x16 … 320x192 | 10 … 51 | 0 … 4 | 1 … 40 |
+| moving synthetic texture (inter, heavy AC) | 320x192, 320x176, 320x208 | 12, 18, 23, 26, 28, 32, 40 | 0 … 4 | 1 … 60 |
+| translated noise / gradient clips | 96x96 | 23, 32 | 0, 2 | 3 |
+| odd frame sizes (13 MB rows, 11 MB rows) | 320x208, 320x176 | 23 … 28 | 2, 3 | 3 … 4 |
 
-both with and without the in-loop deblocking filter.  `make test` asserts this
-(`reconstruction vs decode = 99.00 dB, max abs diff 0`).
+with and without the in-loop deblocking filter.  `make test` asserts this and
+fails (non-zero exit) on any mismatch; it checks all nine clips frame by frame.
 
 Implemented and building without warnings:
 
@@ -65,17 +68,64 @@ Implemented and building without warnings:
    high QPs drift (`>> 7`/`>> 8` DC dequant wrap-around).
 9. **QPc table** for 4:2:0: QP 47..49 map to 38 (not 39) — the tail is
    `…, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39`.
+10. **Inter residual block order.**  The sixteen 4x4 luma blocks of an inter
+    macroblock are transmitted quadrant by quadrant (`i4x4 + 4*i8x8`, i.e.
+    blocks `{0,1,4,5}, {2,3,6,7}, {8,9,12,13}, {10,11,14,15}`), and **every**
+    block of a coded 8x8 group is present — including the ones whose
+    `coeff_token` ends up `TotalCoeff == 0`.  Writing a coded group in raster
+    order, or skipping the empty blocks, both desynchronise the decoder.
+11. **`coded_block_pattern` <-> codeNum table (the last inter-only bug).**
+    Both directions of the table had five entries rotated:
+    `aeg_cbp_code_num` at codeNum 41…45 and `aeg_cbp_codenum` at cbp
+    22, 25, 27, 29, 30.  The symptom is nasty because the decoder reads a
+    *legal* pattern with the *same* number of coded 8x8 groups, so there is no
+    parse error and no drift — the residual simply lands in the wrong
+    quadrants (`0b1011` instead of `0b1101`, say), which looks like "the
+    decoder dropped the residual in some blocks of a few P macroblocks" and
+    moved around with the content.  `tests/syntax_check.c` now asserts that
+    the two tables are exact inverses.
+12. **MV predictor.**  The third candidate is the macroblock *above and to the
+    right* (its block 12), falling back to block 15 of the above-left
+    macroblock when the above-right one does not exist (H.264 8.4.1.3.1).
+    Using the above macroblock's own MV makes every right-border macroblock
+    predict differently from the reference decoder.
+13. **Deblocking, p side of an internal edge.**  The samples on the p side of
+    an internal (non-macroblock) edge belong to the macroblock being filtered,
+    not to the neighbour; passing the neighbour's `aeg_mb` mis-evaluates
+    `bs = 2` (non-zero coefficients) and the MV comparison.
+14. **`aeg_params.partitions` default.**  `analyse_mb()` gates the whole inter
+    path on this bitmask; a default of 0 silently turned every picture
+    all-intra (correct, but ~2x the bitrate).  Bit 0 (16x16) is the only
+    partitioning implemented and is now set in `aeg_params_default()`.
+15. **Picture padding geometry.**  Every plane occupies `(h + 2*PAD)` rows of
+    `w + 2*PAD` bytes and the bottom/right padding is edge-replicated.  A row
+    copy that starts at the *sample* origin instead of the row origin runs
+    `PAD` bytes past the plane; the chroma plane offset must be
+    `ls*lh + cs*ch`, not `plane[1] + cs*ch` (which also drops its top
+    padding).
 
 ## Verification
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # cavlc round-trip + end-to-end clip
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc round-trip + 9 clips
 ```
 
-The end-to-end check prints `reconstruction vs decode`; it must be `99.00 dB
-(max abs diff 0)`.  A nonzero diff means the encoder and the decoder disagree
-about samples, which drifts on every following P picture.
+`make test` runs three things:
+
+1. `tests/syntax_check.c` — the two `coded_block_pattern` tables must be exact
+   inverses (see bug 11; this is the check that would have caught it).
+2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
+   a transcription of the reference decoder.
+3. `tests/run_tests.sh` — nine clips (QP 12/23/26/40, presets 0 and 4,
+   deblocking on/off, 64x64 … 320x208, forced CPU backend) encoded, decoded
+   with ffmpeg and compared **frame by frame**: the encoder's `--dump-recon`
+   must be bit-identical to the decoder's output.  Any mismatch fails the
+   script; a decoder that logs an error also fails it.
+
+`reconstruction vs decode` must be `max abs diff 0`.  A nonzero diff means the
+encoder and the decoder disagree about samples, which drifts on every
+following P picture.
 
 Manual single-macroblock probe (used to isolate transform/quantisation bugs):
 
@@ -87,11 +137,12 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 
 ## Next
 
-1. Quality/RD: the mode decision is still SAD + a lambda estimate; compare
-   BD-rate against x264 at matched QP on standard clips.
-2. `src/backend_cuda.c` for the `CUDA=1` build, plus more GPU kernels
-   (intra prediction, SAD, transform/quantisation) and dispatcher calibration
-   on real hardware.
+1. Quality/RD: the mode decision is still SAD + a lambda estimate; the next
+   wins are 16x8/8x16/8x8 partitions, Intra_4x4 and a real `lambda * bits`
+   term (bits are already counted by `aeg_cavlc_block_cost()`).
+2. `src/backend_cuda.cu` for the `CUDA=1` build (the Makefile expects it, the
+   tree does not have it yet), plus more GPU kernels (intra prediction, SAD,
+   transform/quantisation) and dispatcher calibration on real hardware.
 3. Multi-slice / rate control are not implemented yet.
 
 ## Quality against a reference CPU encoder
@@ -102,14 +153,17 @@ with the source:
 
 | QP | ours (kbps / PSNR) | x264 (kbps / PSNR) |
 |---|---|---|
-| 24 | 8930 / 38.50 dB | 4825 / 38.99 dB |
-| 32 | 5593 / 31.22 dB | 2672 / 31.73 dB |
+| 24 | 4592 / 37.19 dB | 4825 / 38.99 dB |
+| 32 | 2497 / 30.23 dB | 2672 / 31.73 dB |
 
-So the *per-QP* quality is within ~0.5 dB of x264, but x264 reaches that quality
-at roughly half the bitrate.  The gap is rate-distortion efficiency, not
-correctness: the mode decision here is SAD-only (no `lambda * bits` term), only
-Intra_16x16 is implemented (no Intra_4x4), and the quantiser has no trellis or
-last-coefficient optimisation.  Those three items are the next quality work;
-they do not affect conformance (any mode decision is decodable, and the recon
-still has to match the decoder exactly — re-run `make test` after touching
-them).
+Inter prediction is worth roughly a 2x bitrate cut on this clip (the earlier
+all-intra rows — 8930 kbps at QP 24 — came from `partitions == 0`, bug 14).
+Today we spend ~5% *fewer* bits than x264 at the same QP and get ~1.5–1.8 dB
+less PSNR, i.e. x264 is still ~15–20% more efficient.  The gap is
+rate-distortion efficiency, not correctness: the mode decision compares 16x16
+inter against Intra_16x16 with a lambda estimate, only Intra_16x16 is
+implemented (no Intra_4x4 / I_PCM / 8x8 partitions), and the quantiser has no
+trellis or last-coefficient optimisation.  Those items are the next quality
+work; they do not affect conformance (any mode decision is decodable, and the
+recon still has to match the decoder exactly — re-run `make test` after
+touching them).

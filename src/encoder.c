@@ -44,6 +44,16 @@ struct aeg_encoder {
     aeg_mb  *mbs;
     aeg_picture pic;
 
+    /* per-macroblock decision scratch filled by analyse_mb() and consumed by
+     * code_mb(): the intra modes ordered by SAD and the inter candidate. */
+    int mb_modes[4];
+    int mb_nmodes;
+    int mb_inter_ok;
+    int mb_sad;
+    int mb_inter_sad;
+    int mb_mv[2];
+    int mb_pmv[2];
+
     aeg_dispatcher d;
     int frame_count;         /* total pictures encoded                  */
     int frame_num;           /* frame_num of the current picture (8.2.1) */
@@ -83,9 +93,14 @@ static int enc_alloc_picture(struct aeg_encoder *e, uint8_t **mem, uint8_t **pla
     *mem = (uint8_t *)aeg_alloc(total);
     if (!*mem)
         return AEG_ENOMEM;
+    /* Every plane occupies exactly lh*ls (or ch*cs) bytes starting at its own
+     * origin: the left/right padding is part of the stride and the top/bottom
+     * padding fits inside the row count.  Placing plane 2 at plane 1 plus one
+     * chroma plane -- rather than plus the padding of the next origin -- used to
+     * write one row band past the end of the allocation. */
     plane[0] = *mem + AEG_PAD * ls + AEG_PAD;
     plane[1] = *mem + ls * lh + AEG_PAD * cs + AEG_PAD;
-    plane[2] = plane[1] + cs * ch;
+    plane[2] = *mem + ls * lh + cs * ch + AEG_PAD * cs + AEG_PAD;
     e->stride[0] = (int)ls;
     e->stride[1] = e->stride[2] = (int)cs;
     return AEG_OK;
@@ -101,12 +116,35 @@ static void copy_plane_pad(uint8_t *dst, int dstride, const uint8_t *src,
         memset(dst + y * dstride - AEG_PAD, dst[y * dstride], AEG_PAD);
         memset(dst + y * dstride + w, dst[y * dstride + w - 1], AEG_PAD);
     }
+    /* A padded row is exactly `w + 2 * AEG_PAD` bytes wide and starts AEG_PAD
+     * bytes left of the content origin, so the copies must be taken from the
+     * row origin -- otherwise every row runs AEG_PAD bytes past the plane. */
     for (y = 1; y <= AEG_PAD; y++) {
-        memcpy(dst - y * dstride, dst, (size_t)(w + 2 * AEG_PAD));
-        memcpy(dst + (h - 1 + y) * dstride, dst + (h - 1) * dstride,
+        memcpy(dst - y * dstride - AEG_PAD, dst - AEG_PAD,
                (size_t)(w + 2 * AEG_PAD));
+        memcpy(dst + (h - 1 + y) * dstride - AEG_PAD,
+               dst + (h - 1) * dstride - AEG_PAD, (size_t)(w + 2 * AEG_PAD));
     }
     (void)x;
+}
+
+/* Replicate the reconstructed picture's edges into the padding.  The motion
+ * compensated prediction of a macroblock on the picture border reads samples
+ * outside the visible area, and the decoder pads with the edge sample, so the
+ * reference buffer has to hold exactly that. */
+static void pad_edges(uint8_t *p, int stride, int w, int h)
+{
+    int y;
+    for (y = 0; y < h; y++) {
+        memset(p + y * stride - AEG_PAD, p[y * stride], AEG_PAD);
+        memset(p + y * stride + w, p[y * stride + w - 1], AEG_PAD);
+    }
+    for (y = 1; y <= AEG_PAD; y++) {
+        memcpy(p - y * stride - AEG_PAD, p - AEG_PAD,
+               (size_t)(w + 2 * AEG_PAD));
+        memcpy(p + (h - 1 + y) * stride - AEG_PAD, p + (h - 1) * stride - AEG_PAD,
+               (size_t)(w + 2 * AEG_PAD));
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -233,6 +271,20 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                                             luma_ac_nc(e, mbx, mby, c, blk), 3);
 }
 
+/* 8x8 group index (0..3, raster) of a 4x4 luma block: the coded block pattern
+ * has one bit per group, not one per block row. */
+static int blk_group(int blk)
+{
+    int bx = blk & 3, by = blk >> 2;
+    return (by >> 1) * 2 + (bx >> 1);
+}
+
+/* The four 4x4 blocks of every 8x8 group, in the order the bitstream uses:
+ * group by group (TL, TR, BL, BR), each group in raster order. */
+static const uint8_t group_blk[4][4] = {
+    { 0, 1, 4, 5 }, { 2, 3, 6, 7 }, { 8, 9, 12, 13 }, { 10, 11, 14, 15 }
+};
+
 /* ------------------------------------------------------------------ */
 /* Luma coding: inter                                                  */
 /* ------------------------------------------------------------------ */
@@ -263,7 +315,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             nz += c->level[blk][i] != 0;
         c->nz[blk] = (int8_t)nz;
         if (nz)
-            luma_cbp |= 1 << (blk >> 2);
+            luma_cbp |= 1 << blk_group(blk);
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++)
                 r[y * e->stride[0] + x] = pr[y * 16 + x];
@@ -276,10 +328,18 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             }
     }
     c->cbp = (c->cbp & 0x30) | luma_cbp;
-    for (blk = 0; blk < 16; blk++)
-        if (c->nz[blk])
-            c->bits += aeg_cavlc_block_cost(c->level[blk],
-                                            luma_nc(e, mbx, mby, c, blk), 0);
+    {
+        int g, k;
+        for (g = 0; g < 4; g++) {
+            if (!(c->cbp & (1 << g)))
+                continue;
+            for (k = 0; k < 4; k++) {
+                int b = group_blk[g][k];
+                c->bits += aeg_cavlc_block_cost(c->level[b],
+                                                luma_nc(e, mbx, mby, c, b), 0);
+            }
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,13 +464,19 @@ static int chroma_sad(struct aeg_encoder *e, int mbx, int mby, int pl, int mode)
 /* Inter prediction of the 16x16 luma block and both chroma planes. */
 static void inter_predict(struct aeg_encoder *e, int mbx, int mby, int mvx, int mvy)
 {
-    const uint8_t *r = e->refp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    /* The motion vector is in quarter luma samples: the integer part moves the
+     * reference pointer, the remainder selects the interpolation phase.  Chroma
+     * runs at eighth-sample precision, so the same vector is already in eighth
+     * chroma samples (one luma quarter pel is half a chroma sample). */
+    const uint8_t *r = e->refp[0] + mby * 16 * e->stride[0] + mbx * 16 +
+                       (mvx >> 2) + (mvy >> 2) * e->stride[0];
     int pl;
     aeg_mc_luma(e->pred_l, 16, r, e->stride[0], 16, 16, mvx & 3, mvy & 3);
     for (pl = 0; pl < 2; pl++) {
-        const uint8_t *rc = e->refp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8;
+        const uint8_t *rc = e->refp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8 +
+                            (mvx >> 3) + (mvy >> 3) * e->stride[1];
         aeg_mc_chroma(e->pred_c[pl], 8, rc, e->stride[1], 8, 8,
-                      (mvx >> 2) & 7, (mvy >> 2) & 7);
+                      mvx & 7, mvy & 7);
     }
 }
 
@@ -424,93 +490,269 @@ static void reset_mb_enc(mbenc *c, int qp)
     c->type = AEG_MB_I16x16;
 }
 
+/* Chroma prediction modes in bitstream order: 0 = DC, 1 = horizontal,
+ * 2 = vertical, 3 = plane.  Only the modes whose references exist are legal. */
+static int chroma_mode_ok(int cm, int mbx, int mby)
+{
+    if ((cm == 1 || cm == 3) && mbx == 0)
+        return 0;
+    if ((cm == 2 || cm == 3) && mby == 0)
+        return 0;
+    return 1;
+}
+
+static int luma_mode_ok(int mode, int mbx, int mby)
+{
+    if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && mby == 0)
+        return 0;
+    if ((mode == AEG_MB_I_H || mode == AEG_MB_I_P) && mbx == 0)
+        return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Decision: intra candidates, chroma candidates, inter candidate      */
+/* ------------------------------------------------------------------ */
+/* Best chroma prediction mode by SAD (the same mode is used for Cb and Cr). */
+static int chroma_mode_by_sad(struct aeg_encoder *e, int mbx, int mby)
+{
+    int cm, best = 0, best_sad = 1 << 30;
+    for (cm = 0; cm < 4; cm++) {
+        int s;
+        if (!chroma_mode_ok(cm, mbx, mby))
+            continue;
+        s = chroma_sad(e, mbx, mby, 0, cm) + chroma_sad(e, mbx, mby, 1, cm);
+        if (s < best_sad) { best_sad = s; best = cm; }
+    }
+    return best;
+}
+
+/* Fills e->mb_modes[] with the legal Intra_16x16 modes ordered by SAD, runs
+ * the motion search and remembers its result.  Nothing is coded here: code_mb()
+ * either uses this SAD ranking directly (preset 0) or refines it with a full
+ * rate-distortion search. */
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
-    int mode, best_mode = 2, best_sad = 1 << 30;
-    int qp = c->qp;
+    int mode, n = 0, sad_of[4];
 
-    /* luma intra 16x16: pick the prediction with the smallest SAD */
+    for (mode = 0; mode < 4; mode++)
+        sad_of[mode] = luma_mode_ok(mode, mbx, mby)
+                           ? intra16_sad(e, mbx, mby, mode) : (1 << 30);
+    /* insertion sort: four entries, cheapest first */
     for (mode = 0; mode < 4; mode++) {
-        int sad;
-        /* Only predict from samples that exist: vertical needs the row above,
-         * horizontal the column on the left, plane both plus the corner.  A
-         * macroblock on the top/left edge therefore has fewer candidates, and
-         * the one on the top-left corner only DC. */
-        if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && !mby)
+        int i;
+        if (sad_of[mode] == (1 << 30))
             continue;
-        if ((mode == AEG_MB_I_H || mode == AEG_MB_I_P) && !mbx)
-            continue;
-        sad = intra16_sad(e, mbx, mby, mode);
-        if (sad < best_sad) { best_sad = sad; best_mode = mode; }
-    }
-    c->i16_mode = best_mode;
-
-    /* chroma: the same for both planes (one mode for Cb and Cr) */
-    {
-        int cm, cbest = 0, csad = 1 << 30;
-        for (cm = 0; cm < 4; cm++) {
-            int s = 0;
-            /* same availability rules as luma (1 = HOR, 2 = VERT, 3 = PLANE) */
-            if ((cm == 1 || cm == 3) && !mbx)
-                continue;
-            if ((cm == 2 || cm == 3) && !mby)
-                continue;
-            s += chroma_sad(e, mbx, mby, 0, cm);
-            s += chroma_sad(e, mbx, mby, 1, cm);
-            if (s < csad) { csad = s; cbest = cm; }
+        i = n++;
+        while (i > 0 && sad_of[e->mb_modes[i - 1]] > sad_of[mode]) {
+            e->mb_modes[i] = e->mb_modes[i - 1];
+            i--;
         }
-        c->chroma_mode = cbest;
+        e->mb_modes[i] = mode;
     }
+    e->mb_nmodes = n;
+    e->mb_sad = sad_of[e->mb_modes[0]];
+    c->i16_mode = e->mb_modes[0];
+    c->chroma_mode = chroma_mode_by_sad(e, mbx, mby);
 
-    /* leave the luma prediction of the chosen 16x16 mode in pred_l */
-    intra16_sad(e, mbx, mby, best_mode);
-    if (e->p.partitions == 0 || qp < 0)
-        return;
-
-    if (e->p.gop_size && e->has_ref) {
-        int pmvx, pmvy, mvx, mvy, sad;
-        aeg_mv_predict(e->mbs, e->mb_w, mbx, mby, &pmvx, &pmvy);
-        aeg_me_block(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16, e->stride[0],
-                     e->recp[0] + mby * 16 * e->stride[0] + mbx * 16,
+    e->mb_inter_ok = 0;
+    e->mb_mv[0] = e->mb_mv[1] = 0;
+    e->mb_pmv[0] = e->mb_pmv[1] = 0;
+    if (e->p.partitions != 0 && c->qp >= 0 && e->p.gop_size && e->has_ref) {
+        int mvx, mvy, sad;
+        aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby,
+                       &e->mb_pmv[0], &e->mb_pmv[1]);
+        /* The block to match is the *source* macroblock.  recp still holds the
+         * previous picture at this position (nothing has been reconstructed
+         * here yet), so searching against it would always favour mv = 0. */
+        aeg_me_block(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
+                     e->stride[0],
+                     e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
                      e->stride[0], 16, 16,
                      e->p.search_range ? e->p.search_range : 16,
-                     e->p.subme, pmvx, pmvy, &mvx, &mvy, &sad);
-        (void)pmvx;
-        {
-            /* compare inter against the best intra candidate */
-            int inter_cost = sad * 8 + aeg_mvd_bits((mvx - pmvx) >> 2, (mvy - pmvy) >> 2);
-            int intra_cost = best_sad * 8;
-            if (inter_cost < intra_cost) {
-                int i;
-                c->type = AEG_MB_P16x16;
-                c->mv[0][0] = c->mv[1][0] = c->mv[2][0] = c->mv[3][0] = (int16_t)mvx;
-                c->mv[0][1] = c->mv[1][1] = c->mv[2][1] = c->mv[3][1] = (int16_t)mvy;
-                for (i = 4; i < 16; i++) {
-                    c->mv[i][0] = (int16_t)mvx;
-                    c->mv[i][1] = (int16_t)mvy;
-                }
-                inter_predict(e, mbx, mby, mvx, mvy);
+                     e->p.subme, e->mb_pmv[0], e->mb_pmv[1], &mvx, &mvy, &sad);
+        e->mb_mv[0] = mvx;
+        e->mb_mv[1] = mvy;
+        e->mb_inter_ok = 1;
+        e->mb_inter_sad = sad;
+    }
+
+    /* Preset 0 keeps the plain SAD decision; it leaves both predictions in
+     * place so that code_mb() can use them directly. */
+    if (e->p.preset <= 0) {
+        if (e->mb_inter_ok &&
+            e->mb_inter_sad * 8 + aeg_mvd_bits((e->mb_mv[0] - e->mb_pmv[0]) >> 2,
+                                               (e->mb_mv[1] - e->mb_pmv[1]) >> 2)
+                < e->mb_sad * 8) {
+            int i;
+            c->type = AEG_MB_P16x16;
+            for (i = 0; i < 16; i++) {
+                c->mv[i][0] = (int16_t)e->mb_mv[0];
+                c->mv[i][1] = (int16_t)e->mb_mv[1];
             }
-        }
-        /* chroma prediction of the chosen chroma mode is recomputed by
-         * code_chroma(); for an inter block the chroma follows the luma
-         * motion vector. */
-        if (c->type == AEG_MB_P16x16) {
-            int cm = c->chroma_mode;
-            (void)cm;
+            inter_predict(e, mbx, mby, e->mb_mv[0], e->mb_mv[1]);
+        } else {
+            c->type = AEG_MB_I16x16;
+            intra16_sad(e, mbx, mby, c->i16_mode);   /* leave pred_l */
         }
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Rate-distortion helpers                                             */
+/* ------------------------------------------------------------------ */
+/* The distortion is a real SSD (the samples the decoder will reproduce), the
+ * rate is the payload the entropy coder will actually spend, so the decision
+ * minimises J = SSD + lambda * bits.  lambda = 0.85 * 2^((QP-12)/3) is the
+ * usual H.264 choice for an SSD-based cost. */
+
+static void snap_luma(const struct aeg_encoder *e, int mbx, int mby, uint8_t *buf)
+{
+    const uint8_t *p = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    int y;
+    for (y = 0; y < 16; y++)
+        memcpy(buf + y * 16, p + y * e->stride[0], 16);
+}
+
+static void restore_luma(struct aeg_encoder *e, int mbx, int mby, const uint8_t *buf)
+{
+    uint8_t *p = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    int y;
+    for (y = 0; y < 16; y++)
+        memcpy(p + y * e->stride[0], buf + y * 16, 16);
+}
+
+static void snap_chroma(const struct aeg_encoder *e, int mbx, int mby, uint8_t *buf)
+{
+    int pl, y;
+    for (pl = 0; pl < 2; pl++) {
+        const uint8_t *p = e->recp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8;
+        uint8_t *b = buf + pl * 64;
+        for (y = 0; y < 8; y++)
+            memcpy(b + y * 8, p + y * e->stride[1], 8);
+    }
+}
+
+static void restore_chroma(struct aeg_encoder *e, int mbx, int mby, const uint8_t *buf)
+{
+    int pl, y;
+    for (pl = 0; pl < 2; pl++) {
+        uint8_t *p = e->recp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8;
+        const uint8_t *b = buf + pl * 64;
+        for (y = 0; y < 8; y++)
+            memcpy(p + y * e->stride[1], b + y * 8, 8);
+    }
+}
+
+/* Code the luma part of one candidate into `t` and return its RD cost.  The
+ * reconstruction is left in the picture buffer, so the caller snapshots it. */
+static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp,
+                       int type, int i16_mode, double lambda)
+{
+    reset_mb_enc(t, qp);
+    t->type = type;
+    t->i16_mode = i16_mode;
+    if (type == AEG_MB_P16x16) {
+        int i;
+        for (i = 0; i < 16; i++) {
+            t->mv[i][0] = (int16_t)e->mb_mv[0];
+            t->mv[i][1] = (int16_t)e->mb_mv[1];
+        }
+        inter_predict(e, mbx, mby, e->mb_mv[0], e->mb_mv[1]);
+        code_luma_inter(e, mbx, mby, t);
+        t->bits += aeg_mvd_bits((e->mb_mv[0] - e->mb_pmv[0]) >> 2,
+                                (e->mb_mv[1] - e->mb_pmv[1]) >> 2);
+    } else {
+        intra16_sad(e, mbx, mby, i16_mode);   /* leaves the predictor in pred_l */
+        code_luma_i16(e, mbx, mby, t);
+    }
+    t->cost = t->sse + (int64_t)(lambda * t->bits + 0.5);
+    return t->cost;
+}
+
+/* Code the chroma of one candidate and return the cost of the chroma part. */
+static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                         int inter, int cmode, double lambda)
+{
+    int64_t sse0 = t->sse;
+    int bits0 = t->bits;
+    t->chroma_mode = cmode;
+    code_chroma(e, mbx, mby, t, inter);
+    return (t->sse - sse0) +
+           (int64_t)(lambda * (t->bits - bits0) + 0.5);
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
-    if (c->type == AEG_MB_P16x16) {
-        code_luma_inter(e, mbx, mby, c);
-        code_chroma(e, mbx, mby, c, 1);
-    } else {
-        code_luma_i16(e, mbx, mby, c);
-        code_chroma(e, mbx, mby, c, 0);
+    uint8_t snap_l[16 * 16], snap_c[2 * 8 * 8];
+    mbenc best, t;
+    int64_t best_cost = INT64_MAX;
+    double lambda = AEG_LAMBDA(c->qp);
+    int i, inter;
+
+    if (e->p.preset <= 0 || e->mb_nmodes == 0) {
+        /* plain SAD decision (analyse_mb already left the predictor) */
+        if (c->type == AEG_MB_P16x16) {
+            code_luma_inter(e, mbx, mby, c);
+            code_chroma(e, mbx, mby, c, 1);
+        } else {
+            code_luma_i16(e, mbx, mby, c);
+            code_chroma(e, mbx, mby, c, 0);
+        }
+        return;
     }
+
+    /* luma: the SAD-best modes (all of them from preset 2 on) plus inter */
+    for (i = 0; i < (e->p.preset >= 2 ? e->mb_nmodes : 1); i++) {
+        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
+                               e->mb_modes[i], lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
+    }
+    if (e->mb_inter_ok) {
+        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_P16x16, 0, lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
+    }
+    restore_luma(e, mbx, mby, snap_l);
+    inter = (best.type == AEG_MB_P16x16);
+
+    /* chroma: every legal intra mode, or the motion-compensated prediction */
+    if (!inter) {
+        int64_t best_chroma = INT64_MAX;
+        mbenc cbest;
+        int cm;
+        cbest = best;
+        for (cm = 0; cm < 4; cm++) {
+            if (!chroma_mode_ok(cm, mbx, mby))
+                continue;
+            t = best;
+            {
+                int64_t cost = rd_chroma(e, mbx, mby, &t, 0, cm, lambda);
+                if (cost < best_chroma) {
+                    best_chroma = cost;
+                    t.chroma_mode = cm;
+                    cbest = t;
+                    snap_chroma(e, mbx, mby, snap_c);
+                }
+            }
+        }
+        best = cbest;
+    } else {
+        inter_predict(e, mbx, mby, e->mb_mv[0], e->mb_mv[1]);
+        t = best;
+        rd_chroma(e, mbx, mby, &t, 1, t.chroma_mode, lambda);
+        best = t;
+        snap_chroma(e, mbx, mby, snap_c);
+    }
+    restore_chroma(e, mbx, mby, snap_c);
+    *c = best;
 }
 
 /* ------------------------------------------------------------------ */
@@ -556,19 +798,22 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
     } else if (c->type == AEG_MB_P16x16) {
         int pmvx, pmvy;
         aeg_bw_ue(bw, 0);
-        aeg_mv_predict(e->mbs, e->mb_w, mbx, mby, &pmvx, &pmvy);
+        aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, &pmvx, &pmvy);
         aeg_bw_se(bw, c->mv[0][0] - pmvx);
         aeg_bw_se(bw, c->mv[0][1] - pmvy);
-        aeg_bw_ue(bw, (uint32_t)aeg_cbp_code_num[(c->cbp & 0x0f) |
-                                                 (chroma_cbp(c) << 4)]);
+        aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum[(c->cbp & 0x0f) |
+                                                (chroma_cbp(c) << 4)]);
     } else {
         aeg_bw_ue(bw, (uint32_t)(6 + c->i16_mode + 4 * chroma_cbp(c) +
                                  12 * (luma_cbp_on(c) ? 1 : 0)));
     }
     if (c->type != AEG_MB_P16x16)
         aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
-    /* mb_qp_delta */
-    aeg_bw_se(bw, c->qp - e->last_qp);
+    /* mb_qp_delta: only present when the picture actually carries a coded
+     * block pattern (H.264 7.3.5.2); emitting it unconditionally desynchronises
+     * the decoder on the first all-zero macroblock. */
+    if (luma_cbp_on(c) || chroma_cbp(c))
+        aeg_bw_se(bw, c->qp - e->last_qp);
     e->last_qp = c->qp;
 
     if (c->type == AEG_MB_I16x16) {
@@ -583,10 +828,22 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
                                       luma_ac_nc(e, mbx, mby, c, blk), 3);
             }
     } else {
-        for (blk = 0; blk < 16; blk++)
-            if (c->nz[blk])
-                aeg_cavlc_write_block(bw, c->level[blk],
-                                      luma_nc(e, mbx, mby, c, blk), 0);
+        /* 4x4 residual: the blocks of every coded 8x8 group are written group
+         * by group, and every block of a coded group is present, including the
+         * ones whose coeff_token ends up being TotalCoeff 0.  Skipping the
+         * empty ones desynchronises the decoder. */
+        {
+            int g, k;
+            for (g = 0; g < 4; g++) {
+                if (!(c->cbp & (1 << g)))
+                    continue;
+                for (k = 0; k < 4; k++) {
+                    int b = group_blk[g][k];
+                    aeg_cavlc_write_block(bw, c->level[b],
+                                          luma_nc(e, mbx, mby, c, b), 0);
+                }
+            }
+        }
     }
     if (chroma_cbp(c)) {
         /* chroma_cbp 1: DC only, 2: DC + AC.  Both planes' DC blocks are always
@@ -667,7 +924,7 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
 
                 if (is_p && tmp.type == AEG_MB_P16x16) {
                     int pmvx, pmvy;
-                    aeg_mv_predict(e->mbs, e->mb_w, mbx, mby, &pmvx, &pmvy);
+                    aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, &pmvx, &pmvy);
                     (void)pmvx; (void)pmvy;
                 }
                 t0 = aeg_now_ns();
@@ -735,6 +992,13 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                               e->p.deblock_beta, 1);
         }
         e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
+    }
+
+    /* the deblocked reconstruction is the next reference: refresh its border */
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+            pad_edges(e->recp[i], e->stride[i], i ? e->cw : e->w, i ? e->ch : e->h);
     }
 
     /* distortion statistics */

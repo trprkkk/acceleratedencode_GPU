@@ -1,67 +1,110 @@
 #!/bin/sh
-# Local verification: build, encode a synthetic clip, decode it with an
-# independent decoder and report both the coding quality and -- most
-# importantly -- whether the encoder's own reconstruction agrees with the
-# decoder.  Agreement proves the transform/quantisation/deblocking maths and
-# the reconstruction path are right; a disagreement means the encoder and the
-# decoder disagree about the samples, which would drift on P pictures.
+# Local verification: build, encode synthetic clips, decode them with an
+# independent decoder and check that the encoder's own reconstruction is
+# *bit-exact* with the decoder's output on every frame.
 #
-# Set FFMPEG=/path/to/ffmpeg to use a specific build.
+# Conformance (encoder recon == decoder output) is the property that matters:
+# it proves the transform/quantisation/prediction/deblocking maths and the
+# bitstream syntax agree with the standard, because any disagreement would
+# drift on the following P pictures.
+#
+# Set FFMPEG=/path/to/ffmpeg to use a specific build; without one the clip
+# checks are skipped (the table/CAVLC checks in `make test` still run).
 set -e
 BUILD=build
 FF=${FFMPEG:-ffmpeg}
-W=320
-H=192
-N=10
 TMP=${TMPDIR:-/tmp}/aegtest.$$
 mkdir -p "$TMP"
+FAIL=0
 
 echo "== build"
 make -s >/dev/null
-
-echo "== synthetic clip"
 make -s "$BUILD/genyuv"
-"./$BUILD/genyuv" "$W" "$H" "$N" "$TMP/src.yuv"
 
-echo "== encode"
-./$BUILD/aegenc -w $W -h $H -q 23 -n $N -i "$TMP/src.yuv" -o "$TMP/out.264" \
-     --dump-recon "$TMP/recon.yuv" | sed 's/^/   /'
-
-echo "== decode with an independent decoder ($FF)"
-if command -v "$FF" >/dev/null 2>&1; then
-    "$FF" -v error -i "$TMP/out.264" -f rawvideo -pix_fmt yuv420p \
-        "$TMP/dec.yuv" -y 2>"$TMP/dec.log" || true
-    if [ -s "$TMP/dec.log" ]; then
-        echo "   decoder reported problems:"
-        sed 's/^/     /' "$TMP/dec.log" | head -5
-    fi
-    python3 - "$TMP" "$W" "$H" <<'PY'
-import sys, math, os
-tmp, w, h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+# compare BOTH files fully, over every frame
+cat > "$TMP/cmp.py" <<'PY'
+import sys, os, math
+rec, dec, w, h, n, tag = (sys.argv[1], sys.argv[2], int(sys.argv[3]),
+                          int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
 fs = w * h * 3 // 2
-def rd(n):
-    p = os.path.join(tmp, n)
-    if not os.path.exists(p):
-        return b''
-    return open(p, 'rb').read()[:fs]
-src, dec, rec = rd('src.yuv'), rd('dec.yuv'), rd('recon.yuv')
-def psnr(a, b):
-    if not a or not b or len(a) != len(b):
-        return -1
-    s = sum((x - y) ** 2 for x, y in zip(a, b)) / len(a)
-    return 99.0 if s == 0 else 10 * math.log10(255 * 255 / s)
-print("   bitstream vs source      %.2f dB" % psnr(src, dec))
-print("   reconstruction vs source %.2f dB" % psnr(src, rec))
-d = psnr(rec, dec)
-if rec and dec:
-    mx = max(abs(x - y) for x, y in zip(rec, dec))
-    print("   reconstruction vs decode %.2f dB (max abs diff %d)" % (d, mx))
+a = open(rec, 'rb').read() if os.path.exists(rec) else b''
+b = open(dec, 'rb').read() if os.path.exists(dec) else b''
+if len(a) != len(b) or len(a) < fs * n:
+    print("   %-22s SIZE MISMATCH recon=%d dec=%d (expected %d)"
+          % (tag, len(a), len(b), fs * n))
+    sys.exit(1)
+bad = 0
+first = None
+for i in range(len(a)):
+    if a[i] != b[i]:
+        bad += 1
+        if first is None:
+            f, o = divmod(i, fs)
+            first = (f, o // w, o % w)
+mx = max(abs(x - y) for x, y in zip(a, b))
+if bad:
+    print("   %-22s FAIL %d/%d samples differ, first at frame %d (x=%d y=%d), "
+          "max abs diff %d" % (tag, bad, len(a), first[0], first[2], first[1], mx))
+    sys.exit(1)
+print("   %-22s bit-exact (%d frames, max abs diff 0)" % (tag, n))
 PY
-else
-    echo "   skipped (no ffmpeg; set FFMPEG=...)"
-fi
+
+# run_case <name> <w> <h> <frames> <extra aegenc args...>
+run_case() {
+    name=$1; w=$2; h=$3; n=$4; shift 4
+    "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" >/dev/null
+    ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
+        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" "$@" \
+        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
+    if ! command -v "$FF" >/dev/null 2>&1; then
+        echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
+        return
+    fi
+    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
+        "$TMP/$name.dec" 2>"$TMP/$name.decerr"
+    if [ -s "$TMP/$name.decerr" ]; then
+        echo "   $name: decoder reported problems:"
+        sed 's/^/     /' "$TMP/$name.decerr" | head -3
+        FAIL=1
+    fi
+    python3 "$TMP/cmp.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" "$n" "$name" || FAIL=1
+}
+
+echo "== inter conformance (encoder recon vs independent decoder, every frame)"
+run_case h264_320x192 320 192 10 -q 23
+run_case lowqp        320 192  6 -q 12
+run_case highqp       320 192  6 -q 40
+run_case nodeblock    320 192  6 -q 23 --no-deblock
+run_case preset0      320 192  6 -q 23 -p 0
+run_case preset4      320 192  6 -q 23 -p 4
+run_case odd_208      320 208  4 -q 26
+run_case small_64     64  64   6 -q 23
+run_case cpu_only     320 192  4 -q 23 -b cpu
+
+echo "== PSNR"
+python3 - "$TMP" "320" "192" "10" <<'PY'
+import sys, os, math
+tmp, w, h, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+fs = w * h * 3 // 2
+src = open(os.path.join(tmp, 'h264_320x192.yuv'), 'rb').read()[:fs * n]
+for tag in ('h264_320x192.recon', 'h264_320x192.dec'):
+    p = os.path.join(tmp, tag)
+    if not os.path.exists(p):
+        continue
+    d = open(p, 'rb').read()[:len(src)]
+    s = sum((x - y) ** 2 for x, y in zip(src, d)) / len(src)
+    print("   %-22s %.2f dB" % (tag, 99.0 if s == 0 else 10 * math.log10(255 * 255 / s)))
+PY
+
+echo "== rate"
+sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
 
 echo "== device enumeration"
 ./$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 
 rm -rf "$TMP"
+if [ "$FAIL" != 0 ]; then
+    echo "== FAILED"
+    exit 1
+fi
+echo "== all conformance cases bit-exact"

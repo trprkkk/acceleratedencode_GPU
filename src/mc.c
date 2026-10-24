@@ -239,6 +239,12 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
 /* ------------------------------------------------------------------ */
 /* MV prediction                                                       */
 /* ------------------------------------------------------------------ */
+static inline int is_intra_mb(const aeg_mb *m)
+{
+    return m->type == AEG_MB_I4x4 || m->type == AEG_MB_I16x16 ||
+           m->type == AEG_MB_IPCM;
+}
+
 static inline int mv_median(int a, int b, int c)
 {
     int mx = a > b ? a : b;
@@ -248,42 +254,48 @@ static inline int mv_median(int a, int b, int c)
     return c;
 }
 
-void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_x, int mb_y,
+/* Motion vector prediction (H.264 8.4.1.3.1).
+ *
+ * The three candidates are the blocks to the left (A), above (B) and above to
+ * the right (C).  C falls back to the block above and to the left when the
+ * macroblock above-right does not exist, which is what makes a macroblock on
+ * the right border predict differently from one in the middle of the line. */
+void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w, int mb_x, int mb_y,
                     int *mvx, int *mvy)
 {
-    int ax, ay, bx, by, cx, cy, a_av = 0, b_av = 0, c_av = 0;
+    const aeg_mb *m;
+    int ax = 0, ay = 0, bx = 0, by = 0, cx = 0, cy = 0;
+    int a_av = 0, b_av = 0, c_av = 0, n;
 
     if (mb_x > 0) {
-        const aeg_mb *m = &mbs[mb_y * mb_stride + mb_x - 1];
-        a_av = m->type != AEG_MB_I4x4 && m->type != AEG_MB_I16x16 &&
-               m->type != AEG_MB_IPCM;
-        ax = m->mv[3][0]; ay = m->mv[3][1];
-    } else { ax = ay = 0; }
-
+        m = &mbs[mb_y * mb_stride + mb_x - 1];
+        a_av = !is_intra_mb(m);
+        ax = m->mv[3][0];  ay = m->mv[3][1];
+    }
     if (mb_y > 0) {
-        const aeg_mb *m = &mbs[(mb_y - 1) * mb_stride + mb_x];
-        b_av = m->type != AEG_MB_I4x4 && m->type != AEG_MB_I16x16 &&
-               m->type != AEG_MB_IPCM;
-        bx = m->mv[3 * 4 + 3][0]; by = m->mv[3 * 4 + 3][1];
-    } else { bx = by = 0; }
+        m = &mbs[(mb_y - 1) * mb_stride + mb_x];
+        b_av = !is_intra_mb(m);
+        bx = m->mv[12][0]; by = m->mv[12][1];
+    }
+    if (mb_y > 0 && mb_x + 1 < mb_w) {
+        m = &mbs[(mb_y - 1) * mb_stride + mb_x + 1];
+        c_av = !is_intra_mb(m);
+        cx = m->mv[12][0]; cy = m->mv[12][1];
+    } else if (mb_y > 0 && mb_x > 0) {
+        m = &mbs[(mb_y - 1) * mb_stride + mb_x - 1];
+        c_av = !is_intra_mb(m);
+        cx = m->mv[15][0]; cy = m->mv[15][1];
+    }
 
-    if (mb_x > 0 && mb_y > 0) {
-        const aeg_mb *m = &mbs[(mb_y - 1) * mb_stride + mb_x - 1];
-        c_av = m->type != AEG_MB_I4x4 && m->type != AEG_MB_I16x16 &&
-               m->type != AEG_MB_IPCM;
-        cx = m->mv[3 * 4 + 3][0]; cy = m->mv[3 * 4 + 3][1];
-    } else { cx = cy = 0; }
-
-    if (!c_av && a_av && b_av) { cx = ax; cy = ay; }
-    if (a_av && b_av && c_av) {
+    n = a_av + b_av + c_av;
+    if (n == 0) {
+        *mvx = *mvy = 0;
+    } else if (n == 1) {
+        *mvx = a_av ? ax : (b_av ? bx : cx);
+        *mvy = a_av ? ay : (b_av ? by : cy);
+    } else {
         *mvx = mv_median(ax, bx, cx);
         *mvy = mv_median(ay, by, cy);
-    } else if (a_av && b_av) {
-        *mvx = ax + bx - cx; *mvy = ay + by - cy;
-    } else if (a_av || b_av) {
-        *mvx = a_av ? ax : bx; *mvy = a_av ? ay : by;
-    } else {
-        *mvx = 0; *mvy = 0;
     }
 }
 

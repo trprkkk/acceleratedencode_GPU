@@ -7,15 +7,16 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: conformant encoder core, quality work in progress.**
+> **Status: conformant encoder core (I and P pictures), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
-> reproduces the encoder's reconstruction **exactly** (max abs diff 0) on
-> 16x16 – 640x368 content, QP 10–51, with every GOP length from all-intra to a
-> single IDR, with and without deblocking.  `make test` asserts it.
-> What is *not* finished is rate-distortion efficiency: per-QP PSNR is within
-> ~0.5 dB of x264 baseline, but at roughly twice the bitrate (SAD-only mode
-> decision, no Intra_4x4, no trellis).  The GPU backends are implemented behind
-> a measured dispatcher but have only been compile-verified in this
+> reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
+> frame, not just the IDR) on 16x16 – 320x208 content, QP 12–40, presets
+> 0–4, with and without deblocking.  `make test` asserts it and *fails* on any
+> mismatch.  What is *not* finished is rate-distortion efficiency: at matched QP
+> the bitrate is already below x264 baseline (~5% less) but the PSNR is ~1.5 dB
+> lower, i.e. x264 is still ~15–20% more efficient (SAD+λ mode decision, no
+> Intra_4x4, no trellis, only 16x16 inter partitioning).  The GPU backends sit
+> behind a measured dispatcher but have only been compile-checked in this
 > environment (no GPU available).  See [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Why this design
@@ -55,7 +56,7 @@ why every kernel is an integer operation and the reference implementation in
 make                 # CPU only (default, no OpenCL/CUDA required)
 make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
 make CUDA=1          # + CUDA backend (needs the CUDA toolkit; not yet written)
-make test            # synthetic clip -> encode -> decode -> PSNR report
+make test            # table + CAVLC checks, then bit-exactness of 9 clips
 ```
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
@@ -83,10 +84,16 @@ speed for quality.
   H.264 decoder and measuring the output pixel is an exact measurement of the
   decoder's inverse quantisation — this is how every scale factor in
   `src/transform.c` was derived and checked (see `docs/STATUS.md`).
-* `tests/run_tests.sh` encodes a synthetic clip, decodes it with ffmpeg and
-  reports source-vs-reconstruction, source-vs-decode and
-  reconstruction-vs-decode PSNR.  When the stream is conformant the last number
-  is +inf; today it is not.
+* `tests/syntax_check.c` asserts that the two `coded_block_pattern` tables are
+  exact inverses of one another.  A single wrong entry does not desynchronise
+  the stream — the decoder reads a legal but *different* pattern and applies
+  residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
+* `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
+  CAVLC writer and a transcription of the reference decoder.
+* `tests/run_tests.sh` encodes nine synthetic cases (QP 12/23/40, presets 0 and
+  4, deblocking on/off, 64x64 … 320x208, forced CPU backend), decodes them with
+  ffmpeg and requires the encoder's own reconstruction to be **bit-identical**
+  on every frame; it exits non-zero otherwise.
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
 
 ## Layout

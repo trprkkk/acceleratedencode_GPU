@@ -68,6 +68,7 @@ extern const uint8_t  aeg_chroma_dc_total_zeros_bits[3][4];
 extern const uint8_t  aeg_run_before_len[7][16];
 extern const uint8_t  aeg_run_before_bits[7][16];
 extern const uint8_t  aeg_cbp_code_num[48];
+extern const uint8_t  aeg_cbp_codenum[48];
 
 
 /* Sub-block scan index helpers: raster position of 4x4 block n */
@@ -216,7 +217,8 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
 int  aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                   int cstride, int bw, int bh, int range, int subme,
                   int pred_x, int pred_y, int *mvx, int *mvy, int *sad_out);
-void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_x, int mb_y,
+void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
+                    int mb_x, int mb_y,
                     int *mvx, int *mvy);
 int  aeg_ue_bits(uint32_t v);
 int  aeg_se_bits(int32_t v);

@@ -103,6 +103,9 @@ void aeg_params_default(aeg_params *p)
     p->deblock_alpha = 0;
     p->deblock_beta = 0;
     p->chroma_me = 1;
+    /* 16x16 is the only inter partitioning the encoder implements; without at
+     * least this bit analyse_mb() treats every picture as all-intra. */
+    p->partitions = 1;      /* bit 0: 16x16, the only mode implemented */
     p->verbose = 1;
 }
 
