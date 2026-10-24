@@ -413,6 +413,24 @@ State of the implementation (this is the provisional part):
   by bytes, because the whole-frame search rounds are a different search, not a
   faster rendering of the same one.
 
+Enabling it on a device, in order of increasing bluntness:
+
+```
+-s tq=opencl -s iq=opencl    # the dispatcher owns both coefficient stages
+                             # (or =cuda), and the paths follow it
+AEG_COEF_BATCH=1             # per-candidate batch, dispatcher ignored
+AEG_RD_BATCH=1               # whole-macroblock batch, dispatcher ignored
+```
+
+The flags are resolved at the top of every picture, not once at open time, so a
+`-s` override takes effect from the first `aeg_dispatch_update()` on.  What is
+*not* implemented is the dispatcher discovering the coefficient stages by
+itself: it only ever measures the path it already chose, so a stage that starts
+on the CPU records no device time and never flips.  Probing both paths for the
+first few pictures (running the loser's work and throwing it away) is the next
+dispatcher change, and it is what would make the placement automatic on
+hardware.
+
 ## Verification
 
 

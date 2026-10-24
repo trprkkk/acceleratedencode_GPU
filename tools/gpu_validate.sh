@@ -21,6 +21,12 @@
 #               fractional ones; the per-macroblock subpel walk is skipped)
 #   all         all of the above at once
 #
+# Set BE=opencl (or BE=cuda) to add one more run that *forces* the two
+# coefficient stages through that backend with `-s tq=... -s iq=...`.  The
+# dispatcher is free not to pick those stages (it may measure the CPU as
+# faster), in which case `auto` is silently all-CPU; that forced run is the one
+# that tells whether the batched form pays for itself on the device.
+#
 # Two checks, and they are different on purpose:
 #
 #   * cpu, auto, coefbatch, rdbatch must produce the *same bitstream*.  Moving a
@@ -96,11 +102,16 @@ run auto -- "$@" || fail=1
 run coefbatch AEG_COEF_BATCH=1 -- "$@" || fail=1
 run rdbatch AEG_RD_BATCH=1 -- "$@" || fail=1
 run search AEG_SEED=1 AEG_PARFULL=1 -- "$@" || fail=1
+if [ -n "${BE:-}" ]; then
+    run stageforce -s "tq=$BE" -s "iq=$BE" -- "$@" || fail=1
+fi
 run all AEG_SEED=1 AEG_PARFULL=1 AEG_COEF_BATCH=1 AEG_RD_BATCH=1 -- "$@" \
     || fail=1
 
 echo "== bitstream: the coefficient stages may not change a single byte"
-for name in auto coefbatch rdbatch; do
+same="auto coefbatch rdbatch"
+[ -n "${BE:-}" ] && same="$same stageforce"
+for name in $same; do
     if [ ! -f "$TMP/$name.264" ] || [ ! -f "$TMP/cpu.264" ]; then
         echo "   $name: no stream to compare"
         fail=1
@@ -118,7 +129,7 @@ echo "   search/all: a different motion search, so the stream differs by"
 echo "   design -- checked below by reconstruction instead of by bytes"
 
 echo "== reconstruction: the encoder's samples against an independent decode"
-for name in cpu auto coefbatch rdbatch search all; do
+for name in cpu auto coefbatch rdbatch search all stageforce; do
     [ -f "$TMP/$name.264" ] || continue
     if ! "$FFMPEG" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
             "$TMP/$name.dec.yuv" 2>"$TMP/$name.dec.log"; then

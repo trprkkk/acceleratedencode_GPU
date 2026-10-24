@@ -120,6 +120,7 @@ struct aeg_encoder {
      * and only then are the costs compared.  Four candidates x sixteen blocks
      * is the largest batch a macroblock can produce. */
     int rd_batch;
+    int coef_force, rd_force;   /* -1: ask the dispatcher, 0/1: forced */
     int16_t rd_res[16 * 16 * AEG_MB_CAND_MAX];
     int16_t rd_lev[16 * 16 * AEG_MB_CAND_MAX];
     int16_t rd_rec[16 * 16 * AEG_MB_CAND_MAX];
@@ -160,6 +161,24 @@ struct aeg_encoder {
     int    rc_frames;       /* pictures coded so far, for the budget        */
     int    rc_active;
 };
+
+/* Which of the two batched coefficient code paths to use for this picture.
+ * Both need the device to own *both* coefficient stages: an inter candidate
+ * cannot transform on one and reconstruct on the other without a round trip in
+ * the middle of its RD cost.  AEG_COEF_BATCH / AEG_RD_BATCH override the
+ * dispatcher, which is how the conformance cases exercise the paths on a
+ * machine with no GPU. */
+static void resolve_coef_stages(struct aeg_encoder *e)
+{
+    int want = e->d.ops.backend != AEG_BACKEND_CPU &&
+               e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
+               e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
+               e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
+    e->coef_batch = e->coef_force >= 0 ? e->coef_force : want;
+    e->rd_batch = e->rd_force >= 0 ? e->rd_force : want;
+    if (e->rd_batch)
+        e->coef_batch = 1;
+}
 
 static inline int clip255(int v)
 {
@@ -2505,6 +2524,7 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
 
+    resolve_coef_stages(e);
     aq_compute(e);
     if (is_p && e->p.subme > 0) {
         /* Build the fractional-pel planes of the reference picture once for the
@@ -2853,20 +2873,15 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * forces the choice, which is how the CPU reference runs the batched code
      * path in the conformance tests (it has to produce the same bitstream). */
     {
+        /* -1 = ask the dispatcher, 0/1 = forced.  The effective flags are
+         * re-resolved at the top of every picture, because the dispatcher only
+         * settles a stage after it has measured it (and a -s override only
+         * takes effect from the first aeg_dispatch_update() on). */
         const char *ev = getenv("AEG_COEF_BATCH");
-        int want = e->d.ops.backend != AEG_BACKEND_CPU &&
-                   e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
-                   e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
-                   e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
-        e->coef_batch = ev ? atoi(ev) != 0 : want;
-        /* The RD batching is the same decision one level up: all candidates of
-         * a macroblock in one launch pair instead of one pair per candidate.
-         * AEG_RD_BATCH=1/0 forces it, which is how the conformance cases cover
-         * the code path on a machine with no GPU. */
+        e->coef_force = ev ? atoi(ev) != 0 : -1;
         ev = getenv("AEG_RD_BATCH");
-        e->rd_batch = ev ? atoi(ev) != 0 : want;
-        if (e->rd_batch)
-            e->coef_batch = 1;
+        e->rd_force = ev ? atoi(ev) != 0 : -1;
+        resolve_coef_stages(e);
     }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
