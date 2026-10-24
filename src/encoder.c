@@ -1130,8 +1130,10 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
             uint8_t tavail[16];
             int geo[4][4], b0, n = sub_cnt[s], satd_sum = 0, bits, mv[4][2],
                 pmv[4][2];
+            int traded = 0;   /* the trial cannot beat the best shape */
             memcpy(trial, cur, sizeof(trial));
             memcpy(tavail, avail, sizeof(tavail));
+            bits = aeg_ue_bits((uint32_t)s);
             for (k = 0; k < n; k++) {
                 int sad;
                 sub_geom(s, bx, by, k, geo[k], &b0);
@@ -1144,11 +1146,21 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                 satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
                 me_publish(trial, geo[k], mv[k][0], mv[k][1]);
                 avail_publish(tavail, geo[k]);
-            }
-            bits = aeg_ue_bits((uint32_t)s);
-            for (k = 0; k < n; k++)
                 bits += aeg_mvd_bits(mv[k][0] - pmv[k][0],
                                      mv[k][1] - pmv[k][1]);
+                /* Exact early exit: SATD and bits are both non-negative, so the
+                 * cost of the complete shape is at least what the partitions
+                 * decided so far cost.  Once that reaches the best shape, no
+                 * remaining partition can change the decision -- the reason the
+                 * 4x4 shape (four searches per sub-macroblock) is not always
+                 * paid for in full. */
+                if (satd_sum + 8 * bits >= best_cost) {
+                    traded = 1;
+                    break;
+                }
+            }
+            if (traded)
+                continue;
             /* The shape decision compares SATD (not SAD: on a sub-partition
              * scale a small DC error can make a badly aligned 4x4 look good)
              * against the partition's own header cost.  The weight was swept
