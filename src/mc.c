@@ -145,6 +145,99 @@ void aeg_mc_ctx_free(aeg_mc_ctx *mc)
  * operation: the GPU kernel computes the same samples for the same region and
  * fills the margin the same way, so the buffer it produces is byte-identical
  * and the two paths can be cross-checked (tests/kernel_check.c). */
+#if defined(__SSE2__)
+/* Six taps of eight consecutive output samples, as int16 lanes: byte loads are
+ * widened to int16 and combined with the filter of hpel_h().  Every
+ * intermediate is inside int16 (20 * (255 + 255) + 2 * 255 = 10710), so the
+ * lanes hold the scalar value exactly, and the trailing `packus` is the same
+ * clip to [0, 255] that clip8() does -- `packus` saturates unsigned. */
+static inline __m128i taps8(const uint8_t *p, int off)
+{
+    return _mm_unpacklo_epi8(
+        _mm_loadl_epi64((const __m128i *)(p + off)), _mm_setzero_si128());
+}
+
+static inline __m128i hpel_h8(const uint8_t *p)
+{
+    const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5),
+                  c16 = _mm_set1_epi16(16);
+    const __m128i s0 = _mm_add_epi16(taps8(p, 0), taps8(p, 1));
+    const __m128i s1 = _mm_add_epi16(taps8(p, -1), taps8(p, 2));
+    const __m128i s2 = _mm_add_epi16(taps8(p, -2), taps8(p, 3));
+    __m128i v = _mm_sub_epi16(_mm_mullo_epi16(s0, c20), _mm_mullo_epi16(s1, c5));
+
+    v = _mm_add_epi16(v, s2);
+    return _mm_srai_epi16(_mm_add_epi16(v, c16), 5);
+}
+
+static inline __m128i hpel_v8(const uint8_t *p, int s)
+{
+    const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5),
+                  c16 = _mm_set1_epi16(16);
+    const __m128i s0 = _mm_add_epi16(taps8(p, 0), taps8(p, s));
+    const __m128i s1 = _mm_add_epi16(taps8(p, -s), taps8(p, 2 * s));
+    const __m128i s2 = _mm_add_epi16(taps8(p, -2 * s), taps8(p, 3 * s));
+    __m128i v = _mm_sub_epi16(_mm_mullo_epi16(s0, c20), _mm_mullo_epi16(s1, c5));
+
+    v = _mm_add_epi16(v, s2);
+    return _mm_srai_epi16(_mm_add_epi16(v, c16), 5);
+}
+
+/* The unshifted horizontal intermediate of hsum_h(), eight lanes at a time. */
+static inline __m128i hsum_h8(const uint8_t *p)
+{
+    const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5);
+    const __m128i s0 = _mm_add_epi16(taps8(p, 0), taps8(p, 1));
+    const __m128i s1 = _mm_add_epi16(taps8(p, -1), taps8(p, 2));
+    const __m128i s2 = _mm_add_epi16(taps8(p, -2), taps8(p, 3));
+
+    return _mm_add_epi16(_mm_sub_epi16(_mm_mullo_epi16(s0, c20),
+                                      _mm_mullo_epi16(s1, c5)), s2);
+}
+
+/* Wide a 4-lane group of int16 to int32 (sign extended), for the vertical pass
+ * of the two-dimensional position: its intermediates reach +-690 000. */
+static inline __m128i widen_lo(__m128i v)
+{
+    return _mm_unpacklo_epi16(v, _mm_srai_epi16(v, 15));
+}
+static inline __m128i widen_hi(__m128i v)
+{
+    return _mm_unpackhi_epi16(v, _mm_srai_epi16(v, 15));
+}
+static inline __m128i times20_epi32(__m128i v)
+{
+    return _mm_add_epi32(_mm_slli_epi32(v, 4), _mm_slli_epi32(v, 2));
+}
+static inline __m128i times5_epi32(__m128i v)
+{
+    return _mm_add_epi32(_mm_slli_epi32(v, 2), v);
+}
+
+/* hpel_hv() for eight samples: six horizontal intermediates, then the vertical
+ * 6-tap over them in int32 lanes, one shift at the end (H.264 8.4.2.2.1 keeps
+ * the horizontal stage unshifted, which is why this cannot be built from the
+ * clipped plane-1 samples). */
+static inline __m128i hpel_hv8(const uint8_t *p, int s)
+{
+    const __m128i a0 = hsum_h8(p - 2 * s), a1 = hsum_h8(p - s);
+    const __m128i a2 = hsum_h8(p), a3 = hsum_h8(p + s);
+    const __m128i a4 = hsum_h8(p + 2 * s), a5 = hsum_h8(p + 3 * s);
+    const __m128i c512 = _mm_set1_epi32(512);
+    __m128i lo, hi;
+
+    lo = _mm_add_epi32(widen_lo(a0), times20_epi32(_mm_add_epi32(widen_lo(a2),
+                                                                widen_lo(a3))));
+    lo = _mm_sub_epi32(lo, times5_epi32(_mm_add_epi32(widen_lo(a1), widen_lo(a4))));
+    lo = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(lo, widen_lo(a5)), c512), 10);
+    hi = _mm_add_epi32(widen_hi(a0), times20_epi32(_mm_add_epi32(widen_hi(a2),
+                                                                widen_hi(a3))));
+    hi = _mm_sub_epi32(hi, times5_epi32(_mm_add_epi32(widen_hi(a1), widen_hi(a4))));
+    hi = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(hi, widen_hi(a5)), c512), 10);
+    return _mm_packs_epi32(lo, hi);
+}
+#endif
+
 void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
                          int rstride, int w, int h, int which)
 {
@@ -155,6 +248,34 @@ void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
     for (y = y0; y <= y1; y++) {
         const uint8_t *rrow = ref + (ptrdiff_t)y * rstride;
         uint8_t *orow = pl + (ptrdiff_t)y * dstride;
+#if defined(__SSE2__)
+        /* eight samples per iteration; the tail stays scalar, and every load
+         * above reaches at most three bytes past the last output of the row,
+         * which is inside the picture's padding */
+        for (x = x0; x + 7 <= x1; x += 8) {
+            __m128i v;
+            if (which == 1)
+                v = hpel_h8(rrow + x);
+            else if (which == 2)
+                v = hpel_v8(rrow + x, rstride);
+            else
+                v = hpel_hv8(rrow + x, rstride);
+            _mm_storel_epi64((__m128i *)(orow + x),
+                             _mm_packus_epi16(v, _mm_setzero_si128()));
+        }
+        for (; x <= x1; x++) {
+            const uint8_t *p = rrow + x;
+            int v;
+            if (which == 1)
+                v = hpel_h(p);
+            else if (which == 2)
+                v = hpel_v(p, rstride);
+            else
+                v = hpel_hv(p, rstride);
+            orow[x] = clip8(v);
+        }
+        x = x1 + 1;
+#else
         for (x = x0; x <= x1; x++) {
             const uint8_t *p = rrow + x;
             int v;
@@ -166,6 +287,8 @@ void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
                 v = hpel_hv(p, rstride);
             orow[x] = clip8(v);
         }
+        x = x1 + 1;
+#endif
         for (x = -AEG_PAD; x < x0; x++)
             orow[x] = orow[x0];
         for (x = x1 + 1; x < w + AEG_PAD; x++)

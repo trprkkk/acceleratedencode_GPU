@@ -69,7 +69,7 @@ Implemented and building without warnings:
   (with `__kernel`/`__global`/`get_global_id` macros) and runs every kernel
   work item against the CPU reference, so kernel regressions are caught on a
   machine with no GPU.
-* SSE2 fast paths for the six hottest inner loops, each kept bit-identical to
+* SSE2 fast paths for the seven hottest inner loops, each kept bit-identical to
   the scalar code it replaces (so none of them can change a decision) and each
   with the scalar loop left in place as the non-x86 fallback and as the
   reference the tests compare against:
@@ -105,6 +105,16 @@ Implemented and building without warnings:
     two int16 truncation points of the reference arithmetic applied explicitly
     (`_mm_srai_epi32(_mm_slli_epi32(v, 16), 16)`), because those truncations are
     part of what the decoder does, not an artefact of the scalar code.
+  * `aeg_hpel_plane_fill()` -- the three fractional-pel planes, eight samples at
+    a time (0.19/0.22/0.65 -> 0.05/0.04/0.23 ms per 320x192 picture).  The
+    two-dimensional plane is the interesting one: it needs the *unshifted*
+    horizontal intermediate (H.264 8.4.2.2.1), whose values reach +-13 260, and
+    the vertical sum over six of those reaches +-690 000, so the horizontal
+    stage stays in int16 lanes and the vertical one is widened to int32 --
+    rounding the horizontal stage first, as the clip of a real sample would,
+    gives different samples (bug 28 in reverse).  This function is also the CPU
+    reference the `interp_plane` device kernel is checked against, so its
+    output has to stay byte-identical; `kernel_check` still passes.
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`,
   `--slices N` and `-t N` (slice threads)
 
@@ -891,7 +901,7 @@ this sandbox), best of three runs:
 | encoder | fps | bytes | Y-PSNR |
 |---|---|---|---|
 | ours, preset 0 | 708 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 97.4 / 95 | 78502 / 78468 | 45.12 / 45.12 |
+| ours, preset 2 / 4 | 100 / 96 | 78502 / 78468 | 45.12 / 45.12 |
 | x264 baseline (no asm) | 175 | 78 664 | 45.16 |
 
 At a matched QP the two encoders land within 0.2% of each other in rate and
@@ -914,6 +924,7 @@ can move a decision):
 | SSE2 quantiser (2.5x per block) | 91 | 46 395 |
 | SSE2 4x4 forward transform (3.2x per call) | 92.6 | 117 974 |
 | SSE2 inverse transform for the RD residual (`idct_core`, 784 k calls / 60 fr) | 97.4 | 117 974 |
+| SSE2 half-pel planes (all three, 3.3x: 1.06 -> 0.32 ms per picture) | ~100 | 117 974 |
 
 The two newest rows are 90-frame runs of the panning texture at QP 24 (the
 older rows are 40-frame runs, hence the different byte count); both are
