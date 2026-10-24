@@ -565,9 +565,12 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 ## Next
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
-   the last non-zero coefficient), then the 8x8 DCT (the latter needs a
-   High-profile SPS).  That is where the remaining ~0.6-1.0 dB of inter and
-   ~1.5-2 dB of intra-only efficiency sits.  The sub-partition *shape* choice
+   the last non-zero coefficient).  Measured against x264 (which has trellis=1
+   by default) on the panning clip at QP 24: trellis off 60 047 B / 45.95 dB,
+   trellis 1 61 495 B / 46.26 dB, trellis 2 61 106 B / 46.24 dB -- i.e. it buys
+   quality with bits at a fixed QP and is a wash in PSNR-per-bit here, which is
+   why it has not been a priority.  The bigger item behind it is the 8x8 DCT
+   (see 3).  The sub-partition *shape* choice
    is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
    would recover a little more (it picks a slightly too fine shape on some
    macroblocks).
@@ -591,7 +594,15 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    dispatcher also only ever measures the path it chose, so a stage is switched
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
-3. Threads beyond slices: a per-thread device context (so that slice threads
+3. Encoder features that need the profile to change: the 8x8 transform and
+   Intra_8x8 prediction (High profile, ~0.6-1.0 dB of inter and 1.5-2 dB of
+   intra efficiency), and CABAC (~10% of rate at equal quality).  MB-tree was
+   evaluated for the rate controller and is *not* in: at a fixed rate on the
+   two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
+   this environment has no real content to show the gain it is known for, so
+   two-pass allocation (which is measurable here, +3.8 dB) is the mechanism that
+   was kept.
+4. Threads beyond slices: a per-thread device context (so that slice threads
    and GPU stages can run at the same time -- today a picture with any stage on
    a device is coded by one thread), and frame-level threading (code picture
    N+1's decision pass while picture N is being written), which needs the
