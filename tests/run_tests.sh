@@ -137,6 +137,32 @@ run_case aq           320 192  8 4 -q 26 --aq 12
 # which is where the mode prediction and the reference handling meet.
 run_case all_intra    320 192  6 1 -q 26 -g 1
 run_case gop3         320 192 10 1 -q 26 -g 3
+# Slices: every slice is its own NAL and start code, so a macroblock in the top
+# row of a non-first slice must not predict from anything above it, and each
+# slice's data has to end exactly on its last macroblock (a slice that ends in
+# the middle of a picture is what tells the decoder to stop).  The decoder is
+# strict about both, so these run every slice count that the encoder supports
+# end to end, plus a picture whose rows do not divide evenly.
+run_case slices2      320 192  8 1 -q 26 --slices 2
+run_case slices3      320 192  8 4 -q 26 --slices 3
+run_case slices4      320 192  8 1 -q 26 --slices 4 -g 4
+run_case slices6      320 192  8 4 -q 22 --slices 6 --partitions 15
+run_case slices12     320 192  6 0 -q 26 --slices 12
+run_case slices_odd   320 208  4 1 -q 24 --slices 5
+run_case slices_small  64  64  6 0 -q 23 --slices 2
+run_case slices_pskip 320 192  8 3 -q 26 --slices 3
+# The same slices coded serially (-t 1) and by two threads have to produce the
+# same bytes -- a slice's bits are a function of its own rows only, so the
+# thread count must not be visible in the bitstream.
+run_case slices_serial 320 192 8 1 -q 26 --slices 4 -t 1
+run_case slices_thr    320 192 8 1 -q 26 --slices 4 -t 2
+# -t without --slices: one slice per thread, which is the shape the option is
+# meant for.
+run_case threads_only  320 192 8 4 -q 26 -t 2
+# Threads and the batched coefficient path together: the batch buffers live in
+# the encoder struct, which the threads copy, so each thread must end up with
+# its own.
+AEG_COEF_BATCH=1 run_case slices_coef 320 192 6 1 -q 26 --slices 4 -t 2 --partitions 15
 
 echo "== PSNR"
 python3 - "$TMP" "320" "192" "10" <<'PY'

@@ -17,9 +17,10 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | Intra_4x4 probes (random 16x16, 32x16 gradient) | 16x16, 32x16 | 24 … 33 | 2, 4 | 1 … 2 |
 | P_8x8 (four quadrants moving apart, all four `sub_mb_type` shapes) | 320x192, 96x64, 48x32 | 12, 20, 26, 34 | 2 | 6 … 8 |
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
+| slices (`--slices 2 … 12`, including uneven row counts) | 320x192, 320x208, 64x64 | 22 … 26 | 0, 1, 4 | 4 … 8 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs twenty-six encoded clip cases
+fails (non-zero exit) on any mismatch; it runs forty-one encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -44,6 +45,12 @@ Implemented and building without warnings:
   sub-macroblock picks its own `sub_mb_type`: 8x8, 8x4, 4x8 or 4x4.
 * P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
   the picture
+* multiple slices per picture (`--slices N`): the picture is cut into N row
+  ranges, each an independent NAL with its own slice header and
+  `first_mb_in_slice`, and every neighbour outside the current slice is
+  unavailable (see *Slices* below)
+* slice threads (`-t N`): the slices of a picture are coded concurrently, with
+  a bitstream identical to the serial one (see *Slice threads* below)
 * one-pass average-bitrate rate control (`--bitrate`, `AEG_RC_ABR`) and
   variance-based adaptive quantisation (`--aq`, off by default, see below)
 * presets scale the integer search range (8/16/24/32/48) and the subpel
@@ -88,7 +95,8 @@ Implemented and building without warnings:
     wrong half), and the DC-only shortcut is only valid when there is a
     prediction to add -- without one, a very large DC has to go through the
     int16 truncation that the shortcut would skip.
-* CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`
+* CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`,
+  `--slices N` and `-t N` (slice threads)
 
 ## Bugs found by the bit-exactness work (do not reintroduce)
 
@@ -318,6 +326,25 @@ Implemented and building without warnings:
     a *third* transcription of the reference.  The rule this is an instance of:
     a fast path must never be validated against another copy of itself.
 
+32. **A slice ended with an extra `0x80` byte, so the decoder walked out of
+    it.**  `code_slice()` aligned the bit writer and then called
+    `aeg_bw_finish()`, which aligns *again* -- a second, all-zero-padded
+    `0x80` byte at the end of every slice.  A single-slice picture could not
+    show this: the decoder stops at the last macroblock of the picture and the
+    tail is never read, so 30 conformance cases and a bit-exact reconstruction
+    stayed green for a whole afternoon of debugging.  A slice that ends in the
+    middle of a picture is decoded differently: FFmpeg's `decode_slice()` (the
+    non-threaded path) has no idea where the next slice starts, it only knows
+    that the slice is over when the bit reader lands *exactly* on the end of
+    the RBSP -- `get_bits_left(&sl->gb) <= 0`.  With the extra byte the reader
+    had 2 bits left after the last macroblock, fell through to the next
+    `ff_h264_decode_mb_cavlc()`, and decoded the following slice's header as
+    macroblock data ("left block unavailable for requested intra4x4 mode -1",
+    "error while decoding MB 0 6").  The lesson: *a bitstream bug that the
+    last macroblock of a picture hides is not a small bug* -- `decode_slice()`
+    consumes the very bits that a picture end makes unreachable, so
+    multi-slice is a stricter conformance test than the whole picture is.
+
 ## The coefficient stages as one batch per macroblock
 
 The forward transform + quantisation and the inverse transform of an inter
@@ -537,9 +564,114 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    dispatcher also only ever measures the path it chose, so a stage is switched
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
-3. Multi-slice and multi-threaded slice encoding are not implemented yet, and
-   rate control is picture-level only (no VBV/HRD model, no macroblock-tree
-   lookahead).
+3. Threads beyond slices: a per-thread device context (so that slice threads
+   and GPU stages can run at the same time -- today a picture with any stage on
+   a device is coded by one thread), and frame-level threading (code picture
+   N+1's decision pass while picture N is being written), which needs the
+   reconstruct-then-write split that the loop already has, plus one reference
+   picture per thread.  Rate control is picture-level only (no VBV/HRD model,
+   no macroblock-tree lookahead).
+
+## Slices
+
+`--slices N` cuts a picture into `N` row ranges (`slice_rows = ceil(mb_h / N)`,
+so a picture whose rows do not divide evenly gets fewer than `N` slices --
+320x208 has 13 rows, `--slices 5` gives slices of 3 rows: 5 slices, the last
+one with 1 row).  Each slice is a NAL of its own (`nal_ref_idc` 3 for IDR, 2
+otherwise; type 5/1) with its own slice header, `first_mb_in_slice = first_row
+* mb_w` and its own `rbsp_trailing_bits`.  The SPS and PPS still go out once per
+IDR picture.
+
+The interesting part is not the header, it is what the macroblocks may *not* do
+next to a slice boundary.  H.264 7.4.1.2.4 and 8.4.1.3: a macroblock outside
+the current slice is unavailable, which for row slices means that in the first
+row of every non-top slice
+
+* `intra4x4_pred_mode` and Intra_16x16/chroma prediction treat the whole row
+  above as unavailable (`DC`/`DC_128` instead of `DDR`/`DDL`, no top-right
+  samples, `prev_intra4x4_pred_mode_flag` predicted from the left only);
+* the deblocking filter does not touch the edge above the slice (that edge is
+  filtered by the slice above, from its side, where the samples are available);
+* the coefficient contexts `top_nz[]`, `luma_nc[]`, `chroma_nc[]` and
+  `luma_ac_nc[]` are zero, and `mb_qp_delta` chains restart from the slice QP;
+* MV prediction loses the B/C candidates of the row above, so `P_Skip`'s
+  implicit vector changes too.
+
+All of that is one `mby > e->top_row` test (`e->top_row` is the first row of the
+slice being coded) in each neighbour query, which is why the encoder only sets
+`top_row` around `code_slice()` and leaves it at 0 everywhere else.  With
+`n_slices == 1` the whole path is the code it was before slices existed.
+
+What it costs, 320x192, 60 frames, preset 2, QP 26:
+
+| slices | bytes | PSNR | encode |
+|---|---|---|---|
+| 1 | 67 906 | 45.32 dB | 82.9 fps |
+| 2 | 67 484 | 45.28 dB | 84.3 fps |
+| 3 | 70 076 | 45.30 dB | 91.2 fps |
+| 4 | 69 277 | 45.34 dB | 86.2 fps |
+| 6 | 71 415 | 45.36 dB | 95.1 fps |
+| 12 | 77 343 | 45.06 dB | 95.8 fps |
+
+The rate rises with the slice count (up to 14% at one slice per row) because
+prediction and the deblocking filter lose their vertical reach at every
+boundary; the picture quality at a fixed QP is flat, as it should be.  Slices
+are therefore a parallelism knob, not a compression one -- the point of them is
+that slices are what a decoder can decode in parallel, and what slice threads
+in the encoder can code in parallel (not implemented yet: the decision pass of
+every slice would have to run against the same reference picture and its own
+per-macroblock context, see *Next*).
+
+## Slice threads
+
+`-t N` codes the slices of a picture with `N` threads (`0` = one per CPU, `1` =
+serial, and `-t N` without `--slices` uses one slice per thread).  Nothing in
+the bitstream depends on it: the bytes are identical for any thread count,
+because a slice's bits are a function of its own rows only.
+
+The obstacle is that the encoder keeps the mode decision's working state in the
+encoder struct: `top_row`, the candidate list of the macroblock being analysed,
+the pending skip run, the bit writer, the stage timers.  Threading a per-thread
+context through a few hundred call sites of `analyse_mb()`/`code_mb()` would be
+a rewrite; instead each thread runs against its own *shallow copy* of
+`struct aeg_encoder`.  The copy carries the scratch, while every pointer in it
+(the source and reference pictures, the half/quarter-pel planes, the
+per-macroblock decisions, the slice bitstream buffers) still points at the
+original's memory.  That is safe because of what slices mean: a thread only
+writes the rows of its own slices (disjoint), and everything else it reads is
+read-only for the whole picture -- the same reason a decoder can decode the
+slices in parallel.
+
+Two things a copy cannot do, both handled in `encode_frame()`:
+
+* *grow a buffer*: a `realloc` in a copy would only grow that copy's pointer, so
+  every slice's bitstream buffer is allocated before the threads start;
+* *report a timer*: the stage timers and the dispatcher's counters are written
+  through the struct, so each copy starts with them zeroed and they are summed
+  after the join.  The bitstream is unaffected by that sum.
+
+A device context -- one OpenCL command queue or one CUDA stream -- is not safe
+to submit to from several threads, so the slice loop stays serial while any
+stage is dispatched to a non-CPU backend (`slice_thread_count()`); per-thread
+device contexts are the follow-up that lifts that restriction.
+
+320x192, 60 frames, preset 2, QP 26, on **two** cores:
+
+| slices | threads | encode | bytes |
+|---|---|---|---|
+| 1 | 1 | 85.8 fps | 67 906 |
+| 2 | 1 | 89.2 fps | 67 484 |
+| 4 | 1 | 85.5 fps | 69 277 |
+| 2 | 2 | 124.3 fps | 67 484 |
+| 4 | 2 | 151.0 fps | 69 277 |
+| 6 | 2 | 150.9 fps | 71 415 |
+
+So four slices on two threads is 1.76x the serial single-slice encoder for 2%
+more bytes.  The speedup is close to linear in the thread count while the slices
+are large enough to keep the threads busy: each slice costs the prediction and
+the deblocking filter its vertical reach, which is the price of the
+parallelism, and it is paid in bytes, not in quality (the PSNR at a fixed QP is
+flat, see the table in *Slices*).
 
 ## P_8x8 sub-macroblock partitions
 

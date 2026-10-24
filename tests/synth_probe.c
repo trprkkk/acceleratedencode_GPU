@@ -46,7 +46,8 @@ int main(int argc, char **argv)
     pps_len = aeg_write_pps(pps, sizeof(pps));
 
     aeg_bw_init(&bw, rbsp, sizeof(rbsp), 0);
-    aeg_write_slice_header(&bw, 2 /* I */, 0, 8, 1 /* idr */, 0, qp_delta, 0, 0, 0);
+    aeg_write_slice_header(&bw, 2 /* I */, 0, 8, 1 /* idr */, 0, qp_delta, 0, 0, 0,
+                             0 /* first_mb_in_slice */);
 
     /* I_16x16 DC prediction, cbp_chroma = 1, cbp_luma = 15 -> mb_type 19 */
     aeg_bw_ue(&bw, (uint32_t)mb_type);

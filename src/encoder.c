@@ -12,6 +12,9 @@
  * reconstruction with an independent decode of the bitstream.
  */
 #include <math.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
 #include "backend.h"
 
 #define AEG_LAMBDA(qp) (0.85 * pow(2.0, ((qp) - 12) / 3.0))
@@ -44,6 +47,10 @@ typedef struct mbenc {
  * sub_macroblock types and, per 4x4 block, the motion vector, plus the
  * predictor of every partition (indexed by its first 4x4 block). */
 #define AEG_MB_CAND_MAX 4
+
+/* Upper bound on the slices a picture may be cut into.  Slice threads use one
+ * thread per slice, so this also bounds the thread count. */
+#define AEG_MAX_SLICES 64
 typedef struct {
     int     type;
     int     nparts;
@@ -93,11 +100,24 @@ struct aeg_encoder {
     int idr_pic_id;
     int last_qp;
 
-    uint8_t *bs;    size_t bs_cap;
-    uint8_t *nal;   size_t nal_cap;
+    /* One RBSP buffer per slice: a slice is its own NAL unit, and with slice
+     * threads the slices are written by different threads at the same time.
+     * They are all allocated before the threads start, because the pointers
+     * live in the encoder and a per-thread copy of it must not grow its own
+     * (see slice_thread()). */
+    uint8_t *slice_bs[AEG_MAX_SLICES];
+    size_t slice_bs_cap[AEG_MAX_SLICES];
+    int n_threads;         /* threads used for the slice loop (1 = serial) */
     uint8_t *out;   size_t out_cap;
 
     aeg_stats st;
+
+    /* Every macroblock's decision, kept until the picture's bitstream is
+     * written.  The decision pass and the bitstream pass are separate so that
+     * the first one can run macroblocks out of order (see the threading note
+     * above encode_frame()); the second one needs them in raster order because
+     * CAVLC is serial.  About 1 kB per macroblock. */
+    mbenc *mb_encs;
 
     int16_t mv_batch[2 * 256];
     int32_t sad_batch[256];
@@ -144,6 +164,15 @@ struct aeg_encoder {
     uint8_t pred_c[2][8 * 8];
     int has_ref;
     int cur_is_p;           /* the picture being coded is a P slice */
+    /* Slice geometry of the picture being coded.  A slice owns a whole number
+     * of macroblock rows, so "the block above is in another slice" is one
+     * comparison.  H.264 treats every neighbour outside the current slice as
+     * unavailable (7.4.1.2.4 for intra prediction, 8.4.1.3 for MV prediction,
+     * the nC contexts of 9.2.1), which is exactly what top_row does: with one
+     * slice per picture it is 0 and nothing changes. */
+    int top_row;            /* first macroblock row of the current slice */
+    int slice_rows;         /* rows per slice, 0 = one slice per picture   */
+    int n_slices;
     int cur_qp;             /* QP of the picture being coded         */
 
     /* Per-macroblock QP offsets of the current picture (adaptive
@@ -372,7 +401,7 @@ static int left_nz(struct aeg_encoder *e, int mbx, int mby, int blk)
 
 static int top_nz(struct aeg_encoder *e, int mbx, int mby, int blk)
 {
-    return mby ? e->mbs[(mby - 1) * e->mb_w + mbx].nz[blk] : 0;
+    return mby > e->top_row ? e->mbs[(mby - 1) * e->mb_w + mbx].nz[blk] : 0;
 }
 
 static int luma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c, int blk)
@@ -380,7 +409,8 @@ static int luma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c, int 
     int bx = blk & 3, by = blk >> 2;
     int a = bx ? c->nz[blk - 1] : left_nz(e, mbx, mby, blk + 3);
     int b = by ? c->nz[blk - 4] : top_nz(e, mbx, mby, blk + 12);
-    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0, mby > 0 || by > 0);
+    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
+                       mby > e->top_row || by > 0);
 }
 
 static int chroma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
@@ -390,7 +420,8 @@ static int chroma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
     int bx = blk & 1, by = blk >> 1;
     int a = bx ? c->nz[base + blk - 1] : left_nz(e, mbx, mby, base + blk + 1);
     int b = by ? c->nz[base + blk - 2] : top_nz(e, mbx, mby, base + blk + 2);
-    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0, mby > 0 || by > 0);
+    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
+                       mby > e->top_row || by > 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,7 +447,8 @@ static int luma_ac_nc(struct aeg_encoder *e, int mbx, int mby,
         b = c->nz[blk - 4];
     else
         b = top_nz(e, mbx, mby, 12 + bx);
-    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0, mby > 0 || by > 0);
+    return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
+                       mby > e->top_row || by > 0);
 }
 
 static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
@@ -634,7 +666,7 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     static const int bxy[4][2] = { {0, 0}, {4, 0}, {0, 4}, {4, 4} };
     int qpc = aeg_qp_chroma(c->qp, 0);
     int pl, blk, i, x, y;
-    int avail_l = mbx > 0, avail_t = mby > 0;
+    int avail_l = mbx > 0, avail_t = mby > e->top_row;
 
     c->cbp &= 0x0f;
     for (pl = 0; pl < 2; pl++) {
@@ -727,7 +759,8 @@ static int intra16_sad(struct aeg_encoder *e, int mbx, int mby, int mode)
     for (y = 0; y < 16; y++)
         left[y] = p[-1 + y * e->stride[0]];
     aeg_intra_predict_16x16(e->pred_l, 16, p - e->stride[0], left,
-                            mby > 0, mbx > 0, mby > 0 && mbx > 0, mode);
+                            mby > e->top_row, mbx > 0,
+                            mby > e->top_row && mbx > 0, mode);
     return aeg_sad(16, 16, e->pred_l, 16, src, e->stride[0]);
 }
 
@@ -740,7 +773,8 @@ static int chroma_sad(struct aeg_encoder *e, int mbx, int mby, int pl, int mode)
     for (y = 0; y < 8; y++)
         left[y] = p[-1 + y * e->stride[1]];
     aeg_intra_predict_chroma(e->pred_c[pl], 8, p - e->stride[1], left,
-                             mby > 0, mbx > 0, mby > 0 && mbx > 0, mode);
+                             mby > e->top_row, mbx > 0,
+                             mby > e->top_row && mbx > 0, mode);
     return aeg_sad(8, 8, e->pred_c[pl], 8, src, e->stride[1]);
 }
 
@@ -888,7 +922,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
                    cur[((by - 1) << 2) + bx][1]);
         else
             nb_from_mb(&B, NULL, 0);
-    } else if (mby > 0) {
+    } else if (mby > e->top_row) {
         nb_from_mb(&B, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx);
     } else {
         nb_from_mb(&B, NULL, 0);
@@ -909,12 +943,12 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
         } else if (cy >= 0) {
             nb_set(&C, NB_UNAVAIL, 0, 0);
         } else if (cx <= 3) {
-            if (mby > 0)
+            if (mby > e->top_row)
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + cx);
             else
                 nb_from_mb(&C, NULL, 0);
         } else {
-            if (mby > 0 && mbx + 1 < e->mb_w)
+            if (mby > e->top_row && mbx + 1 < e->mb_w)
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx + 1], 12);
             else
                 nb_from_mb(&C, NULL, 0);
@@ -935,9 +969,9 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
                                ((by - 1) << 2) + 3);
                 else
                     nb_from_mb(&C, NULL, 0);
-            } else if (bx > 0 && mby > 0) {
+            } else if (bx > 0 && mby > e->top_row) {
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx - 1);
-            } else if (mby > 0 && mbx > 0) {
+            } else if (mby > e->top_row && mbx > 0) {
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx - 1], 15);
             } else {
                 nb_from_mb(&C, NULL, 0);
@@ -997,7 +1031,7 @@ static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
     int refa = -1, refb = -1, refc = -1, match;
 
     *mvx = *mvy = 0;
-    if (mbx <= 0 || mby <= 0)
+    if (mbx <= 0 || mby <= e->top_row)
         return;
     m = &e->mbs[mby * e->mb_w + mbx - 1];          /* A: left */
     if (is_inter_type(m->type)) {
@@ -1045,19 +1079,21 @@ static void reset_mb_enc(mbenc *c, int qp)
 }
 
 /* Chroma prediction modes in bitstream order: 0 = DC, 1 = horizontal,
- * 2 = vertical, 3 = plane.  Only the modes whose references exist are legal. */
-static int chroma_mode_ok(int cm, int mbx, int mby)
+ * 2 = vertical, 3 = plane.  Only the modes whose references exist are legal;
+ * "exists" means "inside this slice", so the first row of a slice counts like
+ * the first row of the picture (7.4.1.2.4). */
+static int chroma_mode_ok(const struct aeg_encoder *e, int cm, int mbx, int mby)
 {
     if ((cm == 1 || cm == 3) && mbx == 0)
         return 0;
-    if ((cm == 2 || cm == 3) && mby == 0)
+    if ((cm == 2 || cm == 3) && mby <= e->top_row)
         return 0;
     return 1;
 }
 
-static int luma_mode_ok(int mode, int mbx, int mby)
+static int luma_mode_ok(const struct aeg_encoder *e, int mode, int mbx, int mby)
 {
-    if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && mby == 0)
+    if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && mby <= e->top_row)
         return 0;
     if ((mode == AEG_MB_I_H || mode == AEG_MB_I_P) && mbx == 0)
         return 0;
@@ -1073,7 +1109,7 @@ static int chroma_mode_by_sad(struct aeg_encoder *e, int mbx, int mby)
     int cm, best = 0, best_sad = 1 << 30;
     for (cm = 0; cm < 4; cm++) {
         int s;
-        if (!chroma_mode_ok(cm, mbx, mby))
+        if (!chroma_mode_ok(e, cm, mbx, mby))
             continue;
         s = chroma_sad(e, mbx, mby, 0, cm) + chroma_sad(e, mbx, mby, 1, cm);
         if (s < best_sad) { best_sad = s; best = cm; }
@@ -1571,7 +1607,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     int mode, n = 0, sad_of[4];
 
     for (mode = 0; mode < 4; mode++)
-        sad_of[mode] = luma_mode_ok(mode, mbx, mby)
+        sad_of[mode] = luma_mode_ok(e, mode, mbx, mby)
                            ? intra16_sad(e, mbx, mby, mode) : (1 << 30);
     /* insertion sort: four entries, cheapest first */
     for (mode = 0; mode < 4; mode++) {
@@ -1600,7 +1636,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * coded (writing them as an I macroblock desynchronises the decoder). */
     if (e->p.partitions != 0 && c->qp >= 0 && e->has_ref && e->cur_is_p) {
         int mvx, mvy, sad;
-        aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby,
+        aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, e->top_row,
                        &e->mb_pmv[0], &e->mb_pmv[1]);
         /* The block to match is the *source* macroblock.  recp still holds the
          * previous picture at this position (nothing has been reconstructed
@@ -1834,7 +1870,7 @@ static int intra4_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
     }
     if (by > 0) {
         b = cur[intra4_idx(bx, by - 1)];
-    } else if (mby > 0) {
+    } else if (mby > e->top_row) {
         const aeg_mb *m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         b = m->type == AEG_MB_I4x4 ? m->intra4[intra4_idx(bx, 3)] : 2;
     } else {
@@ -1867,7 +1903,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         int ry = ((blk >> 3) & 1) * 2 + ((blk >> 1) & 1);
         int bx = rx * 4, by = ry * 4;
         int rb = ry * 4 + rx;           /* raster index of the block */
-        int top_avail = mby > 0 || by > 0;
+        int top_avail = mby > e->top_row || by > 0;
         int left_avail = mbx > 0 || bx > 0;
         /* The four samples p[4..7][-1] continue to the right of the block.
          * Inside the macroblock they belong to the block one column right in
@@ -1881,7 +1917,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         if (by)
             tr_avail = bx < 12 && !((rx & 1) && (ry & 1));
         else
-            tr_avail = mby > 0 && (bx < 12 || mbx + 1 < e->mb_w);
+            tr_avail = mby > e->top_row && (bx < 12 || mbx + 1 < e->mb_w);
         uint8_t top[8], left[4], pred[16];
         const uint8_t *sb = src + by * s + bx;
         uint8_t *db = dst + by * s + bx;
@@ -2209,7 +2245,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         int cm;
         cbest = best;
         for (cm = 0; cm < 4; cm++) {
-            if (!chroma_mode_ok(cm, mbx, mby))
+            if (!chroma_mode_ok(e, cm, mbx, mby))
                 continue;
             t = best;
             {
@@ -2499,17 +2535,212 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
     (void)is_idr;
 }
 
+/* One slice of the current picture: macroblock rows `first_row` to `last_row`
+ * (inclusive), written as a complete NAL payload (RBSP) of its own.
+ *
+ * A slice is the unit of independence in H.264, which is what makes slice
+ * threads possible: every neighbour outside the slice counts as unavailable
+ * (see `top_row`), the nC contexts restart, and the QP context restarts with
+ * the slice's own slice_qp_delta.  With one slice per picture nothing above
+ * changes and the bitstream is exactly what it was before slices existed. */
+static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
+                      int first_row, int last_row, int is_p, int is_idr,
+                      size_t *rbsp_len)
+{
+    int mbx, mby;
+    int skip_run = 0;
+    aeg_bitwriter bw;
+
+    e->top_row = first_row;
+    e->last_qp = e->cur_qp;
+    aeg_bw_init(&bw, bs, cap, 0);
+    aeg_write_slice_header(&bw, is_p ? 5 : 7,
+                           e->frame_num & ((1 << e->frame_num_bits) - 1),
+                           e->frame_num_bits, is_idr, e->idr_pic_id,
+                           e->cur_qp - 26, 0, 0,
+                           e->p.deblock ? 0 : 1, first_row * e->mb_w);
+
+    /* ---- decision pass -------------------------------------------------
+     * Everything that decides *what* a macroblock is: the motion search, the
+     * mode decision, the transform/quantise/reconstruct of every candidate and
+     * the reconstruction written into the picture.  Nothing here writes to the
+     * bitstream, so the macroblocks only have to be processed in an order that
+     * respects their neighbours (see the note above aeg_encoder_encode). */
+    for (mby = first_row; mby <= last_row; mby++) {
+        for (mbx = 0; mbx < e->mb_w; mbx++) {
+            int idx = mby * e->mb_w + mbx;
+            mbenc *tmp = &e->mb_encs[idx];
+            aeg_mb *m = &e->mbs[idx];
+            int i;
+            int64_t t0 = aeg_now_ns();
+
+            reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
+            analyse_mb(e, mbx, mby, tmp);
+            e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
+
+            t0 = aeg_now_ns();
+            code_mb(e, mbx, mby, tmp);
+            e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+
+            /* store the decisions for the neighbour queries of the following
+             * macroblocks (and for the deblocking filter) */
+            memset(m, 0, sizeof(*m));
+            m->type = (uint8_t)tmp->type;
+            m->i16_mode = (uint8_t)tmp->i16_mode;
+            m->chroma_mode = (uint8_t)tmp->chroma_mode;
+            m->cbp = (uint8_t)tmp->cbp;
+            m->qp = (int8_t)tmp->qp;
+            for (i = 0; i < 16; i++)
+                m->intra4[i] = tmp->intra4[i];
+            for (i = 0; i < AEG_BLK_COUNT; i++)
+                m->nz[i] = tmp->nz[i];
+            for (i = 0; i < 16; i++) {
+                m->mv[i][0] = tmp->mv[i][0];
+                m->mv[i][1] = tmp->mv[i][1];
+            }
+            m->cost = (int32_t)tmp->sse;
+        }
+    }
+
+    /* ---- bitstream pass ------------------------------------------------
+     * CAVLC is serial: the bit cost and the bits themselves depend on the
+     * non-zero counts of the neighbours, so the macroblocks go out in raster
+     * order, and mb_qp_delta depends on the previous macroblock's QP. */
+    for (mby = first_row; mby <= last_row; mby++) {
+        for (mbx = 0; mbx < e->mb_w; mbx++) {
+            int idx = mby * e->mb_w + mbx;
+            mbenc *tmp = &e->mb_encs[idx];
+            int64_t t0 = aeg_now_ns();
+
+            /* A macroblock without any coded residual does not carry an
+             * mb_qp_delta (H.264 7.3.5), so the decoder keeps the previous QP
+             * for it.  Reconstruction is the prediction either way, but the
+             * deblocking filter reads the QP, so the encoder has to keep the
+             * same value: fall back to the QP the decoder is still using. */
+            if (!luma_cbp_on(tmp) && !chroma_cbp(tmp) &&
+                tmp->type != AEG_MB_I16x16)
+                tmp->qp = e->last_qp;
+            e->mbs[idx].qp = (int8_t)tmp->qp;
+
+            /* emit.  A P_L0_16x16 macroblock whose motion vector equals the
+             * predictor and that carries no residual at all reconstructs
+             * exactly like P_Skip (same prediction, no residual), so it is
+             * coded as part of the skip run: same picture, fewer bits. */
+            {
+                int skipped = 0;
+                if (is_p && tmp->type == AEG_MB_P16x16 && tmp->cbp == 0) {
+                    int pmvx, pmvy;
+                    pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+                    if (tmp->mv[0][0] == pmvx && tmp->mv[0][1] == pmvy)
+                        skipped = 1;
+                }
+                if (skipped)
+                    skip_run++;
+                else {
+                    if (is_p)
+                        flush_skip_run(&bw, &skip_run);
+                    write_mb(e, &bw, mbx, mby, tmp, is_p);
+                }
+            }
+            e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+        }
+    }
+    /* A skip run that reaches the end of the frame still has to be emitted:
+     * the decoder counts macroblocks by consuming mb_skip_run values, so an
+     * unwritten tail run makes it stop before the last row. */
+    if (is_p && skip_run > 0)
+        flush_skip_run(&bw, &skip_run);
+    /* aeg_bw_finish() appends rbsp_trailing_bits (the stop bit and the zero
+     * padding); aligning here as well used to add a second, all-zero-padded
+     * 0x80 byte.  A single slice could get away with it - the decoder stops at
+     * the end of the picture and ignores the tail - but a slice that ends in
+     * the middle of the picture must end exactly at its last macroblock, or
+     * the decoder keeps reading macroblocks out of the next slice's header. */
+    *rbsp_len = aeg_bw_finish(&bw);
+    return AEG_OK;
+}
+
+/* How many threads the slice loop may use.  A device context (one command
+ * queue) is not safe to submit to from several threads, so as long as any stage
+ * is dispatched to a non-CPU backend the slices stay serial; per-thread device
+ * contexts are the follow-up that lifts that. */
+static int slice_thread_count(const struct aeg_encoder *e)
+{
+    int k;
+
+    if (e->n_threads <= 1 || e->n_slices <= 1)
+        return 1;
+    for (k = 0; k < AEG_STAGE_COUNT; k++)
+        if (e->d.use_gpu[k] && e->d.ops.backend != AEG_BACKEND_CPU)
+            return 1;
+    return e->n_threads;
+}
+
+/* ------------------------------------------------------------------ */
+/* Slice threads                                                       */
+/* ------------------------------------------------------------------ */
+/* A slice is coded entirely from the samples and the decisions of its own
+ * macroblock rows (that is what code_slice() makes true: every neighbour outside
+ * the slice is unavailable), so two slices can be coded at the same time.  What
+ * they cannot share is the encoder's *scratch*: `top_row`, the candidate list of
+ * the macroblock being analysed, the pending skip run, the bit writer, the stage
+ * timers.  Those are plain fields of struct aeg_encoder, so rather than thread a
+ * per-thread context through every function of the mode decision, each thread
+ * runs against its own shallow copy of the encoder: the copy carries the
+ * scratch, and every pointer in it (the source and reference pictures, the
+ * coefficient planes, the per-macroblock decisions, the slice buffers) points at
+ * the same memory as the original.  The macroblocks a thread touches are exactly
+ * the rows of the slices it owns, so its writes into that shared memory are
+ * disjoint from every other thread's, and everything else it reads it does not
+ * write at all.
+ *
+ * Two consequences, both handled in encode_frame():
+ *   - whatever a thread writes through the struct (the stage timers, the
+ *     dispatcher's counters) has to be merged back after the join, and
+ *   - a buffer that a thread *grows* would be grown in its private copy, so
+ *     every slice buffer is allocated before the threads start.
+ * The bitstream does not depend on the thread count or on which thread coded
+ * which slice: a slice's bits are a function of its own rows only. */
+typedef struct {
+    struct aeg_encoder *te;       /* the thread's copy of the encoder     */
+    int tid, nthreads;
+    int is_p, is_idr;
+    size_t lens[AEG_MAX_SLICES];
+    int err;
+} slice_job;
+
+static void *slice_thread(void *arg)
+{
+    slice_job *j = (slice_job *)arg;
+    struct aeg_encoder *te = j->te;
+    int si;
+
+    for (si = j->tid; si < te->n_slices; si += j->nthreads) {
+        int first_row = si * te->slice_rows;
+        int last_row = first_row + te->slice_rows;
+
+        if (first_row >= te->mb_h)
+            break;
+        if (last_row > te->mb_h)
+            last_row = te->mb_h;
+        if (code_slice(te, te->slice_bs[si], te->slice_bs_cap[si], first_row,
+                       last_row - 1, j->is_p, j->is_idr, &j->lens[si]) != AEG_OK) {
+            j->err = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
 static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                         aeg_packet *pkt)
 {
-    int mbx, mby;
     int is_p = !is_idr && e->has_ref;
-    size_t rbsp_len, out_len;
-    aeg_bitwriter bw;
-    int skip_run = 0;
+    size_t out_len;
     int64_t t_all = aeg_now_ns();
 
-    if (ensure_buf(&e->bs, &e->bs_cap, (size_t)e->mb_count * 400 + 16384) != AEG_OK)
+    if (ensure_buf(&e->out, &e->out_cap,
+                   (size_t)e->mb_count * 400 * 3 + 65536) != AEG_OK)
         return AEG_ENOMEM;
 
     /* the picture's QP: constant in CQP, the controller's output in ABR */
@@ -2555,100 +2786,16 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     }
     me_seed_frame(e);
 
-    aeg_bw_init(&bw, e->bs, e->bs_cap, 0);
     /* frame_num counts the pictures since the last IDR (H.264 8.2.1): an IDR
      * always carries 0, otherwise the decoder invents "non-existing" frames to
      * fill the gap. */
     if (is_idr)
         e->frame_num = 0;
-    aeg_write_slice_header(&bw, is_p ? 5 : 7,
-                           e->frame_num & ((1 << e->frame_num_bits) - 1),
-                           e->frame_num_bits, is_idr, e->idr_pic_id,
-                           e->cur_qp - 26, 0, 0,
-                           e->p.deblock ? 0 : 1);
-    e->last_qp = e->cur_qp;
     e->cur_is_p = is_p;
 
-    for (mby = 0; mby < e->mb_h; mby++) {
-        for (mbx = 0; mbx < e->mb_w; mbx++) {
-            {
-                mbenc tmp;
-                int64_t t0 = aeg_now_ns();
-                reset_mb_enc(&tmp, mb_qp_of(e, mbx, mby));
-                analyse_mb(e, mbx, mby, &tmp);
-                e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
-
-                t0 = aeg_now_ns();
-                code_mb(e, mbx, mby, &tmp);
-                e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
-
-                /* A macroblock without any coded residual does not carry an
-                 * mb_qp_delta (H.264 7.3.5), so the decoder keeps the previous
-                 * QP for it.  Reconstruction is the prediction either way, but
-                 * the deblocking filter reads the QP, so the encoder has to
-                 * keep the same value: fall back to the QP the decoder is
-                 * still using. */
-                if (!luma_cbp_on(&tmp) && !chroma_cbp(&tmp) &&
-                    tmp.type != AEG_MB_I16x16)
-                    tmp.qp = e->last_qp;
-
-                /* store the decisions for the neighbour queries */
-                {
-                    aeg_mb *m = &e->mbs[mby * e->mb_w + mbx];
-                    int i;
-                    memset(m, 0, sizeof(*m));
-                    m->type = (uint8_t)tmp.type;
-                    m->i16_mode = (uint8_t)tmp.i16_mode;
-                    m->chroma_mode = (uint8_t)tmp.chroma_mode;
-                    m->cbp = (uint8_t)tmp.cbp;
-                    m->qp = (int8_t)tmp.qp;
-                    for (i = 0; i < 16; i++)
-                        m->intra4[i] = tmp.intra4[i];
-                    for (i = 0; i < AEG_BLK_COUNT; i++)
-                        m->nz[i] = tmp.nz[i];
-                    for (i = 0; i < 16; i++) {
-                        m->mv[i][0] = tmp.mv[i][0];
-                        m->mv[i][1] = tmp.mv[i][1];
-                    }
-                    m->cost = (int32_t)tmp.sse;
-                }
-
-                /* emit.  A P_L0_16x16 macroblock whose motion vector equals the
-                 * predictor and that carries no residual at all reconstructs
-                 * exactly like P_Skip (same prediction, no residual), so it is
-                 * coded as part of the skip run: same picture, fewer bits. */
-                {
-                    int skipped = 0;
-                    if (is_p && tmp.type == AEG_MB_P16x16 && tmp.cbp == 0) {
-                        int pmvx, pmvy;
-                        pskip_mv(e, mbx, mby, &pmvx, &pmvy);
-                        if (tmp.mv[0][0] == pmvx && tmp.mv[0][1] == pmvy)
-                            skipped = 1;
-                    }
-                    if (skipped)
-                        skip_run++;
-                    else {
-                        if (is_p)
-                            flush_skip_run(&bw, &skip_run);
-                        write_mb(e, &bw, mbx, mby, &tmp, is_p);
-                    }
-                }
-                e->st.frames += 0;
-            }
-        }
-    }
-    /* A skip run that reaches the end of the frame still has to be emitted:
-     * the decoder counts macroblocks by consuming mb_skip_run values, so an
-     * unwritten tail run makes it stop before the last row. */
-    if (is_p && skip_run > 0)
-        flush_skip_run(&bw, &skip_run);
-    aeg_bw_align_one(&bw);
-    rbsp_len = aeg_bw_finish(&bw);
-
-    if (ensure_buf(&e->nal, &e->nal_cap, rbsp_len * 3 + 64) != AEG_OK ||
-        ensure_buf(&e->out, &e->out_cap, rbsp_len * 3 + 512) != AEG_OK)
-        return AEG_ENOMEM;
-
+    /* One slice per picture is the default and keeps the bitstream single-NAL;
+     * `--slices N` (or `-t N`, which uses one slice per thread) cuts the picture
+     * into N row ranges, each an independently decodable NAL. */
     out_len = 0;
     if (is_idr) {
         uint8_t sps[256], pps[64];
@@ -2660,8 +2807,120 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 8,
                                  pps, pl, 0);
     }
-    out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
-                             is_idr ? 3 : 2, is_idr ? 5 : 1, e->bs, rbsp_len, 0);
+    {
+        size_t lens[AEG_MAX_SLICES];
+        int si;
+
+        memset(lens, 0, sizeof(lens));
+        /* allocate every slice buffer up front: the pointers live in the
+         * encoder struct that the threads copy */
+        for (si = 0; si < e->n_slices; si++) {
+            int first_row = si * e->slice_rows;
+            int last_row = first_row + e->slice_rows;
+
+            if (first_row >= e->mb_h)
+                break;
+            if (last_row > e->mb_h)
+                last_row = e->mb_h;
+            if (ensure_buf(&e->slice_bs[si], &e->slice_bs_cap[si],
+                           (size_t)(last_row - first_row) * e->mb_w * 400 +
+                           16384) != AEG_OK)
+                return AEG_ENOMEM;
+        }
+
+        if (slice_thread_count(e) > 1) {
+            int nt = slice_thread_count(e);
+            struct aeg_encoder *copies = calloc((size_t)nt, sizeof(*copies));
+            slice_job *jobs = calloc((size_t)nt, sizeof(*jobs));
+            pthread_t *th = calloc((size_t)nt, sizeof(*th));
+
+            if (!copies || !jobs || !th) {
+                free(copies);
+                free(jobs);
+                free(th);
+                return AEG_ENOMEM;
+            }
+            for (si = 0; si < nt; si++) {
+                copies[si] = *e;
+                /* the timers are accumulated per thread and summed below, so
+                 * the copy must not inherit (and then re-add) the picture's */
+                memset(copies[si].st.stage_ns, 0,
+                       sizeof(copies[si].st.stage_ns));
+                memset(copies[si].st.stage_gpu_ns, 0,
+                       sizeof(copies[si].st.stage_gpu_ns));
+                memset(copies[si].st.stage_cpu_ns, 0,
+                       sizeof(copies[si].st.stage_cpu_ns));
+                memset(copies[si].d.cpu_ns, 0, sizeof(copies[si].d.cpu_ns));
+                memset(copies[si].d.gpu_ns, 0, sizeof(copies[si].d.gpu_ns));
+                jobs[si].te = &copies[si];
+                jobs[si].tid = si;
+                jobs[si].nthreads = nt;
+                jobs[si].is_p = is_p;
+                jobs[si].is_idr = is_idr;
+                jobs[si].err = 0;
+            }
+            for (si = 1; si < nt; si++)
+                if (pthread_create(&th[si], NULL, slice_thread, &jobs[si]) != 0) {
+                    slice_thread(&jobs[si]);  /* no thread: run it here */
+                    th[si] = 0;
+                }
+            slice_thread(&jobs[0]);           /* this thread codes slice 0 */
+            for (si = 1; si < nt; si++)
+                if (th[si])
+                    pthread_join(th[si], NULL);
+
+            {
+                int bad = 0;
+
+                for (si = 0; si < nt; si++) {
+                    int k;
+
+                    if (jobs[si].err)
+                        bad = 1;
+                    for (k = 0; k < e->n_slices && k < AEG_MAX_SLICES; k++)
+                        if (jobs[si].lens[k])
+                            lens[k] = jobs[si].lens[k];
+                    for (k = 0; k < AEG_STAGE_COUNT; k++) {
+                        e->st.stage_ns[k] += copies[si].st.stage_ns[k];
+                        e->st.stage_gpu_ns[k] += copies[si].st.stage_gpu_ns[k];
+                        e->st.stage_cpu_ns[k] += copies[si].st.stage_cpu_ns[k];
+                        e->d.cpu_ns[k][0] += copies[si].d.cpu_ns[k][0];
+                        e->d.gpu_ns[k][0] += copies[si].d.gpu_ns[k][0];
+                    }
+                }
+                free(copies);
+                free(jobs);
+                free(th);
+                if (bad)
+                    return AEG_ENOMEM;
+            }
+        } else {
+            for (si = 0; si < e->n_slices; si++) {
+                int first_row = si * e->slice_rows;
+                int last_row = first_row + e->slice_rows;
+                size_t sl_len = 0;
+
+                if (first_row >= e->mb_h)
+                    break;
+                if (last_row > e->mb_h)
+                    last_row = e->mb_h;
+                if (code_slice(e, e->slice_bs[si], e->slice_bs_cap[si],
+                               first_row, last_row - 1, is_p, is_idr,
+                               &sl_len) != AEG_OK)
+                    return AEG_ENOMEM;
+                lens[si] = sl_len;
+            }
+        }
+
+        for (si = 0; si < e->n_slices; si++) {
+            if (!lens[si])
+                break;
+            out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
+                                     is_idr ? 3 : 2, is_idr ? 5 : 1,
+                                     e->slice_bs[si], lens[si], 0);
+        }
+    }
+    e->top_row = 0;
 
     /* deblock the reconstructed picture */
     {
@@ -2820,6 +3079,32 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         return NULL;
     }
     aeg_mc_ctx_init(&e->mc, e->w, e->h, e->stride[0]);
+    e->top_row = 0;
+    /* One slice per picture unless the caller asked for more.  Slices own whole
+     * macroblock rows, and that is the granularity the picture is cut at. */
+    {
+        int want = pp->slices > 0 ? pp->slices : 0;
+        int th = pp->threads > 0 ? pp->threads : 0;
+
+        /* -t N without --slices means one slice per thread: slices are what
+         * makes the rows independent, so a thread needs its own slice. */
+        if (want <= 0)
+            want = th > 1 ? th : 1;
+        if (want > AEG_MAX_SLICES) want = AEG_MAX_SLICES;
+        if (want > e->mb_h) want = e->mb_h;
+        e->slice_rows = (e->mb_h + want - 1) / want;
+        e->n_slices = (e->mb_h + e->slice_rows - 1) / e->slice_rows;
+
+        /* threads: 0 = auto (the CPUs there are, capped at the slice count) */
+        if (th <= 0) {
+            long nc = sysconf(_SC_NPROCESSORS_ONLN);
+            th = (nc > 0 && nc < 64) ? (int)nc : 8;
+        }
+        if (th > e->n_slices) th = e->n_slices;
+        if (th < 1) th = 1;
+        e->n_threads = th;
+    }
+    e->mb_encs = (mbenc *)aeg_alloc((size_t)e->mb_count * sizeof(mbenc));
     e->seed_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
     e->seed_cand = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 4 *
                                         sizeof(int16_t));
@@ -2994,6 +3279,7 @@ void aeg_encoder_close(aeg_encoder *enc)
         return;
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);
+    aeg_free(e->mb_encs);
     aeg_free(e->seed_mv);
     aeg_free(e->seed_cand);
     aeg_free(e->prev_seed);
@@ -3007,8 +3293,11 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->src_mem);
     aeg_free(e->rec_mem);
     aeg_free(e->ref_mem);
-    aeg_free(e->bs);
-    aeg_free(e->nal);
+    {
+        int i;
+        for (i = 0; i < AEG_MAX_SLICES; i++)
+            aeg_free(e->slice_bs[i]);
+    }
     aeg_free(e->out);
     aeg_free(e);
 }

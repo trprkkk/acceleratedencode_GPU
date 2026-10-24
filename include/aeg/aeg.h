@@ -102,6 +102,7 @@ typedef struct aeg_params {
     int gop_size;             /* keyframe interval, 0 = only first      */
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
+    int slices;               /* slices per picture, 0/1 = one           */
     int backend;              /* aeg_backend                            */
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */
     int aq_mode;              /* 0 off, 1 variance AQ                   */

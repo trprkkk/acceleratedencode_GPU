@@ -452,7 +452,7 @@ static inline int mv_median(int a, int b, int c)
  * macroblock above-right does not exist, which is what makes a macroblock on
  * the right border predict differently from one in the middle of the line. */
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w, int mb_x, int mb_y,
-                    int *mvx, int *mvy)
+                    int top_row, int *mvx, int *mvy)
 {
     const aeg_mb *m;
     int ax = 0, ay = 0, bx = 0, by = 0, cx = 0, cy = 0;
@@ -463,16 +463,16 @@ void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w, int mb_x, int mb
         a_av = !is_intra_mb(m);
         ax = m->mv[3][0];  ay = m->mv[3][1];
     }
-    if (mb_y > 0) {
+    if (mb_y > top_row) {
         m = &mbs[(mb_y - 1) * mb_stride + mb_x];
         b_av = !is_intra_mb(m);
         bx = m->mv[12][0]; by = m->mv[12][1];
     }
-    if (mb_y > 0 && mb_x + 1 < mb_w) {
+    if (mb_y > top_row && mb_x + 1 < mb_w) {
         m = &mbs[(mb_y - 1) * mb_stride + mb_x + 1];
         c_av = !is_intra_mb(m);
         cx = m->mv[12][0]; cy = m->mv[12][1];
-    } else if (mb_y > 0 && mb_x > 0) {
+    } else if (mb_y > top_row && mb_x > 0) {
         m = &mbs[(mb_y - 1) * mb_stride + mb_x - 1];
         c_av = !is_intra_mb(m);
         cx = m->mv[15][0]; cy = m->mv[15][1];

@@ -154,7 +154,7 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap);
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int slice_qp_delta, int deblock_alpha,
-                              int deblock_beta, int deblock_idc);
+                              int deblock_beta, int deblock_idc, int first_mb);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma
@@ -283,7 +283,7 @@ int  aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                   int pred_x, int pred_y, const int seed[2],
                   const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out);
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
-                    int mb_x, int mb_y,
+                    int mb_x, int mb_y, int top_row,
                     int *mvx, int *mvy);
 int  aeg_ue_bits(uint32_t v);
 int  aeg_se_bits(int32_t v);

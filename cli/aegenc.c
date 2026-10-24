@@ -35,6 +35,10 @@ static void usage(void)
 "  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
 "  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
 "                   default 10 = x264 aq-strength 1.0)\n"
+"  --slices <n>     slices per picture (0/1 = one slice; n>1 cuts the\n"
+"                   picture into n row ranges, one NAL each)\n"
+"  -t <int>         slice threads (0 = auto, 1 = serial; -t N without\n"
+"                   --slices uses one slice per thread)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8 (8x8 with 8x4/4x8/4x4 sub-partitions)\n"
 "                   (default 15; P_8x8 is skipped by preset 0)\n"
@@ -117,6 +121,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-n")) max_frames = atoi(argv[++i]);
         else if (!strcmp(a, "-b")) backend = parse_backend(argv[++i]);
         else if (!strcmp(a, "-p")) p.preset = atoi(argv[++i]);
+        else if (!strcmp(a, "--slices")) p.slices = atoi(argv[++i]);
+        else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
+            p.threads = atoi(argv[++i]);
         else if (!strcmp(a, "-v")) verbose = atoi(argv[++i]);
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
@@ -262,8 +269,13 @@ int main(int argc, char **argv)
             aeg_encoder_stats(enc, &st);
             printf("encoded %d frames in %.3f s (%.2f fps), %" PRId64 " bytes\n",
                    n, secs, secs > 0 ? n / secs : 0.0, st.bytes);
-            printf("bitrate %.1f kb/s, PSNR %.2f dB (Y+U+V average)\n",
-                   secs > 0 ? st.bytes * 8.0 / secs / 1000.0 : 0.0, st.psnr_avg);
+            /* the stream's rate is a property of the file and the frame rate,
+             * not of how fast this machine happened to encode it */
+            printf("bitrate %.1f kb/s at %d fps, PSNR %.2f dB (Y+U+V average)\n",
+                   st.frames > 0
+                       ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0
+                       : 0.0,
+                   fps, st.psnr_avg);
             for (i = 0; i < AEG_STAGE_COUNT; i++)
                 if (st.stage_ns[i] > 0)
                     printf("  stage %-12s %8.1f ms  %s\n", aeg_stage_name(i),

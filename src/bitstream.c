@@ -242,9 +242,9 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap)
 void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                             int frame_num_bits, int idr, int idr_pic_id,
                             int slice_qp_delta, int deblock_alpha,
-                            int deblock_beta, int deblock_idc)
+                            int deblock_beta, int deblock_idc, int first_mb)
 {
-    aeg_bw_ue(bw, 0);                 /* first_mb_in_slice                  */
+    aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type);
     aeg_bw_ue(bw, 0);                 /* pic_parameter_set_id               */
     aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
