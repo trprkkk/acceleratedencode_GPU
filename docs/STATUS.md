@@ -55,6 +55,8 @@ Implemented and building without warnings:
   unavailable (see *Slices* below)
 * slice threads (`-t N`): the slices of a picture are coded concurrently, with
   a bitstream identical to the serial one (see *Slice threads* below)
+* two-pass rate control (`--pass 1/2 --stats <file>`, `--qcomp`, see *Two-pass
+  rate control* below)
 * one-pass average-bitrate rate control (`--bitrate`, `AEG_RC_ABR`) and
   variance-based adaptive quantisation (`--aq`, off by default, see below)
 * presets scale the integer search range (8/16/24/32/48) and the subpel
@@ -598,6 +600,54 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    lookahead), and the VBV model tracks the buffer level between pictures
    rather than the coded-picture removal times a full HRD also signals
    (`cpb_removal_delay` in the SPS VUI).
+
+## Two-pass rate control
+
+`--pass 1 --stats F` codes the stream at a fixed QP and records the bits each
+picture took; `--pass 2 --stats F --bitrate N` uses those numbers to decide how
+the bits are shared out.
+
+The interesting part is what a first pass is *for*.  Scaling the measurements to
+the target (`bits_i` proportional to `bits_i`) is exactly a constant QP shift --
+it measures nothing.  The allocation is `bits_i ~ complexity_i^qcomp` with
+`qcomp = 0.6` (x264's default), which gives the hard pictures slightly less than
+proportional and the easy ones slightly more; that is the right direction because
+distortion per bit falls faster in flat, well-predicted areas than in busy ones.
+With `t_i ~ b_i^alpha` normalised to the same total, the QP of a picture relative
+to a constant-QP stream is
+
+    QP_i - QP = 6 * (1 - alpha) * (log2 b_i - mean_j log2 b_j)
+
+so the result is a *mean-zero per-picture QP bias* that depends only on how
+unusual a picture is, not on the target rate.  That is why pass 2 keeps the
+normal rate controller: the controller owns the level (the stream still lands on
+target), the bias owns the distribution
+(`aeg_encoder_set_qp_offset()`).  With `--qcomp 100` the bias is identically
+zero and pass 2 reproduces the one-pass stream bit for bit -- which is what the
+`qcomp` check in the suite relies on.
+
+Measured on a 60-picture clip made of two 30-picture clips of very different
+complexity (140 kb/s against 311 kb/s at QP 26):
+
+| mode | rate | PSNR |
+|---|---|---|
+| one-pass ABR, target 250 kb/s | 267.8 kb/s | 38.56 dB |
+| two-pass, target 250 kb/s | 248.1 kb/s | **42.32 dB** |
+| one-pass ABR, target 300 kb/s | 307.9 kb/s | 40.48 dB |
+| two-pass, target 300 kb/s | 297.0 kb/s | **44.72 dB** |
+
+Two-pass is 3.8 dB better at a 7% lower rate, and it is also more accurate: the
+one-pass controller overspends by 7% here because the picture after the join
+costs ten times a P picture, and a one-pass controller only finds that out by
+coding it.  On a single-complexity clip the gain is the smaller, honest one:
+300.6 kb/s / 46.37 dB against 300.5 / 46.10 for one pass (+0.27 dB at the same
+rate).
+
+The same round fixed the one-pass controller's response to a picture that costs
+ten times the target (a keyframe, or any picture after a scene cut): the debt it
+creates is now clamped to three pictures' worth, because letting a single
+overshoot follow the controller for the whole window is what turns one expensive
+picture into thirty bad ones -- on the clip above it cost 10 dB.
 
 ## Scene cuts
 

@@ -178,6 +178,11 @@ int  aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out);
 int  aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3],
                        int stride[3], int mb_qp[]);
 int  aeg_encoder_set_qp(aeg_encoder *enc, int qp);
+/* Bias the QP of the pictures that follow, in QP steps (positive = coarser).
+ * The two-pass mode uses it to redistribute a fixed budget: the rate controller
+ * keeps the stream on target, the bias moves bits from the pictures that are
+ * easy to the ones that are hard.  It is cleared by aeg_encoder_open(). */
+int  aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset);
 void aeg_encoder_close(aeg_encoder *enc);
 const char *aeg_last_error(void);
 

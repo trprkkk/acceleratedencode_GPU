@@ -191,6 +191,7 @@ struct aeg_encoder {
     double rc_debt;         /* budget - spent (positive = under budget)     */
     int    rc_frames;       /* pictures coded so far, for the budget        */
     int    rc_active;
+    int    rc_qp_offset;    /* user bias on the per-picture QP (two-pass)     */
 
     /* VBV/HRD (H.264 Annex C): the receiver's buffer is modelled picture by
      * picture.  `vbv_full` is what the model says is in the buffer when the
@@ -2599,6 +2600,7 @@ static void vbv_update(struct aeg_encoder *e, int bits)
  * average on track for short streams too. */
 #define RC_WINDOW 6.0
 #define RC_GAIN   1.2
+#define RC_DEBT_MAX 3.0
 static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
 {
     double bpf = e->rc_bits_per_frame;
@@ -2609,6 +2611,15 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
     e->rc_frames++;
     e->rc_spent += (double)bits;
     e->rc_debt = e->rc_frames * bpf - e->rc_spent;
+    /* One picture can be many times the target -- a keyframe, or any picture
+     * after a scene cut -- and letting that single picture's overshoot follow
+     * the controller for the next `RC_WINDOW` pictures is what turns one
+     * expensive frame into thirty bad ones.  The debt is therefore clamped to
+     * RC_DEBT_MAX pictures' worth: the overshoot is still repaid, just over a
+     * window long enough that the quality does not collapse (the alternative,
+     * a 20% target floor, lets the QP run away while the debt is large). */
+    if (e->rc_debt >  RC_DEBT_MAX * bpf) e->rc_debt =  RC_DEBT_MAX * bpf;
+    if (e->rc_debt < -RC_DEBT_MAX * bpf) e->rc_debt = -RC_DEBT_MAX * bpf;
     want = bpf + e->rc_debt / RC_WINDOW;
     if (want < 0.2 * bpf)          /* never ask for the impossible */
         want = 0.2 * bpf;
@@ -2925,6 +2936,11 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
          * slightly finer quantiser than the inter pictures that follow */
         if (is_idr)
             e->cur_qp -= 2;
+        if (e->cur_qp < 0)  e->cur_qp = 0;
+        if (e->cur_qp > 51) e->cur_qp = 51;
+    }
+    if (e->rc_qp_offset) {
+        e->cur_qp += e->rc_qp_offset;
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
@@ -3478,6 +3494,18 @@ int aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3], int stride[3],
         for (i = 0; i < n; i++)
             mb_qp[i] = e->mbs[i].qp;
     }
+    return AEG_OK;
+}
+
+int aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+
+    if (!e)
+        return AEG_EINVAL;
+    if (offset < -12) offset = -12;
+    if (offset >  12) offset =  12;
+    e->rc_qp_offset = offset;
     return AEG_OK;
 }
 

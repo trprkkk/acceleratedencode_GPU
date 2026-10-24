@@ -323,6 +323,54 @@ print("   --vbv-* alone (no --bitrate): %.1f kb/s" % kbps)
 sys.exit(0 if ok else 1)
 PY2
 
+echo "== two-pass rate control"
+# Two-pass on a clip whose two halves have very different complexity: the point
+# of the first pass is to *measure* that difference and spend accordingly.  The
+# rate controller stays on in pass 2, so the stream still lands on target; the
+# first pass only decides how the bits are shared out.
+./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+    -o "$TMP/2p1.264" --pass 1 --stats "$TMP/2p.stats" >"$TMP/2p1.log" 2>&1 \
+    || { echo "   pass 1 failed"; FAIL=1; }
+./$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
+    -o "$TMP/2p2.264" --pass 2 --stats "$TMP/2p.stats" --bitrate 250 \
+    --dump-recon "$TMP/2p.recon" >"$TMP/2p2.log" 2>&1 \
+    || { echo "   pass 2 failed"; FAIL=1; }
+./$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
+    -o "$TMP/1p.264" --bitrate 250 >"$TMP/1p.log" 2>&1 \
+    || { echo "   one-pass control failed"; FAIL=1; }
+python3 - "$TMP/2p2.log" "$TMP/1p.log" <<'PY2' || FAIL=1
+import re, sys
+
+def measure(path):
+    t = open(path).read()
+    m = re.search(r'bitrate ([0-9.]+) kb/s at \d+ fps, PSNR ([0-9.]+) dB', t)
+    return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+
+two, one = measure(sys.argv[1]), measure(sys.argv[2])
+ok = True
+if abs(two[0] - 250) > 15:
+    print("   two-pass rate %.1f kb/s, target 250  FAIL" % two[0])
+    ok = False
+if two[1] <= one[1]:
+    print("   two-pass %.2f dB did not beat one-pass %.2f dB  FAIL"
+          % (two[1], one[1]))
+    ok = False
+print("   1-pass %5.1f kb/s %.2f dB  ->  2-pass %5.1f kb/s %.2f dB"
+      % (one[0], one[1], two[0], two[1]))
+sys.exit(0 if ok else 1)
+PY2
+if command -v "$FF" >/dev/null 2>&1; then
+    "$FF" -v error -y -i "$TMP/2p2.264" -f rawvideo -pix_fmt yuv420p \
+        "$TMP/2p.dec" 2>"$TMP/2p.decerr"
+    if [ -s "$TMP/2p.decerr" ]; then
+        echo "   two-pass: decoder reported problems:"
+        sed 's/^/     /' "$TMP/2p.decerr" | head -3
+        FAIL=1
+    fi
+    python3 "$TMP/cmp.py" "$TMP/2p.recon" "$TMP/2p.dec" 320 192 60 two_pass \
+        || FAIL=1
+fi
+
 echo "== device enumeration"
 ./$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 

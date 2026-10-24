@@ -7,6 +7,7 @@
  * elementary stream.
  */
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
@@ -27,6 +28,11 @@ static void usage(void)
 "  -g <int>         GOP size, 0 = only the first frame is IDR (default 250)\n"
 "  --scenecut <pct> insert an IDR when a scene change is detected (0 = off,\n"
 "                   default 120: inter prediction 20%% worse than intra)\n"
+"  --pass <1|2>     two-pass rate control: pass 1 measures each picture, pass 2\n"
+"                   spends the bits where they buy the most (needs --bitrate)\n"
+"  --stats <file>   statistics file for --pass (default: <output>.stats)\n"
+"  --qcomp <pct>    complexity-to-bits exponent of pass 2, in percent\n"
+"                   (default 60: bits ~ complexity^0.6)\n"
 "  -n <int>         encode at most n frames\n"
 "  -b <backend>     auto | cpu | opencl | cuda (default auto)\n"
 "  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
@@ -95,6 +101,48 @@ typedef struct {
     aeg_stats st;
 } run_result;
 
+/* Two-pass rate control, second pass: turn the first pass's measurement of every
+ * picture into that picture's QP bias.
+ *
+ * Pass 1 codes the stream at a fixed QP, so the bits it spends on a picture are
+ * a measurement of how hard that picture is.  Scaling them to the target
+ * (`bits_i` proportional to `bits_i`) would be exactly a constant QP shift --
+ * the whole point of two passes is to spend *unevenly*.  The allocation is
+ * therefore bits proportional to `complexity^qcomp` with qcomp < 1 (x264's
+ * default 0.6): the hard pictures get a little less than proportional and the
+ * easy ones a little more, which is the right direction because distortion per
+ * bit falls faster in flat, well-predicted areas than in busy ones.
+ *
+ * The controller keeps the *rate*; this only says how the bits are shared out.
+ * With `t_i ~ b_i^alpha` normalised to the same total, the QP of picture i
+ * relative to a constant-QP stream is
+ *
+ *     QP_i - QP = 6 * (1 - alpha) * (log2 b_i - mean_j log2 b_j)
+ *
+ * so the bias is mean-zero over the stream and depends only on how unusual a
+ * picture is, not on the target bitrate.  It is rounded to whole QP steps and
+ * clipped to +-12. */
+static void pass2_bias(const int64_t *bits, int n, int qcomp, int *bias_out)
+{
+    double mean = 0.0, keep = 6.0 * (1.0 - qcomp / 100.0);
+    int i;
+
+    if (n <= 0)
+        return;
+    for (i = 0; i < n; i++)
+        mean += log2((double)(bits[i] > 0 ? bits[i] : 1));
+    mean /= n;
+    for (i = 0; i < n; i++) {
+        double l = log2((double)(bits[i] > 0 ? bits[i] : 1));
+        double b = keep * (l - mean);
+        int bi = (int)(b > 0 ? b + 0.5 : b - 0.5);
+
+        if (bi < -12) bi = -12;
+        if (bi > 12) bi = 12;
+        bias_out[i] = bi;
+    }
+}
+
 int main(int argc, char **argv)
 {
     aeg_params p;
@@ -103,7 +151,10 @@ int main(int argc, char **argv)
     int width = 0, height = 0, qp = 23, fps = 30, gop = 250, max_frames = 0;
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
-    int range = 0, subme = -1, partitions = -1;
+    int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
+    int64_t *pass1_bits = NULL;
+    int pass1_n = 0;
+    char stats_path[4096];
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
     uint8_t *frame;
     size_t fsize;
@@ -129,6 +180,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
             p.threads = atoi(argv[++i]);
         else if (!strcmp(a, "--scenecut")) p.scenecut = atoi(argv[++i]);
+        else if (!strcmp(a, "--pass")) pass = atoi(argv[++i]);
+        else if (!strcmp(a, "--qcomp")) qcomp = atoi(argv[++i]);
+        else if (!strcmp(a, "--stats")) {
+            snprintf(stats_path, sizeof(stats_path), "%s", argv[++i]);
+            stats_path[0] = stats_path[0];      /* keep -Wall quiet */
+        }
         else if (!strcmp(a, "--vbv-maxrate"))
             p.vbv_maxrate_kbps = atoi(argv[++i]);
         else if (!strcmp(a, "--vbv-bufsize"))
@@ -178,6 +235,49 @@ int main(int argc, char **argv)
         if (!out) { perror(outpath); return 1; }
     }
 
+    if (pass) {
+        if (!stats_path[0]) {
+            if (!outpath) {
+                fprintf(stderr, "--pass needs --stats <file> when writing to stdout\n");
+                return 1;
+            }
+            snprintf(stats_path, sizeof(stats_path), "%s.stats", outpath);
+        }
+        if (pass == 2 && bitrate <= 0) {
+            fprintf(stderr, "--pass 2 needs --bitrate (the first pass only measures)\n");
+            return 1;
+        }
+        if (pass == 2) {
+            FILE *sf = fopen(stats_path, "r");
+            int cap = 0;
+
+            if (!sf) {
+                fprintf(stderr, "cannot read statistics file %s\n", stats_path);
+                return 1;
+            }
+            while (!feof(sf)) {
+                long long b;
+                if (fscanf(sf, "%lld", &b) != 1)
+                    break;
+                if (pass1_n == cap) {
+                    int ncap = cap ? cap * 2 : 256;
+                    int64_t *nb = realloc(pass1_bits, (size_t)ncap * sizeof(*nb));
+                    if (!nb) { fprintf(stderr, "out of memory\n"); return 1; }
+                    pass1_bits = nb;
+                    cap = ncap;
+                }
+                pass1_bits[pass1_n++] = b;
+            }
+            fclose(sf);
+            if (pass1_n <= 0) {
+                fprintf(stderr, "no statistics in %s\n", stats_path);
+                return 1;
+            }
+            if (max_frames && pass1_n < max_frames)
+                max_frames = pass1_n;
+        }
+    }
+
     p.width = width;
     p.height = height;
     p.qp = qp;
@@ -187,6 +287,10 @@ int main(int argc, char **argv)
     p.bitrate_kbps = bitrate;
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
     p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
+    /* In pass 2 the rate controller stays on -- it is what keeps the stream on
+     * target -- and the first pass's measurement arrives per picture as a QP
+     * bias (aeg_encoder_set_qp_offset), so the two never fight: the controller
+     * owns the level, the bias owns the distribution. */
     p.backend = backend;
     p.verbose = verbose;
     if (range) p.search_range = range;
@@ -243,9 +347,24 @@ int main(int argc, char **argv)
     {
         int64_t t0 = aeg_now_ns();
         int n = 0;
+        int *bias_of_frame = NULL;
+
+        if (pass == 2) {
+            bias_of_frame = malloc((size_t)pass1_n * sizeof(*bias_of_frame));
+            if (!bias_of_frame) {
+                fprintf(stderr, "out of memory\n");
+                aeg_encoder_close(enc);
+                return 1;
+            }
+            pass2_bias(pass1_bits, pass1_n, qcomp, bias_of_frame);
+        }
         while (fread(frame, 1, fsize, in) == fsize) {
             aeg_packet pkt;
-            int r = aeg_encoder_encode(enc, frame, fsize, pts++, &pkt);
+            int r;
+
+            if (pass == 2)
+                aeg_encoder_set_qp_offset(enc, n < pass1_n ? bias_of_frame[n] : 0);
+            r = aeg_encoder_encode(enc, frame, fsize, pts++, &pkt);
             if (r != 0) {
                 fprintf(stderr, "encode failed: %s\n", aeg_last_error());
                 ret = 1;
@@ -269,10 +388,44 @@ int main(int argc, char **argv)
                     fclose(df);
                 }
             }
+            if (pass == 1) {
+                static int cap = 0;
+
+                if (n == cap) {
+                    int ncap = cap ? cap * 2 : 256;
+                    int64_t *nb = realloc(pass1_bits, (size_t)ncap * sizeof(*nb));
+                    if (!nb) {
+                        fprintf(stderr, "out of memory\n");
+                        ret = 1;
+                        break;
+                    }
+                    pass1_bits = nb;
+                    cap = ncap;
+                }
+                pass1_bits[n] = (int64_t)pkt.size * 8;   /* bits, not bytes */
+                pass1_n = n + 1;
+            }
             n++;
             if (max_frames && n >= max_frames)
                 break;
         }
+        if (pass == 1) {
+            FILE *sf = fopen(stats_path, "w");
+
+            if (!sf) {
+                fprintf(stderr, "cannot write statistics file %s\n", stats_path);
+                ret = 1;
+            } else {
+                int k;
+                for (k = 0; k < pass1_n; k++)
+                    fprintf(sf, "%lld\n", (long long)pass1_bits[k]);
+                fclose(sf);
+                if (verbose)
+                    printf("pass 1: measured %d pictures -> %s\n", pass1_n,
+                           stats_path);
+            }
+        }
+        free(bias_of_frame);
         if (verbose) {
             double secs = (aeg_now_ns() - t0) / 1e9;
             aeg_encoder_stats(enc, &st);
