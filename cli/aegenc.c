@@ -33,6 +33,8 @@ static void usage(void)
 "  --range <int>    integer motion search range (default: from preset)\n"
 "  --subme <int>    subpel refinement 0..2 (default 1)\n"
 "  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
+"  --vbv-maxrate <kbps>  VBV/HRD channel rate (implies ABR)\n"
+"  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
 "  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
 "                   default 10 = x264 aq-strength 1.0)\n"
 "  --slices <n>     slices per picture (0/1 = one slice; n>1 cuts the\n"
@@ -124,6 +126,10 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--slices")) p.slices = atoi(argv[++i]);
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
             p.threads = atoi(argv[++i]);
+        else if (!strcmp(a, "--vbv-maxrate"))
+            p.vbv_maxrate_kbps = atoi(argv[++i]);
+        else if (!strcmp(a, "--vbv-bufsize"))
+            p.vbv_bufsize_kbits = atoi(argv[++i]);
         else if (!strcmp(a, "-v")) verbose = atoi(argv[++i]);
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
@@ -276,6 +282,11 @@ int main(int argc, char **argv)
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0
                        : 0.0,
                    fps, st.psnr_avg);
+            if (st.vbv_min_fill_bits > 0.0 || st.vbv_underflows)
+                printf("vbv: buffer low water %.1f kbit, %" PRId64
+                       " underflow(s), %" PRId64 " picture(s) raised to fit\n",
+                       st.vbv_min_fill_bits / 1000.0, st.vbv_underflows,
+                       st.vbv_size_clamps);
             for (i = 0; i < AEG_STAGE_COUNT; i++)
                 if (st.stage_ns[i] > 0)
                     printf("  stage %-12s %8.1f ms  %s\n", aeg_stage_name(i),

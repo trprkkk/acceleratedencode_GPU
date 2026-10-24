@@ -99,6 +99,12 @@ typedef struct aeg_params {
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
+    /* VBV/HRD (H.264 Annex C) buffer model: the decoder's buffer must never
+     * run dry, so a picture may not take more bits than the buffer holds at
+     * the moment it starts.  Both 0 = no constraint.  Setting them implies
+     * ABR; a bitrate above the maximum rate is clamped to it. */
+    int vbv_maxrate_kbps;     /* R: channel rate, 0 = off               */
+    int vbv_bufsize_kbits;    /* B: buffer size, 0 = off                */
     int gop_size;             /* keyframe interval, 0 = only first      */
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
@@ -141,6 +147,12 @@ typedef struct aeg_stats {
     int     stage_use_gpu[AEG_STAGE_COUNT];
     double  psnr_y, psnr_u, psnr_v, psnr_avg; /* reconstructed vs source  */
     double  ssim_y;
+    /* VBV/HRD accounting (zero when the model is off): the lowest buffer level
+     * the model reached, in bits, and how many pictures would have underflowed
+     * it -- which the controller is supposed to have avoided. */
+    double  vbv_min_fill_bits;
+    int64_t vbv_underflows;
+    int64_t vbv_size_clamps;    /* pictures whose QP the buffer raised */
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

@@ -189,6 +189,22 @@ struct aeg_encoder {
     double rc_debt;         /* budget - spent (positive = under budget)     */
     int    rc_frames;       /* pictures coded so far, for the budget        */
     int    rc_active;
+
+    /* VBV/HRD (H.264 Annex C): the receiver's buffer is modelled picture by
+     * picture.  `vbv_full` is what the model says is in the buffer when the
+     * next picture starts.  A picture may not take more bits than that, so the
+     * controller raises its QP when the picture it is about to code does not
+     * fit -- that is the whole point of a buffer model, and what makes a stream
+     * playable at a rate the network actually has to deliver. */
+    int    vbv_active;
+    double vbv_buf_bits;    /* B: the buffer size                           */
+    double vbv_rate_bits;   /* R: bits delivered per picture period         */
+    double vbv_full;        /* modelled fullness, bits                      */
+    double vbv_min_full;    /* lowest level seen                            */
+    int    vbv_underflows;
+    int    vbv_clamps;
+    int    last_pic_bits;   /* the previous picture, to predict this one    */
+    int    last_pic_qp;
 };
 
 /* Which of the two batched coefficient code paths to use for this picture.
@@ -2498,6 +2514,75 @@ static int mb_qp_of(const struct aeg_encoder *e, int mbx, int mby)
     return qp;
 }
 
+/* VBV/HRD: how many bits the picture about to be coded may take.  The channel
+ * has delivered `vbv_rate_bits` since the last picture; the buffer cannot hold
+ * more than B, so a burst is capped at the buffer size (a picture larger than
+ * that could never be sent at rate R). */
+static double vbv_available(const struct aeg_encoder *e)
+{
+    double level = e->vbv_full + e->vbv_rate_bits;
+
+    if (level > e->vbv_buf_bits)
+        level = e->vbv_buf_bits;
+    return level;
+}
+
+/* Raise the QP if the picture would not fit in the buffer.
+ *
+ * The size of a picture is not known before it is coded, so it is predicted
+ * from the previous one: rate grows roughly with 2^(-QP/6), so a picture coded
+ * at QP q is expected to take last_bits * 2^((last_qp - q)/6) bits.  Solving
+ * that for the largest QP whose prediction fits gives the clamp.  A picture
+ * that still does not fit at QP 51 (a buffer smaller than a single picture)
+ * cannot be helped by the quantiser; it is counted as an underflow when it
+ * happens instead of being hidden. */
+static void vbv_clamp_qp(struct aeg_encoder *e)
+{
+    double avail, pred, q_min;
+
+    if (!e->vbv_active || e->last_pic_bits <= 0 || e->last_pic_qp < 0)
+        return;
+    avail = vbv_available(e);
+    if (avail < 1.0)
+        avail = 1.0;
+    pred = (double)e->last_pic_bits *
+           pow(2.0, (double)(e->last_pic_qp - e->cur_qp) / 6.0);
+    if (pred <= avail)
+        return;
+    q_min = (double)e->last_pic_qp -
+            6.0 * log2(avail / (double)e->last_pic_bits);
+    if ((double)e->cur_qp < q_min) {
+        int q = (int)ceil(q_min);
+
+        if (q > 51) q = 51;
+        if (q > e->cur_qp) {
+            e->cur_qp = q;
+            e->vbv_clamps++;
+        }
+    }
+}
+
+/* Take the coded picture out of the modelled buffer. */
+static void vbv_update(struct aeg_encoder *e, int bits)
+{
+    double level;
+
+    e->last_pic_bits = bits;
+    e->last_pic_qp = e->cur_qp;
+    if (!e->vbv_active)
+        return;
+    level = vbv_available(e) - (double)bits;
+    if (level < 0.0) {
+        /* the picture needed more than the buffer held: the model cannot
+         * deliver it, and a decoder would starve waiting for the rest */
+        e->vbv_underflows++;
+        level = 0.0;
+    }
+    e->vbv_full = level;
+    if (level < e->vbv_min_full)
+        e->vbv_min_full = level;
+}
+
 /* One step of the ABR controller (H.264 Annex; a one-pass, picture-level
  * controller).
  *
@@ -2525,6 +2610,16 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
     want = bpf + e->rc_debt / RC_WINDOW;
     if (want < 0.2 * bpf)          /* never ask for the impossible */
         want = 0.2 * bpf;
+    if (e->vbv_active) {
+        /* ask for a picture the buffer can actually take, with a little room
+         * left over so that the clamp in vbv_clamp_qp() is the exception */
+        double room = vbv_available(e) * 0.8;
+
+        if (want > room)
+            want = room;
+        if (want < 1.0)
+            want = 1.0;
+    }
     ratio = (double)(bits + 1) / want;
     adj = RC_GAIN * (ratio > 0.0 ? log2(ratio) : 0.0);
     if (adj > 1.5)  adj = 1.5;     /* at most 1.5 QP per picture, so a scene */
@@ -2754,6 +2849,8 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
+    if (e->vbv_active)
+        vbv_clamp_qp(e);
 
     resolve_coef_stages(e);
     aq_compute(e);
@@ -2993,9 +3090,10 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     if (is_idr)
         e->idr_pic_id = (e->idr_pic_id + 1) & 0xffff;
     if (getenv("AEG_RCDBG"))
-        fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f\n",
+        fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f vbv %.0f\n",
                 e->frame_count, e->cur_qp, (int)(out_len * 8),
-                e->rc_bits_per_frame, e->rc_debt);
+                e->rc_bits_per_frame, e->rc_debt, e->vbv_full);
+    vbv_update(e, (int)(out_len * 8));
     rc_update(e, (int)(out_len * 8), is_idr);
     aeg_dispatch_update(&e->d);
     return AEG_OK;
@@ -3036,6 +3134,21 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     if (pp->subme < 0) pp->subme = pp->preset <= 0 ? 0 : 1;
     if (pp->gop_size < 0) pp->gop_size = 250;
+    /* A buffer model without a rate target makes no sense -- a constant-QP
+     * stream cannot be squeezed into a channel -- so asking for a VBV turns
+     * ABR on, with the maximum rate as the target when no bitrate was given. */
+    if (pp->vbv_maxrate_kbps > 0 && pp->vbv_bufsize_kbits > 0) {
+        if (pp->bitrate_kbps <= 0)
+            pp->bitrate_kbps = pp->vbv_maxrate_kbps;
+        if (pp->bitrate_kbps > pp->vbv_maxrate_kbps) {
+            aeg_log(1, "aeg: bitrate clamped to the VBV maximum rate (%d kb/s)",
+                    pp->vbv_maxrate_kbps);
+            pp->bitrate_kbps = pp->vbv_maxrate_kbps;
+        }
+        pp->rc_mode = AEG_RC_ABR;
+    } else
+        pp->vbv_maxrate_kbps = pp->vbv_bufsize_kbits = 0;
+
     if (pp->rc_mode != AEG_RC_ABR || pp->bitrate_kbps <= 0)
         pp->rc_mode = AEG_RC_CQP;
     else {
@@ -3048,6 +3161,21 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->rc_frames = 0;
         aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
                 pp->bitrate_kbps, e->rc_bits_per_frame, fps, pp->qp);
+        if (pp->vbv_maxrate_kbps > 0) {
+            e->vbv_active = 1;
+            e->vbv_buf_bits = (double)pp->vbv_bufsize_kbits * 1000.0;
+            e->vbv_rate_bits = (double)pp->vbv_maxrate_kbps * 1000.0 / fps;
+            /* start the model with the buffer nearly full: the first picture is
+             * a keyframe and would starve a buffer that starts empty */
+            e->vbv_full = 0.9 * e->vbv_buf_bits;
+            e->vbv_min_full = e->vbv_full;
+            e->last_pic_bits = 0;
+            e->last_pic_qp = -1;
+            aeg_log(1, "aeg: VBV %d kb/s, buffer %d kbit -> level %.0f bits, "
+                        "%.0f bits delivered per picture",
+                    pp->vbv_maxrate_kbps, pp->vbv_bufsize_kbits,
+                    e->vbv_full, e->vbv_rate_bits);
+        }
     }
 
     e->w = params->width & ~15;
@@ -3234,6 +3362,9 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     if (!e || !out)
         return AEG_EINVAL;
     *out = e->st;
+    out->vbv_min_fill_bits = e->vbv_active ? e->vbv_min_full : 0.0;
+    out->vbv_underflows = e->vbv_underflows;
+    out->vbv_size_clamps = e->vbv_clamps;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         out->stage_use_gpu[i] = e->d.use_gpu[i];
         out->stage_cpu_ns[i] = e->d.cpu_ns[i][1];

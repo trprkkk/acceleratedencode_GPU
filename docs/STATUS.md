@@ -569,8 +569,10 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    a device is coded by one thread), and frame-level threading (code picture
    N+1's decision pass while picture N is being written), which needs the
    reconstruct-then-write split that the loop already has, plus one reference
-   picture per thread.  Rate control is picture-level only (no VBV/HRD model,
-   no macroblock-tree lookahead).
+   picture per thread.  Rate control is picture-level only (no macroblock-tree
+   lookahead), and the VBV model tracks the buffer level between pictures
+   rather than the coded-picture removal times a full HRD also signals
+   (`cpb_removal_delay` in the SPS VUI).
 
 ## Slices
 

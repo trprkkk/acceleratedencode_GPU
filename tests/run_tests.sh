@@ -131,6 +131,9 @@ AEG_RD_BATCH=1 run_case rd_batch4   320 192  6 4 -q 22 -g 3
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.
 run_case abr          320 192 16 1 -q 24 --bitrate 300
+# A buffer model changes the QP per picture (that is the point), so it goes
+# through the same conformance check as the plain ABR case.
+run_case vbv          320 192 12 1 -q 24 --vbv-maxrate 400 --vbv-bufsize 60
 run_case abr_gop4     320 192 16 4 -q 24 --bitrate 400 -g 4
 run_case aq           320 192  8 4 -q 26 --aq 12
 # Intra_4x4 in every picture, and IDR pictures after P pictures (gop > 1),
@@ -194,6 +197,77 @@ ok = abs(kbps - 400) <= 40
 print("   ABR target 400 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
 sys.exit(0 if ok else 1)
 ' "$TMP/abr.264" || FAIL=1
+
+echo "== VBV / HRD"
+# The buffer model has to do two things: leave a stream that fits its channel
+# alone (the bytes must be exactly what the same ABR configuration without a
+# buffer produces), and raise the QP when a picture would not fit -- including
+# saying so when even QP 51 cannot make it fit, because a model that can never
+# report an underflow is not a model.
+"$BUILD/genyuv" 320 192 40 "$TMP/vbv.yuv" 0 >/dev/null
+./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_off.264" --bitrate 400 -v 0
+./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_wide.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 120 \
+    >"$TMP/vbv_wide.log" 2>&1
+if cmp -s "$TMP/vbv_off.264" "$TMP/vbv_wide.264"; then
+    echo "   generous buffer (120 kbit): stream unchanged"
+else
+    echo "   generous buffer (120 kbit): stream differs from the ABR stream  FAIL"
+    FAIL=1
+fi
+./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_tight.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 30 \
+    >"$TMP/vbv_tight.log" 2>&1
+./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_alone.264" --vbv-maxrate 400 --vbv-bufsize 120 \
+    >"$TMP/vbv_alone.log" 2>&1
+python3 - "$TMP" <<'PY2' || FAIL=1
+import re, sys, os
+tmp = sys.argv[1]
+
+def read(name):
+    return open(os.path.join(tmp, name)).read()
+
+def vbv_line(text):
+    m = re.search(r'vbv: buffer low water ([0-9.]+) kbit, (\d+) underflow\(s\), '
+                  r'(\d+) picture\(s\) raised to fit', text)
+    return tuple(float(m.group(1)) if i == 0 else int(m.group(i + 1))
+                 for i in range(3)) if m else None
+
+wide = vbv_line(read('vbv_wide.log'))
+tight = vbv_line(read('vbv_tight.log'))
+alone = vbv_line(read('vbv_alone.log'))
+ok = True
+
+if wide is None or tight is None or alone is None:
+    print("   VBV: the model's report is missing")
+    ok = False
+else:
+    if wide[1] != 0 or wide[2] != 0:
+        print("   byte-identical stream reported %d underflows, %d clamps  FAIL"
+              % (wide[1], wide[2]))
+        ok = False
+    if tight[1] + tight[2] == 0:
+        print("   a 30 kbit buffer fit every picture unchanged  FAIL")
+        ok = False
+    if wide[0] <= tight[0]:
+        print("   the tight buffer did not get closer to empty  FAIL")
+        ok = False
+
+# --vbv-maxrate/--vbv-bufsize alone must imply ABR (a buffer model without a
+# rate target cannot squeeze anything), and the rate must still land.
+kbps = os.path.getsize(os.path.join(tmp, 'vbv_alone.264')) * 8 * 30 / 40 / 1000.0
+if abs(kbps - 400) > 40:
+    print("   --vbv-* alone: %.1f kb/s, wanted 400  FAIL" % kbps)
+    ok = False
+print("   generous buffer: low water %.1f kbit, 0 clamps" % wide[0]
+      if ok and wide else "   VBV check failed")
+print("   30 kbit buffer:  low water %.1f kbit, %d underflow(s), %d clamp(s)"
+      % tight[:3] if ok and tight else "")
+print("   --vbv-* alone (no --bitrate): %.1f kb/s" % kbps)
+sys.exit(0 if ok else 1)
+PY2
 
 echo "== device enumeration"
 ./$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
