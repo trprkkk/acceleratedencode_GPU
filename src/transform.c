@@ -156,19 +156,17 @@ int aeg_quant_bias(int qbits, int den)
                  (den * QUANT_BIAS_DEN));
 }
 
-static inline int quant_coef(int32_t coef, int qp, int cls, int bias_num,
-                             int bias_den)
-{
-    const int qbits = 15 + (qp / 6);
-    const int mf = aeg_quant_mf[qp % 6][cls];
-    const int f = aeg_quant_bias(qbits, bias_den) * bias_num;
-    int abs = coef < 0 ? -coef : coef;
-    int level = (int)(((int64_t)abs * mf + f) >> qbits);
-    return coef < 0 ? -level : level;
-}
-
 void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
 {
+    /* The rounding offset and the scale factors depend only on qp (and on
+     * whether this is an intra block), so they are computed once for the
+     * sixteen coefficients: aeg_quant_bias() is a 64-bit division and this
+     * function runs a million times per thirty frames. */
+    const int qbits = 15 + (qp / 6);
+    const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+    const int mf0 = aeg_quant_mf[qp % 6][0];
+    const int mf1 = aeg_quant_mf[qp % 6][1];
+    const int mf2 = aeg_quant_mf[qp % 6][2];
     int x, y;
     /* The decoder's 4x4 inverse transform is the transpose of ours: a
      * coefficient in slot (row 1, column 0) comes out as a horizontal ramp
@@ -178,10 +176,12 @@ void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
      * in x and y, so the quantiser itself is unaffected. */
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
-            int cls = (x & 1) + (y & 1);
-            level[y * 4 + x] = (int16_t)quant_coef(coef[x * 4 + y], qp, cls,
-                                                   intra ? 1 : 1,
-                                                   intra ? 3 : 6);
+            const int c = coef[x * 4 + y];
+            const int cls = (x & 1) + (y & 1);
+            const int mf = cls == 0 ? mf0 : (cls == 1 ? mf1 : mf2);
+            const int abs = c < 0 ? -c : c;
+            const int lv = (int)(((int64_t)abs * mf + f) >> qbits);
+            level[y * 4 + x] = (int16_t)(c < 0 ? -lv : lv);
         }
 }
 

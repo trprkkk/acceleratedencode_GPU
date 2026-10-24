@@ -15,6 +15,10 @@
  */
 #include "h264.h"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 static inline uint8_t clip8(int v)
 {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
@@ -225,8 +229,31 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
         for (y = 0; y < h; y++) {
             const uint8_t *r1 = mc->base[pl1] + off + (ptrdiff_t)(y + o1y) * mc->stride;
             const uint8_t *r2 = mc->base[pl2] + off + (ptrdiff_t)y * mc->stride + o2x;
-            for (x = 0; x < w; x++)
-                dst[(size_t)y * dstride + x] = (uint8_t)((r1[x] + r2[x] + 1) >> 1);
+            uint8_t *d = dst + (size_t)y * dstride;
+#if defined(__SSE2__)
+            /* pavgb is exactly (r1 + r2 + 1) >> 1, the average H.264 8.4.2.2.2
+             * specifies, sixteen samples at a time.  The search averages a
+             * block per candidate (a million times per 30 frames), so this is
+             * one of the hottest loops in the encoder. */
+            for (x = 0; x + 16 <= w; x += 16)
+                _mm_storeu_si128((__m128i *)(d + x),
+                                 _mm_avg_epu8(_mm_loadu_si128((const __m128i *)(r1 + x)),
+                                              _mm_loadu_si128((const __m128i *)(r2 + x))));
+            if (w - x >= 8) {
+                _mm_storel_epi64((__m128i *)(d + x),
+                                 _mm_avg_epu8(_mm_loadl_epi64((const __m128i *)(r1 + x)),
+                                              _mm_loadl_epi64((const __m128i *)(r2 + x))));
+                x += 8;
+            }
+            if (w - x >= 4) {
+                _mm_storeu_si32(d + x,
+                                _mm_avg_epu8(_mm_cvtsi32_si128(*(const int *)(r1 + x)),
+                                             _mm_cvtsi32_si128(*(const int *)(r2 + x))));
+                x += 4;
+            }
+#endif
+            for (; x < w; x++)
+                d[x] = (uint8_t)((r1[x] + r2[x] + 1) >> 1);
         }
     }
 }

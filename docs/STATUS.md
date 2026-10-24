@@ -589,11 +589,15 @@ P_8x8 early exit -- is committed before it):
 | change | fps | bytes |
 |---|---|---|
 | before | 54.5 | 46 395 |
-| SSE2 SAD (13x per 16x16 call) | 65.0 | 46 395 |
-| SSE2 4x4 SATD (2.2x per call, the subpel walk's only real cost) | 75.8 | 46 395 |
+| SSE2 SAD (13x per 16x16 call) | 65 | 46 395 |
+| SSE2 4x4 SATD (2.2x per call, the subpel walk's only real cost) | 76 | 46 395 |
+| `_mm_avg_epu8` for the two-plane average of a fractional block | 78 | 46 395 |
 
-Byte-identical output: both kernels add the same integers, so they cannot move
-a decision.
+Every row is byte-identical output: the kernels add and average the same
+integers, so they cannot move a decision.  The machine is noisy (the same
+binary measures anywhere between 63 and 79 fps depending on the run), so these
+are best-of-three on one sitting rather than a precision result; the shape of
+the curve is what matters.
 
 Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
 221 ms, fractional-pel planes 42 ms, transform 260 ms, deblocking 4 ms of
