@@ -220,20 +220,7 @@ void aeg_cavlc_write_block8(aeg_bitwriter *bw, const int16_t *coef, int sub,
     int n;
     for (n = 0; n < 16; n++)
         list[n] = coef[aeg_zigzag8x8[sub + 4 * n]];
-    if (getenv("AEGDBG")) {
-        fprintf(stderr, "ENC sub %d nC %d:", sub, nC);
-        for (n = 15; n >= 0; n--)
-            if (list[n])
-                fprintf(stderr, " [%d]=%d", n, list[n]);
-        fprintf(stderr, "\n");
-    }
-    if (getenv("AEGDBG"))
-        fprintf(stderr, "ENC sub %d bits before %d\n", sub,
-                (int)(bw->len * 8 + bw->bits));
     write_block(bw, list, scan_dc, 16, nC, 16, 0);
-    if (getenv("AEGDBG"))
-        fprintf(stderr, "ENC sub %d bits after %d\n", sub,
-                (int)(bw->len * 8 + bw->bits));
 }
 
 /* Number of non-zero coefficients of one of the four lists (its

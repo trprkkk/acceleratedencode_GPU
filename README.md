@@ -7,14 +7,15 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: conformant encoder core (I and P pictures, Intra_16x16 and
-> Intra_4x4, 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions
-> and P_Skip), quality work in progress.**
+> **Status: conformant High-profile encoder core (I and P pictures,
+> Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform,
+> 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions and
+> P_Skip), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 28 clip cases, a 200 000-block coefficient
+> `make test` asserts it over 45 clip cases, a 200 000-block coefficient
 > cross-check and the device kernels, and *fails* on any mismatch.  What
 > is *not* finished is speed and the last few percent of efficiency: at
 > matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
@@ -108,8 +109,9 @@ selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
 default), `--dump-recon` writes what the encoder itself
 reconstructed (this is what a decoder must produce, so it is the primary
-conformance check), and `--no-deblock`, `--subme N`, `--range N` override the
-preset.
+conformance check), `--no-8x8dct` falls back to the Baseline profile (4x4 luma
+transforms only, which is how the cost of the High-profile tools was measured),
+and `--no-deblock`, `--subme N`, `--range N` override the preset.
 
 ## What is verified, and how
 
@@ -140,7 +142,7 @@ preset.
   independent decode.  Run it on the machine that has the GPU; on a CPU-only
   machine everything passes trivially, because the batch entry points fall back
   to the reference ops.
-* `tests/run_tests.sh` encodes thirty synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes forty-five synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   integer-only and quarter-pel search, the forced whole-frame search seed,

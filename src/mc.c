@@ -555,8 +555,8 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
 /* ------------------------------------------------------------------ */
 static inline int is_intra_mb(const aeg_mb *m)
 {
-    return m->type == AEG_MB_I4x4 || m->type == AEG_MB_I16x16 ||
-           m->type == AEG_MB_IPCM;
+    return m->type == AEG_MB_I4x4 || m->type == AEG_MB_I8x8 ||
+           m->type == AEG_MB_I16x16 || m->type == AEG_MB_IPCM;
 }
 
 static inline int mv_median(int a, int b, int c)

@@ -18,9 +18,10 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | P_8x8 (four quadrants moving apart, all four `sub_mb_type` shapes) | 320x192, 96x64, 48x32 | 12, 20, 26, 34 | 2 | 6 … 8 |
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 | slices (`--slices 2 … 12`, including uneven row counts) | 320x192, 320x208, 64x64 | 22 … 26 | 0, 1, 4 | 4 … 8 |
+| 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs forty-two encoded clip cases
+fails (non-zero exit) on any mismatch; it runs forty-five encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -37,6 +38,14 @@ Implemented and building without warnings:
 * Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
   block order, `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` and the
   per-block mode decision), chroma (all four modes)
+* the 8x8 luma transform and **Intra_8x8** prediction (High profile): 8x8
+  integer DCT/quantisation/dequantisation/IDCT matching the reference
+  decoder's rounding, 8x8 CAVLC (four interleaved 16-coefficient lists per
+  block with the group-end non-zero rule), all nine Intra_8x8 modes chosen by
+  exact rate-distortion, `transform_size_8x8_flag` in the SPS/PPS syntax and
+  the deblocking rules that go with it, and `--no-8x8dct` to code the same clip
+  in the Baseline profile for comparison (see *The 8x8 transform and
+  Intra_8x8* below)
 * half/quarter-pel motion estimation and compensation, MV prediction, skip runs
 * P inter partitioning: 16x16, 16x8, 8x16 and **P_8x8** (four 8x8 sub-macroblock
   partitions, one motion vector and one `mvd` each).  Every partition gets its
@@ -372,6 +381,62 @@ Implemented and building without warnings:
     consumes the very bits that a picture end makes unreachable, so
     multi-slice is a stricter conformance test than the whole picture is.
 
+33. **An Intra_8x8 neighbour is not a DC neighbour.**  H.264 derives the
+    Intra_4x4 prediction mode of a block from `min(left, top)` of the
+    *neighbouring blocks' modes*, and a decoder keeps those modes in one cache
+    of 4x4 slots.  An Intra_8x8 macroblock has no 4x4 modes, but a decoder
+    still fills the cache: it replicates each 8x8 mode over the 2x2 group of
+    slots it covers, so the block to the left of block row `by` reports the
+    mode of the 8x8 group in the right-hand group column of that block row.
+    The encoder treated every non-Intra_4x4 neighbour as "no mode" and used the
+    DC fallback 2 instead, which changes `min(left, top)` and therefore the
+    *predicted* mode, and therefore which of `prev_intra4x4_pred_mode_flag` and
+    `rem_intra4x4_pred_mode` the block sends.  The decoder then reads a
+    different mode from the same bits -- the macroblock's reconstruction
+    diverges while the syntax still parses, so nothing reports an error and the
+    mismatch only shows up as a slightly wrong picture.  `intra4_pred_mode()`
+    now maps an Intra_8x8 neighbour the way the cache does, and
+    `intra8_pred_mode()` the other way round (an Intra_4x4 neighbour
+    contributes the 4x4 mode of its last block column/row).  Found by
+    comparing the encoder's chosen modes against FFmpeg's `DEMODE` dump
+    macroblock by macroblock on a 32x16 ramp at QP 22.
+
+34. **`transform_size_8x8_flag` is not always present for inter
+    macroblocks.**  For an inter macroblock the flag follows the coded block
+    pattern, but only when the luma pattern is non-zero *and* no partition is
+    smaller than 8x8: `P_8x8` with an 8x4, 4x8 or 4x4 `sub_mb_type` may not
+    signal it, and the decoder does not read a bit there at all.  Writing one
+    anyway shifts every following bit, which showed up as
+    "mb_type 689 in P slice too large", "negative number of zero coeffs" and
+    "cbp too large" from the second P picture on -- 15 of the conformance
+    cases failed at once.  `t8_allowed()` is now the single place that decides
+    it, and it gates the decision, the bit count and the write.
+
+35. **Motion-vector prediction has to know that Intra_8x8 is intra.**
+    `is_intra_mb()` in `mc.c` listed I4x4, I16x16 and IPCM but not the new
+    I8x8 type, so an Intra_8x8 neighbour was taken as an inter block with
+    motion vector (0,0) and counted as an available candidate in the
+    A/B/C/median rule.  With one reference picture that changes the predictor
+    from "the single matching neighbour" to a median that includes a zero --
+    the encoder then writes a different `mvd` than it meant, and the picture
+    drifts from the first macroblock whose top-right neighbour happened to be
+    Intra_8x8.  The type is added, which also fixes the same test for skip
+    detection.
+
+36. **The deblocking filter needs one non-zero count per 8x8 group, not per
+    4x4 block.**  With the 8x8 transform the CAVLC lists carry a quarter of an
+    entire 8x8 block each, so the 4x4-block non-zero counts an 8x8 macroblock
+    holds are *sub-list* totals, not block totals; a decoder broadcasts one
+    count per 8x8 group.  The boundary strength therefore has to compare
+    groups.  Comparing sub-list totals made bS 2 instead of 0 (or 1) on an
+    edge, i.e. it filtered an edge the decoder left alone, and with the
+    deblocking filter enabled the picture drifted after a few frames in exactly
+    the macroblocks whose 8x8 neighbour was coded.  `aeg_mb.nz8[4]` now keeps
+    the group flags and `boundary_strength()` uses them for the side that was
+    coded with the 8x8 transform.  With the filter off
+    (`--no-deblock`) this bug is invisible, which is why the 30-case I-picture
+    matrix was green while `make test` was not.
+
 ## The coefficient stages as one batch per macroblock
 
 The forward transform + quantisation and the inverse transform of an inter
@@ -490,7 +555,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 45 clip cases
 ```
 
 `make test` runs five things:
@@ -521,12 +586,13 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-5. `tests/run_tests.sh` — thirty cases (QP 12/23/26/40, presets 0 and 4,
+5. `tests/run_tests.sh` — forty-five cases (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
    forced whole-frame fractional refinement, all-intra and 3-frame GOPs, the RD
-   Intra_4x4 decision of the slow presets, P_Skip, ABR and AQ)
+   Intra_4x4 decision of the slow presets, P_Skip, ABR and AQ -- all of them
+   with the 8x8 transform enabled, which is the default)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -594,9 +660,9 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    dispatcher also only ever measures the path it chose, so a stage is switched
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
-3. Encoder features that need the profile to change: the 8x8 transform and
-   Intra_8x8 prediction (High profile, ~0.6-1.0 dB of inter and 1.5-2 dB of
-   intra efficiency), and CABAC (~10% of rate at equal quality).  MB-tree was
+3. Encoder features that need the profile to change: CABAC (~10% of rate at
+   equal quality) is the remaining one -- the 8x8 transform and Intra_8x8 are
+   in (section below).  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so
@@ -917,6 +983,61 @@ already recovered by the macroblock-level RD pass choosing a coarser partition.
 A full trellis (every coefficient, every level, with the cbp and neighbour
 context costs carried through the whole 4x4 block) is the version that pays in
 x264, and that is a bigger piece of work than this shortcut.
+
+## The 8x8 transform and Intra_8x8
+
+The High profile tools are in: the SPS signals `profile_idc = 100` with
+`transform_8x8_mode_flag`, the PPS signals the 8x8 transform, and a macroblock
+may use either the four 8x8 luma transforms or the sixteen 4x4 ones (chroma
+keeps 4x4 throughout).  `--no-8x8dct` turns the whole thing off and codes
+Baseline, which is what makes the cost measurable on this machine.
+
+*Transform.*  `aeg_transform_8x8` is the H.264 integer 8x8 DCT; the quantiser
+multiplier is x264's `quant8_scale`, and the dequantiser is the reference
+decoder's `dequant8_coeff` (coefficient class `(x&1)+(y&1)`, `<< qp/6`, int16
+truncation, `+32` on the DC before the first pass, rows then columns, `>>6` at
+the end).  Quantise-then-dequantise reproduces each coefficient exactly at
+every QP, which is what `tests/coef_check.c` checks (2.27 M coefficients).
+
+*CAVLC.*  An 8x8 block is sent as four 16-coefficient lists: list `k` holds
+`zigzag8x8[4n + k]`, i.e. every fourth entry of the 64-entry scan (the scan is
+`ff_zigzag_direct`, and the decoder's `zigzag_scan8x8_cavlc` is its transpose,
+so the transposition cancels out).  The lists are *not* independent: each one's
+`nC` is the previous list's TotalCoeff, and the slot that survives into the
+neighbour context is the sum of the four lists' TotalCoeff, written to the
+group's first block when the group is finished -- exactly what
+`h264_cavlc.c` does with `nnz[0] += nnz[1] + nnz[8] + nnz[9]`.  `luma8_costs()`
+and `write_mb()` walk the same `group_blk[]` order with the same slot state,
+because a cost pass and a write pass that disagree about `nC` produce a stream
+that decodes to something else without any syntax error.
+
+*Intra_8x8.*  All nine modes (`aeg_intra_predict_8x8`), chosen by exact
+rate-distortion against the four 4x4 and four Intra_16x16 alternatives, with
+`prev_intra8x8_pred_mode_flag`/`rem_intra8x8_pred_mode` and the
+`min(left, top)` predictor.  The top-right samples follow 8.3.3.4.2: for a
+block in the last block column they are unavailable unless the macroblock to
+the right is alread decoded, and for the bottom-right block they are always
+unavailable (the predictor clamps them to `p[3][-1]`).
+
+*Deblocking.*  A macroblock coded with the 8x8 transform only has a transform
+boundary at luma position 8, so only that internal edge (and the macroblock
+edge) is filtered; the boundary strength compares 8x8 groups rather than 4x4
+blocks (bug 36).
+
+*What it buys.*  Measured with the same encoder at the same QP on three
+320x192 synthetic clips (12 frames each), 8x8DCT off → on:
+
+| clip | QP | bytes | PSNR (Y+U+V) |
+|---|---|---|---|
+| panning texture (mode 0) | 26 | 9 179 → 9 124 | 45.66 → 45.84 dB |
+| half/half motion (mode 1) | 26 | 15 397 → 15 021 | 45.22 → 45.41 dB |
+| four quadrants (mode 4) | 26 | 16 883 → 16 580 | 45.19 → 45.36 dB |
+| panning texture | 22 | 11 411 → 11 654 | 47.96 → 48.18 dB |
+| panning texture | 34 | 5 906 → 5 822 | 38.50 → 38.77 dB |
+
+i.e. +0.2 dB at equal or fewer bits, the direction and size a synthetic
+smooth-gradient clip should show (real content gains more from Intra_8x8 in
+particular, which cannot be measured here).
 
 ## Quality against a reference CPU encoder
 

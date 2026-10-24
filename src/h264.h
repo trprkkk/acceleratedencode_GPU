@@ -114,6 +114,7 @@ typedef struct aeg_mb {
     int8_t   sub_type[4];     /* P_8x8 sub partitions: 0=8x8,1=8x4,2=4x8,3=4x4 */
     int16_t  mv[16][2];       /* per 4x4 MV in 1/4 pel (luma)             */
     int8_t   nz[AEG_BLK_COUNT];
+    int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     int16_t  coef[AEG_BLK_COUNT][AEG_DCT_SIZE]; /* quantised coefficients  */
     int32_t  cost;            /* chosen RD cost (debug/stats)             */
 } aeg_mb;

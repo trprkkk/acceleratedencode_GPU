@@ -120,6 +120,13 @@ static inline int is_intra(const aeg_mb *m)
            m->type == AEG_MB_I16x16 || m->type == AEG_MB_IPCM;
 }
 
+/* Index of the 8x8 group that holds 4x4 block `blk` (raster order). */
+static inline int nz8_group(int blk)
+{
+    int bx = blk & 3, by = blk >> 2;
+    return (by >> 1) * 2 + (bx >> 1);
+}
+
 /* bS for the luma edge between block `pa` of MB p and block `qa` of MB q,
  * where both blocks are 4x4 luma blocks addressed in raster order. */
 static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
@@ -135,8 +142,10 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
         nzp = (p->cbp >> 4) & 3;
         nzq = (q->cbp >> 4) & 3;
     } else {
-        nzp = p->nz[pa] != 0;
-        nzq = q->nz[qa] != 0;
+        /* With the 8x8 transform a decoder keeps one non-zero count per 8x8
+         * group and compares groups, not 4x4 blocks. */
+        nzp = p->t8 ? p->nz8[nz8_group(pa)] != 0 : p->nz[pa] != 0;
+        nzq = q->t8 ? q->nz8[nz8_group(qa)] != 0 : q->nz[qa] != 0;
     }
     if (nzp || nzq)
         return 2;
