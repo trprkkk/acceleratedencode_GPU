@@ -158,6 +158,498 @@ void aeg_intra_predict_chroma(uint8_t *pred, int stride, const uint8_t *top,
 }
 
 /* ------------------------------------------------------------------ */
+/* Intra_8x8 (High profile, 8.3.3.4)                                   */
+/* ------------------------------------------------------------------ */
+#define I8_F1(a, b)    (((a) + (b) + 1) >> 1)
+#define I8_F2(a, b, c) (((a) + 2 * (b) + (c) + 2) >> 2)
+/* The nine predictors below are transcribed from the reference encoder's
+ * predict_8x8_* bodies, which spell the two interpolators F1/F2. */
+#define F1(a, b)       I8_F1(a, b)
+#define F2(a, b, c)    I8_F2(a, b, c)
+
+/* The eight-by-eight prediction modes are the same nine directions as the
+ * four-by-four ones, but they read *filtered* reference samples z[]: a low-pass
+ * along the neighbouring row and column (which is what stops the 1/4-sample
+ * diagonal interpolation of the larger block from ringing) and, at the two
+ * ends, a one-sided filter.  The prediction equations below are those of
+ * 8.3.3.4.3 with z in place of p.
+ *
+ * Availability: the caller substitutes an unavailable side with the first
+ * sample of the other one (8.3.3.1) -- so an unavailable top-right corner,
+ * which this signature has no flag for, is simply the block's last top sample
+ * repeated, which is exactly what the filtering then produces as well. */
+void aeg_intra_predict_8x8(uint8_t *pred, int stride, const uint8_t *top,
+                           const uint8_t *left, int topleft, int mode,
+                           int top_avail, int left_avail, int topleft_avail)
+{
+    int rt[16], rl[8], rlt, zt[16], zl[8], zlt, x, y, i, dc;
+    uint8_t p[64];
+
+    for (x = 0; x < 16; x++)
+        rt[x] = top_avail ? top[x] : (left_avail ? left[0] : 128);
+    for (y = 0; y < 8; y++)
+        rl[y] = left_avail ? left[y] : (top_avail ? top[0] : 128);
+    rlt = topleft_avail ? topleft
+                        : (top_avail ? top[0] : (left_avail ? left[0] : 128));
+
+    zlt = I8_F2(rt[0], rlt, rl[0]);
+    zt[0] = I8_F2(rlt, rt[0], rt[1]);
+    for (x = 1; x < 7; x++)
+        zt[x] = I8_F2(rt[x - 1], rt[x], rt[x + 1]);
+    zt[7] = I8_F2(rt[6], rt[7], rt[8]);
+    for (x = 8; x < 15; x++)
+        zt[x] = I8_F2(rt[x - 1], rt[x], rt[x + 1]);
+    zt[15] = (rt[14] + 3 * rt[15] + 2) >> 2;
+    zl[0] = I8_F2(rlt, rl[0], rl[1]);
+    for (y = 1; y < 7; y++)
+        zl[y] = I8_F2(rl[y - 1], rl[y], rl[y + 1]);
+    zl[7] = (rl[6] + 3 * rl[7] + 2) >> 2;
+
+    switch (mode) {
+    case 0:                                     /* vertical */
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++)
+                p[y * 8 + x] = (uint8_t)zt[x];
+        break;
+    case 1:                                     /* horizontal */
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++)
+                p[y * 8 + x] = (uint8_t)zl[y];
+        break;
+    case 2:                                     /* DC */
+        if (top_avail && left_avail) {
+            dc = 8;
+            for (i = 0; i < 8; i++)
+                dc += zt[i] + zl[i];
+            dc >>= 4;
+        } else if (top_avail) {
+            dc = 4;
+            for (i = 0; i < 8; i++)
+                dc += zt[i];
+            dc >>= 3;
+        } else if (left_avail) {
+            dc = 4;
+            for (i = 0; i < 8; i++)
+                dc += zl[i];
+            dc >>= 3;
+        } else {
+            dc = 128;
+        }
+        for (i = 0; i < 64; i++)
+            p[i] = (uint8_t)dc;
+        break;
+    case 3:                                     /* diagonal down-left */
+    p[0] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[1] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[2] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[3] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[4] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[5] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[6] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[7] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[8] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[9] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[10] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[11] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[12] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[13] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[14] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[15] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[16] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[17] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[18] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[19] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[20] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[21] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[22] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[23] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[24] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[25] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[26] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[27] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[28] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[29] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[30] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[31] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    p[32] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[33] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[34] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[35] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[36] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[37] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[38] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    p[39] = (uint8_t)F2(zt[11],zt[12],zt[13]);
+    p[40] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[41] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[42] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[43] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[44] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[45] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    p[46] = (uint8_t)F2(zt[11],zt[12],zt[13]);
+    p[47] = (uint8_t)F2(zt[12],zt[13],zt[14]);
+    p[48] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[49] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[50] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[51] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[52] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    p[53] = (uint8_t)F2(zt[11],zt[12],zt[13]);
+    p[54] = (uint8_t)F2(zt[12],zt[13],zt[14]);
+    p[55] = (uint8_t)F2(zt[13],zt[14],zt[15]);
+    p[56] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[57] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[58] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[59] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    p[60] = (uint8_t)F2(zt[11],zt[12],zt[13]);
+    p[61] = (uint8_t)F2(zt[12],zt[13],zt[14]);
+    p[62] = (uint8_t)F2(zt[13],zt[14],zt[15]);
+    p[63] = (uint8_t)F2(zt[14],zt[15],zt[15]);
+    break;
+    case 4:                                     /* diagonal down-right */
+    p[0] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[1] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[2] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[3] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[4] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[5] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[6] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[7] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[8] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[9] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[10] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[11] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[12] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[13] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[14] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[15] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[16] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[17] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[18] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[19] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[20] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[21] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[22] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[23] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[24] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[25] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[26] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[27] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[28] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[29] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[30] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[31] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[32] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[33] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[34] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[35] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[36] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[37] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[38] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[39] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[40] = (uint8_t)F2(zl[5],zl[4],zl[3]);
+    p[41] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[42] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[43] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[44] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[45] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[46] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[47] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[48] = (uint8_t)F2(zl[6],zl[5],zl[4]);
+    p[49] = (uint8_t)F2(zl[5],zl[4],zl[3]);
+    p[50] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[51] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[52] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[53] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[54] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[55] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[56] = (uint8_t)F2(zl[7],zl[6],zl[5]);
+    p[57] = (uint8_t)F2(zl[6],zl[5],zl[4]);
+    p[58] = (uint8_t)F2(zl[5],zl[4],zl[3]);
+    p[59] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[60] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[61] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[62] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[63] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    break;
+    case 5:                                     /* vertical-right */
+    p[0] = (uint8_t)F1(zlt,zt[0]);
+    p[1] = (uint8_t)F1(zt[0],zt[1]);
+    p[2] = (uint8_t)F1(zt[1],zt[2]);
+    p[3] = (uint8_t)F1(zt[2],zt[3]);
+    p[4] = (uint8_t)F1(zt[3],zt[4]);
+    p[5] = (uint8_t)F1(zt[4],zt[5]);
+    p[6] = (uint8_t)F1(zt[5],zt[6]);
+    p[7] = (uint8_t)F1(zt[6],zt[7]);
+    p[8] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[9] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[10] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[11] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[12] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[13] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[14] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[15] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[16] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[17] = (uint8_t)F1(zlt,zt[0]);
+    p[18] = (uint8_t)F1(zt[0],zt[1]);
+    p[19] = (uint8_t)F1(zt[1],zt[2]);
+    p[20] = (uint8_t)F1(zt[2],zt[3]);
+    p[21] = (uint8_t)F1(zt[3],zt[4]);
+    p[22] = (uint8_t)F1(zt[4],zt[5]);
+    p[23] = (uint8_t)F1(zt[5],zt[6]);
+    p[24] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[25] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[26] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[27] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[28] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[29] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[30] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[31] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[32] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[33] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[34] = (uint8_t)F1(zlt,zt[0]);
+    p[35] = (uint8_t)F1(zt[0],zt[1]);
+    p[36] = (uint8_t)F1(zt[1],zt[2]);
+    p[37] = (uint8_t)F1(zt[2],zt[3]);
+    p[38] = (uint8_t)F1(zt[3],zt[4]);
+    p[39] = (uint8_t)F1(zt[4],zt[5]);
+    p[40] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[41] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[42] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[43] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[44] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[45] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[46] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[47] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[48] = (uint8_t)F2(zl[5],zl[4],zl[3]);
+    p[49] = (uint8_t)F2(zl[3],zl[2],zl[1]);
+    p[50] = (uint8_t)F2(zl[1],zl[0],zlt);
+    p[51] = (uint8_t)F1(zlt,zt[0]);
+    p[52] = (uint8_t)F1(zt[0],zt[1]);
+    p[53] = (uint8_t)F1(zt[1],zt[2]);
+    p[54] = (uint8_t)F1(zt[2],zt[3]);
+    p[55] = (uint8_t)F1(zt[3],zt[4]);
+    p[56] = (uint8_t)F2(zl[6],zl[5],zl[4]);
+    p[57] = (uint8_t)F2(zl[4],zl[3],zl[2]);
+    p[58] = (uint8_t)F2(zl[2],zl[1],zl[0]);
+    p[59] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[60] = (uint8_t)F2(zlt,zt[0],zt[1]);
+    p[61] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[62] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[63] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    break;
+    case 6:                                     /* horizontal-down */
+    p[0] = (uint8_t)F1(zlt,zl[0]);
+    p[1] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[2] = (uint8_t)F2(zt[1],zt[0],zlt);
+    p[3] = (uint8_t)F2(zt[2],zt[1],zt[0]);
+    p[4] = (uint8_t)F2(zt[3],zt[2],zt[1]);
+    p[5] = (uint8_t)F2(zt[4],zt[3],zt[2]);
+    p[6] = (uint8_t)F2(zt[5],zt[4],zt[3]);
+    p[7] = (uint8_t)F2(zt[6],zt[5],zt[4]);
+    p[8] = (uint8_t)F1(zl[0],zl[1]);
+    p[9] = (uint8_t)F2(zlt,zl[0],zl[1]);
+    p[10] = (uint8_t)F1(zlt,zl[0]);
+    p[11] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[12] = (uint8_t)F2(zt[1],zt[0],zlt);
+    p[13] = (uint8_t)F2(zt[2],zt[1],zt[0]);
+    p[14] = (uint8_t)F2(zt[3],zt[2],zt[1]);
+    p[15] = (uint8_t)F2(zt[4],zt[3],zt[2]);
+    p[16] = (uint8_t)F1(zl[1],zl[2]);
+    p[17] = (uint8_t)F2(zl[0],zl[1],zl[2]);
+    p[18] = (uint8_t)F1(zl[0],zl[1]);
+    p[19] = (uint8_t)F2(zlt,zl[0],zl[1]);
+    p[20] = (uint8_t)F1(zlt,zl[0]);
+    p[21] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[22] = (uint8_t)F2(zt[1],zt[0],zlt);
+    p[23] = (uint8_t)F2(zt[2],zt[1],zt[0]);
+    p[24] = (uint8_t)F1(zl[2],zl[3]);
+    p[25] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[26] = (uint8_t)F1(zl[1],zl[2]);
+    p[27] = (uint8_t)F2(zl[0],zl[1],zl[2]);
+    p[28] = (uint8_t)F1(zl[0],zl[1]);
+    p[29] = (uint8_t)F2(zlt,zl[0],zl[1]);
+    p[30] = (uint8_t)F1(zlt,zl[0]);
+    p[31] = (uint8_t)F2(zl[0],zlt,zt[0]);
+    p[32] = (uint8_t)F1(zl[3],zl[4]);
+    p[33] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[34] = (uint8_t)F1(zl[2],zl[3]);
+    p[35] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[36] = (uint8_t)F1(zl[1],zl[2]);
+    p[37] = (uint8_t)F2(zl[0],zl[1],zl[2]);
+    p[38] = (uint8_t)F1(zl[0],zl[1]);
+    p[39] = (uint8_t)F2(zlt,zl[0],zl[1]);
+    p[40] = (uint8_t)F1(zl[4],zl[5]);
+    p[41] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[42] = (uint8_t)F1(zl[3],zl[4]);
+    p[43] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[44] = (uint8_t)F1(zl[2],zl[3]);
+    p[45] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[46] = (uint8_t)F1(zl[1],zl[2]);
+    p[47] = (uint8_t)F2(zl[0],zl[1],zl[2]);
+    p[48] = (uint8_t)F1(zl[5],zl[6]);
+    p[49] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[50] = (uint8_t)F1(zl[4],zl[5]);
+    p[51] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[52] = (uint8_t)F1(zl[3],zl[4]);
+    p[53] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[54] = (uint8_t)F1(zl[2],zl[3]);
+    p[55] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[56] = (uint8_t)F1(zl[6],zl[7]);
+    p[57] = (uint8_t)F2(zl[5],zl[6],zl[7]);
+    p[58] = (uint8_t)F1(zl[5],zl[6]);
+    p[59] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[60] = (uint8_t)F1(zl[4],zl[5]);
+    p[61] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[62] = (uint8_t)F1(zl[3],zl[4]);
+    p[63] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    break;
+    case 7:                                     /* vertical-left */
+    p[0] = (uint8_t)F1(zt[0],zt[1]);
+    p[1] = (uint8_t)F1(zt[1],zt[2]);
+    p[2] = (uint8_t)F1(zt[2],zt[3]);
+    p[3] = (uint8_t)F1(zt[3],zt[4]);
+    p[4] = (uint8_t)F1(zt[4],zt[5]);
+    p[5] = (uint8_t)F1(zt[5],zt[6]);
+    p[6] = (uint8_t)F1(zt[6],zt[7]);
+    p[7] = (uint8_t)F1(zt[7],zt[8]);
+    p[8] = (uint8_t)F2(zt[0],zt[1],zt[2]);
+    p[9] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[10] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[11] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[12] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[13] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[14] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[15] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[16] = (uint8_t)F1(zt[1],zt[2]);
+    p[17] = (uint8_t)F1(zt[2],zt[3]);
+    p[18] = (uint8_t)F1(zt[3],zt[4]);
+    p[19] = (uint8_t)F1(zt[4],zt[5]);
+    p[20] = (uint8_t)F1(zt[5],zt[6]);
+    p[21] = (uint8_t)F1(zt[6],zt[7]);
+    p[22] = (uint8_t)F1(zt[7],zt[8]);
+    p[23] = (uint8_t)F1(zt[8],zt[9]);
+    p[24] = (uint8_t)F2(zt[1],zt[2],zt[3]);
+    p[25] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[26] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[27] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[28] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[29] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[30] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[31] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[32] = (uint8_t)F1(zt[2],zt[3]);
+    p[33] = (uint8_t)F1(zt[3],zt[4]);
+    p[34] = (uint8_t)F1(zt[4],zt[5]);
+    p[35] = (uint8_t)F1(zt[5],zt[6]);
+    p[36] = (uint8_t)F1(zt[6],zt[7]);
+    p[37] = (uint8_t)F1(zt[7],zt[8]);
+    p[38] = (uint8_t)F1(zt[8],zt[9]);
+    p[39] = (uint8_t)F1(zt[9],zt[10]);
+    p[40] = (uint8_t)F2(zt[2],zt[3],zt[4]);
+    p[41] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[42] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[43] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[44] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[45] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[46] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[47] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[48] = (uint8_t)F1(zt[3],zt[4]);
+    p[49] = (uint8_t)F1(zt[4],zt[5]);
+    p[50] = (uint8_t)F1(zt[5],zt[6]);
+    p[51] = (uint8_t)F1(zt[6],zt[7]);
+    p[52] = (uint8_t)F1(zt[7],zt[8]);
+    p[53] = (uint8_t)F1(zt[8],zt[9]);
+    p[54] = (uint8_t)F1(zt[9],zt[10]);
+    p[55] = (uint8_t)F1(zt[10],zt[11]);
+    p[56] = (uint8_t)F2(zt[3],zt[4],zt[5]);
+    p[57] = (uint8_t)F2(zt[4],zt[5],zt[6]);
+    p[58] = (uint8_t)F2(zt[5],zt[6],zt[7]);
+    p[59] = (uint8_t)F2(zt[6],zt[7],zt[8]);
+    p[60] = (uint8_t)F2(zt[7],zt[8],zt[9]);
+    p[61] = (uint8_t)F2(zt[8],zt[9],zt[10]);
+    p[62] = (uint8_t)F2(zt[9],zt[10],zt[11]);
+    p[63] = (uint8_t)F2(zt[10],zt[11],zt[12]);
+    break;
+    case 8:                                     /* horizontal-up */
+    p[0] = (uint8_t)F1(zl[0],zl[1]);
+    p[1] = (uint8_t)F2(zl[0],zl[1],zl[2]);
+    p[2] = (uint8_t)F1(zl[1],zl[2]);
+    p[3] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[4] = (uint8_t)F1(zl[2],zl[3]);
+    p[5] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[6] = (uint8_t)F1(zl[3],zl[4]);
+    p[7] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[8] = (uint8_t)F1(zl[1],zl[2]);
+    p[9] = (uint8_t)F2(zl[1],zl[2],zl[3]);
+    p[10] = (uint8_t)F1(zl[2],zl[3]);
+    p[11] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[12] = (uint8_t)F1(zl[3],zl[4]);
+    p[13] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[14] = (uint8_t)F1(zl[4],zl[5]);
+    p[15] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[16] = (uint8_t)F1(zl[2],zl[3]);
+    p[17] = (uint8_t)F2(zl[2],zl[3],zl[4]);
+    p[18] = (uint8_t)F1(zl[3],zl[4]);
+    p[19] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[20] = (uint8_t)F1(zl[4],zl[5]);
+    p[21] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[22] = (uint8_t)F1(zl[5],zl[6]);
+    p[23] = (uint8_t)F2(zl[5],zl[6],zl[7]);
+    p[24] = (uint8_t)F1(zl[3],zl[4]);
+    p[25] = (uint8_t)F2(zl[3],zl[4],zl[5]);
+    p[26] = (uint8_t)F1(zl[4],zl[5]);
+    p[27] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[28] = (uint8_t)F1(zl[5],zl[6]);
+    p[29] = (uint8_t)F2(zl[5],zl[6],zl[7]);
+    p[30] = (uint8_t)F1(zl[6],zl[7]);
+    p[31] = (uint8_t)F2(zl[6],zl[7],zl[7]);
+    p[32] = (uint8_t)F1(zl[4],zl[5]);
+    p[33] = (uint8_t)F2(zl[4],zl[5],zl[6]);
+    p[34] = (uint8_t)F1(zl[5],zl[6]);
+    p[35] = (uint8_t)F2(zl[5],zl[6],zl[7]);
+    p[36] = (uint8_t)F1(zl[6],zl[7]);
+    p[37] = (uint8_t)F2(zl[6],zl[7],zl[7]);
+    p[38] = (uint8_t)zl[7];
+    p[39] = (uint8_t)zl[7];
+    p[40] = (uint8_t)F1(zl[5],zl[6]);
+    p[41] = (uint8_t)F2(zl[5],zl[6],zl[7]);
+    p[42] = (uint8_t)F1(zl[6],zl[7]);
+    p[43] = (uint8_t)F2(zl[6],zl[7],zl[7]);
+    p[44] = (uint8_t)zl[7];
+    p[45] = (uint8_t)zl[7];
+    p[46] = (uint8_t)zl[7];
+    p[47] = (uint8_t)zl[7];
+    p[48] = (uint8_t)F1(zl[6],zl[7]);
+    p[49] = (uint8_t)F2(zl[6],zl[7],zl[7]);
+    p[50] = (uint8_t)zl[7];
+    p[51] = (uint8_t)zl[7];
+    p[52] = (uint8_t)zl[7];
+    p[53] = (uint8_t)zl[7];
+    p[54] = (uint8_t)zl[7];
+    p[55] = (uint8_t)zl[7];
+    p[56] = (uint8_t)zl[7];
+    p[57] = (uint8_t)zl[7];
+    p[58] = (uint8_t)zl[7];
+    p[59] = (uint8_t)zl[7];
+    p[60] = (uint8_t)zl[7];
+    p[61] = (uint8_t)zl[7];
+    p[62] = (uint8_t)zl[7];
+    p[63] = (uint8_t)zl[7];
+    break;
+    default:
+        for (i = 0; i < 64; i++)
+            p[i] = 128;
+        break;
+    }
+
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            pred[y * stride + x] = p[y * 8 + x];
+}
+#undef F1
+#undef F2
+#undef I8_F1
+#undef I8_F2
+
+/* ------------------------------------------------------------------ */
 /* Intra_4x4                                                           */
 /* ------------------------------------------------------------------ */
 /* `top` holds p[-1][-1] at index 0? No: top[0..7] are p[0][-1]..p[7][-1]

@@ -37,6 +37,7 @@ static void usage(void)
 "  -b <backend>     auto | cpu | opencl | cuda (default auto)\n"
 "  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
 "  -p <preset>      0=ultrafast 1=fast 2=medium 3=slow 4=veryslow\n"
+"  --no-8x8dct      use only 4x4 luma transforms (Baseline profile)\n"
 "  --no-deblock     disable the in-loop deblocking filter\n"
 "  --range <int>    integer motion search range (default: from preset)\n"
 "  --subme <int>    subpel refinement 0..2 (default 1)\n"
@@ -196,6 +197,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
         else if (!strcmp(a, "--aq")) aq = atoi(argv[++i]);
+        else if (!strcmp(a, "--no-8x8dct")) p.transform_8x8 = 0;
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--calibrate")) {

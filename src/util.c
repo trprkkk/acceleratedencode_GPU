@@ -107,6 +107,7 @@ void aeg_params_default(aeg_params *p)
      * when the yardstick is PSNR.  See docs/STATUS.md. */
     p->aq_mode = 0;
     p->aq_strength = 10;
+    p->transform_8x8 = 1;
     p->deblock = 1;
     p->deblock_alpha = 0;
     p->deblock_beta = 0;

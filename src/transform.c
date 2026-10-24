@@ -825,6 +825,185 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
 }
 
 /* ------------------------------------------------------------------ */
+/* 8x8 transform (High profile)                                        */
+/* ------------------------------------------------------------------ */
+/* Two passes of the eight-point integer butterfly, rows then columns on the
+ * way in, columns then rows on the way out.  The forward pair has a DC gain of
+ * 64 and the inverse one brings it back with a >>6 in its second pass.
+ *
+ * The forward and inverse butterflies are the ones the H.264 8x8 transform is
+ * built from, and the inverse is written to the *decoder's* arithmetic: the
+ * dequantiser applies the reference scaling with its rounding and its int16
+ * clamp, the first pass truncates into int16 (8.5.10.2 keeps 16-bit
+ * intermediates) and the second one shifts by six.  That is not an
+ * optimisation of the arithmetic, it *is* the arithmetic: it is what makes the
+ * encoder's reconstruction bit-identical to a decoder's.
+ *
+ * Scaling.  The dequantiser is the reference decoder's: d = level * V8(qp%6,
+ * class) * 16 * 2^(qp/6), clipped to int16 and rounded by >>6.  The quantiser
+ * multiplier of each coefficient position is the one that inverts exactly that
+ * path (aeg_quant8_mf, see tables.c), applied with a 16 + qp/6 shift, so
+ * quantise-then-dequantise reproduces the coefficient at any QP.
+ *
+ * The 8x8 transform is not in the batched interface yet (tq_batch and
+ * iq_idct_batch take 4x4 blocks), so it always runs on the CPU. */
+#define DCT8_QUANT_SHIFT 16
+
+static inline void fdct8_1d(const int *s, int *d)
+{
+    const int s07 = s[0] + s[7], s16 = s[1] + s[6];
+    const int s25 = s[2] + s[5], s34 = s[3] + s[4];
+    const int d07 = s[0] - s[7], d16 = s[1] - s[6];
+    const int d25 = s[2] - s[5], d34 = s[3] - s[4];
+    const int a0 = s07 + s34, a1 = s16 + s25;
+    const int a2 = s07 - s34, a3 = s16 - s25;
+    const int a4 = d16 + d25 + (d07 + (d07 >> 1));
+    const int a5 = d07 - d34 - (d25 + (d25 >> 1));
+    const int a6 = d07 + d34 - (d16 + (d16 >> 1));
+    const int a7 = d16 - d25 + (d34 + (d34 >> 1));
+    d[0] = a0 + a1;
+    d[1] = a4 + (a7 >> 2);
+    d[2] = a2 + (a3 >> 1);
+    d[3] = a5 + (a6 >> 2);
+    d[4] = a0 - a1;
+    d[5] = a6 - (a5 >> 2);
+    d[6] = (a2 >> 1) - a3;
+    d[7] = (a4 >> 2) - a7;
+}
+
+static inline void idct8_1d(const int *s, int *d)
+{
+    const int a0 = s[0] + s[4], a2 = s[0] - s[4];
+    const int a4 = (s[2] >> 1) - s[6], a6 = (s[6] >> 1) + s[2];
+    const int b0 = a0 + a6, b2 = a2 + a4, b4 = a2 - a4, b6 = a0 - a6;
+    const int a1 = -s[3] + s[5] - s[7] - (s[7] >> 1);
+    const int a3 = s[1] + s[7] - s[3] - (s[3] >> 1);
+    const int a5 = -s[1] + s[7] + s[5] + (s[5] >> 1);
+    const int a7 = s[3] + s[5] + s[1] + (s[1] >> 1);
+    const int b1 = (a7 >> 2) + a1, b3 = a3 + (a5 >> 2);
+    const int b5 = (a3 >> 2) - a5, b7 = a7 - (a1 >> 2);
+    d[0] = b0 + b7;
+    d[1] = b2 + b5;
+    d[2] = b4 + b3;
+    d[3] = b6 + b1;
+    d[4] = b6 - b1;
+    d[5] = b4 - b3;
+    d[6] = b2 - b5;
+    d[7] = b0 - b7;
+}
+
+void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef)
+{
+    int tmp[64], out[64], s[8], d[8];
+    int x, y;
+
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            tmp[y * 8 + x] = res[y * stride + x];
+    for (y = 0; y < 8; y++) {                   /* rows */
+        fdct8_1d(tmp + y * 8, out + y * 8);
+    }
+    for (x = 0; x < 8; x++) {                   /* columns */
+        for (y = 0; y < 8; y++)
+            s[y] = out[y * 8 + x];
+        fdct8_1d(s, d);
+        for (y = 0; y < 8; y++) {
+            int v = d[y];
+            /* The coefficient buffer is 16 bits wide, as in the reference
+             * encoder; an eight-bit residual cannot reach the clamp (the
+             * largest single coefficient of a +-255 residual is about 7700). */
+            coef[y * 8 + x] = (int16_t)(v < -32768 ? -32768 :
+                                        (v > 32767 ? 32767 : v));
+        }
+    }
+}
+
+void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra)
+{
+    const int qbits = DCT8_QUANT_SHIFT + qp / 6;
+    const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+    const int m = qp % 6, sh = qp / 6;
+    int x, y;
+
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++) {
+            const int c = coef[y * 8 + x];
+            const int abs = c < 0 ? -c : c;
+            int lv = (int)(((int64_t)abs * aeg_quant8_mf[m][y * 8 + x] + f)
+                           >> qbits);
+            /* Keep the dequantised level inside the decoder's int16 range:
+             * |level * V8 * 16 * 2^(qp/6) >> 6| <= 32767. */
+            if (lv) {
+                const int64_t lim = ((int64_t)32767 << 6) /
+                                    ((int64_t)aeg_dequant8_ls[m][aeg_cls8[y][x]]
+                                     << sh);
+                if (lv > lim)
+                    lv = (int)lim;
+            }
+            level[y * 8 + x] = (int16_t)(c < 0 ? -lv : lv);
+        }
+}
+
+void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp)
+{
+    const int m = qp % 6, sh = qp / 6;
+    int x, y;
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++) {
+            const int64_t v = ((int64_t)level[y * 8 + x] *
+                               (aeg_dequant8_ls[m][aeg_cls8[y][x]] << sh) * 16
+                               + 32) >> 6;
+            coef[y * 8 + x] = (int16_t)(v < -32768 ? -32768 :
+                                        (v > 32767 ? 32767 : v));
+        }
+}
+
+void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
+{
+    int16_t d[64];
+    int16_t t[64];
+    int s[8], o[8];
+    int x, y;
+
+    aeg_dequant_8x8(level, d, qp);
+    d[0] = (int16_t)(d[0] + 32);        /* the decoder's rounding offset */
+    /* Rows first, then columns.  The forward transform post-multiplies by the
+     * 1-D transform along the rows and pre-multiplies by it along the columns,
+     * so its inverse has to run in the same order to undo both; running the
+     * columns first would reconstruct the transposed residual.  The reference
+     * decoder truncates to sixteen bits after the first pass and shifts only
+     * at the end of the second one, which is what the two int16 arrays here
+     * do. */
+    for (y = 0; y < 8; y++) {                   /* rows */
+        for (x = 0; x < 8; x++)
+            s[x] = d[y * 8 + x];
+        idct8_1d(s, o);
+        for (x = 0; x < 8; x++)
+            t[y * 8 + x] = (int16_t)o[x];
+    }
+    for (x = 0; x < 8; x++) {                   /* columns */
+        for (y = 0; y < 8; y++)
+            s[y] = t[y * 8 + x];
+        idct8_1d(s, o);
+        for (y = 0; y < 8; y++)
+            res[y * 8 + x] = (int16_t)(o[y] >> 6);
+    }
+}
+
+void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
+                      const uint8_t *pred, int pred_stride)
+{
+    int16_t res[64];
+    int x, y;
+    aeg_idct_8x8_residual(level, qp, res);
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++) {
+            int p = (int)pred[y * pred_stride + x] + (int)res[y * 8 + x];
+            dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+        }
+}
+
+/* ------------------------------------------------------------------ */
 /* Distortion                                                          */
 /* ------------------------------------------------------------------ */
 #if defined(__SSE2__)
@@ -965,6 +1144,48 @@ int aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb)
     for (i = 0; i < 16; i++)
         sum += abs(d[i]);
     return (sum + 1) >> 1;
+}
+
+/* 8x8 Walsh-Hadamard transform of `v`, in place. */
+static void hadamard8(int *v)
+{
+    int step, i, j;
+    for (step = 1; step < 8; step <<= 1)
+        for (i = 0; i < 8; i += 2 * step)
+            for (j = i; j < i + step; j++) {
+                int a = v[j], b = v[j + step];
+                v[j] = a + b;
+                v[j + step] = a - b;
+            }
+}
+
+/* Sum of absolute 8x8 Hadamard coefficients of the difference, scaled like
+ * aeg_satd_4x4 so that the two numbers are directly comparable: a flat
+ * residual of v costs 8v per 4x4 SATD block and 16v per 8x8 block, while a
+ * residual with detail at the 4x4 level costs more in the 8x8 measure.  That
+ * is exactly the comparison the transform-size decision needs -- the 8x8
+ * transform concentrates smooth energy into fewer coefficients, but it cannot
+ * represent the high frequencies of a busy block without ringing. */
+int aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+    int t[64], d[64], x, y, sum = 0;
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++)
+            d[x] = (int)a[y * sa + x] - (int)b[y * sb + x];
+        hadamard8(d);
+        for (x = 0; x < 8; x++)
+            t[y * 8 + x] = d[x];
+    }
+    for (x = 0; x < 8; x++) {
+        for (y = 0; y < 8; y++)
+            d[y] = t[y * 8 + x];
+        hadamard8(d);
+        for (y = 0; y < 8; y++)
+            t[y * 8 + x] = d[y];
+    }
+    for (x = 0; x < 64; x++)
+        sum += abs(t[x]);
+    return (sum + 2) >> 2;
 }
 
 int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)

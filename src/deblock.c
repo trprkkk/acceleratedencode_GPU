@@ -116,8 +116,8 @@ static void filter_chroma_intra_edge(uint8_t *pix, int xs, int alpha, int beta)
 /* ------------------------------------------------------------------ */
 static inline int is_intra(const aeg_mb *m)
 {
-    return m->type == AEG_MB_I4x4 || m->type == AEG_MB_I16x16 ||
-           m->type == AEG_MB_IPCM;
+    return m->type == AEG_MB_I4x4 || m->type == AEG_MB_I8x8 ||
+           m->type == AEG_MB_I16x16 || m->type == AEG_MB_IPCM;
 }
 
 /* bS for the luma edge between block `pa` of MB p and block `qa` of MB q,
@@ -239,6 +239,14 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         int qp, xs, step, lx, ly;
 
         if (mb_edge && ((vertical && mb_x == 0) || (!vertical && mb_y == 0)))
+            continue;
+        /* A macroblock whose luma was coded with the 8x8 transform has no
+         * transform boundary at 4 or 12, so only the internal edge at 8 is a
+         * filtering candidate (7.3.5, 8.7: the reference decoder filters the
+         * internal edges 0 and 2 only when IS_8x8DCT is set).  Chroma keeps
+         * its 4x4 transforms, whose single internal edge is the one at luma
+         * position 8, so this skip never removes a chroma edge. */
+        if (q->t8 && (k & 1))
             continue;
 
         edge_bs(p_mb, q, vertical, k, mb_edge, bs);

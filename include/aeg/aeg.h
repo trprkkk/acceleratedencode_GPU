@@ -118,6 +118,11 @@ typedef struct aeg_params {
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */
     int aq_mode;              /* 0 off, 1 variance AQ                   */
     int aq_strength;          /* 0..3, default 1.0 (units of 0.1?)      */
+    /* High-profile 8x8 luma transform.  One transform per 8x8 block instead of
+     * four 4x4 ones, with the matching Intra_8x8 prediction modes; a stream that
+     * uses it needs profile_idc 100 (High).  On by default: it is the larger of
+     * the two quality tools this encoder implements. */
+    int transform_8x8;
     int deblock;              /* 0 = off, 1 = on (default on)           */
     int deblock_alpha;        /* slice_alpha_c0_offset_div2, -6..6      */
     int deblock_beta;         /* slice_beta_offset_div2, -6..6          */

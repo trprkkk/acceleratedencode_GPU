@@ -38,7 +38,10 @@ enum {
     AEG_MB_P8x8,
     AEG_MB_I4x4,
     AEG_MB_I16x16,
-    AEG_MB_IPCM
+    AEG_MB_IPCM,
+    /* Intra_8x8 (High profile): I_NxN with transform_size_8x8_flag = 1 and one
+     * prediction mode per 8x8 luma block. */
+    AEG_MB_I8x8
 };
 
 enum { AEG_MB_I_V = 0, AEG_MB_I_H = 1, AEG_MB_I_DC = 2, AEG_MB_I_P = 3 };
@@ -57,10 +60,20 @@ enum {
 
 /* Zigzag scan (frame coded order) */
 extern const uint8_t aeg_zigzag4x4[16];
+/* 8x8 coefficient scan (High profile): scan position -> raster position of the
+ * 8x8 block, i.e. aeg_zigzag8x8[i] = y * 8 + x. */
+extern const uint8_t aeg_zigzag8x8[64];
 
 /* Constant tables (tables.c) */
 extern const uint16_t aeg_quant_mf[6][3];
 extern const uint8_t  aeg_dequant_ls[6][3];
+/* The 8x8 pair.  The dequantiser is the reference decoder's scaling table (six
+ * positional classes laid out in a 4x4 pattern tiled over the block, given per
+ * QP%6); the quantiser multiplier is one row of 64 per QP%6, in raster order,
+ * calibrated so that it inverts the reconstruction path (see tables.c). */
+extern const uint16_t aeg_quant8_mf[6][64];
+extern const uint8_t  aeg_dequant8_ls[6][6];
+extern const uint8_t  aeg_cls8[8][8];
 extern const uint8_t  aeg_qp_chroma_420[52];
 extern const uint8_t  aeg_alpha_tab[52];
 extern const uint8_t  aeg_beta_tab[52];
@@ -92,6 +105,8 @@ typedef struct aeg_mb {
     uint8_t  type;            /* AEG_MB_*                                 */
     uint8_t  i16_mode;        /* intra 16x16: V/H/DC/Plane                */
     uint8_t  intra4[16];      /* intra 4x4 modes, raster order            */
+    uint8_t  intra8[4];       /* intra 8x8 modes, 8x8 raster order        */
+    uint8_t  t8;              /* transform_size_8x8_flag of this MB       */
     uint8_t  chroma_mode;     /* intra chroma V(0)/H(1)/DC(2)/Plane(3)    */
     uint8_t  cbp;             /* H.264 CodedBlockPattern: (c<<4)|luma     */
     int8_t   qp;              /* luma QP actually used by this MB         */
@@ -187,7 +202,7 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
                      int long_start_code);
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap);
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8);
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int slice_qp_delta, int deblock_alpha,
@@ -198,12 +213,28 @@ void   aeg_set_last_error(const char *msg);
  * DC, 3 = Intra_16x16 AC block. */
 void aeg_cavlc_write_block(aeg_bitwriter *bw, const int16_t *coef, int nC, int kind);
 int  aeg_cavlc_block_cost(const int16_t *coef, int nC, int kind);
+/* 8x8 luma residual: four interleaved 4x4 lists, written one at a time
+ * because each list's context depends on the previous list's TotalCoeff. */
+void aeg_cavlc_write_block8(aeg_bitwriter *bw, const int16_t *coef, int sub,
+                            int nC);
+int  aeg_cavlc_block_cost8(const int16_t *coef, int sub, int nC);
+int  aeg_cavlc_nz8(const int16_t *coef, int sub);
 int  aeg_cavlc_nc(int nz_left, int nz_top, int have_left, int have_top);
 
 /* ------------------------------------------------------------------ */
 /* Transform / quantisation                                            */
 /* ------------------------------------------------------------------ */
 void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef);
+/* 8x8 (High profile) transform pair.  `res` is eight rows of `stride`; the 64
+ * coefficients of `coef`, of `level` and of the residual produced by
+ * aeg_idct_8x8_residual() are in raster order (index = y * 8 + x), which is the
+ * order the reference decoder's inverse transform reads. */
+void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef);
+void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra);
+void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp);
+void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res);
+void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
+                      const uint8_t *pred, int pred_stride);
 void aeg_transform_dc4x4(const int16_t dc[16], int16_t out[16]);
 void aeg_itransform_dc4x4(const int16_t in[16], int16_t out[16]);
 void aeg_transform_dc2x2(const int16_t dc[4], int16_t out[4]);
@@ -247,6 +278,9 @@ int  aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_16x16(const uint8_t *a, int sa, const uint8_t *b, int sb);
+/* 8x8 Hadamard SA8D, scaled to be comparable with aeg_satd_4x4 (see
+ * transform.c); the transform-size decision compares the two. */
+int  aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb);
 
 /* ------------------------------------------------------------------ */
@@ -258,6 +292,11 @@ void aeg_intra_predict_16x16(uint8_t *pred, int stride, const uint8_t *top,
                              const uint8_t *left, int top_avail, int left_avail,
                              int topleft_avail, int mode);
 void aeg_intra_predict_4x4(uint8_t *pred, int stride, const uint8_t *top,
+                           const uint8_t *left, int topleft, int mode,
+                           int top_avail, int left_avail, int topleft_avail);
+/* Intra_8x8 (High profile, H.264 8.3.3.4): `top` holds p[0..15][-1], `left`
+ * p[-1][0..7] and mode 2 is DC (one average, unlike the chroma 8x8 DC). */
+void aeg_intra_predict_8x8(uint8_t *pred, int stride, const uint8_t *top,
                            const uint8_t *left, int topleft, int mode,
                            int top_avail, int left_avail, int topleft_avail);
 void aeg_intra_predict_chroma(uint8_t *pred, int stride, const uint8_t *top,

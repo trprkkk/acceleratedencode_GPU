@@ -8,6 +8,8 @@
  * than a few dozen table lookups.  The dispatcher models this cost
  * explicitly rather than pretending otherwise.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "h264.h"
 
 static const uint8_t scan_dc[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
@@ -197,6 +199,53 @@ void aeg_cavlc_write_block(aeg_bitwriter *bw, const int16_t *coef, int nC,
     }
 }
 
+/* CAVLC residual of one 8x8 luma block (High profile, H.264 7.3.5.3.1.2).
+ *
+ * The sixty-four coefficients are transmitted as four 4x4 lists, each coded
+ * with the ordinary 4x4 syntax -- its own coeff_token, so its own nC, and
+ * maxNumCoeff = 16 -- but the lists are not the four quadrants of the block:
+ * they interleave the 8x8 scan, list k taking scan positions k, k + 4, k + 8,
+ * ...  That keeps the run-length coding of the 4x4 syntax usable on an 8x8
+ * block, because every list then holds sixteen coefficients spread evenly over
+ * the frequency range.
+ *
+ * The four lists are written one at a time, in transmission order, because the
+ * context of list k depends on the number of coefficients list k-1 turned out
+ * to have: the caller therefore reads each list's count back (aeg_cavlc_nz8)
+ * and passes it to the neighbouring lists as they come. */
+void aeg_cavlc_write_block8(aeg_bitwriter *bw, const int16_t *coef, int sub,
+                            int nC)
+{
+    int16_t list[16];
+    int n;
+    for (n = 0; n < 16; n++)
+        list[n] = coef[aeg_zigzag8x8[sub + 4 * n]];
+    if (getenv("AEGDBG")) {
+        fprintf(stderr, "ENC sub %d nC %d:", sub, nC);
+        for (n = 15; n >= 0; n--)
+            if (list[n])
+                fprintf(stderr, " [%d]=%d", n, list[n]);
+        fprintf(stderr, "\n");
+    }
+    if (getenv("AEGDBG"))
+        fprintf(stderr, "ENC sub %d bits before %d\n", sub,
+                (int)(bw->len * 8 + bw->bits));
+    write_block(bw, list, scan_dc, 16, nC, 16, 0);
+    if (getenv("AEGDBG"))
+        fprintf(stderr, "ENC sub %d bits after %d\n", sub,
+                (int)(bw->len * 8 + bw->bits));
+}
+
+/* Number of non-zero coefficients of one of the four lists (its
+ * TotalCoeff), which is what the neighbouring lists use as their context. */
+int aeg_cavlc_nz8(const int16_t *coef, int sub)
+{
+    int n = 0, i;
+    for (i = 0; i < 16; i++)
+        n += coef[aeg_zigzag8x8[sub + 4 * i]] != 0;
+    return n;
+}
+
 int aeg_cavlc_nc(int nz_left, int nz_top, int have_left, int have_top)
 {
     if (have_left && have_top)
@@ -216,5 +265,14 @@ int aeg_cavlc_block_cost(const int16_t *coef, int nC, int kind)
     aeg_bitwriter bw;
     aeg_bw_init(&bw, NULL, 0, 0);
     aeg_cavlc_write_block(&bw, coef, nC, kind);
+    return (int)(bw.len * 8 + bw.bits);
+}
+
+/* Same measurement for one list of an 8x8 block (aeg_cavlc_write_block8). */
+int aeg_cavlc_block_cost8(const int16_t *coef, int sub, int nC)
+{
+    aeg_bitwriter bw;
+    aeg_bw_init(&bw, NULL, 0, 0);
+    aeg_cavlc_write_block8(&bw, coef, sub, nC);
     return (int)(bw.len * 8 + bw.bits);
 }

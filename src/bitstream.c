@@ -155,11 +155,23 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
         level_idc = pick_level(mb_w, mb_h, p->fps_num, p->fps_den,
                                p->bitrate_kbps);
 
+    /* High profile as soon as the 8x8 transform is on -- it is the profile that
+     * introduced transform_size_8x8_flag (the rest of the stream stays inside
+     * the Baseline tool set, so the constraint flags are not set). */
+    const int high = p->transform_8x8 != 0;
+
     aeg_bw_init(&bw, rbsp, cap, 0);
-    aeg_bw_put(&bw, 8, 66);              /* profile_idc = Baseline          */
-    aeg_bw_put(&bw, 8, 0xc0);            /* constraint_set0/1               */
+    aeg_bw_put(&bw, 8, high ? 100 : 66); /* profile_idc                     */
+    aeg_bw_put(&bw, 8, high ? 0x00 : 0xc0); /* constraint_set0/1            */
     aeg_bw_put(&bw, 8, (uint32_t)level_idc);
     aeg_bw_ue(&bw, 0);                   /* seq_parameter_set_id            */
+    if (high) {
+        aeg_bw_ue(&bw, 1);               /* chroma_format_idc = 4:2:0       */
+        aeg_bw_ue(&bw, 0);               /* bit_depth_luma_minus8           */
+        aeg_bw_ue(&bw, 0);               /* bit_depth_chroma_minus8         */
+        aeg_bw_put(&bw, 1, 0);           /* qpprime_y_zero_transform_bypass */
+        aeg_bw_put(&bw, 1, 0);           /* seq_scaling_matrix_present_flag */
+    }
     aeg_bw_ue(&bw, (uint32_t)(frame_num_bits - 4));
     aeg_bw_ue(&bw, 2);                   /* pic_order_cnt_type = 2          */
     aeg_bw_ue(&bw, 1);                   /* max_num_ref_frames              */
@@ -182,7 +194,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     return aeg_bw_finish(&bw);
 }
 
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap)
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, rbsp, cap, 0);
@@ -201,6 +213,13 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap)
     aeg_bw_put(&bw, 1, 1);      /* deblocking_filter_control_present_flag  */
     aeg_bw_put(&bw, 1, 0);      /* constrained_intra_pred_flag             */
     aeg_bw_put(&bw, 1, 0);      /* redundant_pic_cnt_present_flag          */
+    /* High profile extensions: only written when the 8x8 transform is on, and
+     * then only to switch it on -- the scaling matrices stay flat (absent). */
+    if (transform_8x8) {
+        aeg_bw_put(&bw, 1, 1);  /* transform_8x8_mode_flag                 */
+        aeg_bw_put(&bw, 1, 0);  /* pic_scaling_matrix_present_flag          */
+        aeg_bw_se(&bw, 0);      /* second_chroma_qp_index_offset            */
+    }
     return aeg_bw_finish(&bw);
 }
 

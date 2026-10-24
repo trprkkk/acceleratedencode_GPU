@@ -12,6 +12,7 @@
  * reconstruction with an independent decode of the bitstream.
  */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -22,10 +23,20 @@
 typedef struct mbenc {
     int16_t  level[AEG_BLK_COUNT][16];
     int8_t   nz[AEG_BLK_COUNT];
+    /* Luma coded with the 8x8 transform (High profile): one 64-coefficient
+     * block per 8x8 group in raster order, the group's non-zero flag, and the
+     * transform_size_8x8_flag itself.  `nz[]` still carries the per-4x4-block
+     * numbers the CAVLC contexts need; for these macroblocks they hold each
+     * list's coefficient count while the lists are coded and the block's 0/1
+     * flag afterwards (see luma8_costs). */
+    int16_t  level8[4][64];
+    int8_t   nz8[4];
+    int      t8;
     int16_t  mv[16][2];             /* per 4x4 block, 1/4 pel               */
     int      type;                  /* AEG_MB_*                             */
     int      i16_mode;              /* 0=V 1=H 2=DC 3=Plane                 */
     uint8_t  intra4[16];            /* Intra_4x4 modes, Figure 6-8 order    */
+    uint8_t  intra8[4];             /* Intra_8x8 modes, 8x8 raster order    */
     int      chroma_mode;           /* 0=DC 1=H 2=V 3=Plane                 */
     int      cbp;
     int      qp;
@@ -238,7 +249,8 @@ static inline int clip255(int v)
 /* ------------------------------------------------------------------ */
 static int is_intra_type(int t)
 {
-    return t == AEG_MB_I4x4 || t == AEG_MB_I16x16 || t == AEG_MB_IPCM;
+    return t == AEG_MB_I4x4 || t == AEG_MB_I8x8 || t == AEG_MB_I16x16 ||
+           t == AEG_MB_IPCM;
 }
 
 static int is_inter_type(int t)
@@ -674,6 +686,134 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         aeg_quant_4x4(coef, c->level[blk], qp, 0);
     }
     luma_inter_finish(e, mbx, mby, c, &c->level[0][0], NULL, NULL, pred);
+}
+
+/* ------------------------------------------------------------------ */
+/* Luma coding: the 8x8 transform (High profile)                       */
+/* ------------------------------------------------------------------ */
+/* Which 8x8 block a 4x4 slot belongs to (the coded block pattern has one bit
+ * per 8x8 block) is blk_group() above; the four 4x4 blocks of a group, in the
+ * order their coefficient lists are transmitted, are group_blk[][]. */
+
+/* Coefficients, residual and reconstruction of one 8x8 luma block.
+ *
+ * `pred` holds the predictor of the block (stride pred_stride); the
+ * reconstruction is written straight into the picture, because the blocks that
+ * follow predict from it -- for Intra_8x8 that includes the next block of the
+ * same macroblock. */
+static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                             int g, const uint8_t *pred, int pred_stride,
+                             int intra)
+{
+    const int s = e->stride[0];
+    const uint8_t *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    uint8_t *dst = e->recp[0] + mby * 16 * s + mbx * 16;
+    const int bx = (g & 1) * 8, by = (g >> 1) * 8;
+    int16_t res[64], coef[64];
+    int i, x, y;
+
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            res[y * 8 + x] = (int16_t)((int)src[(by + y) * s + bx + x] -
+                                       (int)pred[y * pred_stride + x]);
+    aeg_transform_8x8(res, 8, coef);
+    aeg_quant_8x8(coef, c->level8[g], c->qp, intra);
+    c->nz8[g] = 0;
+    for (i = 0; i < 64; i++)
+        c->nz8[g] |= c->level8[g][i] != 0;
+
+    aeg_idct_8x8_add(dst + by * s + bx, s, c->level8[g], c->qp, pred,
+                     pred_stride);
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++) {
+            int d = (int)dst[(by + y) * s + bx + x] -
+                    (int)src[(by + y) * s + bx + x];
+            c->sse += (int64_t)d * d;
+        }
+}
+
+/* Coded block pattern, contexts and CAVLC cost of the four 8x8 luma blocks.
+ *
+ * The order is the transmission order: the groups in raster order, and the
+ * four coefficient lists of a group in the order of group_blk[].  The context
+ * of a list comes from the neighbouring 4x4 slots, so the slots have to hold
+ * what the reference decoder holds when it reaches the same list: a group's
+ * four slots start undefined, each list's slot takes that list's TotalCoeff as
+ * soon as the list has been read, and when the group is finished the decoder
+ * adds the four counts into the group's first slot (decode_luma_residual), so
+ * the blocks below and to the right of an 8x8 block see its total.  A group
+ * whose coded block pattern bit is clear has all four slots zeroed.  Only
+ * slots of blocks that have already been coded are ever read, so coding in
+ * this order keeps both sides in step. */
+static void luma8_group_done(mbenc *c, int g)
+{
+    int k, sum = 0;
+    for (k = 0; k < 4; k++)
+        sum += c->nz[group_blk[g][k]];
+    c->nz[group_blk[g][0]] = (int8_t)sum;
+}
+
+static void luma8_costs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    int g, k, cbp = c->cbp & 0x30;
+
+    for (g = 0; g < 4; g++) {
+        int flag = c->nz8[g] != 0;
+        if (flag)
+            cbp |= 1 << g;
+        for (k = 0; k < 4; k++) {
+            int b = group_blk[g][k];
+            if (flag) {
+                c->bits += aeg_cavlc_block_cost8(c->level8[g], k,
+                                                 luma_nc(e, mbx, mby, c, b));
+                c->nz[b] = (int8_t)aeg_cavlc_nz8(c->level8[g], k);
+            } else {
+                c->nz[b] = 0;
+            }
+        }
+        luma8_group_done(c, g);
+    }
+    c->cbp = cbp;
+}
+
+/* Inter residual with the 8x8 transform.  The prediction of the whole
+ * macroblock is already in e->pred_l (every partition is motion compensated
+ * before the residual is coded), so the four blocks are independent. */
+static void code_luma_inter8(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    int g;
+    c->t8 = 1;
+    for (g = 0; g < 4; g++)
+        code_luma8_block(e, mbx, mby, c, g,
+                         e->pred_l + (g >> 1) * 8 * 16 + (g & 1) * 8, 16, 0);
+    luma8_costs(e, mbx, mby, c);
+}
+
+/* Which transform a macroblock's luma residual should use.  The reference
+ * encoder's test: compare the summed 4x4 SATD of the residual with its summed
+ * 8x8 SA8D, both scaled to the same units.  A residual whose detail lives
+ * inside the 4x4 blocks (busy areas) costs more in the 8x8 measure, because
+ * the 8x8 transform cannot represent that detail without ringing; a smooth
+ * residual costs more in the 4x4 measure, because sixteen small transforms
+ * spread it over more coefficients than four large ones. */
+static int use_t8(const struct aeg_encoder *e, int mbx, int mby)
+{
+    const int s = e->stride[0];
+    const uint8_t *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    int g, x, y, cost4 = 0, cost8 = 0;
+
+    if (!e->p.transform_8x8)
+        return 0;
+    for (g = 0; g < 4; g++) {
+        const int bx = (g & 1) * 8, by = (g >> 1) * 8;
+        cost8 += aeg_sa8d_8x8(src + by * s + bx, s, e->pred_l + by * 16 + bx,
+                              16);
+        for (y = 0; y < 8; y += 4)
+            for (x = 0; x < 8; x += 4)
+                cost4 += aeg_satd_4x4(src + (by + y) * s + bx + x, s,
+                                      e->pred_l + (by + y) * 16 + bx + x, 16);
+    }
+    return cost8 < cost4;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1752,10 +1892,13 @@ static int luma_cbp_on(const mbenc *c)
 
 /* Bits the macroblock header costs: mb_type (and, for the intra types, the
  * chroma prediction mode and the coded block pattern that mb_type carries). */
-static int mb_type_bits(const mbenc *c, int is_p)
+static int mb_type_bits(const struct aeg_encoder *e, const mbenc *c, int is_p)
 {
-    if (c->type == AEG_MB_I4x4)
-        return aeg_ue_bits(is_p ? 5u : 0u);
+    /* An I_NxN macroblock carries transform_size_8x8_flag right after mb_type
+     * (7.3.5.2) whenever the picture parameter set enables the 8x8 transform,
+     * whether or not the macroblock actually uses it. */
+    if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
+        return aeg_ue_bits(is_p ? 5u : 0u) + (e->p.transform_8x8 ? 1 : 0);
     if (!is_p)
         return aeg_ue_bits((uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
                                       12 * (luma_cbp_on(c) ? 1 : 0)));
@@ -1767,9 +1910,9 @@ static int mb_type_bits(const mbenc *c, int is_p)
 
 /* Header bits of the inter geometry: mb_type plus one mvd pair per partition
  * (H.264 codes mvd in the same 1/4-pel units as the MV itself). */
-static int inter_hdr_bits(const mbenc *c)
+static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
 {
-    int p, i, bits = mb_type_bits(c, 1);
+    int p, i, bits = mb_type_bits(e, c, 1);
     /* P_8x8 carries a sub_mb_type per 8x8 partition, before any mvd. */
     if (c->type == AEG_MB_P8x8)
         for (i = 0; i < 4; i++)
@@ -1780,6 +1923,10 @@ static int inter_hdr_bits(const mbenc *c)
         bits += aeg_mvd_bits(c->mv[b0][0] - c->pmv[b0][0],
                              c->mv[b0][1] - c->pmv[b0][1]);
     }
+    /* transform_size_8x8_flag: for inter macroblocks it comes after the coded
+     * block pattern and only when the luma pattern is non-zero. */
+    if (e->p.transform_8x8 && (c->cbp & 0x0f) && c->t8)
+        bits += 1;
     return bits;
 }
 
@@ -2058,6 +2205,151 @@ static int64_t rd_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
     reset_mb_enc(t, qp);
     code_luma_i4x4(e, mbx, mby, t, lambda);
     t->cost = t->sse + (int64_t)(lambda * t->bits + 0.5);
+    if (getenv("AEGDBG") && mbx == 2 && mby == 0) {
+        int j;
+        fprintf(stderr, "ENCI4C nz %d %d %d %d lev8:", t->nz[8], t->nz[9],
+                t->nz[10], t->nz[11]);
+        for (j = 0; j < 16; j++)
+            fprintf(stderr, " %d", t->level[8][j]);
+        fprintf(stderr, " px %d %d\n", e->recp[0][8 * e->stride[0] + 34],
+                e->recp[0][8 * e->stride[0] + 35]);
+    }
+    return t->cost;
+}
+
+/* H.264 8.3.1.2: the Intra_8x8 mode predictor is the smaller of the modes of
+ * the 8x8 blocks to the left and above, where a neighbour that is not
+ * Intra_8x8-coded counts as DC and one outside the picture makes the whole
+ * prediction DC.  `cur` holds the modes decided so far, in raster order. */
+static int intra8_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
+                            const uint8_t *cur, int gx, int gy)
+{
+    int a, b;
+    if (gx > 0) {
+        a = cur[gy * 2 + gx - 1];
+    } else if (mbx > 0) {
+        const aeg_mb *m = &e->mbs[mby * e->mb_w + mbx - 1];
+        a = m->type == AEG_MB_I8x8 ? m->intra8[gy * 2 + 1] : 2;
+    } else {
+        a = -1;
+    }
+    if (gy > 0) {
+        b = cur[(gy - 1) * 2 + gx];
+    } else if (mby > e->top_row) {
+        const aeg_mb *m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+        b = m->type == AEG_MB_I8x8 ? m->intra8[2 + gx] : 2;
+    } else {
+        b = -1;
+    }
+    if (a < 0 || b < 0)
+        return 2;
+    return a < b ? a : b;
+}
+
+/* Intra_8x8 luma: one prediction mode per 8x8 block, decided and coded in
+ * raster block order, because every block predicts from the reconstruction of
+ * the block to its left and the one above it -- including the ones of the same
+ * macroblock.  The mode is chosen by the 8x8 SATD of the prediction plus the
+ * bits the mode itself costs; the residual is then coded with the 8x8
+ * transform, which is what makes this an Intra_8x8 macroblock. */
+static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                           double lambda)
+{
+    const int s = e->stride[0];
+    const uint8_t *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    uint8_t *dst = e->recp[0] + mby * 16 * s + mbx * 16;
+    int bits_scale = (int)(lambda * 0.5 + 0.5);
+    int g, k, mode_bits = 0;
+
+    t->type = AEG_MB_I8x8;
+    t->t8 = 1;
+    t->cbp &= 0x30;                     /* keep the chroma pattern */
+    memset(t->intra8, 0, sizeof(t->intra8));
+
+    for (g = 0; g < 4; g++) {
+        const int gx = g & 1, gy = g >> 1;
+        const int bx = gx * 8, by = gy * 8;
+        const int top_avail = mby > e->top_row || by > 0;
+        const int left_avail = mbx > 0 || bx > 0;
+        uint8_t top[16], left[8];
+        int tl, tr_avail;
+        int nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
+        uint8_t pred[64];
+
+        /* The sixteen top samples.  Inside the macroblock the row above the
+         * block has already been reconstructed, so its samples are used as
+         * they are; at the top of the macroblock they come from the
+         * macroblock above, and the eight on the right only when the
+         * macroblock above-right has been decoded -- otherwise p[15][-1] is
+         * replicated into them (8.3.3.4.2). */
+        if (top_avail) {
+            const uint8_t *tr = by ? dst + (by - 1) * s + bx : dst - s + bx;
+            /* The eight samples on the right come from the 8x8 block above
+             * and to the right (8.3.3.4.2).  For the two blocks in the left
+             * column that block has already been reconstructed -- it is the
+             * top-right block of this macroblock for the lower one -- so the
+             * samples are used as they are.  For the top-right block it is in
+             * the macroblock above, which has been decoded when there is one,
+             * and for the bottom-right block it is in the macroblock to the
+             * right, which comes later in raster order and is therefore not
+             * available. */
+            tr_avail = (bx == 0) || (by == 0 && mbx + 1 < e->mb_w);
+            for (k = 0; k < 8; k++)
+                top[k] = tr[k];
+            for (k = 8; k < 16; k++)
+                top[k] = tr_avail ? tr[k] : top[7];
+        } else {
+            for (k = 0; k < 16; k++)
+                top[k] = 128;
+        }
+        if (left_avail) {
+            for (k = 0; k < 8; k++)
+                left[k] = dst[(by + k) * s + bx - 1];
+        } else {
+            for (k = 0; k < 8; k++)
+                left[k] = 128;
+        }
+        tl = (top_avail && left_avail) ? (by ? dst[(by - 1) * s + bx - 1]
+                                             : dst[-s + bx - 1]) : 128;
+
+        pmode = intra8_pred_mode(e, mbx, mby, t->intra8, gx, gy);
+        nmodes = intra4_mode_list(top_avail, left_avail, modes);
+        for (k = 0; k < nmodes; k++) {
+            int cost;
+            m = modes[k];
+            aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
+                                  left_avail, top_avail && left_avail);
+            cost = 2 * aeg_satd_8x8(pred, 8, src + by * s + bx, s);
+            /* The mode costs one bit when it matches the predictor and four
+             * otherwise, as for Intra_4x4. */
+            cost += bits_scale * (m == pmode ? 1 : 4);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = m;
+            }
+        }
+        t->intra8[g] = (uint8_t)best;
+        mode_bits += (best == pmode) ? 1 : 4;
+
+        aeg_intra_predict_8x8(pred, 8, top, left, tl, best, top_avail,
+                              left_avail, top_avail && left_avail);
+        code_luma8_block(e, mbx, mby, t, g, pred, 8, 1);
+    }
+
+    t->bits += mode_bits;
+    luma8_costs(e, mbx, mby, t);
+}
+
+static int64_t rd_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                            int qp, double lambda)
+{
+    reset_mb_enc(t, qp);
+    code_luma_i8x8(e, mbx, mby, t, lambda);
+    t->cost = t->sse + (int64_t)(lambda * t->bits + 0.5);
+    if (getenv("AEGDBG") && mby == 0 && mbx == 2)
+        fprintf(stderr, "ENCAND i8 cost %lld sse %lld bits %d level8_0 %d\n",
+                (long long)t->cost, (long long)t->sse, t->bits,
+                t->level8[2][0]);
     return t->cost;
 }
 
@@ -2082,8 +2374,11 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
             t->pmv[b][1] = (int16_t)e->mb_cand[cand].pmv[b][1];
         }
         inter_predict_typed(e, mbx, mby, t);
-        code_luma_inter(e, mbx, mby, t);
-        t->bits += inter_hdr_bits(t);
+        if (use_t8(e, mbx, mby))
+            code_luma_inter8(e, mbx, mby, t);
+        else
+            code_luma_inter(e, mbx, mby, t);
+        t->bits += inter_hdr_bits(e, t);
     } else {
         t->nparts = 1;
         intra16_sad(e, mbx, mby, i16_mode);   /* leaves the predictor in pred_l */
@@ -2164,9 +2459,18 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
         mbenc t;
         int64_t cost;
         cand_enc(e, k, qp, &t);
-        luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * k, e->rd_nz + 16 * k,
-                          e->rd_rec + 256 * k, e->rd_pred + 256 * k);
-        t.bits += inter_hdr_bits(&t);
+        /* The batch only produces 4x4 blocks: a candidate whose residual wants
+         * the 8x8 transform is coded through the serial path, which is what
+         * makes the two decisions agree. */
+        memcpy(e->pred_l, e->rd_pred + 256 * k, 256);
+        if (use_t8(e, mbx, mby)) {
+            code_luma_inter8(e, mbx, mby, &t);
+        } else {
+            luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * k,
+                              e->rd_nz + 16 * k, e->rd_rec + 256 * k,
+                              e->rd_pred + 256 * k);
+        }
+        t.bits += inter_hdr_bits(e, &t);
         cost = t.sse + (int64_t)(lambda * t.bits + 0.5);
         t.cost = cost;
         if (cost < best_cost) {
@@ -2188,6 +2492,16 @@ static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
     code_chroma(e, mbx, mby, t, inter);
     return (t->sse - sse0) +
            (int64_t)(lambda * (t->bits - bits0) + 0.5);
+}
+
+
+static void dbg_px(struct aeg_encoder *e, int mbx, int mby, const char *tag)
+{
+    if (getenv("AEGDBG") && mby == 0 && mbx == 2)
+        fprintf(stderr, "ENCPX %s: %d %d %d\n", tag,
+                e->recp[0][8 * e->stride[0] + mbx * 16 + 2],
+                e->recp[0][8 * e->stride[0] + mbx * 16 + 3],
+                e->recp[0][9 * e->stride[0] + mbx * 16 + 2]);
 }
 
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
@@ -2248,13 +2562,29 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * where most of the encode time of the candidate goes. */
     if (!(e->mb_inter_ok && e->mb_inter_sad * 2 < e->mb_sad)) {
         int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
+        dbg_px(e, mbx, mby, "after i4");
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
             snap_luma(e, mbx, mby, snap_l);
         }
+        /* Intra_8x8: four mode decisions instead of sixteen, so it is much
+         * cheaper to evaluate than Intra_4x4, and it reconstructs smooth
+         * regions with fewer coefficients.  It only exists in the High
+         * profile, where the picture parameter set enables the 8x8
+         * transform. */
+        if (e->p.transform_8x8) {
+            cost = rd_luma_i8x8(e, mbx, mby, &t, c->qp, lambda);
+            dbg_px(e, mbx, mby, "after i8");
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = t;
+                snap_luma(e, mbx, mby, snap_l);
+            }
+        }
     }
     restore_luma(e, mbx, mby, snap_l);
+    dbg_px(e, mbx, mby, "after restore");
     inter = is_inter_type(best.type);
 
     /* chroma: every legal intra mode, or the motion-compensated prediction */
@@ -2306,11 +2636,11 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 /* Bitstream                                                           */
 /* ------------------------------------------------------------------ */
 static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
-                     const mbenc *c, int is_p)
+                     mbenc *c, int is_p)
 {
     int blk;
     if (!is_p) {
-        if (c->type == AEG_MB_I4x4)
+        if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
             aeg_bw_ue(bw, 0);           /* I_NxN */
         else
             aeg_bw_ue(bw, (uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
@@ -2333,14 +2663,61 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
         }
         aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum[(c->cbp & 0x0f) |
                                                 (chroma_cbp(c) << 4)]);
-    } else if (c->type == AEG_MB_I4x4) {
+        /* transform_size_8x8_flag of an inter macroblock: after the coded
+         * block pattern, and only when the luma pattern is non-zero. */
+        if (e->p.transform_8x8 && (c->cbp & 0x0f))
+            aeg_bw_put(bw, 1, c->t8 ? 1u : 0u);
+    } else if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8) {
         aeg_bw_ue(bw, 5);               /* P slice: I_NxN */
     } else {
         aeg_bw_ue(bw, (uint32_t)(6 + c->i16_mode + 4 * chroma_cbp(c) +
                                  12 * (luma_cbp_on(c) ? 1 : 0)));
     }
-    if (c->type == AEG_MB_I4x4) {
+    if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8) {
         int b;
+        if (getenv("AEGDBG") && mbx == 0 && mby == 0)
+            fprintf(stderr, "ENCHDR type %d t8 %d intra8 %d %d %d %d cbp %d "
+                    "chroma %d bits %d\n", c->type, c->t8, c->intra8[0],
+                    c->intra8[1], c->intra8[2], c->intra8[3], c->cbp,
+                    c->chroma_mode, (int)(bw->len * 8 + bw->bits));
+        /* transform_size_8x8_flag comes before the prediction modes (7.3.5.2)
+         * and is present for every I_NxN macroblock when the parameter set
+         * enables the 8x8 transform. */
+        if (e->p.transform_8x8)
+            aeg_bw_put(bw, 1, c->type == AEG_MB_I8x8 ? 1u : 0u);
+        if (getenv("AEGDBG") && mbx == 0 && mby == 0)
+            fprintf(stderr, "ENC after t8 flag %d\n",
+                    (int)(bw->len * 8 + bw->bits));
+        if (c->type == AEG_MB_I8x8) {
+            /* One prev_intra8x8_pred_mode_flag per 8x8 block (raster order),
+             * then rem_intra8x8_pred_mode where the mode is not the predicted
+             * one.  The remainder is coded with the predicted value skipped,
+             * exactly like Intra_4x4. */
+            for (b = 0; b < 4; b++) {
+                int pm = intra8_pred_mode(e, mbx, mby, c->intra8, b & 1,
+                                          b >> 1);
+                int mode = c->intra8[b];
+                if (mode == pm) {
+                    aeg_bw_put(bw, 1, 1);
+                } else {
+                    aeg_bw_put(bw, 1, 0);
+                    aeg_bw_put(bw, 3, (uint32_t)(mode < pm ? mode : mode - 1));
+                }
+            }
+            if (getenv("AEGDBG") && mbx == 0 && mby == 0)
+                fprintf(stderr, "ENC after modes %d\n",
+                        (int)(bw->len * 8 + bw->bits));
+            aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
+            if (getenv("AEGDBG") && mbx == 0 && mby == 0)
+                fprintf(stderr, "ENC after chroma %d\n",
+                        (int)(bw->len * 8 + bw->bits));
+            aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum_i4x4[(c->cbp & 0x0f) |
+                                                         (chroma_cbp(c) << 4)]);
+            if (getenv("AEGDBG") && mbx == 0 && mby == 0)
+                fprintf(stderr, "ENC after cbp %d\n",
+                        (int)(bw->len * 8 + bw->bits));
+            goto after_modes;
+        }
         /* One prev_intra4x4_pred_mode_flag per block (raster order), followed
          * by rem_intra4x4_pred_mode when the mode is not the predicted one.
          * The remainder is coded with the predicted value skipped, so it is
@@ -2350,6 +2727,8 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
             int ry = ((b >> 3) & 1) * 2 + ((b >> 1) & 1);
             int pm = intra4_pred_mode(e, mbx, mby, c->intra4, rx, ry);
             int mode = c->intra4[b];
+            if (getenv("AEGDBG") && mbx == 2 && mby == 0 && b >= 8)
+                fprintf(stderr, "ENCMODE b %d pm %d mode %d\n", b, pm, mode);
             if (mode == pm) {
                 aeg_bw_put(bw, 1, 1);
             } else {
@@ -2363,6 +2742,7 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
     } else if (is_intra_type(c->type)) {
         aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
     }
+after_modes:
     /* mb_qp_delta: only present when the picture actually carries a coded
      * block pattern (H.264 7.3.5.2); emitting it unconditionally desynchronises
      * the decoder on the first all-zero macroblock. */
@@ -2381,7 +2761,34 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
                 aeg_cavlc_write_block(bw, c->level[rb],
                                       luma_ac_nc(e, mbx, mby, c, blk), 3);
             }
+    } else if (c->t8) {
+        /* 8x8 residual: one 64-coefficient block per coded 8x8 group, sent as
+         * four interleaved 4x4 lists.  The slots are filled list by list, in
+         * the same order and the same state luma8_costs() measured. */
+        int g;
+        for (g = 0; g < 4; g++) {
+            for (blk = 0; blk < 4; blk++) {
+                int b = group_blk[g][blk];
+                if (c->cbp & (1 << g)) {
+                    aeg_cavlc_write_block8(bw, c->level8[g], blk,
+                                           luma_nc(e, mbx, mby, c, b));
+                    c->nz[b] = (int8_t)aeg_cavlc_nz8(c->level8[g], blk);
+                } else {
+                    c->nz[b] = 0;
+                }
+            }
+            luma8_group_done(c, g);
+        }
     } else {
+        if (getenv("AEGDBG") && mbx == 2 && mby == 0) {
+            int q, j;
+            for (q = 8; q < 12; q++) {
+                fprintf(stderr, "ENCDUMP blk %d nz %d:", q, c->nz[q]);
+                for (j = 0; j < 16; j++)
+                    fprintf(stderr, " %d", c->level[q][j]);
+                fprintf(stderr, "\n");
+            }
+        }
         /* 4x4 residual: the blocks of every coded 8x8 group are written group
          * by group, and every block of a coded group is present, including the
          * ones whose coeff_token ends up being TotalCoeff 0.  Skipping the
@@ -2393,8 +2800,14 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
                     continue;
                 for (k = 0; k < 4; k++) {
                     int b = group_blk[g][k];
-                    aeg_cavlc_write_block(bw, c->level[b],
-                                          luma_nc(e, mbx, mby, c, b), 0);
+                    int nc = luma_nc(e, mbx, mby, c, b);
+                    int bit0 = (int)(bw->len * 8 + bw->bits);
+                    aeg_cavlc_write_block(bw, c->level[b], nc, 0);
+                    if (getenv("AEGDBG") && mbx == 2 && mby == 0)
+                        fprintf(stderr, "ENCW n %d nz %d nc %d bits %d->%d lvl"
+                                " %d %d %d\n", b, c->nz[b], nc, bit0,
+                                (int)(bw->len * 8 + bw->bits), c->level[b][0],
+                                c->level[b][1], c->level[b][2]);
                 }
             }
         }
@@ -2772,11 +3185,30 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             memset(m, 0, sizeof(*m));
             m->type = (uint8_t)tmp->type;
             m->i16_mode = (uint8_t)tmp->i16_mode;
+            m->t8 = (uint8_t)tmp->t8;
             m->chroma_mode = (uint8_t)tmp->chroma_mode;
             m->cbp = (uint8_t)tmp->cbp;
             m->qp = (int8_t)tmp->qp;
             for (i = 0; i < 16; i++)
                 m->intra4[i] = tmp->intra4[i];
+            for (i = 0; i < 4; i++)
+                m->intra8[i] = tmp->intra8[i];
+            if (getenv("AEGDBG"))
+                fprintf(stderr, "ENCI4 %d,%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+                        mbx, mby, tmp->intra4[0], tmp->intra4[1], tmp->intra4[2],
+                        tmp->intra4[3], tmp->intra4[4], tmp->intra4[5],
+                        tmp->intra4[6], tmp->intra4[7], tmp->intra4[8],
+                        tmp->intra4[9], tmp->intra4[10], tmp->intra4[11],
+                        tmp->intra4[12], tmp->intra4[13], tmp->intra4[14],
+                        tmp->intra4[15]);
+            if (getenv("AEGDBG"))
+                fprintf(stderr, "ENCMB %d,%d type %d t8 %d cbp %d qp %d "
+                        "i8 %d %d %d %d i4 %d %d %d %d i16m %d ch %d\n",
+                        mbx, mby, tmp->type, tmp->t8, tmp->cbp, tmp->qp,
+                        tmp->intra8[0], tmp->intra8[1], tmp->intra8[2],
+                        tmp->intra8[3], tmp->intra4[0], tmp->intra4[1],
+                        tmp->intra4[2], tmp->intra4[3], tmp->i16_mode,
+                        tmp->chroma_mode);
             for (i = 0; i < AEG_BLK_COUNT; i++)
                 m->nz[i] = tmp->nz[i];
             for (i = 0; i < 16; i++) {
@@ -2784,6 +3216,17 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 m->mv[i][1] = tmp->mv[i][1];
             }
             m->cost = (int32_t)tmp->sse;
+            if (getenv("AEGDBG") && mby == 0 && mbx == 2) {
+                int yy;
+                fprintf(stderr, "ENCRECON:");
+                for (yy = 8; yy < 10; yy++) {
+                    int xx;
+                    for (xx = 30; xx < 38; xx++)
+                        fprintf(stderr, " %d",
+                                e->recp[0][yy * e->stride[0] + mbx * 16 + xx - 32 + 0]);
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
 
@@ -2993,7 +3436,7 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         uint8_t sps[256], pps[64];
         size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                                   e->frame_num_bits, e->level_idc);
-        size_t pl = aeg_write_pps(pps, sizeof(pps));
+        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 7,
                                  sps, sl, 1);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 8,
