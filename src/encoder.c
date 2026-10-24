@@ -73,6 +73,13 @@ struct aeg_encoder {
     int mb_inter_sad;
     int mb_mv[2];
     int mb_pmv[2];
+    /* Fractional part of the macroblock's 16x16 motion vector (0..3 quarter
+     * pels).  The 16x16 search always runs the quarter-pel refinement, and
+     * its result is a good estimate of the sub-pixel alignment of the whole
+     * region, so the smaller partitions start from it instead of each running
+     * its own full refinement -- that costs one refinement per macroblock
+     * instead of up to eighteen. */
+    int mb_frac[2];
     /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8,
      * 8x16 and P_8x8.  Each carries the per-partition MVs and their
      * predictors, which is exactly what the bitstream has to transmit. */
@@ -971,23 +978,6 @@ static void me_publish(int16_t cur[16][2], const int geo[4], int mvx, int mvy)
         }
 }
 
-/* Motion search for one partition: its own search window, centred on its own
- * MV predictor. */
-static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
-                         int p, const int geo[4], int pmvx, int pmvy,
-                         int *mvx, int *mvy, int *sad)
-{
-    aeg_me_block(e->refp[0] + (mby * 16 + geo[1]) * e->stride[0] +
-                     mbx * 16 + geo[0],
-                 e->stride[0],
-                 e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
-                     mbx * 16 + geo[0],
-                 e->stride[0], geo[2], geo[3],
-                 e->p.search_range ? e->p.search_range : 16,
-                 e->p.subme, pmvx, pmvy, mvx, mvy, sad);
-    (void)type; (void)p;
-}
-
 /* Sum of absolute transformed differences of one partition at a given motion
  * vector.  The motion search itself is SAD driven (it has to look at hundreds
  * of candidates), but the *decision* between partition shapes is made on SATD:
@@ -1004,6 +994,43 @@ static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
     return aeg_satd(geo[2], geo[3], buf, geo[2],
                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
                     geo[0], e->stride[0]);
+}
+
+/* Motion search for one partition: its own search window, centred on its own
+ * MV predictor.  `refine` selects the quarter-pel stage: the P_8x8 shape trials
+ * run integer only (they compare shapes, not vectors) and the winning shape is
+ * searched again with the refinement, which is where the quality comes from. */
+static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
+                         int p, const int geo[4], int pmvx, int pmvy,
+                         int *mvx, int *mvy, int *sad, int refine)
+{
+    aeg_me_block(e->refp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                     mbx * 16 + geo[0],
+                 e->stride[0],
+                 e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                     mbx * 16 + geo[0],
+                 e->stride[0], geo[2], geo[3],
+                 e->p.search_range ? e->p.search_range : 16,
+                 refine ? e->p.subme : 0, pmvx, pmvy, mvx, mvy, sad);
+    /* Sub-pixel alignment: the integer search leaves the vector on an integer
+     * pel.  Rather than repeating the whole quarter-pel search for a 4x4
+     * partition, apply the fractional offset the macroblock's 16x16 search
+     * found -- objects move as a whole, so within one macroblock the offset is
+     * usually the same -- and keep it when it improves the match. */
+    if (!refine && e->p.subme > 0) {
+        int fx = e->mb_frac[0], fy = e->mb_frac[1];
+        int qx = (*mvx & ~3) + fx, qy = (*mvy & ~3) + fy;
+        if (fx || fy) {
+            int c_int = part_satd(e, mbx, mby, geo, *mvx, *mvy);
+            int c_frac = part_satd(e, mbx, mby, geo, qx, qy);
+            if (c_frac < c_int) {
+                *mvx = qx;
+                *mvy = qy;
+                *sad = c_frac;
+            }
+        }
+    }
+    (void)type; (void)p;
 }
 
 /* Motion search for one partitioned candidate (16x8 or 8x16): every partition
@@ -1039,7 +1066,8 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
         part_geom(type, p, geo, &b0);
         predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, type, p,
                       geo[0] / 4, geo[1] / 4, geo[2] / 4, &pmvx, &pmvy);
-        me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad);
+        me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad,
+                     0);
         cand_publish(&e->mb_cand[slot], geo, mvx, mvy);
         e->mb_cand[slot].pmv[b0][0] = pmvx;
         e->mb_cand[slot].pmv[b0][1] = pmvy;
@@ -1092,7 +1120,7 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                               geo[k][1] / 4, geo[k][2] / 4, &pmv[k][0],
                               &pmv[k][1]);
                 me_partition(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmv[k][0],
-                             pmv[k][1], &mv[k][0], &mv[k][1], &sad);
+                             pmv[k][1], &mv[k][0], &mv[k][1], &sad, 0);
                 satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
                 me_publish(trial, geo[k], mv[k][0], mv[k][1]);
                 avail_publish(tavail, geo[k]);
@@ -1114,15 +1142,27 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                 memcpy(best_pmv, pmv, sizeof(pmv));
             }
         }
-        /* commit the winning shape; its predictors were derived from the state
-         * before this sub-macroblock, which is exactly what the decoder sees */
+        /* Commit the winning shape and search its partitions again, this time
+         * with the quarter-pel stage.  The predictors are re-derived as we go
+         * from the MVs already committed, which is exactly the state the
+         * decoder is in when it reads each partition's mvd. */
         cand->sub_type[sub] = (uint8_t)best_st;
         for (k = 0; k < sub_cnt[best_st]; k++) {
-            int b0;
+            int b0, pmvx, pmvy, sad;
             sub_geom(best_st, bx, by, k, best_geo[k], &b0);
+            predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail,
+                          AEG_MB_P8x8, 0, best_geo[k][0] / 4,
+                          best_geo[k][1] / 4, best_geo[k][2] / 4, &pmvx, &pmvy);
+            /* An 8x8 partition gets the full quarter-pel search; the smaller
+             * ones inherit the macroblock's fractional offset (see
+             * me_partition), which is nearly free and within a hundredth of a
+             * dB of refining each of them separately. */
+            me_partition(e, mbx, mby, AEG_MB_P8x8, k, best_geo[k], pmvx, pmvy,
+                         &best_mv[k][0], &best_mv[k][1], &sad,
+                         best_geo[k][2] >= 8 && best_geo[k][3] >= 8);
             cand_publish(cand, best_geo[k], best_mv[k][0], best_mv[k][1]);
-            cand->pmv[b0][0] = best_pmv[k][0];
-            cand->pmv[b0][1] = best_pmv[k][1];
+            cand->pmv[b0][0] = pmvx;
+            cand->pmv[b0][1] = pmvy;
             me_publish(cur, best_geo[k], best_mv[k][0], best_mv[k][1]);
             avail_publish(avail, best_geo[k]);
             cand->nparts++;
@@ -1163,6 +1203,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     e->mb_ncand = 0;
     e->mb_mv[0] = e->mb_mv[1] = 0;
     e->mb_pmv[0] = e->mb_pmv[1] = 0;
+    e->mb_frac[0] = e->mb_frac[1] = 0;
     /* The motion search needs a reference picture *and* a P slice: an IDR
      * picture is always an I slice, so inter candidates there could never be
      * coded (writing them as an I macroblock desynchronises the decoder). */
@@ -1181,6 +1222,8 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                      e->p.subme, e->mb_pmv[0], e->mb_pmv[1], &mvx, &mvy, &sad);
         e->mb_mv[0] = mvx;
         e->mb_mv[1] = mvy;
+        e->mb_frac[0] = mvx & 3;
+        e->mb_frac[1] = mvy & 3;
         e->mb_inter_ok = 1;
         e->mb_inter_sad = sad;
 

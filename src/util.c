@@ -108,6 +108,10 @@ void aeg_params_default(aeg_params *p)
     p->deblock_alpha = 0;
     p->deblock_beta = 0;
     p->chroma_me = 1;
+    /* -1 = "decide from the preset" (aeg_encoder_open): 0 for ultrafast, 1 for
+     * everything else.  Leaving the field zeroed silently disabled the
+     * quarter-pel refinement at every preset, which cost ~1 dB of PSNR. */
+    p->subme = -1;
     /* Inter partitioning mask: bit 0 = 16x16, bit 1 = 16x8, bit 2 = 8x16,
      * bit 3 = P_8x8 (four 8x8 sub-macroblocks with a motion vector each, each
      * of which may further split into 8x4, 4x8 or 4x4).  The mask must not be

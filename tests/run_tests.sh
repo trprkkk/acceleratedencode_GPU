@@ -95,6 +95,12 @@ run_case part8x8only  320 192  8 4 -q 26 --partitions 8
 # this case exercises the availability rule (it desynced before that fix).
 run_case p8x8_gop2    320 192  8 4 -q 26 --partitions 15 -g 2
 run_case p8x8_q12     320 192  6 4 -q 12 --partitions 15
+# The quarter-pel stage is what most of the inter efficiency rides on, so both
+# it and the integer-only path get their own case: the two use different
+# motion compensation code (integer copy vs. the 6-tap filter chain), and the
+# half-pel-in-both-axes position is the one that is easy to round twice.
+run_case subpel       320 192  8 1 -q 26 --subme 1
+run_case integer_me   320 192  8 1 -q 26 --subme 0
 # Rate control and adaptive quantisation both change the QP per picture (and,
 # for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
 # a macroblock without a coded residual must not change the decoder's QP.

@@ -33,16 +33,22 @@ static inline int hpel_v(const uint8_t *p, int s)
     return ((int)p[-2 * s] + p[3 * s] - 5 * (p[-s] + p[2 * s]) +
             20 * (p[0] + p[s]) + 16) >> 5;
 }
-/* both axes: vertical 6-tap applied to clipped horizontal half-pel values */
+/* Horizontal 6-tap *without* the shift and clip: the intermediate the
+ * two-dimensional half-pel position is built from (H.264 8.4.2.2.1).  The
+ * reference decoder keeps these at 16-bit precision and shifts once at the
+ * end, so rounding the horizontal stage first would give different samples. */
+static inline int hsum_h(const uint8_t *p)
+{
+    return (p[0] + p[1]) * 20 - (p[-1] + p[2]) * 5 + (p[-2] + p[3]);
+}
+
+/* both axes: vertical 6-tap over the unshifted horizontal intermediates, with
+ * both gains (32 * 32) removed at once */
 static inline int hpel_hv(const uint8_t *p, int s)
 {
-    int a = clip8(hpel_h(p - 2 * s));
-    int b = clip8(hpel_h(p - s));
-    int c = clip8(hpel_h(p));
-    int d = clip8(hpel_h(p + s));
-    int e = clip8(hpel_h(p + 2 * s));
-    int f = clip8(hpel_h(p + 3 * s));
-    return (a - 5 * b + 20 * c + 20 * d - 5 * e + f + 512) >> 10;
+    return (hsum_h(p - 2 * s) - 5 * hsum_h(p - s) + 20 * hsum_h(p) +
+            20 * hsum_h(p + s) - 5 * hsum_h(p + 2 * s) + hsum_h(p + 3 * s) +
+            512) >> 10;
 }
 
 /* Which of the 4 interpolated planes to combine for each 1/4-pel position
@@ -160,6 +166,10 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
     return best;
 }
 
+#ifndef AEG_SUBPEL_ITERS
+#define AEG_SUBPEL_ITERS 2
+#endif
+
 /* subpel refinement: quarter-pel, SATD driven */
 static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                          int cstride, int bw, int bh, int range,
@@ -173,11 +183,15 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
     int i, pass;
     int cx = *mvx, cy = *mvy;
 
-    /* two passes: half-pel then quarter-pel steps */
+    /* Two passes: half-pel then quarter-pel steps.  Each pass walks until it
+     * stops improving, but at most `iters` steps: past the second step the
+     * search has almost always converged (the vectors it would still find move
+     * by a quarter pel more and change the SATD by less than the mvd they
+     * cost), and every step is a full motion compensation. */
     for (pass = 0; pass < 2; pass++) {
         int step = pass ? 1 : 2;
-        int improved = 1;
-        while (improved) {
+        int improved = 1, iters = 0;
+        while (improved && iters++ < AEG_SUBPEL_ITERS) {
             improved = 0;
             for (i = 0; i < 9; i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;

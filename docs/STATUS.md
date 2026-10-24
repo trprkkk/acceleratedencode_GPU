@@ -19,7 +19,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs twenty-two encoded clip cases
+fails (non-zero exit) on any mismatch; it runs twenty-four encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -47,7 +47,11 @@ Implemented and building without warnings:
 * one-pass average-bitrate rate control (`--bitrate`, `AEG_RC_ABR`) and
   variance-based adaptive quantisation (`--aq`, off by default, see below)
 * presets scale the integer search range (8/16/24/32/48) and the subpel
-  refinement
+  refinement (off for ultrafast).  The quarter-pel stage runs once for the
+  macroblock's 16x16 vector and once per 8x8 partition; the smaller partitions
+  inherit the macroblock's fractional offset and only choose between it and the
+  integer position, which is within 0.05 dB of refining each of them and twice
+  as fast
 * deblocking filter (all edges, normative order, alpha/beta/tc0 tables)
 * CPU + OpenCL + CUDA backends behind a measured dispatcher, device query,
   calibration.  The CUDA backend is plain C: `libcuda.so.1` (driver API) and
@@ -230,6 +234,27 @@ Implemented and building without warnings:
     map that `avail_publish()` fills exactly where `me_publish()` fills the
     MV, and `predict_mv_at()` consults both.
 
+28. **The two-dimensional half-pel sample was rounded twice.**  H.264 8.4.2.2
+    builds the `j` position (half pel in both axes) from *unshifted* horizontal
+    6-tap intermediates: the vertical 6-tap runs over 16-bit sums and the whole
+    thing is shifted by 10 once (`+512 >> 10`).  Our `hpel_hv()` computed each
+    horizontal intermediate with the full `+16 >> 5` shift and *clipped* it to
+    8 bits, then ran the vertical pass with another `+16 >> 5`.  The gain is the
+    same (32), so the error is only the double rounding plus the intermediate
+    clipping -- a few levels on steep gradients -- but it is a real mismatch
+    between our reconstruction and the decoder's.  It went unnoticed because
+    the subpel refinement was never enabled by default (bug 29); the first
+    `--subme 1` sweep desynchronised on the very first P picture.  Fixed by
+    keeping the horizontal stage unshifted and shifting once at the end.
+29. **`aeg_params_default()` left `subme` at zero**, so every preset ran with
+    the quarter-pel stage disabled even though the CLI help and the preset
+    table both say otherwise (`aeg_encoder_open()` only substitutes the preset
+    value when the caller passes a negative `subme`).  Quarter-pel motion
+    compensation is worth far more than any other single feature measured in
+    this project: at the same QP it takes the panning-texture clip from 35 157 B
+    / Y 43.64 dB to 28 676 B / Y 44.50 dB, and it is what closes most of the
+    gap to x264.  It is now on for every preset except ultrafast.
+
 ## Verification
 
 ```sh
@@ -243,11 +268,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — twenty-two clips (QP 12/23/26/40, presets 0 and 4,
+3. `tests/run_tests.sh` — twenty-four clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
-   partitioning with all four `sub_mb_type` shapes, all-intra and 3-frame GOPs,
-   P_Skip, ABR and AQ) encoded, decoded with ffmpeg and compared **frame by
-   frame**, then an ABR accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
+   partitioning with all four `sub_mb_type` shapes, both the integer and the
+   quarter-pel motion search, all-intra and 3-frame GOPs, P_Skip, ABR and AQ)
+   encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
+   accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
    fails it.  `tests/genyuv.c` takes a mode argument so that the partitioning
    cases really move the two halves of the picture in opposite directions —
@@ -339,8 +365,9 @@ It costs about 30 % of the encode speed over mask 7 (124 -> 87 fps on the
 320x192 clips, two cores), because the 4x4 shape runs sixteen motion searches
 per macroblock and all four shapes are searched per sub-macroblock.  `x264` (master, baseline, no asm) on the same clips at QP 24:
 18 841 B / 46.14 dB, 33 003 B / 45.83 dB, 31 897 B / 45.83 dB, 35 074 B /
-45.43 dB, so the remaining inter gap is ~8-25 % of the rate at ~1 dB lower Y
-PSNR.
+45.43 dB.  Those numbers were taken with the quarter-pel stage *off* (bug 29);
+with it on, the gap at matched PSNR is 3-7 % (see "Quality against a reference
+CPU encoder" below).
 
 ## Rate control and adaptive quantisation
 
@@ -419,30 +446,33 @@ x264, and that is a bigger piece of work than this shortcut.
 
 ## Quality against a reference CPU encoder
 
-`x264` (master, `--profile baseline --qp N --keyint 250`, built without asm) on
-the same 60-frame 320x192 synthetic texture, both streams decoded and compared
-with the source:
+`x264` (master, `--profile baseline --keyint 250 --qp N`, built without asm) on
+two 60-frame 320x192 clips: the panning synthetic texture (`genyuv` mode 1) and
+the four-quadrants clip (mode 4).  Both streams are decoded and compared with
+the source; the "rate at a given PSNR" numbers are interpolated on the
+rate-PSNR curve, which is the only fair comparison (a QP index is not
+comparable between encoders).
 
-| QP | ours (kbps / PSNR Y, all) | x264 (kbps / PSNR Y, all) |
-|---|---|---|
-| 24 | 4776 / 37.10, 38.14 dB | 4825 / 38.09, 38.99 dB |
-| 32 | 2621 / 29.61, 31.08 dB | 2672 / 30.36, 31.73 dB |
+| Y-PSNR | ours | x264 baseline | x264 is |
+|---|---|---|---|
+| 45.00 dB (pan clip) | 46 555 B | 44 991 B | 3.4 % smaller |
+| 45.56 dB (pan clip) | 49 438 B | 48 039 B | 2.8 % smaller |
+| 44.90 dB (quadrants) | 51 127 B | 47 851 B | 6.4 % smaller |
+| 45.25 dB (quadrants) | 52 958 B | 49 367 B | 6.8 % smaller |
 
-At the same *QP* we spend about 1% fewer bits and get ~1 dB less PSNR, i.e.
-x264 is ~0.6–0.9 dB ahead on the rate-distortion curve.  Comparing streams at
-the same QP is misleading though (the QP is only an index into a quantiser, and
-x264 spends 20% more bits at the same index): on the IDR frame, at matched
-*rate*, we are level with it —
+So the rate penalty is now 3-7 %, against 25-27 % before the quarter-pel fix
+(bug 28/29) and ~50 % before P_8x8.  For reference, x264 here uses three
+reference pictures, trellis quantisation, adaptive quantisation and hand-written
+SIMD; we use one reference, none of those, and portable C, and are 5x slower
+(27 fps against ~148 fps on two cores at 320x192).  At a matched QP we now
+spend the same number of bits for the same PSNR: QP 26 gives 46 555 B /
+Y 44.10 dB against x264's 48 039 B / Y 44.23 dB.
 
-| IDR frame, Y-PSNR | ours | x264 baseline |
-|---|---|---|
-| ~45 kB | 42.82 dB (QP 20) | 41.63 dB (QP 24) |
-| ~38 kB | 38.78 dB (QP 24) | 39.52 dB (QP 26) |
-
-The remaining inter gap is RD efficiency, not correctness: the mode decision
-compares inter against Intra_16x16 / Intra_4x4 with a lambda estimate and a
-SATD-based per-block mode choice, the motion vectors come from a single
-predictor, and the quantiser has no trellis or last-coefficient optimisation.
+Intra-only (a 60-frame all-intra encode, `-g 1`) is still behind: at QP 24 we
+spend 69 350 B / Y 45.16 dB where x264 spends 80 735 B / Y 46.38 dB, i.e. ~1.2 dB
+at matched rate.  That is the Intra_4x4 mode decision (per-block SAD, no
+rate-distortion mode search) and the absence of any intra prediction refinement;
+it is the clearest remaining quality target.
 
 The quantiser now retains coefficients 1.5x more eagerly than the reference
 rounding offset (`quant_bias()` in `src/transform.c`).  Without trellis, the

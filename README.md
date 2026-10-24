@@ -14,12 +14,14 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 22 clip cases and *fails* on any mismatch.  What
-> is *not* finished is rate-distortion efficiency: with P_8x8 (including the
-> 8x4/4x8/4x4 `sub_mb_type` shapes) in place, x264 baseline still spends
-> ~10–20 % fewer bits at 0.6–1.0 dB higher Y PSNR on the inter test clips
-> (SATD+λ mode decision, no trellis quantisation, no 8x8 DCT).  Finer
-> partitioning alone was worth 17–20 % of the rate.  The GPU backends sit behind a measured
+> `make test` asserts it over 24 clip cases and *fails* on any mismatch.  What
+> is *not* finished is rate-distortion efficiency, though it is now close: at
+> matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 3–7 %
+> fewer bits on the inter test clips, where it used to be 25–50 %.  What is
+> left is intra-only efficiency (~1.2 dB at matched rate: Intra_4x4 is chosen by
+> SAD, not RD) and speed: 27 fps against x264's ~148 fps on two cores at
+> 320x192, since the reference C path has no SIMD.  That is the part the GPU
+> backends are for.  The GPU backends sit behind a measured
 > dispatcher, and the kernels are checked against the CPU reference by
 > `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
 > environment (there is no GPU available).  See
@@ -110,7 +112,7 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes twenty-two synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes twenty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   all-intra and short GOPs, ABR and AQ), decodes them
