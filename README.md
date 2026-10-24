@@ -1,1 +1,113 @@
 # acceleratedencode_GPU
+
+A from-scratch H.264 (AVC) encoder core written in portable C, whose compute
+stages are dispatched between the CPU and a general-purpose GPU backend
+(OpenCL, with a CUDA backend behind the same interface).  **No NVENC, no QSV,
+no fixed-function hardware encoder is used anywhere**: every pixel operation is
+ordinary SIMD/SIMT compute, so the picture quality is decided by our own
+rate-distortion decisions and transforms, not by a vendor ASIC.
+
+> **Status: work in progress, not yet a usable encoder.**
+> See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is validated and what
+> is still broken.  The short version: the entropy coder, transforms,
+> dequantisation, intra prediction and motion compensation are implemented and
+> individually verified against a reference decoder, and the encoder core
+> reconstructs to 38 dB on a smooth clip at QP 23 — but the bitstream it emits
+> is **not yet decodable by an external decoder**, because of a residual bug in
+> multi-coefficient CAVLC level coding.  Do not use this to encode anything you
+> care about yet.
+
+## Why this design
+
+Porting x264/x265 to the GPU is attractive because the expensive stages
+(motion search, forward/inverse transforms, quantisation, loop filter) are data
+parallel, while the serial stages (entropy coding, bitstream assembly, rate
+control) are not.  This project therefore splits the encoder into two classes:
+
+| Stage | Where it runs | Why |
+|---|---|---|
+| Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
+| Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
+| Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
+| SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
+| Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
+| Deblocking filter | CPU | pinned: serial in MB order, communication cost dominates |
+| CAVLC entropy coding | CPU | inherently serial (nC context depends on previous blocks) |
+| Bitstream assembly / rate decisions | CPU | serial |
+
+The dispatcher is *measured*, not guessed: each stage is timed per frame in both
+places when `--bench` is used, and a stage only stays on the GPU when the
+measured time (including transfer and launch overhead) is lower than the CPU
+path, with 10% hysteresis to avoid oscillation.  `aeg_backend_calibrate()`
+measures a real kernel launch + transfer round trip so the model knows the
+fixed cost below which batching cannot pay off.
+
+Quality goal: the encoder must be *decision equivalent* to a CPU implementation
+of the same algorithm — same transforms, same quantiser, same integer
+reconstruction.  The CPU and GPU paths are required to be bit-identical; that is
+why every kernel is an integer operation and the reference implementation in
+`src/backend.c` is the ground truth the GPU kernels are checked against.
+
+## Building
+
+```sh
+make                 # CPU only (default, no OpenCL/CUDA required)
+make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
+make CUDA=1          # + CUDA backend (needs the CUDA toolkit; not yet written)
+make test            # synthetic clip -> encode -> decode -> PSNR report
+```
+
+`make OPENCL=1` needs no headers or libraries at build time: the backend
+resolves `libOpenCL.so` with `dlopen()` so a CPU-only machine can still build
+the tree.
+
+## Usage
+
+```sh
+./build/aegenc --list-devices
+./build/aegenc --calibrate
+./build/aegenc -w 320 -h 192 -q 23 -n 300 -i input.yuv -o out.264 \
+               --dump-recon recon.yuv --bench
+```
+
+`-b cpu|opencl|cuda|auto` selects the backend, `--dump-recon` writes what the
+encoder itself reconstructed (this is what a decoder must produce, so it is the
+primary conformance check), `--no-deblock`, `--subme N` and `--range N` trade
+speed for quality.
+
+## What is verified, and how
+
+* `tests/synth_probe.c` writes a hand-built slice containing exactly one
+  macroblock with a single known coefficient.  Decoding it with an independent
+  H.264 decoder and measuring the output pixel is an exact measurement of the
+  decoder's inverse quantisation — this is how every scale factor in
+  `src/transform.c` was derived and checked (see `docs/STATUS.md`).
+* `tests/run_tests.sh` encodes a synthetic clip, decodes it with ffmpeg and
+  reports source-vs-reconstruction, source-vs-decode and
+  reconstruction-vs-decode PSNR.  When the stream is conformant the last number
+  is +inf; today it is not.
+* `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
+
+## Layout
+
+```
+include/aeg/aeg.h   public API
+src/h264.h          internal data structures and prototypes
+src/tables.c        all constant tables (quantiser, deblock, CAVLC, zigzag, QP map)
+src/transform.c     forward/inverse 4x4 transform, DC Hadamard, quantisation
+src/intra.c         Intra_4x4 / Intra_16x16 / chroma prediction
+src/mc.c            motion estimation and quarter-pel motion compensation
+src/deblock.c       in-loop deblocking filter
+src/cavlc.c         CAVLC entropy coding of residual blocks
+src/bitstream.c     NAL, SPS, PPS, slice headers, bit writer
+src/encoder.c       the encoder itself (analysis, RD decision, reconstruction)
+src/backend.c       CPU kernels, dispatch model, device query, calibration
+src/backend_opencl.c OpenCL backend (dlopen, cached buffers, 4 kernels)
+src/kernels.h       the shared kernel source string (OpenCL C / CUDA C)
+cli/aegenc.c        command line front end
+tests/              synthetic clip generator, single-MB probe, test runner
+```
+
+## Licence
+
+MIT (see `LICENSE`).
