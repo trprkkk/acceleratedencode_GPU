@@ -62,6 +62,16 @@ Implemented and building without warnings:
   (with `__kernel`/`__global`/`get_global_id` macros) and runs every kernel
   work item against the CPU reference, so kernel regressions are caught on a
   machine with no GPU.
+* SSE2 fast paths for the two distortion metrics -- `aeg_sad()` and the 4x4
+  Hadamard `aeg_satd_4x4()` -- which are the innermost loop of the motion
+  search (a 16x16 SAD 13x faster, a 4x4 SATD 2.2x faster).  Both add exact
+  integers, so they are bit-identical to the scalar loops they replace and
+  cannot change a decision; the scalar code stays as the fallback for
+  non-x86 targets and as the reference the kernel cross-check compares the
+  device kernels against.  The 4x4 SATD is a register-resident Hadamard
+  (butterfly across rows, transpose, butterfly across columns) on int16 lanes,
+  which is exact because a block of byte differences cannot leave the int16
+  range (|coef| <= 255 * 16).
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`
 
 ## Bugs found by the bit-exactness work (do not reintroduce)
@@ -334,10 +344,10 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
    would recover a little more (it picks a slightly too fine shape on some
    macroblocks).
-2. GPU: the stage profile now says where the next kernel goes — motion
-   estimation (~66% of the encode, of which the integer SAD walk and the
-   subpel SATD are the two halves), then the coefficient pipeline (forward
-   transform + quantisation + inverse transform of every candidate).  The
+2. GPU: the stage profile now says where the next kernel goes -- motion
+   estimation (41% of the encode; the integer SAD walk and the subpel SATD are
+   its two halves, both already batched), then the coefficient pipeline (48%:
+   forward transform, quantisation and reconstruction of every candidate).  The
    plane build is already a kernel (`interp_plane`), both halves of the search
    now run as rounds through `sad_batch` and `satd_batch`, and
    `tests/kernel_check.c` cross-checks six kernels (`sad_batch`, `tq_batch`,
@@ -558,28 +568,44 @@ frame of the `genyuv … 3` clip costs 4148 bytes, each following frame 8 bytes.
 ## Speed
 
 60 frames of 320x192 at QP 24, single thread, CPU backend (2 cores, no GPU in
-this sandbox):
+this sandbox), best of three runs:
 
-| encoder | fps | bytes |
+| encoder | fps | bytes | Y-PSNR |
+|---|---|---|---|
+| ours, preset 0 | 552 | 163386 | 42.30 |
+| ours, preset 2 / 4 | 73.9 / 71.6 | 78358 / 78468 | 45.13 / 45.12 |
+| x264 baseline (no asm) | 169.5 | 78 664 | 45.16 |
+
+At a matched QP the two encoders land within 0.4% of each other in rate and
+0.03 dB in quality, and x264 is 2.3x faster (it was 3.4x before the distortion
+kernels below).  Absolute numbers move a few percent between runs; the
+`--frames 60`, single-thread, same-QP comparison is the one to repeat.
+
+The two changes of this round, on the 40-frame QP 26 clip they were measured
+on (the earlier history of that clip -- 30.3 -> 49.0 fps from the plane cache,
+49.0 -> 55.2 from skipping the subpel walk's centre candidate and the exact
+P_8x8 early exit -- is committed before it):
+
+| change | fps | bytes |
 |---|---|---|
-| ours, preset 0 | 384 | 163386 |
-| ours, preset 2 / 4 | 55.2 / 52.9 | 78358 / 78468 |
-| x264 baseline (no asm) | 187 | 78 400 |
+| before | 54.5 | 46 395 |
+| SSE2 SAD (13x per 16x16 call) | 65.0 | 46 395 |
+| SSE2 4x4 SATD (2.2x per call, the subpel walk's only real cost) | 75.8 | 46 395 |
 
-The `fractional-pel planes` cache below took preset 2 from 30.3 to 49.0 fps
-(1.62x) with *identical* output bytes; skipping the centre of the subpel walk
-and the exact P_8x8 early exit added another 13% (49.0 -> 55.2 fps, still
-byte-identical).  Preset 0 is unchanged: it never interpolates.
+Byte-identical output: both kernels add the same integers, so they cannot move
+a decision.
 
 Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
-443 ms, fractional-pel planes 47 ms, transform 278 ms, deblocking 4 ms of
-783 ms — motion estimation is still ~57% of the encode even after the six-fold
-reduction in interpolation work, because what remains is the integer SAD walk
-(hex search over hundreds of candidates per macroblock) and the SATD of the
-subpel walk.  That is the stage a GPU should take: both halves are plain batches
-of independent evaluations.  The whole-frame search (`me_seed_frame()`) already
-goes through `aeg_be_ops.sad_batch` -- five launches per picture -- and the plane
-build already has its kernel (`interp_plane`).
+221 ms, fractional-pel planes 42 ms, transform 260 ms, deblocking 4 ms of
+538 ms (motion estimation was 433 ms of 783 ms before the SIMD kernels).
+Motion estimation is 41% of the encode now and the *transform* stage is the
+largest single block at 48% -- but that stage is the whole of `code_mb()`, i.e.
+the rate-distortion pass: forward transform, quantisation and reconstruction of
+every candidate, plus the bitstream, not one 4x4 transform.  The GPU story is
+unchanged and sharper: the search's two halves are pure batches of independent
+evaluations (`sad_batch`, `satd_batch`) and the plane build has its kernel
+(`interp_plane`); the coefficient pipeline is the one that still needs its
+batch form (see *Next*).
 
 ## Fractional-pel planes (the interpolation cache)
 

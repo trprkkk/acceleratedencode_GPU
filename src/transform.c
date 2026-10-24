@@ -15,6 +15,17 @@
  */
 #include "h264.h"
 
+/* The distortion metrics are the innermost loop of the motion search -- a
+ * 320x192 picture at preset 2 runs ~480 block comparisons per macroblock, so a
+ * 16x16 SAD is evaluated millions of times per second and its cost is the
+ * search's cost.  The sums below are exact integers, so the vectorised path
+ * returns bit-identical values to the scalar one and cannot change a decision:
+ * the CPU fallback, the batch operations and the device kernels all keep
+ * agreeing (tests/kernel_check.c compares them sample by sample). */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 /* ------------------------------------------------------------------ */
 /* 4x4 forward transform                                               */
 /* ------------------------------------------------------------------ */
@@ -424,9 +435,55 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
 /* ------------------------------------------------------------------ */
 /* Distortion                                                          */
 /* ------------------------------------------------------------------ */
+#if defined(__SSE2__)
+/* One 16-byte row pair (w == 16) or a zero-extended 8/4-byte load. */
+static inline int sad_row(__m128i *acc, const uint8_t *a, const uint8_t *b, int w)
+{
+    __m128i va, vb;
+    if (w >= 16) {
+        va = _mm_loadu_si128((const __m128i *)a);
+        vb = _mm_loadu_si128((const __m128i *)b);
+    } else if (w == 8) {
+        va = _mm_loadl_epi64((const __m128i *)a);
+        vb = _mm_loadl_epi64((const __m128i *)b);
+    } else if (w == 4) {
+        va = _mm_cvtsi32_si128(*(const int *)a);
+        vb = _mm_cvtsi32_si128(*(const int *)b);
+    } else {
+        return 0;
+    }
+    *acc = _mm_add_epi64(*acc, _mm_sad_epu8(va, vb));
+    return 1;
+}
+
+static inline int sad_reduce(__m128i acc)
+{
+    int64_t v[2];
+    _mm_storeu_si128((__m128i *)v, acc);
+    return (int)(v[0] + v[1]);
+}
+#endif
+
 int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int x, y, sum = 0;
+#if defined(__SSE2__)
+    if (w == 16 || w == 8 || w == 4) {
+        __m128i acc = _mm_setzero_si128();
+        for (y = 0; y < h; y++)
+            sad_row(&acc, a + (size_t)y * sa, b + (size_t)y * sb, w);
+        return sad_reduce(acc);
+    }
+    if (w >= 32 && (w & 15) == 0) {
+        __m128i acc = _mm_setzero_si128();
+        int k, chunks = w >> 4;
+        for (y = 0; y < h; y++)
+            for (k = 0; k < chunks; k++)
+                sad_row(&acc, a + (size_t)y * sa + k * 16,
+                        b + (size_t)y * sb + k * 16, 16);
+        return sad_reduce(acc);
+    }
+#endif
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++)
             sum += abs((int)a[y * sa + x] - (int)b[y * sb + x]);
@@ -445,9 +502,78 @@ int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
     (d3) = t1_ - t3_;                                                \
 } while (0)
 
+#if defined(__SSE2__)
+/* Hadamard transform of one 4x4 block, four int16 lanes per register: the
+ * butterfly runs across the four rows first, then the block is transposed and
+ * the same butterfly runs across the four columns.  The sum of absolute values
+ * does not care about the order of the sixteen outputs, so this is the scalar
+ * transform's result exactly (16-bit is enough: |coef| <= 255*16). */
+static inline __m128i satd_row(const uint8_t *a, const uint8_t *b)
+{
+    const __m128i zero = _mm_setzero_si128();
+    __m128i va = _mm_cvtsi32_si128(*(const int *)a);
+    __m128i vb = _mm_cvtsi32_si128(*(const int *)b);
+    return _mm_sub_epi16(_mm_unpacklo_epi8(va, zero), _mm_unpacklo_epi8(vb, zero));
+}
+
+static inline void hadamard4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r3)
+{
+    const __m128i s0 = _mm_add_epi16(*r0, *r1), d0 = _mm_sub_epi16(*r0, *r1);
+    const __m128i s1 = _mm_add_epi16(*r2, *r3), d1 = _mm_sub_epi16(*r2, *r3);
+    *r0 = _mm_add_epi16(s0, s1);
+    *r1 = _mm_sub_epi16(s0, s1);
+    *r2 = _mm_sub_epi16(d0, d1);
+    *r3 = _mm_add_epi16(d0, d1);
+}
+
+/* 4x4 transpose of int16 held four lanes per register (the upper four lanes of
+ * each register are zero): the two column pairs the unpacks produce are split
+ * apart again so that every register holds one column. */
+static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r3)
+{
+    const __m128i z = _mm_setzero_si128();
+    const __m128i t0 = _mm_unpacklo_epi16(*r0, *r1);
+    const __m128i t1 = _mm_unpacklo_epi16(*r2, *r3);
+    const __m128i lo = _mm_unpacklo_epi32(t0, t1);   /* column 0 | column 1 */
+    const __m128i hi = _mm_unpackhi_epi32(t0, t1);   /* column 2 | column 3 */
+    *r0 = _mm_unpacklo_epi64(lo, z);
+    *r1 = _mm_unpackhi_epi64(lo, z);
+    *r2 = _mm_unpacklo_epi64(hi, z);
+    *r3 = _mm_unpackhi_epi64(hi, z);
+}
+
+static int satd_4x4_sse2(const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i ones = _mm_set1_epi16(1);
+    __m128i r0 = satd_row(a, b);
+    __m128i r1 = satd_row(a + sa, b + sb);
+    __m128i r2 = satd_row(a + 2 * sa, b + 2 * sb);
+    __m128i r3 = satd_row(a + 3 * sa, b + 3 * sb);
+    __m128i acc;
+
+    hadamard4x4(&r0, &r1, &r2, &r3);
+    transpose4x4(&r0, &r1, &r2, &r3);
+    hadamard4x4(&r0, &r1, &r2, &r3);
+    r0 = _mm_max_epi16(r0, _mm_sub_epi16(zero, r0));
+    r1 = _mm_max_epi16(r1, _mm_sub_epi16(zero, r1));
+    r2 = _mm_max_epi16(r2, _mm_sub_epi16(zero, r2));
+    r3 = _mm_max_epi16(r3, _mm_sub_epi16(zero, r3));
+    acc = _mm_add_epi32(_mm_madd_epi16(r0, ones), _mm_madd_epi16(r1, ones));
+    acc = _mm_add_epi32(acc, _mm_madd_epi16(r2, ones));
+    acc = _mm_add_epi32(acc, _mm_madd_epi16(r3, ones));
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+    return (_mm_cvtsi128_si32(acc) + 1) >> 1;
+}
+#endif
+
 int aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int t[16], d[16], i, y, sum = 0;
+#if defined(__SSE2__)
+    return satd_4x4_sse2(a, sa, b, sb);
+#endif
     for (y = 0; y < 4; y++) {
         HADAMARD4(t[y * 4 + 0], t[y * 4 + 1], t[y * 4 + 2], t[y * 4 + 3],
                   (int)a[y * sa + 0] - (int)b[y * sb + 0],

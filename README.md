@@ -46,6 +46,7 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Forward transform (4x4 DCT) + forward quantisation | GPU (batched kernel) | per-block, no dependencies |
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
+| Distortion metrics on the CPU reference (`aeg_sad`, 4x4 Hadamard `aeg_satd`) | CPU, SSE2 | exact integer sums, so a 13x / 2.2x faster vector path cannot change a decision |
 | Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
 | Intra_4x4 mode analysis (9 predictors x 16 blocks per MB) | CPU for now; the 16 blocks of a macroblock are independent once the neighbours exist | the candidate that dominates I-picture cost |
 | Deblocking filter | CPU | pinned: serial in MB order, communication cost dominates |
