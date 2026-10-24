@@ -50,6 +50,33 @@ static int quant_ref(const int16_t *coef, int16_t *level, int qp, int intra)
 }
 
 /* The reference decoder's inverse transform, as a signed residual. */
+/* Forward transform, transcribed from the definition (C_f X C_f^T with the
+ * H.264 butterfly) rather than from the implementation.  It is the reference the
+ * vectorised aeg_transform_4x4() is checked against: the SSE2 path computes the
+ * two passes in the other order and with int16 lanes, which is only equal to
+ * this because a residual sample is in [-255, 255] and every intermediate of
+ * the transform fits int16 -- exactly the property worth testing. */
+static void fdct_ref(const int16_t *res, int stride, int16_t out[16])
+{
+    int t[16], d[16], i;
+#define DCT1(d0, d1, d2, d3, s0, s1, s2, s3) do {                    \
+        const int a_ = (d0) + (d3), b_ = (d1) + (d2);                \
+        const int c_ = (d1) - (d2), e_ = (d0) - (d3);                \
+        (s0) = a_ + b_; (s2) = a_ - b_;                              \
+        (s1) = (e_ << 1) + c_; (s3) = e_ - (c_ << 1);                \
+    } while (0)
+    for (i = 0; i < 4; i++)
+        DCT1(res[i * stride + 0], res[i * stride + 1], res[i * stride + 2],
+             res[i * stride + 3], t[i * 4 + 0], t[i * 4 + 1], t[i * 4 + 2],
+             t[i * 4 + 3]);
+    for (i = 0; i < 4; i++)
+        DCT1(t[0 * 4 + i], t[1 * 4 + i], t[2 * 4 + i], t[3 * 4 + i],
+             d[0 * 4 + i], d[1 * 4 + i], d[2 * 4 + i], d[3 * 4 + i]);
+#undef DCT1
+    for (i = 0; i < 16; i++)
+        out[i] = (int16_t)d[i];
+}
+
 static void idct_ref_res(const int16_t *level, int qp, int32_t res[16])
 {
     int32_t d[16], t[16];
@@ -237,9 +264,19 @@ int main(int argc, char **argv)
             /* forward: transform + quantisation, and the non-zero counts */
             cpu.tq_batch(cpu.priv, resb, 8, qp, q % 3 == 0, levb, nz);
             for (b = 0; b < 8; b++) {
-                int16_t coef[16];
+                int16_t coef[16], coefr[16];
                 int n = 0;
                 aeg_transform_4x4(resb + 16 * b, 4, coef);
+                fdct_ref(resb + 16 * b, 4, coefr);
+                cases++;
+                for (i2 = 0; i2 < 16; i2++)
+                    if (coef[i2] != coefr[i2]) {
+                        printf("   aeg_transform_4x4: qp %d blk %d coef %d: "
+                               "%d vs reference %d\n", qp, b, i2,
+                               (int)coef[i2], (int)coefr[i2]);
+                        bad++;
+                        break;
+                    }
                 aeg_quant_4x4(coef, leva + 16 * b, qp, q % 3 == 0);
                 for (i2 = 0; i2 < 16; i2++)
                     n += leva[16 * b + i2] != 0;

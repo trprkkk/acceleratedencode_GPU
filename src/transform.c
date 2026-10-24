@@ -59,10 +59,66 @@ static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *
     (s3) = t3_ - (t2_ << 1);                                         \
 } while (0)
 
+#if defined(__SSE2__)
+/* 4x4 forward transform, four lanes at a time.
+ *
+ * Every intermediate of the transform is an exact integer: a residual sample is
+ * in [-255, 255], the first pass multiplies that by at most 4, the second by at
+ * most 4 again, so |value| <= 4080 and every int16 lane holds it exactly.  The
+ * final store truncates to int16 just like the scalar version, and the SSE2
+ * path therefore produces the *same* coefficients, not merely close ones -- a
+ * decision that reads them cannot change (tests/coef_check.c compares this
+ * against the independent transcription of the transform that the tq_batch
+ * device kernel carries). */
+static inline void fdct4_1d_sse2(__m128i *r0, __m128i *r1, __m128i *r2,
+                                __m128i *r3)
+{
+    /* d0..d3 -> rows (t0 + t1), (2 * t3 + t2), (t0 - t1), (t3 - 2 * t2) */
+    const __m128i t0 = _mm_add_epi16(*r0, *r3);
+    const __m128i t1 = _mm_add_epi16(*r1, *r2);
+    const __m128i t2 = _mm_sub_epi16(*r1, *r2);
+    const __m128i t3 = _mm_sub_epi16(*r0, *r3);
+
+    *r0 = _mm_add_epi16(t0, t1);
+    *r1 = _mm_add_epi16(_mm_slli_epi16(t3, 1), t2);
+    *r2 = _mm_sub_epi16(t0, t1);
+    *r3 = _mm_sub_epi16(t3, _mm_slli_epi16(t2, 1));
+}
+
+static void transform_4x4_sse2(const int16_t *res, int stride, int16_t *coef)
+{
+    __m128i r0 = _mm_loadl_epi64((const __m128i *)(res + 0 * stride));
+    __m128i r1 = _mm_loadl_epi64((const __m128i *)(res + 1 * stride));
+    __m128i r2 = _mm_loadl_epi64((const __m128i *)(res + 2 * stride));
+    __m128i r3 = _mm_loadl_epi64((const __m128i *)(res + 3 * stride));
+
+    /* C_f X C_f^T is separable, so the order of the two passes does not matter
+     * -- but the result has to come out in the index order the quantiser and
+     * the scan expect.  A register holds one *row* of the block, so the first
+     * butterfly transforms the columns (register index), the transpose turns
+     * that into a row pass, and the second transpose puts the result back into
+     * (row, column) order.  Two transposes are ~16 instructions; the arithmetic
+     * they save is an int->int16 shuffle per sample. */
+    fdct4_1d_sse2(&r0, &r1, &r2, &r3);      /* columns                          */
+    transpose4x4(&r0, &r1, &r2, &r3);
+    fdct4_1d_sse2(&r0, &r1, &r2, &r3);      /* rows                             */
+    transpose4x4(&r0, &r1, &r2, &r3);       /* back to (row, column)            */
+    _mm_storel_epi64((__m128i *)(coef + 0), r0);
+    _mm_storel_epi64((__m128i *)(coef + 4), r1);
+    _mm_storel_epi64((__m128i *)(coef + 8), r2);
+    _mm_storel_epi64((__m128i *)(coef + 12), r3);
+}
+#endif
+
 void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef)
 {
     int d[16];
     int i, t[16];
+
+#if defined(__SSE2__)
+    transform_4x4_sse2(res, stride, coef);
+    return;
+#endif
 
     for (i = 0; i < 4; i++) {
         DCT4_1D(res[i * stride + 0], res[i * stride + 1], res[i * stride + 2],
@@ -600,12 +656,44 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
  * into the first pass, truncate through the second one.  `res` receives the
  * signed residual; without a prediction to add it is also what the batched
  * device path returns, so this is the single definition of the arithmetic. */
+#if defined(__SSE2__)
+/* One pass of the inverse transform, four values at a time.  The registers are
+ * the four *input* values and the four outputs replace them, so a pass along
+ * one axis is four register operations whatever the axis is -- which is why the
+ * block has to be transposed between the two passes. */
+static inline void idct4_1d_epi32(__m128i *r0, __m128i *r1, __m128i *r2,
+                                  __m128i *r3)
+{
+    const __m128i s0 = _mm_add_epi32(*r0, *r2);
+    const __m128i s1 = _mm_sub_epi32(*r0, *r2);
+    const __m128i s2 = _mm_sub_epi32(_mm_srai_epi32(*r1, 1), *r3);
+    const __m128i s3 = _mm_add_epi32(*r1, _mm_srai_epi32(*r3, 1));
+
+    *r0 = _mm_add_epi32(s0, s3);
+    *r1 = _mm_add_epi32(s1, s2);
+    *r2 = _mm_sub_epi32(s1, s2);
+    *r3 = _mm_sub_epi32(s0, s3);
+}
+
+/* The scalar code truncates every intermediate to int16; a 32-bit lane does the
+ * same with two shifts (the reference decoder's dequantised coefficients are
+ * int16, so this is not an optimisation of its arithmetic but part of it -- see
+ * bug 8). */
+static inline __m128i trunc16_epi32(__m128i v)
+{
+    return _mm_srai_epi32(_mm_slli_epi32(v, 16), 16);
+}
+#endif
+
 static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
                       int16_t *res)
 {
     int32_t d[16];
     int t[16];
     int i, x, y, sh = qp / 6;
+#if defined(__SSE2__)
+    __m128i r0, r1, r2, r3;
+#endif
 
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
@@ -618,6 +706,32 @@ static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
     /* The reference decoder rounds the DC coefficient into the first pass and
      * then truncates in the second one (block[0] += 1 << 5 ... >> 6). */
     d[0] += 1 << 5;
+
+#if defined(__SSE2__)
+    /* Same two passes, same two int16 truncation points, four lanes at a time.
+     * The first pass runs along the *rows* of the block, so it has to run along
+     * the register index: load (and transpose) so that a register holds a
+     * column, transform across the registers, truncate, transpose back, and the
+     * second pass -- which runs along the columns -- becomes a transform across
+     * the registers again. */
+    r0 = _mm_loadu_si128((const __m128i *)(d + 0));
+    r1 = _mm_loadu_si128((const __m128i *)(d + 4));
+    r2 = _mm_loadu_si128((const __m128i *)(d + 8));
+    r3 = _mm_loadu_si128((const __m128i *)(d + 12));
+    transpose4x4_epi32(&r0, &r1, &r2, &r3);              /* registers = columns */
+    idct4_1d_epi32(&r0, &r1, &r2, &r3);                  /* the row pass        */
+    r0 = trunc16_epi32(r0); r1 = trunc16_epi32(r1);
+    r2 = trunc16_epi32(r2); r3 = trunc16_epi32(r3);
+    transpose4x4_epi32(&r0, &r1, &r2, &r3);
+    idct4_1d_epi32(&r0, &r1, &r2, &r3);                  /* the column pass     */
+    r0 = _mm_srai_epi32(r0, 6); r1 = _mm_srai_epi32(r1, 6);
+    r2 = _mm_srai_epi32(r2, 6); r3 = _mm_srai_epi32(r3, 6);
+    _mm_storel_epi64((__m128i *)(res + 0), _mm_packs_epi32(r0, r0));
+    _mm_storel_epi64((__m128i *)(res + 4), _mm_packs_epi32(r1, r1));
+    _mm_storel_epi64((__m128i *)(res + 8), _mm_packs_epi32(r2, r2));
+    _mm_storel_epi64((__m128i *)(res + 12), _mm_packs_epi32(r3, r3));
+    return;
+#endif
 
     /* rows */
     for (i = 0; i < 4; i++) {

@@ -69,7 +69,7 @@ Implemented and building without warnings:
   (with `__kernel`/`__global`/`get_global_id` macros) and runs every kernel
   work item against the CPU reference, so kernel regressions are caught on a
   machine with no GPU.
-* SSE2 fast paths for the four hottest inner loops, each kept bit-identical to
+* SSE2 fast paths for the six hottest inner loops, each kept bit-identical to
   the scalar code it replaces (so none of them can change a decision) and each
   with the scalar loop left in place as the non-x86 fallback and as the
   reference the tests compare against:
@@ -95,6 +95,16 @@ Implemented and building without warnings:
     wrong half), and the DC-only shortcut is only valid when there is a
     prediction to add -- without one, a very large DC has to go through the
     int16 truncation that the shortcut would skip.
+  * `aeg_transform_4x4()` -- the forward transform in int16 lanes, 3.2x faster.
+    It computes the two passes in the other order than the scalar code (columns
+    then rows, because a register holds a row), which is the same matrix product
+    for a separable transform, and stores through a second transpose so the
+    coefficients come out in the order the scan expects;
+  * `idct_core()` -- the inverse transform the rate-distortion pass uses for
+    every candidate, 2x faster: four values at a time in int32 lanes, with the
+    two int16 truncation points of the reference arithmetic applied explicitly
+    (`_mm_srai_epi32(_mm_slli_epi32(v, 16), 16)`), because those truncations are
+    part of what the decoder does, not an artefact of the scalar code.
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`,
   `--slices N` and `-t N` (slice threads)
 
@@ -881,7 +891,7 @@ this sandbox), best of three runs:
 | encoder | fps | bytes | Y-PSNR |
 |---|---|---|---|
 | ours, preset 0 | 708 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 91.6 / 89.5 | 78502 / 78468 | 45.12 / 45.12 |
+| ours, preset 2 / 4 | 97.4 / 95 | 78502 / 78468 | 45.12 / 45.12 |
 | x264 baseline (no asm) | 175 | 78 664 | 45.16 |
 
 At a matched QP the two encoders land within 0.2% of each other in rate and
@@ -902,10 +912,26 @@ can move a decision):
 | `-O3` instead of `-O2` | 89 | 46 395 |
 | SSE2 dequant + inverse transform + add (3x per block) | 90 | 46 395 |
 | SSE2 quantiser (2.5x per block) | 91 | 46 395 |
+| SSE2 4x4 forward transform (3.2x per call) | 92.6 | 117 974 |
+| SSE2 inverse transform for the RD residual (`idct_core`, 784 k calls / 60 fr) | 97.4 | 117 974 |
 
-The last two are worth less than the microbenchmarks suggest: instrumenting the
-encoder with a cycle counter shows the three coefficient functions are 10% of
-the encode (2.88 M calls per 150 frames, 40 + 101 + 47 cycles each), not the
+The two newest rows are 90-frame runs of the panning texture at QP 24 (the
+older rows are 40-frame runs, hence the different byte count); both are
+byte-identical to the stream before them, and both were found by profiling
+rather than by guessing: a `-pg` profile put `idct_core` -- the *scalar*
+inverse transform the rate-distortion pass reconstructs every candidate with,
+784 k calls in 60 frames -- at the top with 15.9%, and the forward transform at
+2.3%.  Halving the first and quartering the second is +9.5% of the encode
+(88.9 -> 97.4 fps, medians of five runs).  Their arithmetic is the delicate
+part, not their speed: both passes of the forward transform and both int16
+truncation points of the inverse are part of the *reference* arithmetic (bug
+8), so the vector versions reproduce them exactly and `tests/coef_check.c` now
+checks the forward transform against its own transcription of the definition
+(2.27 M cases), exactly as it already did for the inverse.
+
+The earlier rows are worth less than the microbenchmarks suggest: instrumenting
+the encoder with a cycle counter shows the three coefficient functions were 10%
+of the encode (2.88 M calls per 150 frames, 40 + 101 + 47 cycles each), not the
 33% a `-pg` profile had attributed to them, so a 2-3x faster block is ~3% of
 the picture.  The machine is noisy (the same binary measures anywhere between
 78 and 91 fps depending on the run), so the last rows are medians of five
