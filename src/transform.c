@@ -26,6 +26,25 @@
 #include <emmintrin.h>
 #endif
 
+#if defined(__SSE2__)
+/* 4x4 transpose of int16 held four lanes per register (the upper four lanes of
+ * each register are zero): the two column pairs the unpacks produce are split
+ * apart again so that every register holds one column. */
+static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r3)
+{
+    const __m128i z = _mm_setzero_si128();
+    const __m128i t0 = _mm_unpacklo_epi16(*r0, *r1);
+    const __m128i t1 = _mm_unpacklo_epi16(*r2, *r3);
+    const __m128i lo = _mm_unpacklo_epi32(t0, t1);   /* column 0 | column 1 */
+    const __m128i hi = _mm_unpackhi_epi32(t0, t1);   /* column 2 | column 3 */
+    *r0 = _mm_unpacklo_epi64(lo, z);
+    *r1 = _mm_unpackhi_epi64(lo, z);
+    *r2 = _mm_unpacklo_epi64(hi, z);
+    *r3 = _mm_unpackhi_epi64(hi, z);
+}
+
+#endif
+
 /* ------------------------------------------------------------------ */
 /* 4x4 forward transform                                               */
 /* ------------------------------------------------------------------ */
@@ -156,8 +175,81 @@ int aeg_quant_bias(int qbits, int den)
                  (den * QUANT_BIAS_DEN));
 }
 
+#if defined(__SSE2__)
+/* Quantiser for the 4x4 block, sixteen coefficients at a time.  The multiply
+ * goes through pmaddwd (|coef| <= 4080 for any residual, so the 16x16 product
+ * is exact) and the result is stored transposed, which is the layout the
+ * decoder expects -- see the scalar loop below. */
+static int quant_4x4_sse2(const int16_t *coef, int16_t *level, int qp,
+                          int intra)
+{
+    const int qbits = 15 + (qp / 6);
+    const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+    const int mf0 = aeg_quant_mf[qp % 6][0];
+    const int mf1 = aeg_quant_mf[qp % 6][1];
+    const int mf2 = aeg_quant_mf[qp % 6][2];
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i qb = _mm_cvtsi32_si128(qbits);
+    const __m128i fv = _mm_set1_epi32(f);
+    const __m128i me = _mm_setr_epi16(mf0, 0, mf1, 0, mf0, 0, mf1, 0);
+    const __m128i mo = _mm_setr_epi16(mf1, 0, mf2, 0, mf1, 0, mf2, 0);
+    __m128i r0 = _mm_loadu_si128((const __m128i *)(coef + 0));
+    __m128i r1 = _mm_loadu_si128((const __m128i *)(coef + 8));
+    __m128i o0, o1, o2, o3;
+
+    /* |coef| must fit 16 bits for the pmaddwd product below: the forward
+     * transform of a residual never gets near this, but a caller passing
+     * INT16_MIN would, and the scalar loop handles that case exactly. */
+    if (_mm_movemask_epi8(_mm_or_si128(
+            _mm_cmpeq_epi16(r0, _mm_set1_epi16(-32768)),
+            _mm_cmpeq_epi16(r1, _mm_set1_epi16(-32768)))))
+        return 0;
+
+#define QUANT_ROW(r, m, sgn)                                                   \
+    do {                                                                      \
+        (sgn) = _mm_srai_epi16((r), 15);                                       \
+        {                                                                     \
+            const __m128i ab = _mm_sub_epi16(_mm_xor_si128((r), (sgn)), (sgn));\
+            __m128i lv = _mm_madd_epi16(                                       \
+                _mm_unpacklo_epi16(_mm_srli_si128(ab, 0), zero), (m));         \
+            lv = _mm_sra_epi32(_mm_add_epi32(lv, fv), qb);                      \
+            (r) = _mm_srai_epi16((r), 15);                                      \
+            (r) = _mm_packs_epi32(                                             \
+                _mm_sub_epi32(_mm_xor_si128(lv, _mm_unpacklo_epi16(sgn, sgn)),  \
+                              _mm_unpacklo_epi16(sgn, sgn)), lv);              \
+        }                                                                     \
+    } while (0)
+
+    /* r0/r1 hold coef rows 0-3 and 4-7; the odd rows use the [mf1 mf2] pattern */
+    {
+        __m128i s0, s1, s2, s3;
+        __m128i c0 = _mm_unpacklo_epi64(r0, zero);      /* coef row 0 */
+        __m128i c1 = _mm_unpackhi_epi64(r0, zero);      /* coef row 1 */
+        __m128i c2 = _mm_unpacklo_epi64(r1, zero);      /* coef row 2 */
+        __m128i c3 = _mm_unpackhi_epi64(r1, zero);      /* coef row 3 */
+        QUANT_ROW(c0, me, s0);
+        QUANT_ROW(c1, mo, s1);
+        QUANT_ROW(c2, me, s2);
+        QUANT_ROW(c3, mo, s3);
+        o0 = c0; o1 = c1; o2 = c2; o3 = c3;
+    }
+#undef QUANT_ROW
+    /* level[y * 4 + x] = quant(coef[x * 4 + y]): one transpose at the end */
+    transpose4x4(&o0, &o1, &o2, &o3);
+    _mm_storel_epi64((__m128i *)(level + 0), o0);
+    _mm_storel_epi64((__m128i *)(level + 4), o1);
+    _mm_storel_epi64((__m128i *)(level + 8), o2);
+    _mm_storel_epi64((__m128i *)(level + 12), o3);
+    return 1;
+}
+#endif
+
 void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
 {
+#if defined(__SSE2__)
+    if (quant_4x4_sse2(coef, level, qp, intra))
+        return;
+#endif
     /* The rounding offset and the scale factors depend only on qp (and on
      * whether this is an intra block), so they are computed once for the
      * sixteen coefficients: aeg_quant_bias() is a 64-bit division and this
@@ -357,9 +449,155 @@ void aeg_transform_dc2x2_fwd(const int16_t *dc, int16_t *level)
 /* Applies the inverse transform to the dequantised coefficients and adds
  * the result to the prediction.  `dc`, when non-NULL, replaces coefficient
  * 0 (Intra_16x16 luma DC path). */
-void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
-                        int qp, const uint8_t *pred, int pred_stride,
-                        const int32_t *dc_in)
+#if defined(__SSE2__)
+/* Four int16 in the low lanes of a register, and the reverse. */
+static inline __m128i load4_i16(const int16_t *p)
+{
+    return _mm_loadl_epi64((const __m128i *)p);
+}
+
+/* 4x4 transpose of int32 held one value per lane. */
+static inline void transpose4x4_epi32(__m128i *r0, __m128i *r1, __m128i *r2,
+                                      __m128i *r3)
+{
+    const __m128i t0 = _mm_unpacklo_epi32(*r0, *r1);
+    const __m128i t1 = _mm_unpackhi_epi32(*r0, *r1);
+    const __m128i t2 = _mm_unpacklo_epi32(*r2, *r3);
+    const __m128i t3 = _mm_unpackhi_epi32(*r2, *r3);
+    *r0 = _mm_unpacklo_epi64(t0, t2);
+    *r1 = _mm_unpackhi_epi64(t0, t2);
+    *r2 = _mm_unpacklo_epi64(t1, t3);
+    *r3 = _mm_unpackhi_epi64(t1, t3);
+}
+
+/* The reference decoder's inverse transform, one pass: the four inputs are the
+ * four values along one axis, held in the same lane of four registers. */
+static inline void idct_pass(__m128i *a0, __m128i *a1, __m128i *a2, __m128i *a3)
+{
+    const __m128i s0 = _mm_add_epi32(*a0, *a2);
+    const __m128i s1 = _mm_sub_epi32(*a0, *a2);
+    const __m128i s2 = _mm_sub_epi32(_mm_srai_epi32(*a1, 1), *a3);
+    const __m128i s3 = _mm_add_epi32(*a1, _mm_srai_epi32(*a3, 1));
+    *a0 = _mm_add_epi32(s0, s3);
+    *a1 = _mm_add_epi32(s1, s2);
+    *a2 = _mm_sub_epi32(s1, s2);
+    *a3 = _mm_sub_epi32(s0, s3);
+}
+
+/* Dequantisation + both inverse-transform passes + prediction + clip, in
+ * int32 lanes: 3x the scalar block.  The scalar buffer truncates to int16
+ * between the two passes; a quarter-pel stream that is conformant never leaves
+ * the int16 range there (which is why the reference decoder can use int16
+ * buffers at all), and the differential test in tests/run_tests.sh compares
+ * this against the scalar loop on random levels at every QP to keep it that
+ * way. */
+static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
+                         int qp, const uint8_t *pred, int pred_stride)
+{
+    const int sh = qp / 6;
+    const int qm = qp % 6;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i shv = _mm_cvtsi32_si128(sh);
+    const int16_t ls0 = aeg_dequant_ls[qm][0], ls1 = aeg_dequant_ls[qm][1],
+                  ls2 = aeg_dequant_ls[qm][2];
+    const __m128i e = _mm_setr_epi16(ls0, 0, ls1, 0, ls0, 0, ls1, 0);
+    const __m128i o = _mm_setr_epi16(ls1, 0, ls2, 0, ls1, 0, ls2, 0);
+    __m128i a0 = load4_i16(level + 0), a1 = load4_i16(level + 4);
+    __m128i a2 = load4_i16(level + 8), a3 = load4_i16(level + 12);
+    __m128i v;
+
+    /* level[] is in decoder order, so register i lane j holds d[j][i]: the
+     * register index is the block's column and the lane its row.  Two
+     * consequences, both good: the dequantiser's (x&1)+(y&1) class pattern is
+     * the same per register as it is per lane, and the *first* inverse pass --
+     * the one along x -- is the one that runs across registers, so this needs
+     * a single transpose and applies the passes in the same order (and at the
+     * same int16 truncation points) as the scalar loop, which is the order the
+     * reference decoder sees. */
+#define IDCT_ROW8(p, off) \
+    _mm_unpacklo_epi16( \
+        _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)((p) + (off))), zero), zero)
+    /* DC-only blocks (very common: a macroblock that predicts well leaves one
+     * coefficient per block) skip the transform entirely, as in the scalar
+     * loop -- there the fast path is worth more than the transform is. */
+    {
+        const __m128i dc_mask = _mm_setr_epi16(-1, 0, 0, 0, 0, 0, 0, 0);
+        /* the DC coefficient is the first one; every other one must be zero
+         * for the single-value shortcut to be exact */
+        const __m128i ac = _mm_or_si128(_mm_andnot_si128(dc_mask, a0),
+                                        _mm_or_si128(_mm_or_si128(a1, a2), a3));
+        /* Only the prediction variant has this shortcut in the scalar loop;
+         * without a prediction the scalar runs the transform, whose int16
+         * intermediate truncation a very large DC coefficient does depend on.
+         */
+        if (pred && _mm_movemask_epi8(_mm_cmpeq_epi16(ac, zero)) == 0xFFFF) {
+            const int dc = (int16_t)(((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
+                                      ls0) << sh);
+            const int add = (dc + (1 << 5)) >> 6;
+            const __m128i bias = _mm_set1_epi32(add);
+            __m128i p0 = bias, p1 = bias, p2 = bias, p3 = bias;
+            if (pred) {
+                p0 = _mm_add_epi32(bias, IDCT_ROW8(pred, 0));
+                p1 = _mm_add_epi32(bias, IDCT_ROW8(pred, pred_stride));
+                p2 = _mm_add_epi32(bias, IDCT_ROW8(pred, 2 * pred_stride));
+                p3 = _mm_add_epi32(bias, IDCT_ROW8(pred, 3 * pred_stride));
+            }
+            v = _mm_packus_epi16(_mm_packs_epi32(p0, p1), _mm_packs_epi32(p2, p3));
+            *(int *)(dst) = _mm_cvtsi128_si32(v);
+            *(int *)(dst + stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 4));
+            *(int *)(dst + 2 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 8));
+            *(int *)(dst + 3 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 12));
+            return 1;
+        }
+    }
+    a0 = _mm_madd_epi16(_mm_unpacklo_epi16(a0, zero), e);
+    a1 = _mm_madd_epi16(_mm_unpacklo_epi16(a1, zero), o);
+    a2 = _mm_madd_epi16(_mm_unpacklo_epi16(a2, zero), e);
+    a3 = _mm_madd_epi16(_mm_unpacklo_epi16(a3, zero), o);
+    a0 = _mm_sll_epi32(a0, shv);
+    a1 = _mm_sll_epi32(a1, shv);
+    a2 = _mm_sll_epi32(a2, shv);
+    a3 = _mm_sll_epi32(a3, shv);
+    /* the scalar's (int16_t) cast after the dequantiser ... */
+    a0 = _mm_srai_epi32(_mm_slli_epi32(a0, 16), 16);
+    a1 = _mm_srai_epi32(_mm_slli_epi32(a1, 16), 16);
+    a2 = _mm_srai_epi32(_mm_slli_epi32(a2, 16), 16);
+    a3 = _mm_srai_epi32(_mm_slli_epi32(a3, 16), 16);
+    /* ... and only then the reference decoder's DC rounding, which the scalar
+     * loop also adds after that cast */
+    a0 = _mm_add_epi32(a0, _mm_setr_epi32(1 << 5, 0, 0, 0));
+    idct_pass(&a0, &a1, &a2, &a3);
+    /* and the one between the two passes */
+    a0 = _mm_srai_epi32(_mm_slli_epi32(a0, 16), 16);
+    a1 = _mm_srai_epi32(_mm_slli_epi32(a1, 16), 16);
+    a2 = _mm_srai_epi32(_mm_slli_epi32(a2, 16), 16);
+    a3 = _mm_srai_epi32(_mm_slli_epi32(a3, 16), 16);
+    transpose4x4_epi32(&a0, &a1, &a2, &a3);
+    idct_pass(&a0, &a1, &a2, &a3);
+    a0 = _mm_srai_epi32(a0, 6);
+    a1 = _mm_srai_epi32(a1, 6);
+    a2 = _mm_srai_epi32(a2, 6);
+    a3 = _mm_srai_epi32(a3, 6);
+    if (pred) {
+        a0 = _mm_add_epi32(a0, IDCT_ROW8(pred, 0));
+        a1 = _mm_add_epi32(a1, IDCT_ROW8(pred, pred_stride));
+        a2 = _mm_add_epi32(a2, IDCT_ROW8(pred, 2 * pred_stride));
+        a3 = _mm_add_epi32(a3, IDCT_ROW8(pred, 3 * pred_stride));
+    }
+#undef IDCT_ROW8
+    /* saturating packs do exactly the scalar's clip to [0, 255] */
+    v = _mm_packus_epi16(_mm_packs_epi32(a0, a1), _mm_packs_epi32(a2, a3));
+    *(int *)(dst) = _mm_cvtsi128_si32(v);
+    *(int *)(dst + stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 4));
+    *(int *)(dst + 2 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 8));
+    *(int *)(dst + 3 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 12));
+    return 1;
+}
+#endif
+
+static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
+                            int qp, const uint8_t *pred, int pred_stride,
+                            const int32_t *dc_in)
 {
     int32_t d[16];
     int t[16];
@@ -419,6 +657,19 @@ void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
             int p = (pred ? pred[y * pred_stride + x] : 0) + (int)d[y * 4 + x];
             dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
         }
+}
+
+void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
+                        int qp, const uint8_t *pred, int pred_stride,
+                        const int32_t *dc_in)
+{
+#if defined(__SSE2__)
+    /* The Intra_16x16 DC path (dc_in) keeps the scalar loop: it is one block per
+     * macroblock and it overrides coefficient 0 from the DC Hadamard. */
+    if (!dc_in && idct_add_sse2(dst, stride, level, qp, pred, pred_stride))
+        return;
+#endif
+    idct_add_scalar(dst, stride, level, qp, pred, pred_stride, dc_in);
 }
 
 void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
@@ -526,21 +777,6 @@ static inline void hadamard4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r
     *r3 = _mm_add_epi16(d0, d1);
 }
 
-/* 4x4 transpose of int16 held four lanes per register (the upper four lanes of
- * each register are zero): the two column pairs the unpacks produce are split
- * apart again so that every register holds one column. */
-static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r3)
-{
-    const __m128i z = _mm_setzero_si128();
-    const __m128i t0 = _mm_unpacklo_epi16(*r0, *r1);
-    const __m128i t1 = _mm_unpacklo_epi16(*r2, *r3);
-    const __m128i lo = _mm_unpacklo_epi32(t0, t1);   /* column 0 | column 1 */
-    const __m128i hi = _mm_unpackhi_epi32(t0, t1);   /* column 2 | column 3 */
-    *r0 = _mm_unpacklo_epi64(lo, z);
-    *r1 = _mm_unpackhi_epi64(lo, z);
-    *r2 = _mm_unpacklo_epi64(hi, z);
-    *r3 = _mm_unpackhi_epi64(hi, z);
-}
 
 static int satd_4x4_sse2(const uint8_t *a, int sa, const uint8_t *b, int sb)
 {

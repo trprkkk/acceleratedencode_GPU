@@ -14,16 +14,19 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 26 clip cases and *fails* on any mismatch.  What
+> `make test` asserts it over 28 clip cases, a 200 000-block coefficient
+> cross-check and the device kernels, and *fails* on any mismatch.  What
 > is *not* finished is speed and the last few percent of efficiency: at
 > matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
 > fewer bits on the inter test clips and is level with it on all-intra, where
-> it used to be 25–50 % ahead.  Speed is the real gap: 55 fps against x264's
-> 187 fps (`--preset medium`, no asm) on two cores at 320x192, because the
-> reference path is portable C with no SIMD.  Caching the fractional-pel
-> planes of the reference picture (see `docs/STATUS.md`) closed 1.6x of it;
-> the remaining gap is the integer SAD walk of the motion search.  That is what
-> the GPU backends exist for.  The GPU backends sit behind a measured
+> it used to be 25–50 % ahead.  Speed is the real gap: 90 fps against x264's
+> 170 fps (`--preset medium`, no asm) on two cores at 320x192 QP 24, so it is
+> now 1.9x behind instead of 3.4x.  What closed that: caching the
+> fractional-pel planes of the reference picture (1.6x), then exact-integer
+> SSE2 kernels for SAD, the 4x4 SATD, the quantiser, the inverse transform and
+> its prediction add, plus `-O3`.  What is left is the integer SAD walk of the
+> motion search, 57 % of the encode time, and that is what the GPU backends
+> exist for.  The GPU backends sit behind a measured
 > dispatcher, and the kernels are checked against the CPU reference by
 > `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
 > environment (there is no GPU available).  See
@@ -47,6 +50,7 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Inverse quantisation + inverse transform | GPU (batched kernel) | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
 | Distortion metrics on the CPU reference (`aeg_sad`, 4x4 Hadamard `aeg_satd`) | CPU, SSE2 | exact integer sums, so a 13x / 2.2x faster vector path cannot change a decision |
+| The scalar fallbacks of the quantiser and the inverse transform (`aeg_quant_4x4`, `aeg_idct_add_block`) | CPU, SSE2 | same reason: integer in, integer out, bit-identical to the scalar loop the GPU kernels are checked against |
 | Intra prediction | CPU | needs the just-reconstructed neighbours, serial per MB |
 | Intra_4x4 mode analysis (9 predictors x 16 blocks per MB) | CPU for now; the 16 blocks of a macroblock are independent once the neighbours exist | the candidate that dominates I-picture cost |
 | Deblocking filter | CPU | pinned: serial in MB order, communication cost dominates |
@@ -72,7 +76,8 @@ why every kernel is an integer operation and the reference implementation in
 make                 # CPU only (default, no OpenCL/CUDA required)
 make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
 make CUDA=1          # + CUDA backend (driver API + NVRTC, both dlopen()ed)
-make test            # table + CAVLC checks, then bit-exactness of 13 clips
+make test            # table + CAVLC + coefficient checks, then bit-exactness
+                     # of 28 clips
 ```
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
@@ -118,7 +123,16 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes twenty-six synthetic cases (QP 12/23/26/40,
+* `tests/coef_check.c 200000` drives the coefficient path (forward
+  quantisation, dequantisation, inverse transform, prediction add) with random
+  blocks -- uniform, sparse, single-coefficient, DC-only, and amplitudes at
+  both int16 and dispatch extremes -- at every QP and at six block strides,
+  against a reference written out independently in the test, and through the
+  in-place case as well.  Vector kernels here are the hardest thing in the tree
+  to get right, because a wrong one produces a *valid* stream that simply
+  reconstructs differently; the reference has to be written twice, from the
+  spec, to catch it.
+* `tests/run_tests.sh` encodes twenty-eight synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   integer-only and quarter-pel search, the forced whole-frame search seed,

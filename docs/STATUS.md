@@ -62,16 +62,32 @@ Implemented and building without warnings:
   (with `__kernel`/`__global`/`get_global_id` macros) and runs every kernel
   work item against the CPU reference, so kernel regressions are caught on a
   machine with no GPU.
-* SSE2 fast paths for the two distortion metrics -- `aeg_sad()` and the 4x4
-  Hadamard `aeg_satd_4x4()` -- which are the innermost loop of the motion
-  search (a 16x16 SAD 13x faster, a 4x4 SATD 2.2x faster).  Both add exact
-  integers, so they are bit-identical to the scalar loops they replace and
-  cannot change a decision; the scalar code stays as the fallback for
-  non-x86 targets and as the reference the kernel cross-check compares the
-  device kernels against.  The 4x4 SATD is a register-resident Hadamard
-  (butterfly across rows, transpose, butterfly across columns) on int16 lanes,
-  which is exact because a block of byte differences cannot leave the int16
-  range (|coef| <= 255 * 16).
+* SSE2 fast paths for the four hottest inner loops, each kept bit-identical to
+  the scalar code it replaces (so none of them can change a decision) and each
+  with the scalar loop left in place as the non-x86 fallback and as the
+  reference the tests compare against:
+  * `aeg_sad()` -- `pmpsadbw`, 13x faster per 16x16 call, the motion search's
+    innermost loop;
+  * `aeg_satd_4x4()` -- a register-resident Hadamard (butterfly across rows,
+    transpose, butterfly across columns) on int16 lanes, 2.2x faster; exact
+    because a block of byte differences cannot leave the int16 range
+    (|coef| <= 255 * 16);
+  * `aeg_quant_4x4()` -- abs/sign/multiply through `pmaddwd` with the three
+    (x&1)+(y&1) scale factors and the rounding offset hoisted out of the block,
+    2.5x faster; the block is stored transposed, which is the layout the
+    decoder expects;
+  * `aeg_idct_add_block()` -- dequantise, both inverse passes and the
+    prediction add in int32 lanes with saturating packs for the clip, 3x
+    faster.  This one keeps the scalar loop's *pass order* and its two int16
+    truncation points (bug 8), because the reference decoder truncates there
+    too and a stream that leaves int16 in an intermediate must reconstruct the
+    same way.  The three bugs the first version of it had are worth recording:
+    the DC rounding offset has to be added *after* the dequantised DC has been
+    truncated to int16 (not before), the "no AC coefficients" mask has to
+    select the AC lanes (an `andnot` on the DC lane's own register zeroes the
+    wrong half), and the DC-only shortcut is only valid when there is a
+    prediction to add -- without one, a very large DC has to go through the
+    int16 truncation that the shortcut would skip.
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`
 
 ## Bugs found by the bit-exactness work (do not reintroduce)
@@ -293,13 +309,26 @@ make -j2
 FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
 ```
 
-`make test` runs three things:
+`make test` runs five things:
 
 1. `tests/syntax_check.c` — the two `coded_block_pattern` tables must be exact
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — twenty-eight clips (QP 12/23/26/40, presets 0 and 4,
+3. `tests/coef_check.c 200000` — the coefficient path against an independently
+   written reference: random blocks (uniform, sparse, single-coefficient,
+   DC-only, and amplitudes at both int16/dispatch extremes) at QPs 0…51 and
+   block strides 4, 8, 16, 20, 24 and 384, through the scalar quantiser and
+   inverse transform, the SSE2 dispatcher, and the in-place case
+   (`pred == block` is only defined when `pred_stride == stride`).  This is the
+   test that catches a SIMD path which is self-consistently wrong — the reason
+   the earlier throw-away harnesses in `/tmp` were useless: they re-implemented
+   the reference with the same transposing store as the fast path, so both
+   agreed while the bitstream changed.  Every failure the SSE2 rebuild had
+   (three real ones, listed under bug 8) was found here.
+4. `tests/kernel_check.c` — the OpenCL device kernels against the same scalar
+   reference, when a device is present.
+5. `tests/run_tests.sh` — twenty-eight clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -572,32 +601,36 @@ this sandbox), best of three runs:
 
 | encoder | fps | bytes | Y-PSNR |
 |---|---|---|---|
-| ours, preset 0 | 552 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 73.9 / 71.6 | 78358 / 78468 | 45.13 / 45.12 |
+| ours, preset 0 | 638 | 163386 | 42.30 |
+| ours, preset 2 / 4 | 90.2 / 82.6 | 78502 / 78468 | 45.12 / 45.12 |
 | x264 baseline (no asm) | 169.5 | 78 664 | 45.16 |
 
-At a matched QP the two encoders land within 0.4% of each other in rate and
-0.03 dB in quality, and x264 is 2.3x faster (it was 3.4x before the distortion
-kernels below).  Absolute numbers move a few percent between runs; the
-`--frames 60`, single-thread, same-QP comparison is the one to repeat.
+At a matched QP the two encoders land within 0.2% of each other in rate and
+0.04 dB in quality, and x264 is 1.9x faster (it was 3.4x two rounds ago).
+Absolute numbers move a few percent between runs; the `--frames 60`,
+single-thread, same-QP comparison is the one to repeat.
 
-The two changes of this round, on the 40-frame QP 26 clip they were measured
-on (the earlier history of that clip -- 30.3 -> 49.0 fps from the plane cache,
-49.0 -> 55.2 from skipping the subpel walk's centre candidate and the exact
-P_8x8 early exit -- is committed before it):
+Where the speed came from, each step measured on its own, all of them
+byte-identical (they add, average and shift the same integers, so none of them
+can move a decision):
 
-| change | fps | bytes |
+| change | fps | bytes (40 fr, QP 26) |
 |---|---|---|
-| before | 54.5 | 46 395 |
+| start of the round before this one | 54.5 | 46 395 |
 | SSE2 SAD (13x per 16x16 call) | 65 | 46 395 |
 | SSE2 4x4 SATD (2.2x per call, the subpel walk's only real cost) | 76 | 46 395 |
 | `_mm_avg_epu8` for the two-plane average of a fractional block | 78 | 46 395 |
+| `-O3` instead of `-O2` | 89 | 46 395 |
+| SSE2 dequant + inverse transform + add (3x per block) | 90 | 46 395 |
+| SSE2 quantiser (2.5x per block) | 91 | 46 395 |
 
-Every row is byte-identical output: the kernels add and average the same
-integers, so they cannot move a decision.  The machine is noisy (the same
-binary measures anywhere between 63 and 79 fps depending on the run), so these
-are best-of-three on one sitting rather than a precision result; the shape of
-the curve is what matters.
+The last two are worth less than the microbenchmarks suggest: instrumenting the
+encoder with a cycle counter shows the three coefficient functions are 10% of
+the encode (2.88 M calls per 150 frames, 40 + 101 + 47 cycles each), not the
+33% a `-pg` profile had attributed to them, so a 2-3x faster block is ~3% of
+the picture.  The machine is noisy (the same binary measures anywhere between
+78 and 91 fps depending on the run), so the last rows are medians of five
+alternating runs rather than a precision result.
 
 Stage profile at QP 26, 40 frames, preset 2 (the default): motion estimation
 221 ms, fractional-pel planes 42 ms, transform 260 ms, deblocking 4 ms of
