@@ -217,13 +217,17 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 
 ## Next
 
-1. Quality/RD: the IDR frame is still ~3.5 dB behind x264 at the same QP
-   (Intra_4x4 helped, but the mode decision is SATD-based and the quantiser has
-   no trellis), then 8x8 sub-partitions / 8x8 DCT (needs a High profile SPS),
-   trellis quantisation and a better lambda.
-2. `src/backend_cuda.cu` for the `CUDA=1` build (the Makefile expects it, the
-   tree does not have it yet), plus more GPU kernels (intra prediction, SAD,
-   transform/quantisation) and dispatcher calibration on real hardware.
+1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
+   the last non-zero coefficient), then 8x8 sub-partitions and 8x8 DCT (the
+   latter needs a High-profile SPS).  That is where the remaining ~0.6-0.9 dB
+   of inter and ~1.5-2 dB of intra-only efficiency sits.
+2. GPU: the profile above says where to spend the next kernel — the coefficient
+   pipeline (forward transform + quantisation + inverse quantisation + inverse
+   transform + reconstruction) is now ~80% of the encode time, and the
+   Intra_4x4 mode analysis is a per-block batch that only needs the
+   neighbours.  `src/backend_cuda.cu` still has to be written for `CUDA=1`
+   (see item 2 of the previous list), and the dispatcher's calibration has
+   never run against real hardware in this environment.
 3. Multi-slice / rate control are not implemented yet.
 
 ## Quality against a reference CPU encoder
@@ -234,14 +238,30 @@ with the source:
 
 | QP | ours (kbps / PSNR Y, all) | x264 (kbps / PSNR Y, all) |
 |---|---|---|
-| 24 | 4592 / 36.15, 37.20 dB | 4825 / 38.09, 38.99 dB |
-| 32 | 2497 / 28.76, 30.23 dB | 2672 / 30.36, 31.73 dB |
+| 24 | 4776 / 37.10, 38.14 dB | 4825 / 38.09, 38.99 dB |
+| 32 | 2621 / 29.61, 31.08 dB | 2672 / 30.36, 31.73 dB |
 
-We spend ~5% *fewer* bits at the same QP and get ~1.5–1.8 dB less, i.e. x264 is
-still ~15–20% more efficient.  The residual gap is rate-distortion efficiency,
-not correctness: the mode decision compares inter against Intra_16x16 /
-Intra_4x4 with a lambda estimate and a SATD-based per-block mode choice, and
-the quantiser has no trellis or last-coefficient optimisation.
+At the same *QP* we spend about 1% fewer bits and get ~1 dB less PSNR, i.e.
+x264 is ~0.6–0.9 dB ahead on the rate-distortion curve.  Comparing streams at
+the same QP is misleading though (the QP is only an index into a quantiser, and
+x264 spends 20% more bits at the same index): on the IDR frame, at matched
+*rate*, we are level with it —
+
+| IDR frame, Y-PSNR | ours | x264 baseline |
+|---|---|---|
+| ~45 kB | 42.82 dB (QP 20) | 41.63 dB (QP 24) |
+| ~38 kB | 38.78 dB (QP 24) | 39.52 dB (QP 26) |
+
+The remaining inter gap is RD efficiency, not correctness: the mode decision
+compares inter against Intra_16x16 / Intra_4x4 with a lambda estimate and a
+SATD-based per-block mode choice, the motion vectors come from a single
+predictor, and the quantiser has no trellis or last-coefficient optimisation.
+
+The quantiser now retains coefficients 1.5x more eagerly than the reference
+rounding offset (`quant_bias()` in `src/transform.c`).  Without trellis, the
+standard deadzone (`f = 2^qbits/3` intra, `/6` inter) is too wide: widening it
+by 3/2 moved the curve by 0.2-0.3 dB per percent of rate against a QP slope of
+~0.07 dB/%, i.e. a real gain, at the cost of ~4% more bits for the same QP.
 
 The `QP % 6 == 4` rows of the forward quantiser table were wrong until bug 25
 was fixed, which made half a dozen QPs look like an RD problem.  Same clip, one
@@ -253,9 +273,11 @@ IDR frame, Y-PSNR:
 | 22 (`%6 == 4`) | 33.38 dB | 39.73 dB |
 | 28 (`%6 == 4`) | 31.63 dB | 33.84 dB |
 
-Intra only (one IDR, `-g 1` on a 10-frame clip, QP 24): 37.62 dB at 295.9 kB
-against x264's 41.75 dB at 386.4 kB — Intra_4x4 is worth its keep on the IDR but
-leaves most of that gap open.
+Intra only (`-g 1`, the ten frames of a fast-panning clip, QP 24): 38.78 dB at
+382.0 kB against x264's 41.64 dB at 443.8 kB, i.e. ~1.5-2 dB behind once the
+rate is matched — the IDR of a static scene is level (table above), the frames
+with a lot of motion behind an intra-only decision are where the per-block RD
+(nothing but SATD) shows.
 
 Inter prediction is worth roughly a 2x bitrate cut on this clip (the earlier
 all-intra rows — 8930 kbps at QP 24 — came from `partitions == 0`, bug 14).
@@ -280,12 +302,13 @@ this sandbox):
 
 | encoder | fps | bytes |
 |---|---|---|
-| ours, preset 0 | 250 | 1148272 |
-| ours, preset 2 / 4 | 58 / 59 | 1147968 |
+| ours, preset 0 | 246 | 1194196 |
+| ours, preset 2 / 4 | 51 / 55 | 1194023 |
 | x264 baseline (no asm) | 109 | 1206202 |
 
-Intra_4x4 costs ~22% (preset 2: 75.5 → 58.5 fps) because a macroblock candidate
-now runs sixteen predictors, sixteen transforms and sixteen quantisers.  That is
+Intra_4x4 costs ~22% (preset 2: 75.5 → 58.5 fps with the previous quantiser
+bias) because a macroblock candidate now runs sixteen predictors, sixteen
+transforms and sixteen quantisers.  That is
 also why the stage profile has shifted: `transform` (forward/inverse transform,
 quantisation and reconstruction of every candidate) is now ~80% of the encode
 time, motion estimation ~12%, deblocking ~2% — i.e. the stage that a GPU should
