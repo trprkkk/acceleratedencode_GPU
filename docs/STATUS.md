@@ -29,6 +29,13 @@ Implemented and building without warnings:
   and dequantisation, including the reference decoder's `int16_t` truncation
 * Intra_16x16 (all four modes), chroma (all four modes)
 * half/quarter-pel motion estimation and compensation, MV prediction, skip runs
+* P inter partitioning: 16x16, 16x8 and 8x16, each partition with its own
+  motion search, its own MV predictor and its own `mvd` (8x8 sub-partitions are
+  still missing)
+* P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
+  the picture
+* presets scale the integer search range (8/16/24/32/48) and the subpel
+  refinement
 * deblocking filter (all edges, normative order, alpha/beta/tc0 tables)
 * CPU + OpenCL backends behind a measured dispatcher, device query, calibration
 * CLI with `--list-devices`, `--calibrate`, `--bench`, `--dump-recon`
@@ -97,7 +104,34 @@ Implemented and building without warnings:
     path on this bitmask; a default of 0 silently turned every picture
     all-intra (correct, but ~2x the bitrate).  Bit 0 (16x16) is the only
     partitioning implemented and is now set in `aeg_params_default()`.
-15. **Picture padding geometry.**  Every plane occupies `(h + 2*PAD)` rows of
+15. **MV prediction for partitioned macroblocks is not the median.**  For
+    16x8 and 8x16 the reference decoder short-circuits: the *top* half of a
+    16x8 macroblock predicts from the macroblock above (block 12) as soon as
+    that one is inter, the *bottom* half from the macroblock to the left
+    (block 11), the *left* half of an 8x16 from the macroblock to the left
+    (block 3) and the *right* half from the above-right block — each with the
+    fallback median only when the short-circuit does not apply.  The third
+    neighbour also depends on the partition width: a half-width partition
+    looks at block `12+bx` of the macroblock above, a full-width one at the
+    above-right macroblock.  When a full-width partition is *not* in the top
+    row, its above-right block lies outside everything the decoder tracks and
+    the slot it reads stays `LIST_NOT_USED`.  Getting any of this wrong keeps
+    the stream decodable (same bit count) but moves the residual onto a
+    different prediction, so the picture drifts slowly.
+16. **P_Skip vector.**  `pred_pskip_motion()` is not the median either: as soon
+    as the left or the top neighbour is missing, intra, or sits at a zero
+    vector, the skipped macroblock's vector is `(0,0)`; otherwise it is the
+    median with the "matching reference" count.  Using the plain predictor made
+    every skip in a moving picture reconstruct shifted.
+17. **A skip run that reaches the end of the picture still has to be written.**
+    Decoders count macroblocks by consuming `mb_skip_run`, so a dropped tail
+    run silently ends the slice early: FFmpeg stops at the previous row without
+    logging anything (`get_bits_left() == 0` is accepted as a clean slice end),
+    which looks like "the last macroblock row is wrong".
+18. **`gop_size == 0` means *one IDR then all P*, so it must not gate the motion
+    search.**  `analyse_mb()` also tested `e->p.gop_size`, which turned
+    `-g 0` into an all-intra encode.
+19. **Picture padding geometry.**  Every plane occupies `(h + 2*PAD)` rows of
     `w + 2*PAD` bytes and the bottom/right padding is edge-replicated.  A row
     copy that starts at the *sample* origin instead of the row origin runs
     `PAD` bytes past the plane; the chroma plane offset must be
@@ -117,11 +151,14 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc round-trip + 9 clips
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — nine clips (QP 12/23/26/40, presets 0 and 4,
-   deblocking on/off, 64x64 … 320x208, forced CPU backend) encoded, decoded
-   with ffmpeg and compared **frame by frame**: the encoder's `--dump-recon`
-   must be bit-identical to the decoder's output.  Any mismatch fails the
-   script; a decoder that logs an error also fails it.
+3. `tests/run_tests.sh` — thirteen clips (QP 12/23/26/40, presets 0 and 4,
+   deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16
+   partitioning, P_Skip) encoded, decoded with ffmpeg and compared **frame by
+   frame**: the encoder's `--dump-recon` must be bit-identical to the decoder's
+   output.  Any mismatch fails the script; a decoder that logs an error also
+   fails it.  `tests/genyuv.c` takes a mode argument so that the partitioning
+   cases really move the two halves of the picture in opposite directions —
+   the default clip pans as one block and can never make a partition pay.
 
 `reconstruction vs decode` must be `max abs diff 0`.  A nonzero diff means the
 encoder and the decoder disagree about samples, which drifts on every
@@ -137,9 +174,9 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
 
 ## Next
 
-1. Quality/RD: the mode decision is still SAD + a lambda estimate; the next
-   wins are 16x8/8x16/8x8 partitions, Intra_4x4 and a real `lambda * bits`
-   term (bits are already counted by `aeg_cavlc_block_cost()`).
+1. Quality/RD: `Intra_4x4` is the single biggest remaining win (the IDR frame
+   is 4.1 dB behind x264 while spending *fewer* bits), then 8x8
+   sub-partitions, trellis quantisation and a better lambda.
 2. `src/backend_cuda.cu` for the `CUDA=1` build (the Makefile expects it, the
    tree does not have it yet), plus more GPU kernels (intra prediction, SAD,
    transform/quantisation) and dispatcher calibration on real hardware.
@@ -158,6 +195,19 @@ with the source:
 
 Inter prediction is worth roughly a 2x bitrate cut on this clip (the earlier
 all-intra rows — 8930 kbps at QP 24 — came from `partitions == 0`, bug 14).
+
+Partitioning pays on content a single vector cannot describe.  With
+`--partitions 1` (16x16 only) versus `--partitions 7` (16x16 + 16x8 + 8x16),
+same QP 26, 8 frames:
+
+| clip (320x192) | 16x16 only | with 16x8/8x16 | change |
+|---|---|---|---|
+| halves moving in opposite directions vertically (`genyuv … 1`) | 18556 B | 15086 B | −18.7% |
+| … horizontally (`genyuv … 2`) | 13839 B | 12066 B | −12.8% |
+| noisy clip with a vertical split, 10 frames | 236591 B | 139556 B | −41.0% |
+
+P_Skip collapses a still picture into a handful of bits per frame: the first
+frame of the `genyuv … 3` clip costs 4148 bytes, each following frame 8 bytes.
 Today we spend ~5% *fewer* bits than x264 at the same QP and get ~1.5–1.8 dB
 less PSNR, i.e. x264 is still ~15–20% more efficient.  The gap is
 rate-distortion efficiency, not correctness: the mode decision compares 16x16

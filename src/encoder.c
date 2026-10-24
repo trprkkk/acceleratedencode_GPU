@@ -29,6 +29,10 @@ typedef struct mbenc {
     int      hdr_bits;
     int64_t  sse;
     int64_t  cost;
+    /* inter partitioning: one predicted MV per partition (1/4 pel), in the
+     * order the bitstream carries them. */
+    int16_t  pmv[2][2];
+    uint8_t  nparts;
 } mbenc;
 
 struct aeg_encoder {
@@ -53,6 +57,16 @@ struct aeg_encoder {
     int mb_inter_sad;
     int mb_mv[2];
     int mb_pmv[2];
+    /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8 and
+     * 8x16.  Each carries the per-partition MVs and their predictors, which is
+     * exactly what the bitstream has to transmit. */
+    struct {
+        int  type;
+        int  nparts;
+        int  mv[2][2];
+        int  pmv[2][2];
+    } mb_cand[3];
+    int mb_ncand;
 
     aeg_dispatcher d;
     int frame_count;         /* total pictures encoded                  */
@@ -76,6 +90,51 @@ struct aeg_encoder {
 static inline int clip255(int v)
 {
     return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+/* ------------------------------------------------------------------ */
+/* Inter partition geometry                                            */
+/* ------------------------------------------------------------------ */
+static int is_intra_type(int t)
+{
+    return t == AEG_MB_I4x4 || t == AEG_MB_I16x16 || t == AEG_MB_IPCM;
+}
+
+static int is_inter_type(int t)
+{
+    return !is_intra_type(t);
+}
+
+/* Number of partitions of an inter macroblock type. */
+static int part_count(int type)
+{
+    return (type == AEG_MB_P16x8 || type == AEG_MB_P8x16) ? 2 : 1;
+}
+
+/* Luma geometry of partition `p`: x, y, w, h in pixels inside the macroblock,
+ * plus the index of its first 4x4 block (where its MV is stored). */
+static void part_geom(int type, int p, int geo[4], int *blk0)
+{
+    switch (type) {
+    case AEG_MB_P16x8:
+        geo[0] = 0; geo[1] = p ? 8 : 0; geo[2] = 16; geo[3] = 8;
+        *blk0 = p ? 8 : 0;
+        break;
+    case AEG_MB_P8x16:
+        geo[0] = p ? 8 : 0; geo[1] = 0; geo[2] = 8; geo[3] = 16;
+        *blk0 = p ? 2 : 0;
+        break;
+    default:
+        geo[0] = 0; geo[1] = 0; geo[2] = 16; geo[3] = 16;
+        *blk0 = 0;
+        break;
+    }
+}
+
+/* mb_type code of an inter macroblock (H.264 table 7-13, P slices). */
+static int inter_mb_type_code(int type)
+{
+    return type == AEG_MB_P16x8 ? 1 : (type == AEG_MB_P8x16 ? 2 : 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -461,22 +520,259 @@ static int chroma_sad(struct aeg_encoder *e, int mbx, int mby, int pl, int mode)
     return aeg_sad(8, 8, e->pred_c[pl], 8, src, e->stride[1]);
 }
 
+/* Motion compensation of one rectangle of the macroblock.  The vector is in
+ * quarter luma samples: the integer part moves the reference pointer, the
+ * remainder selects the interpolation phase.  Chroma runs at eighth-sample
+ * precision, so the same vector is already in eighth chroma samples (one luma
+ * quarter pel is half a chroma sample) and the chroma rectangle is half the
+ * size. */
+static void mc_rect_luma(struct aeg_encoder *e, int mbx, int mby,
+                         int x, int y, int w, int h, int mvx, int mvy)
+{
+    const uint8_t *r = e->refp[0] + (mby * 16 + y + (mvy >> 2)) * e->stride[0] +
+                       mbx * 16 + x + (mvx >> 2);
+    aeg_mc_luma(e->pred_l + y * 16 + x, 16, r, e->stride[0], w, h,
+                mvx & 3, mvy & 3);
+}
+
+static void mc_rect_chroma(struct aeg_encoder *e, int mbx, int mby,
+                           int cx, int cy, int cw, int ch, int mvx, int mvy)
+{
+    int pl;
+    for (pl = 0; pl < 2; pl++) {
+        const uint8_t *rc = e->refp[1 + pl] + (mby * 8 + cy + (mvy >> 3)) * e->stride[1] +
+                            mbx * 8 + cx + (mvx >> 3);
+        aeg_mc_chroma(e->pred_c[pl] + cy * 8 + cx, 8, rc, e->stride[1],
+                      cw, ch, mvx & 7, mvy & 7);
+    }
+}
+
 /* Inter prediction of the 16x16 luma block and both chroma planes. */
 static void inter_predict(struct aeg_encoder *e, int mbx, int mby, int mvx, int mvy)
 {
-    /* The motion vector is in quarter luma samples: the integer part moves the
-     * reference pointer, the remainder selects the interpolation phase.  Chroma
-     * runs at eighth-sample precision, so the same vector is already in eighth
-     * chroma samples (one luma quarter pel is half a chroma sample). */
-    const uint8_t *r = e->refp[0] + mby * 16 * e->stride[0] + mbx * 16 +
-                       (mvx >> 2) + (mvy >> 2) * e->stride[0];
-    int pl;
-    aeg_mc_luma(e->pred_l, 16, r, e->stride[0], 16, 16, mvx & 3, mvy & 3);
-    for (pl = 0; pl < 2; pl++) {
-        const uint8_t *rc = e->refp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8 +
-                            (mvx >> 3) + (mvy >> 3) * e->stride[1];
-        aeg_mc_chroma(e->pred_c[pl], 8, rc, e->stride[1], 8, 8,
-                      mvx & 7, mvy & 7);
+    mc_rect_luma(e, mbx, mby, 0, 0, 16, 16, mvx, mvy);
+    mc_rect_chroma(e, mbx, mby, 0, 0, 8, 8, mvx, mvy);
+}
+
+/* Prediction of a whole macroblock coded with `type`, using the per-4x4 MV
+ * table of that candidate (every 4x4 block of a partition shares its MV). */
+static void inter_predict_typed(struct aeg_encoder *e, int mbx, int mby,
+                                int type, const int16_t mv[16][2])
+{
+    int p, n = part_count(type);
+    for (p = 0; p < n; p++) {
+        int geo[4], b0;
+        part_geom(type, p, geo, &b0);
+        mc_rect_luma(e, mbx, mby, geo[0], geo[1], geo[2], geo[3],
+                     mv[b0][0], mv[b0][1]);
+        mc_rect_chroma(e, mbx, mby, geo[0] / 2, geo[1] / 2,
+                       geo[2] / 2, geo[3] / 2, mv[b0][0], mv[b0][1]);
+    }
+}
+
+/* MV prediction of one inter partition (H.264 8.4.1.3.1).
+ *
+ * Partitioned macroblocks do *not* use the plain three-neighbour median: the
+ * reference decoder (and x264) short-circuits to a single neighbour as soon as
+ * it carries the same reference picture, and its third neighbour differs per
+ * partition shape.  The rules below reproduce that derivation exactly --
+ * getting them wrong does not desynchronise the stream, but it makes the
+ * encoder reconstruct with a different motion vector than the decoder. */
+
+/* Availability of a neighbouring block: -2 not available (outside the
+ * picture), -1 available but not inter (intra, so list 0 is not used), 0 the
+ * neighbour predicts from reference 0 with a usable vector. */
+#define NB_UNAVAIL (-2)
+#define NB_NOTUSED (-1)
+#define NB_OK        0
+
+typedef struct {
+    int ref;
+    int mvx, mvy;
+} nb_mv;
+
+static void nb_set(nb_mv *n, int ref, int mvx, int mvy)
+{
+    n->ref = ref; n->mvx = mvx; n->mvy = mvy;
+}
+
+/* Fill `n` from macroblock `m` (NULL when the neighbour does not exist). */
+static void nb_from_mb(nb_mv *n, const aeg_mb *m, int blk)
+{
+    if (!m) {
+        nb_set(n, NB_UNAVAIL, 0, 0);
+        return;
+    }
+    if (is_intra_type(m->type)) {
+        nb_set(n, NB_NOTUSED, 0, 0);
+        return;
+    }
+    nb_set(n, NB_OK, m->mv[blk][0], m->mv[blk][1]);
+}
+
+/* Median of three motion vector components (H.264 8.4.1.3.1). */
+static int mv_median3(int a, int b, int c)
+{
+    int mx = a > b ? a : b;
+    int mn = a < b ? a : b;
+    return c > mx ? mx : (c < mn ? mn : c);
+}
+
+/* Motion vector prediction of partition `p` of `type` in macroblock
+ * (mbx, mby).  `cur` holds the vectors already decided for this macroblock so
+ * that the second partition sees the first one as a neighbour. */
+static void predict_part_mv(struct aeg_encoder *e, int mbx, int mby,
+                            const int16_t cur[16][2], int type, int p,
+                            int *pmvx, int *pmvy)
+{
+    nb_mv A, B, C;
+    int bx = 0, by = 0, pw = 4, match;
+
+    if (type == AEG_MB_P16x8) {
+        by = p ? 2 : 0;
+    } else {
+        bx = p ? 2 : 0;
+        pw = 2;
+    }
+
+    /* A: the block left of the partition (inside this macroblock when bx > 0). */
+    if (bx > 0) {
+        nb_set(&A, NB_OK, cur[(by << 2) + bx - 1][0], cur[(by << 2) + bx - 1][1]);
+    } else if (mbx > 0) {
+        nb_from_mb(&A, &e->mbs[mby * e->mb_w + mbx - 1], (by << 2) + 3);
+    } else {
+        nb_from_mb(&A, NULL, 0);
+    }
+
+    /* B: the block above the partition (inside this macroblock when by > 0). */
+    if (by > 0) {
+        nb_set(&B, NB_OK, cur[((by - 1) << 2) + bx][0], cur[((by - 1) << 2) + bx][1]);
+    } else if (mby > 0) {
+        nb_from_mb(&B, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx);
+    } else {
+        nb_from_mb(&B, NULL, 0);
+    }
+
+    /* C: the block above and to the right of the partition.  Which block that
+     * is depends on the partition width: a full-width partition reaches into
+     * the macroblock above and to the right, a half-width one still sits above
+     * the current macroblock.  The decoder's fallback when that block does not
+     * exist is the block to the left of the partition's above neighbour.  When
+     * the partition is not in the top row of the macroblock and its right edge
+     * is the macroblock's right edge, the block is outside everything the
+     * decoder tracks and its slot is permanently LIST_NOT_USED. */
+    {
+        int cx = bx + pw, cy = by - 1;
+        if (cy >= 0) {
+            if (cx <= 3)
+                nb_set(&C, NB_OK, cur[(cy << 2) + cx][0], cur[(cy << 2) + cx][1]);
+            else
+                nb_set(&C, NB_NOTUSED, 0, 0);
+        } else if (cx <= 3) {
+            if (mby > 0)
+                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + cx);
+            else
+                nb_from_mb(&C, NULL, 0);
+        } else {
+            if (mby > 0 && mbx + 1 < e->mb_w)
+                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx + 1], 12);
+            else
+                nb_from_mb(&C, NULL, 0);
+            if (C.ref == NB_UNAVAIL) {
+                if (mby <= 0)
+                    nb_from_mb(&C, NULL, 0);
+                else if (bx > 0)
+                    nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx],
+                               12 + bx - 1);
+                else if (mbx > 0)
+                    nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx - 1], 15);
+                else
+                    nb_from_mb(&C, NULL, 0);
+            }
+        }
+    }
+
+    /* The decoder prefers a single neighbour that shares the reference. */
+    if (type == AEG_MB_P16x8) {
+        if (p == 0 && B.ref == NB_OK) {
+            *pmvx = B.mvx; *pmvy = B.mvy;
+            return;
+        }
+        if (p == 1 && A.ref == NB_OK) {
+            *pmvx = A.mvx; *pmvy = A.mvy;
+            return;
+        }
+    } else {
+        if (p == 0 && A.ref == NB_OK) {
+            *pmvx = A.mvx; *pmvy = A.mvy;
+            return;
+        }
+        if (p == 1 && C.ref == NB_OK) {
+            *pmvx = C.mvx; *pmvy = C.mvy;
+            return;
+        }
+    }
+
+    match = (C.ref == NB_OK) + (B.ref == NB_OK) + (A.ref == NB_OK);
+    if (match == 1) {
+        if (A.ref == NB_OK)      { *pmvx = A.mvx; *pmvy = A.mvy; }
+        else if (B.ref == NB_OK) { *pmvx = B.mvx; *pmvy = B.mvy; }
+        else                     { *pmvx = C.mvx; *pmvy = C.mvy; }
+    } else if (match == 0 && B.ref == NB_UNAVAIL && C.ref == NB_UNAVAIL &&
+               A.ref != NB_UNAVAIL) {
+        *pmvx = A.mvx; *pmvy = A.mvy;
+    } else {
+        *pmvx = mv_median3(A.mvx, B.mvx, C.mvx);
+        *pmvy = mv_median3(A.mvy, B.mvy, C.mvy);
+    }
+}
+
+/* Motion vector of a P_Skip macroblock (H.264 8.4.1.1).  It is *not* the
+ * median predictor: as soon as the left or the top neighbour is missing, is
+ * intra, or sits at a zero vector, the skipped block's vector is (0,0).
+ * Decoders reconstruct skipped macroblocks with exactly this rule, so the
+ * encoder has to apply it before it may code one as a skip. */
+static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
+                     int *mvx, int *mvy)
+{
+    const aeg_mb *m;
+    int ax = 0, ay = 0, bx = 0, by = 0, cx = 0, cy = 0;
+    int refa = -1, refb = -1, refc = -1, match;
+
+    *mvx = *mvy = 0;
+    if (mbx <= 0 || mby <= 0)
+        return;
+    m = &e->mbs[mby * e->mb_w + mbx - 1];          /* A: left */
+    if (is_inter_type(m->type)) {
+        ax = m->mv[3][0]; ay = m->mv[3][1]; refa = 0;
+        if (ax == 0 && ay == 0)
+            return;
+    }
+    m = &e->mbs[(mby - 1) * e->mb_w + mbx];        /* B: above */
+    if (is_inter_type(m->type)) {
+        bx = m->mv[12][0]; by = m->mv[12][1]; refb = 0;
+        if (bx == 0 && by == 0)
+            return;
+    }
+    if (mbx + 1 < e->mb_w) {                       /* C: above-right */
+        m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
+        if (is_inter_type(m->type)) {
+            cx = m->mv[12][0]; cy = m->mv[12][1]; refc = 0;
+        }
+    } else {                                       /* ... else above-left */
+        m = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
+        if (is_inter_type(m->type)) {
+            cx = m->mv[15][0]; cy = m->mv[15][1]; refc = 0;
+        }
+    }
+    match = (refc == 0) + (refb == 0) + (refa == 0);
+    if (match == 1) {
+        if (refa == 0)      { *mvx = ax; *mvy = ay; }
+        else if (refb == 0) { *mvx = bx; *mvy = by; }
+        else                { *mvx = cx; *mvy = cy; }
+    } else {
+        *mvx = mv_median3(ax, bx, cx);
+        *mvy = mv_median3(ay, by, cy);
     }
 }
 
@@ -488,6 +784,7 @@ static void reset_mb_enc(mbenc *c, int qp)
     memset(c, 0, sizeof(*c));
     c->qp = qp;
     c->type = AEG_MB_I16x16;
+    c->nparts = 1;
 }
 
 /* Chroma prediction modes in bitstream order: 0 = DC, 1 = horizontal,
@@ -527,6 +824,49 @@ static int chroma_mode_by_sad(struct aeg_encoder *e, int mbx, int mby)
     return best;
 }
 
+/* Motion search for one partitioned candidate (16x8 or 8x16): every partition
+ * gets its own search centred on its own MV predictor, and the MVs decided so
+ * far are visible to the following partitions of the same macroblock. */
+static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
+{
+    int16_t cur[16][2];
+    int p, n = part_count(type);
+    int slot = e->mb_ncand;
+
+    if (slot >= (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0])))
+        return;
+    memset(cur, 0, sizeof(cur));
+    e->mb_cand[slot].type = type;
+    e->mb_cand[slot].nparts = n;
+    for (p = 0; p < n; p++) {
+        int geo[4], b0, pmvx, pmvy, mvx, mvy, sad, x, y, x0, y0, x1, y1;
+        part_geom(type, p, geo, &b0);
+        predict_part_mv(e, mbx, mby, (const int16_t (*)[2])cur, type, p,
+                        &pmvx, &pmvy);
+        aeg_me_block(e->refp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                         mbx * 16 + geo[0],
+                     e->stride[0],
+                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                         mbx * 16 + geo[0],
+                     e->stride[0], geo[2], geo[3],
+                     e->p.search_range ? e->p.search_range : 16,
+                     e->p.subme, pmvx, pmvy, &mvx, &mvy, &sad);
+        e->mb_cand[slot].mv[p][0] = mvx;
+        e->mb_cand[slot].mv[p][1] = mvy;
+        e->mb_cand[slot].pmv[p][0] = pmvx;
+        e->mb_cand[slot].pmv[p][1] = pmvy;
+        /* publish this partition's MV for the next partition's predictor */
+        x0 = geo[0] / 4; y0 = geo[1] / 4;
+        x1 = x0 + geo[2] / 4; y1 = y0 + geo[3] / 4;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                cur[(y << 2) + x][0] = (int16_t)mvx;
+                cur[(y << 2) + x][1] = (int16_t)mvy;
+            }
+    }
+    e->mb_ncand = slot + 1;
+}
+
 /* Fills e->mb_modes[] with the legal Intra_16x16 modes ordered by SAD, runs
  * the motion search and remembers its result.  Nothing is coded here: code_mb()
  * either uses this SAD ranking directly (preset 0) or refines it with a full
@@ -556,9 +896,13 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     c->chroma_mode = chroma_mode_by_sad(e, mbx, mby);
 
     e->mb_inter_ok = 0;
+    e->mb_ncand = 0;
     e->mb_mv[0] = e->mb_mv[1] = 0;
     e->mb_pmv[0] = e->mb_pmv[1] = 0;
-    if (e->p.partitions != 0 && c->qp >= 0 && e->p.gop_size && e->has_ref) {
+    /* `has_ref` alone decides: gop_size == 0 means "one IDR, then all P"
+     * (see the is_idr test in aeg_encoder_encode), so it must not gate the
+     * motion search as well. */
+    if (e->p.partitions != 0 && c->qp >= 0 && e->has_ref) {
         int mvx, mvy, sad;
         aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby,
                        &e->mb_pmv[0], &e->mb_pmv[1]);
@@ -575,6 +919,22 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         e->mb_mv[1] = mvy;
         e->mb_inter_ok = 1;
         e->mb_inter_sad = sad;
+
+        e->mb_cand[0].type = AEG_MB_P16x16;
+        e->mb_cand[0].nparts = 1;
+        e->mb_cand[0].mv[0][0] = mvx;
+        e->mb_cand[0].mv[0][1] = mvy;
+        e->mb_cand[0].pmv[0][0] = e->mb_pmv[0];
+        e->mb_cand[0].pmv[0][1] = e->mb_pmv[1];
+        e->mb_ncand = 1;
+        /* Partitioned candidates: 16x8 and 8x16, bit 1 and 2 of the mask.
+         * They only pay off with the RD decision, so ultrafast stays 16x16. */
+        if (e->p.preset >= 1) {
+            if (e->p.partitions & 2)
+                me_candidate(e, mbx, mby, AEG_MB_P16x8);
+            if (e->p.partitions & 4)
+                me_candidate(e, mbx, mby, AEG_MB_P8x16);
+        }
     }
 
     /* Preset 0 keeps the plain SAD decision; it leaves both predictions in
@@ -586,6 +946,9 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 < e->mb_sad * 8) {
             int i;
             c->type = AEG_MB_P16x16;
+            c->nparts = 1;
+            c->pmv[0][0] = (int16_t)e->mb_pmv[0];
+            c->pmv[0][1] = (int16_t)e->mb_pmv[1];
             for (i = 0; i < 16; i++) {
                 c->mv[i][0] = (int16_t)e->mb_mv[0];
                 c->mv[i][1] = (int16_t)e->mb_mv[1];
@@ -596,6 +959,49 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             intra16_sad(e, mbx, mby, c->i16_mode);   /* leave pred_l */
         }
     }
+}
+
+/* CodedBlockPatternChroma as coded in the bitstream: 0 none, 1 DC only,
+ * 2 AC (DC is then implied). */
+static int chroma_cbp(const mbenc *c)
+{
+    if (c->cbp & 0x20)
+        return 2;
+    return (c->cbp & 0x10) ? 1 : 0;
+}
+
+/* CodedBlockPatternLuma is binary in Intra_16x16: 0 means "no AC
+ * coefficients at all", 15 means "all sixteen AC blocks are coded". */
+static int luma_cbp_on(const mbenc *c)
+{
+    return (c->cbp & 0x0f) ? 15 : 0;
+}
+
+/* Bits the macroblock header costs: mb_type (and, for the intra types, the
+ * chroma prediction mode and the coded block pattern that mb_type carries). */
+static int mb_type_bits(const mbenc *c, int is_p)
+{
+    if (!is_p)
+        return aeg_ue_bits((uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
+                                      12 * (luma_cbp_on(c) ? 1 : 0)));
+    if (is_inter_type(c->type))
+        return aeg_ue_bits((uint32_t)inter_mb_type_code(c->type));
+    return aeg_ue_bits((uint32_t)(6 + c->i16_mode + 4 * chroma_cbp(c) +
+                                  12 * (luma_cbp_on(c) ? 1 : 0)));
+}
+
+/* Header bits of the inter geometry: mb_type plus one mvd pair per partition
+ * (H.264 codes mvd in the same 1/4-pel units as the MV itself). */
+static int inter_hdr_bits(const mbenc *c)
+{
+    int p, bits = mb_type_bits(c, 1);
+    for (p = 0; p < c->nparts; p++) {
+        int geo[4], b0;
+        part_geom(c->type, p, geo, &b0);
+        bits += aeg_mvd_bits(c->mv[b0][0] - c->pmv[p][0],
+                             c->mv[b0][1] - c->pmv[p][1]);
+    }
+    return bits;
 }
 
 /* ------------------------------------------------------------------ */
@@ -645,24 +1051,38 @@ static void restore_chroma(struct aeg_encoder *e, int mbx, int mby, const uint8_
 }
 
 /* Code the luma part of one candidate into `t` and return its RD cost.  The
- * reconstruction is left in the picture buffer, so the caller snapshots it. */
+ * reconstruction is left in the picture buffer, so the caller snapshots it.
+ * `cand` selects one of the inter candidates gathered by analyse_mb(); it is
+ * ignored for the intra types. */
 static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp,
-                       int type, int i16_mode, double lambda)
+                       int type, int i16_mode, double lambda, int cand)
 {
     reset_mb_enc(t, qp);
     t->type = type;
     t->i16_mode = i16_mode;
-    if (type == AEG_MB_P16x16) {
-        int i;
-        for (i = 0; i < 16; i++) {
-            t->mv[i][0] = (int16_t)e->mb_mv[0];
-            t->mv[i][1] = (int16_t)e->mb_mv[1];
+    if (is_inter_type(type)) {
+        int p, n = part_count(type);
+        t->nparts = (uint8_t)n;
+        for (p = 0; p < n; p++) {
+            int geo[4], b0, x, y, x0, y0, x1, y1;
+            part_geom(type, p, geo, &b0);
+            t->pmv[p][0] = (int16_t)e->mb_cand[cand].pmv[p][0];
+            t->pmv[p][1] = (int16_t)e->mb_cand[cand].pmv[p][1];
+            x0 = geo[0] / 4; y0 = geo[1] / 4;
+            x1 = x0 + geo[2] / 4; y1 = y0 + geo[3] / 4;
+            for (y = y0; y < y1; y++)
+                for (x = x0; x < x1; x++) {
+                    t->mv[(y << 2) + x][0] =
+                        (int16_t)e->mb_cand[cand].mv[p][0];
+                    t->mv[(y << 2) + x][1] =
+                        (int16_t)e->mb_cand[cand].mv[p][1];
+                }
         }
-        inter_predict(e, mbx, mby, e->mb_mv[0], e->mb_mv[1]);
+        inter_predict_typed(e, mbx, mby, type, t->mv);
         code_luma_inter(e, mbx, mby, t);
-        t->bits += aeg_mvd_bits((e->mb_mv[0] - e->mb_pmv[0]) >> 2,
-                                (e->mb_mv[1] - e->mb_pmv[1]) >> 2);
+        t->bits += inter_hdr_bits(t);
     } else {
+        t->nparts = 1;
         intra16_sad(e, mbx, mby, i16_mode);   /* leaves the predictor in pred_l */
         code_luma_i16(e, mbx, mby, t);
     }
@@ -692,7 +1112,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 
     if (e->p.preset <= 0 || e->mb_nmodes == 0) {
         /* plain SAD decision (analyse_mb already left the predictor) */
-        if (c->type == AEG_MB_P16x16) {
+        if (is_inter_type(c->type)) {
             code_luma_inter(e, mbx, mby, c);
             code_chroma(e, mbx, mby, c, 1);
         } else {
@@ -702,18 +1122,20 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         return;
     }
 
-    /* luma: the SAD-best modes (all of them from preset 2 on) plus inter */
+    /* luma: the SAD-best modes (all of them from preset 2 on) plus every inter
+     * partitioning the motion search produced */
     for (i = 0; i < (e->p.preset >= 2 ? e->mb_nmodes : 1); i++) {
         int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
-                               e->mb_modes[i], lambda);
+                               e->mb_modes[i], lambda, -1);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
             snap_luma(e, mbx, mby, snap_l);
         }
     }
-    if (e->mb_inter_ok) {
-        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_P16x16, 0, lambda);
+    for (i = 0; i < e->mb_ncand; i++) {
+        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
+                               lambda, i);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
@@ -721,7 +1143,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
     }
     restore_luma(e, mbx, mby, snap_l);
-    inter = (best.type == AEG_MB_P16x16);
+    inter = is_inter_type(best.type);
 
     /* chroma: every legal intra mode, or the motion-compensated prediction */
     if (!inter) {
@@ -745,7 +1167,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         best = cbest;
     } else {
-        inter_predict(e, mbx, mby, e->mb_mv[0], e->mb_mv[1]);
+        inter_predict_typed(e, mbx, mby, best.type, best.mv);
         t = best;
         rd_chroma(e, mbx, mby, &t, 1, t.chroma_mode, lambda);
         best = t;
@@ -758,36 +1180,6 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 /* ------------------------------------------------------------------ */
 /* Bitstream                                                           */
 /* ------------------------------------------------------------------ */
-/* CodedBlockPatternChroma as coded in the bitstream: 0 none, 1 DC only,
- * 2 AC (DC is then implied). */
-static int chroma_cbp(const mbenc *c)
-{
-    if (c->cbp & 0x20)
-        return 2;
-    return (c->cbp & 0x10) ? 1 : 0;
-}
-
-/* CodedBlockPatternLuma is binary in Intra_16x16: 0 means "no AC
- * coefficients at all", 15 means "all sixteen AC blocks are coded". */
-static int luma_cbp_on(const mbenc *c)
-{
-    return (c->cbp & 0x0f) ? 15 : 0;
-}
-
-static int mb_type_bits(const mbenc *c, int is_p) __attribute__((unused));
-static int mb_type_bits(const mbenc *c, int is_p)
-{
-    int t;
-    if (!is_p)
-        return aeg_ue_bits((uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
-                                      12 * (luma_cbp_on(c) ? 1 : 0)));
-    if (c->type == AEG_MB_P16x16)
-        t = 0;
-    else
-        t = 6 + c->i16_mode + 4 * chroma_cbp(c) + 12 * (luma_cbp_on(c) ? 1 : 0);
-    return aeg_ue_bits((uint32_t)t);
-}
-
 static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
                      const mbenc *c, int is_p)
 {
@@ -795,19 +1187,25 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
     if (!is_p) {
         aeg_bw_ue(bw, (uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
                                  12 * (luma_cbp_on(c) ? 1 : 0)));
-    } else if (c->type == AEG_MB_P16x16) {
-        int pmvx, pmvy;
-        aeg_bw_ue(bw, 0);
-        aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, &pmvx, &pmvy);
-        aeg_bw_se(bw, c->mv[0][0] - pmvx);
-        aeg_bw_se(bw, c->mv[0][1] - pmvy);
+    } else if (is_inter_type(c->type)) {
+        /* P_L0_16x16 / P_L0_16x8 / P_L0_8x16: one mvd pair per partition, all
+         * of them before the coded block pattern.  There is a single reference
+         * picture, so ref_idx_l0 is omitted. */
+        int p;
+        aeg_bw_ue(bw, (uint32_t)inter_mb_type_code(c->type));
+        for (p = 0; p < c->nparts; p++) {
+            int geo[4], b0;
+            part_geom(c->type, p, geo, &b0);
+            aeg_bw_se(bw, c->mv[b0][0] - c->pmv[p][0]);
+            aeg_bw_se(bw, c->mv[b0][1] - c->pmv[p][1]);
+        }
         aeg_bw_ue(bw, (uint32_t)aeg_cbp_codenum[(c->cbp & 0x0f) |
                                                 (chroma_cbp(c) << 4)]);
     } else {
         aeg_bw_ue(bw, (uint32_t)(6 + c->i16_mode + 4 * chroma_cbp(c) +
                                  12 * (luma_cbp_on(c) ? 1 : 0)));
     }
-    if (c->type != AEG_MB_P16x16)
+    if (is_intra_type(c->type))
         aeg_bw_ue(bw, (uint32_t)c->chroma_mode);
     /* mb_qp_delta: only present when the picture actually carries a coded
      * block pattern (H.264 7.3.5.2); emitting it unconditionally desynchronises
@@ -950,16 +1348,35 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                     m->cost = (int32_t)tmp.sse;
                 }
 
-                /* emit */
+                /* emit.  A P_L0_16x16 macroblock whose motion vector equals the
+                 * predictor and that carries no residual at all reconstructs
+                 * exactly like P_Skip (same prediction, no residual), so it is
+                 * coded as part of the skip run: same picture, fewer bits. */
                 {
-                    if (is_p)
-                        flush_skip_run(&bw, &skip_run);
-                    write_mb(e, &bw, mbx, mby, &tmp, is_p);
+                    int skipped = 0;
+                    if (is_p && tmp.type == AEG_MB_P16x16 && tmp.cbp == 0) {
+                        int pmvx, pmvy;
+                        pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+                        if (tmp.mv[0][0] == pmvx && tmp.mv[0][1] == pmvy)
+                            skipped = 1;
+                    }
+                    if (skipped)
+                        skip_run++;
+                    else {
+                        if (is_p)
+                            flush_skip_run(&bw, &skip_run);
+                        write_mb(e, &bw, mbx, mby, &tmp, is_p);
+                    }
                 }
                 e->st.frames += 0;
             }
         }
     }
+    /* A skip run that reaches the end of the frame still has to be emitted:
+     * the decoder counts macroblocks by consuming mb_skip_run values, so an
+     * unwritten tail run makes it stop before the last row. */
+    if (is_p && skip_run > 0)
+        flush_skip_run(&bw, &skip_run);
     aeg_bw_align_one(&bw);
     rbsp_len = aeg_bw_finish(&bw);
 
@@ -1078,7 +1495,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->fps_den <= 0) pp->fps_den = 1;
     if (pp->qp < 0) pp->qp = 23;
     if (pp->qp > 51) pp->qp = 51;
-    if (pp->subme < 0) pp->subme = 1;
+    /* Presets trade search effort against speed: the integer search range and
+     * whether the subpel refinement runs at all are what actually move the
+     * quality/bitrate curve, so they scale with the preset unless the caller
+     * asked for something specific. */
+    if (pp->preset < 0) pp->preset = 0;
+    if (pp->preset > 4) pp->preset = 4;
+    if (pp->search_range <= 0) {
+        static const int rng[5] = { 8, 16, 24, 32, 48 };
+        pp->search_range = rng[pp->preset];
+    }
+    if (pp->subme < 0) pp->subme = pp->preset <= 0 ? 0 : 1;
     if (pp->gop_size < 0) pp->gop_size = 250;
 
     e->w = params->width & ~15;

@@ -7,7 +7,8 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: conformant encoder core (I and P pictures), quality work in progress.**
+> **Status: conformant encoder core (I and P pictures, 16x16/16x8/8x16 inter
+> partitioning and P_Skip), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 12–40, presets
@@ -15,7 +16,7 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > mismatch.  What is *not* finished is rate-distortion efficiency: at matched QP
 > the bitrate is already below x264 baseline (~5% less) but the PSNR is ~1.5 dB
 > lower, i.e. x264 is still ~15–20% more efficient (SAD+λ mode decision, no
-> Intra_4x4, no trellis, only 16x16 inter partitioning).  The GPU backends sit
+> Intra_4x4, no trellis, no 8x8 sub-partitions).  The GPU backends sit
 > behind a measured dispatcher but have only been compile-checked in this
 > environment (no GPU available).  See [`docs/STATUS.md`](docs/STATUS.md).
 
@@ -56,7 +57,7 @@ why every kernel is an integer operation and the reference implementation in
 make                 # CPU only (default, no OpenCL/CUDA required)
 make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
 make CUDA=1          # + CUDA backend (needs the CUDA toolkit; not yet written)
-make test            # table + CAVLC checks, then bit-exactness of 9 clips
+make test            # table + CAVLC checks, then bit-exactness of 13 clips
 ```
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
@@ -72,10 +73,13 @@ the tree.
                --dump-recon recon.yuv --bench
 ```
 
-`-b cpu|opencl|cuda|auto` selects the backend, `--dump-recon` writes what the
-encoder itself reconstructed (this is what a decoder must produce, so it is the
-primary conformance check), `--no-deblock`, `--subme N` and `--range N` trade
-speed for quality.
+`-b cpu|opencl|cuda|auto` selects the backend, `-p 0..4` is the speed/quality
+preset (it scales the search range and the subpel refinement), `--partitions`
+selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
+16x16 + 16x8 + 8x16), `--dump-recon` writes what the encoder itself
+reconstructed (this is what a decoder must produce, so it is the primary
+conformance check), and `--no-deblock`, `--subme N`, `--range N` override the
+preset.
 
 ## What is verified, and how
 
@@ -90,10 +94,11 @@ speed for quality.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes nine synthetic cases (QP 12/23/40, presets 0 and
-  4, deblocking on/off, 64x64 … 320x208, forced CPU backend), decodes them with
-  ffmpeg and requires the encoder's own reconstruction to be **bit-identical**
-  on every frame; it exits non-zero otherwise.
+* `tests/run_tests.sh` encodes thirteen synthetic cases (QP 12/23/26/40,
+  presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8 and
+  8x16 partitioning, P_Skip), decodes them with ffmpeg and requires the
+  encoder's own reconstruction to be **bit-identical** on every frame; it exits
+  non-zero otherwise.
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
 
 ## Layout

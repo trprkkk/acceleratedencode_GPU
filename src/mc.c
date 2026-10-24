@@ -117,8 +117,9 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
 /* ------------------------------------------------------------------ */
 /* Motion estimation                                                   */
 /* ------------------------------------------------------------------ */
-static const int8_t hex_dx[9] = { 0, -2,  1,  2,  1, -1, -2, -1,  0 };
-static const int8_t hex_dy[9] = { 0,  0, -2,  0,  2,  2,  0, -2, -2 };
+/* Six-point hexagonal search pattern around the centre. */
+static const int8_t hex_dx[7] = { 0, -2, -1,  1,  2,  1, -1 };
+static const int8_t hex_dy[7] = { 0,  0, -1, -1,  0,  1,  1 };
 static const int8_t sq_dx[9]  = { 0, -1,  0,  1, -1,  1, -1,  0,  1 };
 static const int8_t sq_dy[9]  = { 0,  0, -1,  0, -1,  1,  1,  1, -1 };
 
@@ -140,11 +141,12 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
     for (step = 0; step < 2 && improved; step++) {
         const int8_t *dx = step ? sq_dx : hex_dx;
         const int8_t *dy = step ? sq_dy : hex_dy;
+        int n = step ? 9 : 7;
         improved = 1;
         while (improved) {
             int bx = cx, by = cy, bc = best;
             improved = 0;
-            for (i = 1; i < 9; i++) {
+            for (i = 1; i < n; i++) {
                 int nx = cx + dx[i], ny = cy + dy[i], c;
                 if (nx < -range || nx > range || ny < -range || ny > range)
                     continue;
@@ -186,7 +188,7 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                     continue;
                 aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw, bh,
                             nx & 3, ny & 3);
-                cost = aeg_satd_16x16(buf, bw, cur, cstride);
+                cost = aeg_satd(bw, bh, buf, bw, cur, cstride);
                 if (cost < best) { best = cost; bx = nx; by = ny; improved = 1; }
             }
             cx = bx; cy = by;

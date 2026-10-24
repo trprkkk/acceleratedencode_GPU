@@ -49,10 +49,10 @@ if bad:
 print("   %-22s bit-exact (%d frames, max abs diff 0)" % (tag, n))
 PY
 
-# run_case <name> <w> <h> <frames> <extra aegenc args...>
+# run_case <name> <w> <h> <frames> <genyuv mode> <extra aegenc args...>
 run_case() {
-    name=$1; w=$2; h=$3; n=$4; shift 4
-    "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" >/dev/null
+    name=$1; w=$2; h=$3; n=$4; mode=$5; shift 5
+    "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
     ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
         -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" "$@" \
         >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
@@ -71,15 +71,21 @@ run_case() {
 }
 
 echo "== inter conformance (encoder recon vs independent decoder, every frame)"
-run_case h264_320x192 320 192 10 -q 23
-run_case lowqp        320 192  6 -q 12
-run_case highqp       320 192  6 -q 40
-run_case nodeblock    320 192  6 -q 23 --no-deblock
-run_case preset0      320 192  6 -q 23 -p 0
-run_case preset4      320 192  6 -q 23 -p 4
-run_case odd_208      320 208  4 -q 26
-run_case small_64     64  64   6 -q 23
-run_case cpu_only     320 192  4 -q 23 -b cpu
+run_case h264_320x192 320 192 10 0 -q 23
+run_case lowqp        320 192  6 0 -q 12
+run_case highqp       320 192  6 0 -q 40
+run_case nodeblock    320 192  6 0 -q 23 --no-deblock
+run_case preset0      320 192  6 0 -q 23 -p 0
+run_case preset4      320 192  6 0 -q 23 -p 4
+run_case odd_208      320 208  4 0 -q 26
+run_case small_64     64  64   6 0 -q 23
+run_case cpu_only     320 192  4 0 -q 23 -b cpu
+# inter partitioning and P_Skip: motion that a single 16x16 vector cannot
+# describe, then a still picture (which must collapse into skip runs).
+run_case part16x8     320 192  8 1 -q 26 --partitions 7
+run_case part8x16     320 192  8 2 -q 26 --partitions 7
+run_case part_none    320 192  8 1 -q 26 --partitions 1
+run_case pskip        320 192  8 3 -q 26
 
 echo "== PSNR"
 python3 - "$TMP" "320" "192" "10" <<'PY'

@@ -455,11 +455,16 @@ int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
     return sum;
 }
 
-int aeg_satd_16x16(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int sum = 0, x, y;
-    for (y = 0; y < 16; y += 4)
-        for (x = 0; x < 16; x += 4)
+    for (y = 0; y < h; y += 4)
+        for (x = 0; x < w; x += 4)
             sum += aeg_satd_4x4(a + y * sa + x, sa, b + y * sb + x, sb);
     return sum;
+}
+
+int aeg_satd_16x16(const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+    return aeg_satd(16, 16, a, sa, b, sb);
 }

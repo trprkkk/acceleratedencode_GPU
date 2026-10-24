@@ -32,6 +32,7 @@ static void usage(void)
 "  --no-deblock     disable the in-loop deblocking filter\n"
 "  --range <int>    integer motion search range (default: from preset)\n"
 "  --subme <int>    subpel refinement 0..2 (default 1)\n"
+"  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16 (default 7)\n"
 "  -v <int>         verbosity (0 quiet, 1 normal, 2 debug)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
 "  --calibrate      measure the accelerator launch overhead and exit\n"
@@ -88,7 +89,7 @@ int main(int argc, char **argv)
     FILE *in = stdin, *out = stdout;
     int width = 0, height = 0, qp = 23, fps = 30, gop = 250, max_frames = 0;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
-    int range = 0, subme = -1;
+    int range = 0, subme = -1, partitions = -1;
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
     uint8_t *frame;
     size_t fsize;
@@ -113,6 +114,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-v")) verbose = atoi(argv[++i]);
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
+        else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--calibrate")) {
@@ -162,6 +164,7 @@ int main(int argc, char **argv)
     p.verbose = verbose;
     if (range) p.search_range = range;
     if (subme >= 0) p.subme = subme;
+    if (partitions >= 0) p.partitions = partitions;
     aeg_log_level = verbose;
 
     fsize = (size_t)width * height * 3 / 2;
