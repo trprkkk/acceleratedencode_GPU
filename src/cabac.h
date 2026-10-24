@@ -41,12 +41,17 @@ typedef struct aeg_cabac {
     int      have_prev;
     uint8_t  state[AEG_CABAC_CTX_COUNT];
     int      trace;            /* per-bin trace to stderr (AEG_CABAC_TRACE) */
+    int      cost;             /* 1 = price the bins, do not produce bytes
+                                * (the rate-distortion pass)                 */
+    uint32_t cost256;          /* the accumulated price, in 1/256 bit        */
 } aeg_cabac;
 
 /* Table 9-44 (`rangeTabLPS`), addressed as [state >> 1][(range >> 6) - 4]. */
 extern const uint8_t aeg_cabac_lps_range[64][4];
 /* Next context state for bin 0 and bin 1, from Tables 9-45 and 9-46. */
 extern const uint8_t aeg_cabac_trans[128][2];
+/* The price of one bin, in 1/256 bit, as [state][bin]; see cabac.c. */
+extern const uint16_t aeg_cabac_bin_cost[128][2];
 
 /* The context initialization values (Table 9-5 for I slices, Tables 9-12 …
  * 9-33 for P/B), first 460 contexts, as the (m, n) pair the spec's
@@ -73,7 +78,18 @@ void aeg_cabac_renorm(aeg_cabac *c);
 static inline void aeg_cabac_decision(aeg_cabac *c, int ctx, int bin)
 {
     int s = c->state[ctx];
-    int lps = aeg_cabac_lps_range[s >> 1][(c->range >> 6) - 4];
+    int lps;
+    if (c->cost) {
+        /* Price the bin and advance the context only: the decisions are made
+         * one pass before the coder runs, so the rate-distortion pass keeps a
+         * shadow of the coder state (initialized for the slice, then fed every
+         * chosen macroblock through the same writer) and asks it what a
+         * candidate would cost. */
+        c->cost256 += aeg_cabac_bin_cost[s][bin & 1];
+        c->state[ctx] = aeg_cabac_trans[s][bin & 1];
+        return;
+    }
+    lps = aeg_cabac_lps_range[s >> 1][(c->range >> 6) - 4];
     c->range -= (uint32_t)lps;
     if (bin != (s & 1)) {
         c->low += c->range;
@@ -91,6 +107,10 @@ void aeg_cabac_putbyte(aeg_cabac *c);
 
 static inline void aeg_cabac_bypass(aeg_cabac *c, int bin)
 {
+    if (c->cost) {
+        c->cost256 += 256;              /* a bypass bin is one bit, exactly */
+        return;
+    }
     if (c->trace)
         fprintf(stderr, "Y %d %u %u q%d\n", bin & 1, c->range, c->low, c->queue);
     c->low <<= 1;
@@ -104,6 +124,13 @@ static inline void aeg_cabac_bypass(aeg_cabac *c, int bin)
  * macroblock, 0 everywhere except the last. */
 static inline void aeg_cabac_terminate(aeg_cabac *c, int end)
 {
+    if (c->cost) {
+        /* A constant per macroblock, so its exact price cannot change a
+         * decision; the terminating one is charged the flush's few bits. */
+        if (end)
+            c->cost256 += 6 * 256;
+        return;
+    }
     if (c->trace)
         fprintf(stderr, "T %d\n", end & 1);
     if (end)

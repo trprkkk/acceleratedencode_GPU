@@ -118,6 +118,17 @@ struct aeg_encoder {
     int last_dqp;
     int cabac_init_idc;
     int dbg_cabac;
+    /* The decisions are made one pass before the coder runs, so the rate-
+     * distortion pass cannot ask the coder what it will charge.  It keeps a
+     * shadow of the coder instead: initialized from the slice's QP, advanced
+     * once per chosen macroblock (so the context states are the ones the
+     * bitstream pass will have), and copied for every candidate to price what
+     * that candidate would cost (see rd_cabac_bits()).  `rd_last_qp` and
+     * `rd_last_dqp` are the shadow's copy of the two values that cross a
+     * macroblock boundary. */
+    aeg_cabac cab_shadow;
+    int rd_last_qp;
+    int rd_last_dqp;
 
     /* One RBSP buffer per slice: a slice is its own NAL unit, and with slice
      * threads the slices are written by different threads at the same time.
@@ -2560,6 +2571,31 @@ static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
 
 
 
+static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                           int mby, mbenc *c, int is_p, int skip);
+static int rd_cabac_bits(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                         int is_p, int commit);
+
+/* The one place a luma candidate is priced: `est` is what the estimate says
+ * (rd_luma() and friends write it to t->cost), the return value is what the
+ * decision compares -- the coder's own price whenever the coder is CABAC, and
+ * the estimate when it is CAVLC, which is what the estimate models.
+ *
+ * Every candidate is priced.  Pruning the ones the estimate dislikes (scaling
+ * its rate term by the 0.65 CABAC actually spends and requiring them to be
+ * 25% above the best) was measured and is *not* in: it recovered nothing --
+ * the bin walk is a small part of a candidate's cost -- and cost 4% of the
+ * bits on the clip where the decisions are closest. */
+static int64_t rd_price(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
+                        int64_t est, double lambda)
+{
+    if (!e->p.cabac)
+        return est;
+    return t->sse +
+           (int64_t)(lambda * (rd_cabac_bits(e, mbx, mby, t, e->cur_is_p, 0) /
+                               256.0) + 0.5);
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -2581,6 +2617,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             code_luma_i16(e, mbx, mby, c);
             code_chroma(e, mbx, mby, c, 0);
         }
+        if (e->p.cabac)
+            rd_cabac_bits(e, mbx, mby, c, e->cur_is_p, 1);
         return;
     }
 
@@ -2589,6 +2627,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     for (i = 0; i < (e->p.preset >= 2 ? e->mb_nmodes : 1); i++) {
         int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
                                e->mb_modes[i], lambda, -1);
+        cost = rd_price(e, mbx, mby, &t, cost, lambda);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
@@ -2598,10 +2637,16 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     if (e->rd_batch && e->mb_ncand > 0) {
         best_cost = rd_luma_inter_batch(e, mbx, mby, &best, snap_l, best_cost,
                                         lambda, c->qp);
+        /* The batch ranks the inter candidates against each other with the
+         * estimate; the winner is then priced with the coder's own model, so
+         * that comparing it with the intra candidates is like for like. */
+        if (e->p.cabac && best_cost != INT64_MAX)
+            best_cost = rd_price(e, mbx, mby, &best, best_cost, lambda);
     } else {
         for (i = 0; i < e->mb_ncand; i++) {
             int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
                                    lambda, i);
+            cost = rd_price(e, mbx, mby, &t, cost, lambda);
             if (cost < best_cost) {
                 best_cost = cost;
                 best = t;
@@ -2618,6 +2663,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * where most of the encode time of the candidate goes. */
     if (!(e->mb_inter_ok && e->mb_inter_sad * 2 < e->mb_sad)) {
         int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
+        cost = rd_price(e, mbx, mby, &t, cost, lambda);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
@@ -2630,6 +2676,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
          * transform. */
         if (e->p.transform_8x8) {
             cost = rd_luma_i8x8(e, mbx, mby, &t, c->qp, lambda);
+            cost = rd_price(e, mbx, mby, &t, cost, lambda);
             if (cost < best_cost) {
                 best_cost = cost;
                 best = t;
@@ -2652,9 +2699,10 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             t = best;
             {
                 int64_t cost = rd_chroma(e, mbx, mby, &t, 0, cm, lambda);
+                t.chroma_mode = cm;
+                cost = rd_price(e, mbx, mby, &t, cost, lambda);
                 if (cost < best_chroma) {
                     best_chroma = cost;
-                    t.chroma_mode = cm;
                     cbest = t;
                     snap_chroma(e, mbx, mby, snap_c);
                 }
@@ -2670,6 +2718,11 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     }
     restore_chroma(e, mbx, mby, snap_c);
     *c = best;
+    /* Hand the macroblock to the shadow coder: its context states, its
+     * mb_qp_delta history and its per-block motion vectors are what the next
+     * macroblock's decisions are priced against. */
+    if (e->p.cabac)
+        rd_cabac_bits(e, mbx, mby, c, e->cur_is_p, 1);
     if (getenv("AEG_MBDBG") && best.type == AEG_MB_P8x8) {
         int q, n = mb_part_count(&best), fi = e->frame_count;
         fprintf(stderr, "F%d MB %d,%d st %d%d%d%d", fi, mbx, mby,
@@ -3389,6 +3442,56 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
     cabac_mb_residual(e, cb, mbx, mby, c);
 }
 
+/* What the CABAC coder will charge for one macroblock, in 1/256 bit.
+ *
+ * The macroblock is priced by running the writer that will emit it, with the
+ * arithmetic switched off (`aeg_cabac.cost`): every decision still walks its
+ * context, so the price follows the state of the contexts the neighbours left
+ * behind, which is the whole point -- a flag is cheap or expensive depending on
+ * what came before it, and no static bit count can know that.
+ *
+ * `commit` = 0 prices a candidate against a copy of the shadow state; the copy
+ * is thrown away, and so are the per-block motion vectors the writer produces
+ * for the neighbours' contexts.  `commit` = 1 is the chosen macroblock: its
+ * state becomes the shadow, so the next macroblock is priced from where the
+ * bitstream pass will actually be.  The QP bookkeeping mirrors the bitstream
+ * pass exactly (a macroblock with no pattern codes no mb_qp_delta, so the
+ * decoder keeps the previous QP). */
+static int rd_cabac_bits(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                         int is_p, int commit)
+{
+    aeg_cabac cb = e->cab_shadow;
+    int idx = mby * e->mb_w + mbx;
+    int skipped = 0;
+    int save_qp = e->last_qp, save_dqp = e->last_dqp;
+    int16_t save_mvd[16][2];
+
+    memcpy(save_mvd, e->mbs[idx].mvd, sizeof(save_mvd));
+    if (c->cbp == 0)
+        c->qp = e->rd_last_qp;
+    if (is_p && c->type == AEG_MB_P16x16 && c->cbp == 0) {
+        int pmvx, pmvy;
+        pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+        if (c->mv[0][0] == pmvx && c->mv[0][1] == pmvy)
+            skipped = 1;
+    }
+    e->last_qp = e->rd_last_qp;
+    e->last_dqp = e->rd_last_dqp;
+    cb.cost = 1;
+    cb.cost256 = 0;
+    write_mb_cabac(e, &cb, mbx, mby, c, is_p, skipped);
+    if (commit) {
+        e->cab_shadow = cb;
+        e->rd_last_qp = e->last_qp;
+        e->rd_last_dqp = e->last_dqp;
+    } else {
+        memcpy(e->mbs[idx].mvd, save_mvd, sizeof(save_mvd));
+    }
+    e->last_qp = save_qp;
+    e->last_dqp = save_dqp;
+    return (int)cb.cost256;
+}
+
 static int ensure_buf(uint8_t **buf, size_t *cap, size_t need)
 {
     if (need <= *cap)
@@ -3698,6 +3801,16 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
     e->last_qp = e->cur_qp;
     e->last_dqp = 0;
     e->dbg_cabac = getenv("AEG_CABAC_TRACE") != NULL;
+    /* The decision pass prices candidates with a shadow of this slice's coder,
+     * so it starts from the same state the bitstream pass will. */
+    if (e->p.cabac) {
+        aeg_cabac_set_contexts(&e->cab_shadow, !is_p, e->cur_qp,
+                               e->cabac_init_idc);
+        e->cab_shadow.cost = 1;
+        e->cab_shadow.cost256 = 0;
+        e->rd_last_qp = e->cur_qp;
+        e->rd_last_dqp = 0;
+    }
     aeg_bw_init(&bw, bs, cap, 0);
     aeg_write_slice_header(&bw, is_p ? 5 : 7,
                            e->frame_num & ((1 << e->frame_num_bits) - 1),
@@ -3752,6 +3865,11 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             m->cost = (int32_t)tmp->sse;
         }
     }
+
+    /* The decision pass left `last_qp`/`last_dqp` at the values its shadow
+     * ended on; both bitstream passes start from the slice's own state. */
+    e->last_qp = e->cur_qp;
+    e->last_dqp = 0;
 
     /* ---- bitstream pass, CABAC -----------------------------------------
      * The same raster order, for the same reason (every context reads the

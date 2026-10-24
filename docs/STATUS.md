@@ -46,6 +46,11 @@ Implemented and building without warnings:
   transform_size_8x8_flag, mb_qp_delta, and the residual block of all six
   categories with its significance/last/level-prefix contexts.  `make test`
   runs the whole conformance suite through it (see *CABAC* below)
+* the rate-distortion pass priced by that same coder: every candidate is run
+  through `write_mb_cabac()` in price-only mode on a copy of the slice's
+  context state (`rd_cabac_bits()`), so the mode decision optimises for the
+  coder that emits the stream (see *Pricing the decision pass with the
+  coder*)
 * forward/inverse 4x4 integer transform, 4x4 and 2x2 DC Hadamard, quantisation
   and dequantisation, including the reference decoder's `int16_t` truncation
 * Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
@@ -747,6 +752,40 @@ invisible until a whole slice decodes:
   last (9.3.4.4), so the syntax writer needs `aeg_cabac_terminate(c, 0)` per
   macroblock and exactly one `aeg_cabac_flush()` per slice.
 
+**Pricing the decision pass with the coder.**  `write_mb_cabac()` is now the
+rate model as well as the writer: `rd_cabac_bits()` runs it into a copy of the
+slice's coder state (`e->cab_shadow`) with the output switched off
+(`aeg_cabac.cost`), so every bin a candidate would emit advances the real
+context state and is charged what that state charges -- `aeg_cabac_bin_cost
+[state][bin]`, in 1/256 bit, derived from the same `rangeTabLPS` the coder uses
+(`256 * -log2` of the mean LPS probability of each range class, so a fresh
+context is close to one bit and a settled one costs a fraction).  A bypass bin
+is exactly one bit; `end_of_slice_flag` is charged a constant, since it cannot
+change a decision.  The decision compares `SSD + lambda * cost` where CAVLC
+still compares its `aeg_cavlc_block_cost()` estimate, which is what that
+estimate models.
+
+Three details make the shadow coder a faithful copy rather than an
+approximation:
+
+* **The state that `write_mb_cabac()` mutates outside the coder has to travel
+  with it.**  `mb_qp_delta` needs the previous macroblock's QP and its "last
+  delta was non-zero" flag, and the motion-vector predictor of the *next*
+  macroblock reads the mvd field the writer stores.  The pass therefore keeps
+  its own `rd_last_qp`/`rd_last_dqp` alongside the shadow, and a candidate that
+  does not win restores the mvd array (`mbs[idx].mvd`) before the next
+  candidate is priced.
+* **A candidate is priced exactly as the bitstream pass will code it**, so
+  `cbp == 0` reuses the previous QP (there is no delta to code) and the skip
+  test is the same `P16x16 && cbp == 0 && mv == pskip_mv()` the writer uses.
+  The bitstream pass then starts from the last committed decision -- the
+  winner of the macroblock -- which is why it resets `last_qp`/`last_dqp` to the
+  slice's QP at its own start: the decision pass's history is not the
+  bitstream's.
+* **The winner of the macroblock is committed once** (`commit = 1`), not once
+  per candidate: the candidates all price against the same incoming contexts,
+  which is what makes their costs comparable.
+
 `tests/cabac_check.c` encodes 1.6 M bins per `make test` -- context-coded bins
 over all 460 contexts from every initialization table at QPs 0..51, bypass bins,
 runs in both directions, and `end_of_slice_flag = 0` bins between them --
@@ -787,10 +826,22 @@ has to be caught before an external decoder is the only witness.
     107 173 bins into a 320x240 picture.  `mb_t8_coded()` is now the only
     producer of the value the neighbours see.
 
+41. **A coder field added for the rate model has to be initialised by
+    `aeg_cabac_open()`.**  The shadow coder sets `cost = 1` by hand, but the
+    *bitstream* coder is opened by `aeg_cabac_open()`, and when `cost` was added
+    to the struct without being initialised there, the slice stack frame that
+    happened to inherit a non-zero byte priced a macroblock instead of writing
+    it.  Serial encoding was unaffected (the first slice's frame was zeroed),
+    so the whole thing only showed up as `--slices N -t N` writing a five-byte
+    second slice -- the decision pass was identical, byte for byte, which is
+    what pointed at the writer rather than at the rate model.  `aeg_cabac_open()`
+    now clears both price fields.
+
 ## Next
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
-   the last non-zero coefficient).  Measured against x264 (which has trellis=1
+   the last non-zero coefficient).  The rate term is now the coder's own price,
+   so the level decision has the model it needs.  Measured against x264 (which has trellis=1
    by default) on the panning clip at QP 24: trellis off 60 047 B / 45.95 dB,
    trellis 1 61 495 B / 46.26 dB, trellis 2 61 106 B / 46.24 dB -- i.e. it buys
    quality with bits at a fixed QP and is a wash in PSNR-per-bit here, which is
@@ -822,14 +873,12 @@ has to be caught before an external decoder is the only witness.
 3. Encoder features that need the profile to change: none left -- CABAC and the
    8x8 transform are both in (main profile and High profile respectively), and
    the encoder emits Main, High or Baseline depending on which tools a stream
-   uses.  What CABAC still does not do is *drive the decisions*: the
-   rate-distortion pass prices a candidate with `write_block()`'s CAVLC bit
-   count, so the mode decision optimises for a coder that is not the one
-   emitting the stream.  The two agree closely enough that the ordering rarely
-   changes (the CAVLC cost is within a few percent of the CABAC one for the same
-   block), but a `aeg_cabac_cost()` that runs the real coder in "count only"
-   mode is the honest fix, and it is also the prerequisite for trellis-style
-   level optimisation further down this list.  MB-tree was
+   uses.  The decision pass now prices a candidate with the coder that emits the
+   stream (see *Pricing the decision pass with the coder*), which was the
+   prerequisite for trellis-style level optimisation: with a real per-bin price
+   the level choice can be a run over the coefficients of a block, and the 3.6
+   points the trellis row of the table above is worth are the largest single
+   item left on the quality side.  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so
@@ -1215,23 +1264,46 @@ BD-rate over QP 22/25/28/31/34/37, our stream against `libx264 -preset medium
 
 | x264 medium with | ours, bits at matched PSNR |
 |---|---|
-| `cabac=0:8x8dct=0:trellis=0:aq-mode=0` | 47% fewer |
-| `cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 9.3% more |
-| `cabac=1:8x8dct=1:trellis=1:aq-mode=0` | 12.9% more |
-| (preset defaults: + AQ, psy-rd) | 12.9% more |
+| `cabac=0:8x8dct=0:trellis=0:aq-mode=0` | 47.7% fewer |
+| `cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 8.7% more |
+| `cabac=1:8x8dct=1:trellis=1:aq-mode=0` | 12.3% more |
+| (preset defaults: + AQ, psy-rd) | 12.3% more |
 
 So CABAC and the 8x8 transform together are what used to be the whole gap
 against x264 *baseline* (1-8%, table below, which predates CABAC); against the
-*default* preset what is left is 13% on this clip -- 3.6 points of it trellis
+*default* preset what is left is 12% on this clip -- 3.6 points of it trellis
 quantisation, the rest the motion search and the rate-distortion refinement of
 it.  On the two-quadrant clip (mode 2, the one that exists to make 16x8 and
-8x16 partitions pay) the gap is 28%, i.e. partitioning is where a faster search
-and a real sub-partition RD pass would buy the most.  A global scale on lambda
-was tried as a stand-in for a CABAC-accurate rate model (the rate term is still
-CAVLC-priced, which over-prices it by the 0.65 the coder actually spends) and
-is *not* in: it gains 0.9-0.5 points on two clips and loses 1.6 on the third
-(skip-heavy), so the model has per-element biases that a single factor cannot
-fix.
+8x16 partitions pay) the gap is 24%, i.e. partitioning is where a faster search
+and a real sub-partition RD pass would buy the most.
+
+What the decision pass prices a candidate *with* matters more than any of the
+knobs tried before it.  Until this round the rate term was CAVLC-priced (the
+estimate `aeg_cavlc_block_cost()` returns), which over-prices it by the 0.65
+the CABAC coder actually spends, and a single global scale on lambda was tried
+as a stand-in for the real model: it gained 0.9-0.5 points on two clips and lost
+1.6 on the third (skip-heavy), so the bias is per syntax element and a single
+factor cannot fix it.  The rate term is now the coder's own price -- see
+*Pricing the decision pass with the coder* under *CABAC* -- and the three clips
+below are the measurement of it:
+
+| clip | before | after |
+|---|---|---|
+| mode 4, 320x240, 8 frames | 12.9% more | **12.3% more** |
+| mode 2, 320x192, 30 frames | 28.6% more | **24.5% more** |
+| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | **6.2% more** |
+
+The clip that gains most is the one whose decisions are dominated by skip and
+by near-zero residuals, which is exactly where the CAVLC estimate is furthest
+off: a skipped macroblock costs it one flag plus the estimate's guess, while the
+coder charges one context-coded bin whose probability has adapted to the
+neighbourhood, so the skip/inter boundary is finally in the right place.  The
+gain costs 15% of the encode time (320x192, 30 frames: 92 -> 78 fps), which is
+the price of running `write_mb_cabac()` once per candidate instead of once per
+macroblock; pruning the candidates the estimate dislikes was measured and is
+*not* in (it recovered none of the time -- the bin walk is small next to the
+transform and the search -- and cost 4% of the bits on the clip where the
+decisions are closest).
 
 The older comparison, against x264's baseline profile, and the history behind
 it:
@@ -1314,19 +1386,29 @@ frame of the `genyuv … 3` clip costs 4148 bytes, each following frame 8 bytes.
 ## Speed
 
 60 frames of 320x192 at QP 24, single thread, CPU backend (2 cores, no GPU in
-this sandbox), best of three runs:
+this sandbox), best of three runs.  The clip is `genyuv 320 192 60 out.yuv 1`
+(the two halves moving in opposite directions, i.e. the one where 16x8/8x16
+partitions are worth coding):
 
-| encoder | fps | bytes | Y-PSNR |
+| encoder | fps | bytes | PSNR |
 |---|---|---|---|
-| ours, preset 0 | 708 | 163386 | 42.30 |
-| ours, preset 2 / 4 | 105 / 102 | 78502 / 78468 | 45.12 / 45.12 |
-| x264 baseline (no asm) | 175 | 78 664 | 45.16 |
+| ours, preset 0, before / after the coder-priced decision pass | 584 / 537 | 118 680 / 118 680 | 43.74 / 43.74 (YUV) |
+| ours, preset 2 | 86 / 73 | 49 335 / 47 687 | 46.33 / 46.54 (YUV) |
+| ours, preset 4 | 82 / 68 | 49 537 / 47 665 | 46.29 / 46.55 (YUV) |
+| x264 baseline (no asm), earlier round | 175 | 78 664 | 45.16 (Y) |
+| libx264 baseline, this machine, asm | 385 | 78 692 | 46.30 (YUV) |
+| libx264 medium, this machine, asm | 395 | 34 612 | 46.39 (YUV) |
 
-At a matched QP the two encoders land within 0.2% of each other in rate and
-0.04 dB in quality, and x264 is 1.66x faster (it was 3.4x four rounds ago, 1.85x
-one round ago; this round's +15% is four bit-exact changes, listed below).
-Absolute numbers move a few percent between runs; the `--frames 60`,
-single-thread, same-QP comparison is the one to repeat.
+The three x264 rows are on the same clip and QP but from different builds and
+PSNR conventions (the first row predates this table's rewrite and averages Y
+only), so the honest reading is: against a *no-asm* x264 this encoder is within
+1.8x, against a normal libx264 with assembly it is 4-5x slower, and it now
+spends 13-18% more time than it did before the decision pass priced candidates
+with the coder (preset 0 is unaffected -- it takes the SAD path and codes each
+macroblock once).  The bits it buys with that time are 3-5%, and 15 points of
+BD-rate on the clip whose decisions are closest (see *Quality against a
+reference CPU encoder*).  Absolute numbers move a few percent between runs; the
+`-n 60`, single-thread, same-QP comparison is the one to repeat.
 
 Where the speed came from, each step measured on its own, all of them
 byte-identical (they add, average and shift the same integers, so none of them
