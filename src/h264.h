@@ -16,10 +16,14 @@
 /* Geometry                                                            */
 /* ------------------------------------------------------------------ */
 #define AEG_PAD 32              /* border padding around each picture      */
-/* Steps per subpel pass of the motion search: past the third step the walk has
- * almost always converged (see src/mc.c). */
+/* Steps per subpel pass of the motion search.  Swept over 2..6 on four
+ * clip/QP combinations: 2 is consistently worst, 3..5 are within 0.1% of each
+ * other in rate and 0.03 dB in PSNR, and 6 starts to be worse again (an extra
+ * step is a local decision, not a rate-distortion one).  Four it is -- it was
+ * never worse than three and cost nothing measurable (77.2 against 77.3 fps
+ * median over five runs). */
 #ifndef AEG_SUBPEL_ITERS
-#define AEG_SUBPEL_ITERS 3
+#define AEG_SUBPEL_ITERS 4
 #endif
 #define AEG_MAX_MB_W 512
 #define AEG_MAX_MB_H 512
