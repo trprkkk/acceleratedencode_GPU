@@ -95,6 +95,12 @@ run_case part8x8only  320 192  8 4 -q 26 --partitions 8
 # this case exercises the availability rule (it desynced before that fix).
 run_case p8x8_gop2    320 192  8 4 -q 26 --partitions 15 -g 2
 run_case p8x8_q12     320 192  6 4 -q 12 --partitions 15
+# Rate control and adaptive quantisation both change the QP per picture (and,
+# for AQ, per macroblock), which is exactly where an mb_qp_delta could desync:
+# a macroblock without a coded residual must not change the decoder's QP.
+run_case abr          320 192 16 1 -q 24 --bitrate 300
+run_case abr_gop4     320 192 16 4 -q 24 --bitrate 400 -g 4
+run_case aq           320 192  8 4 -q 26 --aq 12
 # Intra_4x4 in every picture, and IDR pictures after P pictures (gop > 1),
 # which is where the mode prediction and the reference handling meet.
 run_case all_intra    320 192  6 1 -q 26 -g 1
@@ -117,6 +123,19 @@ PY
 
 echo "== rate"
 sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
+
+echo "== rate control"
+"$BUILD/genyuv" 320 192 40 "$TMP/abr.yuv" 0 >/dev/null
+./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/abr.yuv" \
+    -o "$TMP/abr.264" --bitrate 400 -v 0
+python3 -c '
+import os, sys
+size = os.path.getsize(sys.argv[1])
+kbps = size * 8 * 30 / 40 / 1000.0
+ok = abs(kbps - 400) <= 40
+print("   ABR target 400 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
+sys.exit(0 if ok else 1)
+' "$TMP/abr.264" || FAIL=1
 
 echo "== device enumeration"
 ./$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'

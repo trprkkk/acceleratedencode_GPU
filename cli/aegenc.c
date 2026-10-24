@@ -32,6 +32,9 @@ static void usage(void)
 "  --no-deblock     disable the in-loop deblocking filter\n"
 "  --range <int>    integer motion search range (default: from preset)\n"
 "  --subme <int>    subpel refinement 0..2 (default 1)\n"
+"  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
+"  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
+"                   default 10 = x264 aq-strength 1.0)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8 (8x8 with 8x4/4x8/4x4 sub-partitions)\n"
 "                   (default 15; P_8x8 is skipped by preset 0)\n"
@@ -90,6 +93,7 @@ int main(int argc, char **argv)
     aeg_encoder *enc;
     FILE *in = stdin, *out = stdout;
     int width = 0, height = 0, qp = 23, fps = 30, gop = 250, max_frames = 0;
+    int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1;
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
@@ -117,6 +121,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
+        else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
+        else if (!strcmp(a, "--aq")) aq = atoi(argv[++i]);
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--calibrate")) {
@@ -162,6 +168,9 @@ int main(int argc, char **argv)
     p.fps_num = fps;
     p.fps_den = 1;
     p.gop_size = gop;
+    p.bitrate_kbps = bitrate;
+    if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
+    p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
     p.backend = backend;
     p.verbose = verbose;
     if (range) p.search_range = range;

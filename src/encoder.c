@@ -97,6 +97,22 @@ struct aeg_encoder {
     uint8_t pred_c[2][8 * 8];
     int has_ref;
     int cur_is_p;           /* the picture being coded is a P slice */
+    int cur_qp;             /* QP of the picture being coded         */
+
+    /* Per-macroblock QP offsets of the current picture (adaptive
+     * quantisation).  Recomputed at the start of every picture from the source
+     * variance and normalised to a zero mean, so AQ redistributes bits inside
+     * a picture without changing the picture's average QP. */
+    int8_t *mb_dqp;
+
+    /* ABR rate control (`AEG_RC_ABR`): a fractional QP that is nudged after
+     * every picture so that the running bit count tracks the target. */
+    double rc_qp;
+    double rc_bits_per_frame;
+    double rc_spent;        /* bits used so far, all pictures               */
+    double rc_debt;         /* budget - spent (positive = under budget)     */
+    int    rc_frames;       /* pictures coded so far, for the budget        */
+    int    rc_active;
 };
 
 static inline int clip255(int v)
@@ -1776,6 +1792,119 @@ static int ensure_buf(uint8_t **buf, size_t *cap, size_t need)
     return *buf ? AEG_OK : AEG_ENOMEM;
 }
 
+/* Variance of a 16x16 luma block of the current source picture. */
+static int mb_variance(const struct aeg_encoder *e, int mbx, int mby)
+{
+    const uint8_t *p = e->srcp[0] + (mby * 16) * e->stride[0] + mbx * 16;
+    int x, y, sum = 0, sum2 = 0;
+    for (y = 0; y < 16; y++)
+        for (x = 0; x < 16; x++) {
+            int v = p[y * e->stride[0] + x];
+            sum += v;
+            sum2 += v * v;
+        }
+    /* 256 * var, exact in integers; the caller only needs the logarithm */
+    return (sum2 * 256 - sum * sum) / 256;
+}
+
+/* Adaptive quantisation (x264's "variance AQ"): flat macroblocks -- sky,
+ * gradients, the inside of a moving object -- can take a coarser quantiser
+ * without becoming visible, while busy macroblocks are where the eye looks
+ * and where the distortion is masked least.  The offset is proportional to
+ * `log2(frame variance) - log2(block variance)`, which is the same
+ * relationship x264 uses; the result is shifted to a zero mean so the picture
+ * QP (and therefore the rate-control target) is unaffected.  `aq_strength`
+ * is in tenths, 10 being x264's aq-strength=1.0. */
+#define AQ_MAX_DQP 12
+static void aq_compute(struct aeg_encoder *e)
+{
+    double strength = e->p.aq_strength / 10.0;
+    int n = e->mb_count, i, x, y, mean = 0, adj;
+
+    if (e->p.aq_mode <= 0 || strength <= 0.0) {
+        for (i = 0; i < n; i++)
+            e->mb_dqp[i] = 0;
+        return;
+    }
+    {
+        double logsum = 0.0;
+        for (i = 0; i < n; i++)
+            logsum += log2((double)mb_variance(e, i % e->mb_w, i / e->mb_w) + 1.0);
+        {
+            double avg = logsum / n;
+            for (i = 0; i < n; i++) {
+                int v = mb_variance(e, i % e->mb_w, i / e->mb_w);
+                double d = strength * (avg - log2((double)v + 1.0));
+                /* a block that is already flat to within noise gets a little
+                 * less than the log suggests: the deadzone of the quantiser
+                 * already removes it, and pushing it further only spends
+                 * header bits */
+                adj = (int)(d + (d < 0 ? -0.5 : 0.5));
+                if (adj > AQ_MAX_DQP)  adj = AQ_MAX_DQP;
+                if (adj < -AQ_MAX_DQP) adj = -AQ_MAX_DQP;
+                e->mb_dqp[i] = (int8_t)adj;
+                mean += adj;
+            }
+        }
+        /* zero mean, so the picture's average QP is exactly what the rate
+         * controller asked for */
+        mean = (int)((double)mean / n + (mean < 0 ? -0.5 : 0.5));
+        for (i = 0; i < n; i++) {
+            int d = e->mb_dqp[i] - mean;
+            if (d > AQ_MAX_DQP)  d = AQ_MAX_DQP;
+            if (d < -AQ_MAX_DQP) d = -AQ_MAX_DQP;
+            e->mb_dqp[i] = (int8_t)d;
+        }
+    }
+    (void)x; (void)y;
+}
+
+/* QP of one macroblock of the current picture. */
+static int mb_qp_of(const struct aeg_encoder *e, int mbx, int mby)
+{
+    int qp = e->cur_qp + e->mb_dqp[mby * e->mb_w + mbx];
+    if (qp < 0)  qp = 0;
+    if (qp > 51) qp = 51;
+    return qp;
+}
+
+/* One step of the ABR controller (H.264 Annex; a one-pass, picture-level
+ * controller).
+ *
+ * The target is a *long-term* average, so the error is driven to zero instead
+ * of merely being reduced: every picture's bits are accumulated, the difference
+ * between the budget for the pictures coded so far and the bits actually spent
+ * (`rc_debt`) is spread over the next `RC_WINDOW` pictures, and the QP follows
+ * the logarithm of (actual / wanted) -- the log is the right variable because
+ * the rate grows roughly exponentially with QP.  A keyframe is many times the
+ * size of a P picture; the debt term absorbs it over the following window
+ * rather than giving keyframes a target of their own, which is what keeps the
+ * average on track for short streams too. */
+#define RC_WINDOW 6.0
+#define RC_GAIN   1.2
+static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
+{
+    double bpf = e->rc_bits_per_frame;
+    double want, ratio, adj;
+
+    if (!e->rc_active || bpf <= 0.0)
+        return;
+    e->rc_frames++;
+    e->rc_spent += (double)bits;
+    e->rc_debt = e->rc_frames * bpf - e->rc_spent;
+    want = bpf + e->rc_debt / RC_WINDOW;
+    if (want < 0.2 * bpf)          /* never ask for the impossible */
+        want = 0.2 * bpf;
+    ratio = (double)(bits + 1) / want;
+    adj = RC_GAIN * (ratio > 0.0 ? log2(ratio) : 0.0);
+    if (adj > 1.5)  adj = 1.5;     /* at most 1.5 QP per picture, so a scene */
+    if (adj < -1.5) adj = -1.5;    /* cut cannot make the quality collapse   */
+    e->rc_qp += adj;
+    if (e->rc_qp > 51.0) e->rc_qp = 51.0;
+    if (e->rc_qp < 0.0)  e->rc_qp = 0.0;
+    (void)is_idr;
+}
+
 static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
                         aeg_packet *pkt)
 {
@@ -1789,6 +1918,20 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     if (ensure_buf(&e->bs, &e->bs_cap, (size_t)e->mb_count * 400 + 16384) != AEG_OK)
         return AEG_ENOMEM;
 
+    /* the picture's QP: constant in CQP, the controller's output in ABR */
+    e->cur_qp = e->p.qp;
+    if (e->rc_active) {
+        e->cur_qp = (int)(e->rc_qp + 0.5);
+        /* a keyframe carries the whole picture on its own, so it gets a
+         * slightly finer quantiser than the inter pictures that follow */
+        if (is_idr)
+            e->cur_qp -= 2;
+        if (e->cur_qp < 0)  e->cur_qp = 0;
+        if (e->cur_qp > 51) e->cur_qp = 51;
+    }
+
+    aq_compute(e);
+
     aeg_bw_init(&bw, e->bs, e->bs_cap, 0);
     /* frame_num counts the pictures since the last IDR (H.264 8.2.1): an IDR
      * always carries 0, otherwise the decoder invents "non-existing" frames to
@@ -1798,9 +1941,9 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     aeg_write_slice_header(&bw, is_p ? 5 : 7,
                            e->frame_num & ((1 << e->frame_num_bits) - 1),
                            e->frame_num_bits, is_idr, e->idr_pic_id,
-                           e->p.qp - 26, 0, 0,
+                           e->cur_qp - 26, 0, 0,
                            e->p.deblock ? 0 : 1);
-    e->last_qp = e->p.qp;
+    e->last_qp = e->cur_qp;
     e->cur_is_p = is_p;
 
     for (mby = 0; mby < e->mb_h; mby++) {
@@ -1808,13 +1951,23 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
             {
                 mbenc tmp;
                 int64_t t0 = aeg_now_ns();
-                reset_mb_enc(&tmp, e->p.qp);
+                reset_mb_enc(&tmp, mb_qp_of(e, mbx, mby));
                 analyse_mb(e, mbx, mby, &tmp);
                 e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
 
                 t0 = aeg_now_ns();
                 code_mb(e, mbx, mby, &tmp);
                 e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+
+                /* A macroblock without any coded residual does not carry an
+                 * mb_qp_delta (H.264 7.3.5), so the decoder keeps the previous
+                 * QP for it.  Reconstruction is the prediction either way, but
+                 * the deblocking filter reads the QP, so the encoder has to
+                 * keep the same value: fall back to the QP the decoder is
+                 * still using. */
+                if (!luma_cbp_on(&tmp) && !chroma_cbp(&tmp) &&
+                    tmp.type != AEG_MB_I16x16)
+                    tmp.qp = e->last_qp;
 
                 /* store the decisions for the neighbour queries */
                 {
@@ -1934,7 +2087,7 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
         pkt->size = out_len;
         pkt->pts = pts;
         pkt->keyframe = is_idr;
-        pkt->qp = e->p.qp;
+        pkt->qp = e->cur_qp;
     }
 
     e->st.bytes += (int64_t)out_len;
@@ -1957,6 +2110,11 @@ static int encode_frame(struct aeg_encoder *e, int is_idr, int64_t pts,
     }
     if (is_idr)
         e->idr_pic_id = (e->idr_pic_id + 1) & 0xffff;
+    if (getenv("AEG_RCDBG"))
+        fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f\n",
+                e->frame_count, e->cur_qp, (int)(out_len * 8),
+                e->rc_bits_per_frame, e->rc_debt);
+    rc_update(e, (int)(out_len * 8), is_idr);
     aeg_dispatch_update(&e->d);
     return AEG_OK;
 }
@@ -1996,6 +2154,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     if (pp->subme < 0) pp->subme = pp->preset <= 0 ? 0 : 1;
     if (pp->gop_size < 0) pp->gop_size = 250;
+    if (pp->rc_mode != AEG_RC_ABR || pp->bitrate_kbps <= 0)
+        pp->rc_mode = AEG_RC_CQP;
+    else {
+        double fps = (double)pp->fps_num / (double)pp->fps_den;
+        e->rc_active = 1;
+        e->rc_qp = (double)pp->qp;
+        e->rc_bits_per_frame = (double)pp->bitrate_kbps * 1000.0 / fps;
+        e->rc_spent = 0.0;
+        e->rc_debt = 0.0;
+        e->rc_frames = 0;
+        aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
+                pp->bitrate_kbps, e->rc_bits_per_frame, fps, pp->qp);
+    }
 
     e->w = params->width & ~15;
     e->h = params->height & ~15;
@@ -2016,13 +2187,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             e->frame_num_bits++;
     }
     e->level_idc = 0;
-    e->last_qp = e->p.qp;
+    e->last_qp = e->cur_qp;
 
     if (enc_alloc_picture(e, &e->src_mem, e->srcp) != AEG_OK ||
         enc_alloc_picture(e, &e->rec_mem, e->recp) != AEG_OK ||
         enc_alloc_picture(e, &e->ref_mem, e->refp) != AEG_OK) {
         aeg_set_last_error("out of memory");
         aeg_free(e);
+        return NULL;
+    }
+    e->mb_dqp = (int8_t *)aeg_alloc((size_t)e->mb_count);
+    if (!e->mb_dqp) {
+        aeg_set_last_error("out of memory");
+        aeg_encoder_close(e);
         return NULL;
     }
     e->mbs = (aeg_mb *)aeg_alloc(sizeof(aeg_mb) * (size_t)e->mb_count);
@@ -2153,6 +2330,7 @@ void aeg_encoder_close(aeg_encoder *enc)
     if (!e)
         return;
     aeg_dispatch_destroy(&e->d);
+    aeg_free(e->mb_dqp);
     aeg_free(e->mbs);
     aeg_free(e->src_mem);
     aeg_free(e->rec_mem);

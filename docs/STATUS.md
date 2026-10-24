@@ -19,9 +19,10 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs nineteen encoded clip cases
-frame by frame, plus a 372-case sweep of the partition, QP and GOP options
-(`/tmp/sweep.sh`) and a 240-case matrix over `--partitions 1|3|7|15`.
+fails (non-zero exit) on any mismatch; it runs twenty-two encoded clip cases
+frame by frame, checks that the ABR controller hits its target, plus a sweep of
+the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
+`--partitions 1|3|7|15`.
 
 Implemented and building without warnings:
 
@@ -43,6 +44,8 @@ Implemented and building without warnings:
   sub-macroblock picks its own `sub_mb_type`: 8x8, 8x4, 4x8 or 4x4.
 * P_Skip macroblocks (`mb_skip_run`), including the run that reaches the end of
   the picture
+* one-pass average-bitrate rate control (`--bitrate`, `AEG_RC_ABR`) and
+  variance-based adaptive quantisation (`--aq`, off by default, see below)
 * presets scale the integer search range (8/16/24/32/48) and the subpel
   refinement
 * deblocking filter (all edges, normative order, alpha/beta/tc0 tables)
@@ -240,11 +243,11 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + 19 clip cases
    inverses (see bug 11; this is the check that would have caught it).
 2. `tests/cavlc_check.c 2000` — random residual blocks through the writer and
    a transcription of the reference decoder.
-3. `tests/run_tests.sh` — nineteen clips (QP 12/23/26/40, presets 0 and 4,
+3. `tests/run_tests.sh` — twenty-two clips (QP 12/23/26/40, presets 0 and 4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, all-intra and 3-frame GOPs,
-   P_Skip) encoded, decoded with ffmpeg and compared **frame by
-   frame**: the encoder's `--dump-recon` must be bit-identical to the decoder's
+   P_Skip, ABR and AQ) encoded, decoded with ffmpeg and compared **frame by
+   frame**, then an ABR accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
    fails it.  `tests/genyuv.c` takes a mode argument so that the partitioning
    cases really move the two halves of the picture in opposite directions —
@@ -290,7 +293,9 @@ ffmpeg -v error -i v.264 -f rawvideo -pix_fmt yuv420p vd.yuv -y
    reference by `tests/kernel_check.c`, but the dispatcher's calibration has
    never run against real hardware in this environment (there is no GPU
    here), so the measured crossover points are still the CPU-model ones.
-3. Multi-slice / rate control are not implemented yet.
+3. Multi-slice and multi-threaded slice encoding are not implemented yet, and
+   rate control is picture-level only (no VBV/HRD model, no macroblock-tree
+   lookahead).
 
 ## P_8x8 sub-macroblock partitions
 
@@ -330,6 +335,57 @@ per macroblock and all four shapes are searched per sub-macroblock.  `x264` (mas
 18 841 B / 46.14 dB, 33 003 B / 45.83 dB, 31 897 B / 45.83 dB, 35 074 B /
 45.43 dB, so the remaining inter gap is ~8-25 % of the rate at ~1 dB lower Y
 PSNR.
+
+## Rate control and adaptive quantisation
+
+`--bitrate <kbps>` switches from constant QP to one-pass average-bitrate rate
+control.  It is a picture-level controller: the debt between the budget for the
+pictures coded so far and the bits actually spent is spread over the next six
+pictures, and the QP follows the logarithm of (actual / wanted) bits, because
+the rate is roughly exponential in the QP.  The QP moves by at most 1.5 per
+picture and stays inside [0, 51], so a scene cut cannot make the quality
+collapse or explode.  Measured over 90 frames of two 320x192 clips:
+
+| target | achieved (pan clip) | achieved (quadrant clip) |
+|---|---|---|
+| 250 kb/s | 250.4 (100.2 %) | 250.4 (100.2 %) |
+| 400 kb/s | 400.8 (100.2 %) | 400.5 (100.1 %) |
+| 600 kb/s | 600.7 (100.1 %) | 601.0 (100.2 %) |
+| 900 kb/s | 901.2 (100.1 %) | 901.3 (100.1 %) |
+
+Targets below the QP-51 floor of the content are not reachable: at 320x192 this
+synthetic texture costs 244 kb/s at QP 51, so a 150 kb/s target ends at 244
+kb/s (the controller sits at QP 51 and reports the overshoot).  Over 24-frame
+streams the first IDR picture, which is ~7x a P picture, is absorbed by the
+debt term and the average lands within 1-3 %.
+
+Adaptive quantisation (`--aq <tenths>`, `aq_mode`/`aq_strength` in the API) is
+the variance-AQ of x264: per-macroblock QP offsets proportional to
+`log2(frame variance) - log2(block variance)`, normalised to a zero mean so the
+picture QP is unchanged, clipped to +/-12, carried by `mb_qp_delta`.  It is
+implemented and conformant but **off by default**, because measured at a fixed
+rate it *costs* PSNR on the test set:
+
+| clip, target | AQ off | AQ 1.0 |
+|---|---|---|
+| panning texture, 300 kb/s | Y 41.38 dB | Y 40.50 dB |
+| panning texture, 500 kb/s | Y 46.05 dB | Y 45.84 dB |
+| quadrants, 300 kb/s | Y 43.58 dB | Y 42.95 dB |
+| quadrants, 500 kb/s | Y 49.66 dB | Y 49.45 dB |
+
+The reason is convexity: a zero-mean *QP* offset still raises the total rate
+(bits grow exponentially in QP), so the controller answers with a slightly
+coarser average QP and every macroblock pays for it.  x264 accepts the same
+PSNR loss for a perceptual gain on natural video; since this project's yardstick
+is PSNR parity with x264, AQ stays opt-in until it has been re-tuned (a
+rate-preserving normalisation, or aq-mode 2 style offsets, is the next step).
+
+One bitstream detail that AQ forces into the open: `mb_qp_delta` is only present
+when the macroblock carries a coded residual, so a macroblock with an all-zero
+`coded_block_pattern` must keep the decoder's current QP.  The encoder therefore
+falls back to the previous QP for such macroblocks (the reconstruction is the
+prediction either way, but the deblocking filter reads the QP).  Getting that
+wrong desynchronises the deblocking on the very first flat macroblock.
 
 ## Quality against a reference CPU encoder
 

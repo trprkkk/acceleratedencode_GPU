@@ -14,7 +14,7 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 19 clip cases and *fails* on any mismatch.  What
+> `make test` asserts it over 22 clip cases and *fails* on any mismatch.  What
 > is *not* finished is rate-distortion efficiency: with P_8x8 (including the
 > 8x4/4x8/4x4 `sub_mb_type` shapes) in place, x264 baseline still spends
 > ~10–20 % fewer bits at 0.6–1.0 dB higher Y PSNR on the inter test clips
@@ -84,7 +84,11 @@ without a GPU simply reports no CUDA device at run time.
                --dump-recon recon.yuv --bench
 ```
 
-`-b cpu|opencl|cuda|auto` selects the backend, `-p 0..4` is the speed/quality
+`-b cpu|opencl|cuda|auto` selects the backend, `--bitrate <kbps>` switches from
+constant QP to one-pass average-bitrate rate control (it lands within 0.2 % of
+the target over 90 frames), `--aq <tenths>` turns on variance-based adaptive
+quantisation (off by default: it is worth its PSNR cost only perceptually, see
+`docs/STATUS.md`), `-p 0..4` is the speed/quality
 preset (it scales the search range and the subpel refinement), `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
@@ -106,10 +110,10 @@ preset.
   residual in the wrong 8x8 quadrants — so it has to be checked explicitly.
 * `tests/cavlc_check.c` round-trips 2 000 random residual blocks through the
   CAVLC writer and a transcription of the reference decoder.
-* `tests/run_tests.sh` encodes nineteen synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes twenty-two synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
-  all-intra and short GOPs), decodes them
+  all-intra and short GOPs, ABR and AQ), decodes them
   with ffmpeg and requires the encoder's own reconstruction to be
   **bit-identical** on every frame; it exits non-zero otherwise.
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.

@@ -97,7 +97,12 @@ void aeg_params_default(aeg_params *p)
     p->backend = AEG_BACKEND_AUTO;
     for (i = 0; i < AEG_STAGE_COUNT; i++)
         p->stage_backend[i] = -1;
-    p->aq_mode = 1;
+    /* Adaptive quantisation (variance AQ) is implemented but off by default:
+     * at a fixed rate it *lowers* PSNR on the test set (0.3 dB on the quadrant
+     * clip, 0.9 dB on the panning texture at 300 kb/s) because the bit
+     * reallocation between flat and busy macroblocks costs more than it buys
+     * when the yardstick is PSNR.  See docs/STATUS.md. */
+    p->aq_mode = 0;
     p->aq_strength = 10;
     p->deblock = 1;
     p->deblock_alpha = 0;
