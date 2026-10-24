@@ -1888,6 +1888,32 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             e->mb_cand[0].pmv[0][1] = e->mb_pmv[1];
         }
         e->mb_ncand = 1;
+        /* The skip candidate: the vector a P_Skip macroblock reconstructs
+         * with (8.4.1.1), which the search itself will rarely land on exactly
+         * because it refines away from the seed.  Without this candidate a
+         * macroblock whose best prediction is "nothing moved" has nothing that
+         * can be coded as a skip, so the cheapest macroblock the standard has
+         * is never priced -- and on a still picture that is nearly all of
+         * them.  It differs from the candidate above only in the vector, so
+         * the two prices are directly comparable. */
+        {
+            int sx, sy, b;
+            pskip_mv(e, mbx, mby, &sx, &sy);
+            if ((sx != mvx || sy != mvy) &&
+                e->mb_ncand < (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0]))) {
+                mbcand *sc = &e->mb_cand[e->mb_ncand];
+                memset(sc, 0, sizeof(*sc));
+                sc->type = AEG_MB_P16x16;
+                sc->nparts = 1;
+                for (b = 0; b < 16; b++) {
+                    sc->mv[b][0] = (int16_t)sx;
+                    sc->mv[b][1] = (int16_t)sy;
+                }
+                sc->pmv[0][0] = (int16_t)e->mb_pmv[0];
+                sc->pmv[0][1] = (int16_t)e->mb_pmv[1];
+                e->mb_ncand++;
+            }
+        }
         /* Partitioned candidates: 16x8 and 8x16, bit 1 and 2 of the mask.
          * They only pay off with the RD decision, so ultrafast stays 16x16. */
         if (e->p.preset >= 1) {

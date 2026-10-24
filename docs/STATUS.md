@@ -50,7 +50,9 @@ Implemented and building without warnings:
   through `write_mb_cabac()` in price-only mode on a copy of the slice's
   context state (`rd_cabac_bits()`), so the mode decision optimises for the
   coder that emits the stream (see *Pricing the decision pass with the
-  coder*)
+  coder*), and a `P_Skip` candidate carrying the vector the skip rule derives,
+  so the cheapest macroblock the standard has is always among the candidates
+  (see *The skip candidate*)
 * forward/inverse 4x4 integer transform, 4x4 and 2x2 DC Hadamard, quantisation
   and dequantisation, including the reference decoder's `int16_t` truncation
 * Intra_16x16 (all four modes), Intra_4x4 (all nine modes, the Figure 6-8
@@ -1079,6 +1081,33 @@ the deblocking filter its vertical reach, which is the price of the
 parallelism, and it is paid in bytes, not in quality (the PSNR at a fixed QP is
 flat, see the table in *Slices*).
 
+## The skip candidate
+
+`P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
+no motion vectors, no residual, and the decoder reconstructs it with a vector
+derived from its neighbours (8.4.1.1).  Coding one therefore needs the
+macroblock's own vector to be *exactly* that derived vector, and the motion
+search never produces it: it refines sub-pel away from its seed, so a
+macroblock whose true motion is "nothing moved" still ends up with a vector a
+quarter pel off, is coded as a normal P16x16 with a residual, and costs a
+hundred bits where a skip costs two.
+
+The fix is one extra candidate: the search runs as usual, and then the same
+16x16 candidate is added again with the vector `pskip_mv()` derives.  It is the
+same prediction machinery, the same residual path and the same price, so the
+two candidates are directly comparable; the skip test in `write_mb_cabac()`
+then sees a candidate it can actually code as a skip, and the decision pass
+prices it as one flag.  On a still clip (mode 3, 320x192, QP 32, 30 frames) the
+stream drops from 6 165 to 4 201 bytes at the same PSNR (39.97 dB) -- 32% of
+the bits, for one more candidate per macroblock.
+
+This is also where the coder-priced decision pass pays off twice: the same
+candidate priced by the CAVLC estimate is still worth coding (the estimate
+charges *more* for the residual than the coder does, so it prefers the skip
+less than it should), and it is the combination that shows in the BD-rate
+table above (mode 3: 21.7% more bits before either change, 11.3% fewer with
+both).
+
 ## P_8x8 sub-macroblock partitions
 
 P_8x8 (mb_type 3) splits the macroblock into four 8x8 partitions, each with its
@@ -1287,22 +1316,36 @@ factor cannot fix it.  The rate term is now the coder's own price -- see
 *Pricing the decision pass with the coder* under *CABAC* -- and the three clips
 below are the measurement of it:
 
-| clip | before | after |
-|---|---|---|
-| mode 4, 320x240, 8 frames | 12.9% more | **12.3% more** |
-| mode 2, 320x192, 30 frames | 28.6% more | **24.5% more** |
-| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | **6.2% more** |
+| clip | before | coder-priced | + the skip candidate |
+|---|---|---|---|
+| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | **12.6% more** |
+| mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | **21.0% more** |
+| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | **11.3% fewer** |
 
 The clip that gains most is the one whose decisions are dominated by skip and
 by near-zero residuals, which is exactly where the CAVLC estimate is furthest
 off: a skipped macroblock costs it one flag plus the estimate's guess, while the
 coder charges one context-coded bin whose probability has adapted to the
 neighbourhood, so the skip/inter boundary is finally in the right place.  The
-gain costs 15% of the encode time (320x192, 30 frames: 92 -> 78 fps), which is
-the price of running `write_mb_cabac()` once per candidate instead of once per
-macroblock; pruning the candidates the estimate dislikes was measured and is
-*not* in (it recovered none of the time -- the bin walk is small next to the
-transform and the search -- and cost 4% of the bits on the clip where the
+last column is the second half of the story: with the price right, the *vector*
+the skip rule reconstructs with is worth having as a candidate of its own (see
+*The skip candidate*), and on the still clip that alone is worth 17 points of
+BD-rate -- the encoder now spends 11% *fewer* bits than x264 medium there
+instead of 6% more.
+
+Lambda itself did not need to move once the price was right: the scale on
+lambda that was tried as a *stand-in* for the coder's model was re-measured
+with the real one (0.7 / 0.85 / 1.0 of `0.85 * 2^((QP-12)/3)`) and 1.0 is the
+best of the three on all three clips -- 0.7 costs 1.3 points on one and 11
+points on the still clip -- so the calibration `AEG_LAMBDA` uses is the right
+one for CABAC-priced bits too.
+
+The two changes together cost 15% of the encode time at this size (320x192,
+30 frames, preset 2: 86 -> 73 fps), which is the price of running
+`write_mb_cabac()` once per candidate instead of once per macroblock and of one
+more 16x16 candidate; pruning the candidates the estimate dislikes was measured
+and is *not* in (it recovered none of the time -- the bin walk is small next to
+the transform and the search -- and cost 4% of the bits on the clip where the
 decisions are closest).
 
 The older comparison, against x264's baseline profile, and the history behind
@@ -1393,7 +1436,7 @@ partitions are worth coding):
 | encoder | fps | bytes | PSNR |
 |---|---|---|---|
 | ours, preset 0, before / after the coder-priced decision pass | 584 / 537 | 118 680 / 118 680 | 43.74 / 43.74 (YUV) |
-| ours, preset 2 | 86 / 73 | 49 335 / 47 687 | 46.33 / 46.54 (YUV) |
+| ours, preset 2 | 86 / 75 | 49 335 / 47 687 | 46.33 / 46.54 (YUV) |
 | ours, preset 4 | 82 / 68 | 49 537 / 47 665 | 46.29 / 46.55 (YUV) |
 | x264 baseline (no asm), earlier round | 175 | 78 664 | 45.16 (Y) |
 | libx264 baseline, this machine, asm | 385 | 78 692 | 46.30 (YUV) |
