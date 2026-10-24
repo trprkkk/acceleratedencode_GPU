@@ -507,8 +507,8 @@ comparable between encoders).
 So the rate penalty is now 1-8 %, against 25-27 % before the quarter-pel fix
 (bug 28/29) and ~50 % before P_8x8.  For reference, x264 here uses three
 reference pictures, trellis quantisation, adaptive quantisation and hand-written
-SIMD; we use one reference, none of those, and portable C, and are 3.4x slower
-(55 fps against ~187 fps on two cores at 320x192).  At a matched QP x264 still
+SIMD; we use one reference, none of those, and C with two SSE2 kernels, and are
+2.3x slower (74 fps against 170 fps on two cores at 320x192, QP 24, 60 frames).  At a matched QP x264 still
 spends more bits for more PSNR: QP 26 gives 46 395 B / Y 45.03 dB against
 x264's 48 039 B / Y 45.56 dB.
 
