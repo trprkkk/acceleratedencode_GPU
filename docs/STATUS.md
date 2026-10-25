@@ -4,7 +4,7 @@ Date: 2026-10-25.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
 
 ## Where the project stands
 
-The encoder is **conformant on I *and* P pictures**: an independent decoder
+The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 (FFmpeg 7.0.2) reproduces the encoder's reconstruction *bit for bit*
 (`max abs diff 0`) on every frame, not only the IDR.
 
@@ -21,8 +21,11 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs fifty-four encoded clip cases
-frame by frame, checks that the ABR controller hits its target, plus a sweep of
+fails (non-zero exit) on any mismatch; it runs sixty-five encoded clip cases
+frame by frame (fifty-nine bit-exact, ten of them with B pictures compared
+through a coding-order map; the six preset-4/trellis cases are the open failure
+described at the end of *Verification*).  It also
+checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
 
@@ -589,7 +592,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 57 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 65 clip cases
 ```
 
 `make test` runs seven things:
@@ -636,7 +639,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 57 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — fifty-four cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — sixty-five cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -645,7 +648,10 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 57 clip cases
    P_Skip runs at two QPs, and level selection on both transforms, through the
    slice threads and through the batched coefficient path, the vector
    refinement of both a 16x16 and a 16x8 winner -- all of them with the 8x8
-   transform and CABAC enabled, which are the defaults)
+   transform and CABAC enabled, which are the defaults; ten of them with B
+   pictures, one, two and three between two anchors, at QP 12 and 51, on a
+   still clip, with a short GOP, without deblocking, without the 8x8 transform
+   and under the rate controller)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -666,6 +672,26 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 57 clip cases
    does not, not in the partition decision.
 
 `reconstruction vs decode` must be `max abs diff 0`.
+
+The B cases cannot compare the two files frame by frame as they are: the encoder
+hands its pictures out, and dumps them, in *coding* order, while a decoder
+outputs in display order.  `run_bcase` therefore rebuilds the coding order the
+scheduler produced -- `[0]`, then per group either `[anchor, B...,]` or, when the
+group ends in an IDR, `[B... (coded as P), anchor]`, then the tail in display
+order -- and compares each dumped frame against the decoded frame at that display
+index.  A B picture whose direct derivation is wrong reconstructs a different
+picture *without* breaking the syntax, so this re-ordering is the only thing in
+the suite that sees the four B bugs listed below.
+
+Six cases fail today and are not a B-picture regression: `refine_thr`,
+`refine_part`, `trellis4`, `trellis8`, `trellis_thr` and `trellis_batch`
+reproduce identically at `db80149`, before B pictures existed.  They all have
+`--refine-mv` on, and the drift starts at a 16x8/8x16/P_8x8 macroblock's second
+partition: the refinement moves one partition's vector, which changes the
+*predictor* of the next one, and the mvd sent then no longer matches what the
+decoder derives.  That is a real bug in the P path, not in the comparison --
+`--partitions 1` with the refinement is bit-exact, `--partitions 5` (which adds
+8x16) is not -- and it is the next thing to fix in the quality work.
 
 With a GPU present, `tools/gpu_validate.sh clip.yuv W H FRAMES QP` runs the same
 comparison over every device code path at once (CPU stream against dispatcher
@@ -855,7 +881,9 @@ has to be caught before an external decoder is the only witness.
 
 ## B pictures
 
-`--bframes N` (0..3, off by default) codes N B pictures between two anchors.
+`--bframes N` (0..3) codes N B pictures between two anchors; the default is
+**three**, with `--bqp 8` (see *Making them pay* below) -- this is the one place
+where a default changed because a measurement said so.
 The stream has `pic_order_cnt_type 0` with an 8-bit `pic_order_cnt_lsb` per
 slice, `max_num_ref_frames 2`, and `direct_spatial_mv_pred_flag = 0` (temporal
 direct, so a direct macroblock's vectors come from the co-located picture and
@@ -900,33 +928,128 @@ them and nothing else did.
    them on moving content; the encoder reconstructed a different picture than
    the decoder without desynchronising the stream.
 
-B pictures are **not yet a rate-distortion win**, so they stay off by default.
-`tools/bdrate.py` against libx264 medium (6 QPs, the four test clips, negative =
-fewer bits than x264) measures +27.8 / +24.7 / -10.2 / +18.6 % for the four
-clips without B pictures and +39.7 / +40.0 / -5.0 / +17.2 % with
-`--bframes 2`: quality rises (on the panning clip, 48.25 dB at 228.6 kb/s
-becomes 48.98 dB at 261.8 kb/s at QP 22), but it rises more slowly than the bits
-do.  The anchors are three times further apart and the B pictures themselves
-have only four shapes to choose from -- no partitions, no `B_8x8` -- so what
-they save in prediction they lose in syntax.  B partitions (`B_L0_16x8` and
-friends, type codes 4-21), `B_8x8` (code 22) and a QP offset for non-reference
-pictures are the three obvious ways to close that; see *Next*.
+### Making them pay
+
+B pictures on their own were a *loss*: four 16x16 shapes with no partitions and
+no `B_8x8` save less in prediction than they spend in syntax, and the anchors sit
+three frames further apart.  Two things turned that around, and neither needed a
+new syntax element.
+
+**A coarser quantiser for the non-reference pictures.**  A B picture is never
+used as a reference, so its quantisation error cannot propagate: rounding it
+harder costs nothing to the pictures that follow, which is why x264 spends a
+`bframes`-dependent offset here by default.  `--bqp N` sets it (default 8 -- no
+longer the +2 the standard advice suggests, see the sweep).  The sweep, with
+`--bframes 2`, `--scenecut 0`, `tools/bdrate.py` against libx264 medium on the
+panning clip / the quadrant clip / the eight-frame one (negative = we spend fewer
+bits than x264):
+
+| `--bqp` | g1_60 | p2 | q4 |
+|---|---|---|---|
+| 0 | +19.7 % | +17.2 % | +17.2 % |
+| 2 | +7.4 % | +5.6 % | +8.5 % |
+| 4 | +3.3 % | +1.9 % | +5.9 % |
+| 6 | +1.1 % | -0.0 % | +4.6 % |
+| 8 | -1.1 % | -1.6 % | +4.0 % |
+
+and the number is monotone in the offset up to 10, where three B pictures per
+group measure -9.1 / -11.0 / +0.7 %.  Eight was chosen rather than ten because
+the coarse offset is buying back exactly what the missing *shapes* cost: once B
+partitions exist the offset has to come down again, and it is easier to defend a
+bound that already sits a little below the measured optimum.
+
+**The rate controller, the buffer model and the scene-cut detector had to learn
+what a B picture is.**  All three were written for a stream of interchangeable
+pictures:
+
+* the controller gave every picture a full frame's worth of budget.  A B picture
+  cannot spend that (it is quantised eight coarser on purpose), so the controller
+  kept lowering the QP to chase a target the picture type cannot reach, and the
+  stream landed 14 % under the requested rate while the anchors got finer than
+  they should.  Each picture's share is now a *measured* weight: the running ratio
+  of B-picture bits to anchor bits (an EWMA, seeded from the QP offset's
+  `2^(-bqp/6)`), so one group is worth exactly the pictures in it.  400 kb/s at
+  `--bframes 3` now lands at 371 kb/s rather than 344, and what is left is the
+  content: at QP 0 with three B pictures this clip produces 343 kb/s, so 400 kb/s
+  is not reachable on it at all;
+* the debt clamp and the per-picture QP step are measured in *this picture's*
+  budget, and the step cap grows with the outstanding debt (up to 4 QP).  With a
+  group of four, the whole group's error is repaid through the anchor alone, and
+  1.5 QP per picture would not converge inside a short clip;
+* the buffer model predicted each picture from whatever was coded last.  A B
+  picture is far cheaper than the anchor before it and far cheaper than the one
+  after, so the prediction swung by a factor of several and the clamp fired on a
+  buffer that was nowhere near empty; a B picture now predicts from the last
+  *anchor*.
+
+**The scene-cut detector was measuring the wrong distance.**  It compared the
+picture being decided against its reference.  Without B pictures those are one
+frame apart, which is the whole point of the metric; with three B pictures the
+reference is the anchor four frames back, and a fast pan over four frames has the
+same `|cur - ref|` as a cut between two unrelated clips -- the ratio test stopped
+being able to tell them apart (2.2 for ordinary motion where it used to be 0.7).
+It now compares two consecutive *source* pictures from the lookahead ring, which
+exists whether or not the stream has B pictures.  And because the decision moved
+to `schedule()`, it no longer has to fire on the anchor alone: every picture of
+the group is in the ring by then, so the group is cut short at the picture that
+actually is the cut and becomes its IDR.  Testing only the anchors missed a cut
+that fell between two of them -- the next anchor is already past it, and compares
+two pictures on the far side of the cut.  The gate now checks the IDR count with
+and without B pictures.
+
+**`--bench` counted packets instead of pictures**, so a B-picture stream reported
+one "frame" per configuration (the first packets are `AEG_EAGAIN` and the rest
+trail the input); it feeds a picture per iteration and drains the lookahead.
+
+### The result
+
+`tools/bdrate.py` against libx264 medium, 6 QPs, negative = we spend fewer bits
+than x264 at matched PSNR:
+
+| clip | B pictures off | default (`--bframes 3 --bqp 8`) |
+|---|---|---|
+| g1_60 (60 frames, panning texture) | +27.8 % | **-7.8 %** |
+| p2 (30 frames, two quadrants apart) | +24.7 % | **-10.1 %** |
+| q4 (8 frames, four quadrants) | +18.6 % | **+0.7 %** |
+| p3 (30 frames, still after the first) | -10.2 % | **-21.5 %** |
+| p0 (30 frames, whole frame pans) | +9.6 % | **-19.0 %** |
+
+Four of the five clips are now *ahead* of x264's default preset, where P-only
+coding was behind on three of them.  The remaining shape gap is the obvious next
+step: the partitioned types (codes 4-21) and `B_8x8` (22, 36-39) let a B picture
+spend its bits where the two references actually disagree, which is where a
+16x16-only B macroblock wastes them.
 
 ## Next
 
-1. B pictures, the rest of them.  They are conformant (see *B pictures*) but
-   they are not yet a BD-rate win: +39.7 / +40.0 / -5.0 / +17.2 % on the four
-   test clips with `--bframes 2` against +27.8 / +24.7 / -10.2 / +18.6 % with
-   them off, because every B macroblock is one of four 16x16 shapes.  In order
-   of expected value: the partitioned B types (codes 4-21 -- one list or both
-   per partition, which the candidate list already carries as
-   `blist`/`mv1`), `B_8x8` with its four `B_Direct_8x8`/`B_L0_8x8`...
-   sub-types (codes 22 and 36-39), and a QP offset for the non-reference
-   pictures so a B picture spends its cheaper prediction on fewer bits.
-   Spatial direct is deliberately *not* on the list: it makes every direct
-   macroblock depend on its neighbours' vectors, so an encoder/decoder
-   disagreement corrupts the picture instead of costing a few bits.
-2. Quality/RD, the parts that are left.  Level selection is implemented and
+1. B pictures, the rest of them.  They are conformant, they are on by default
+   and they now beat x264 medium on four of the five test clips (see *The
+   result*), but every B macroblock is still one of four 16x16 shapes.  In order
+   of expected value: the partitioned B types (codes 4-21 -- one list or both per
+   partition, which the candidate list already carries as `blist`/`mv1`), then
+   `B_8x8` with its four `B_Direct_8x8`/`B_L0_8x8`/... sub-types (codes 22 and
+   36-39).  Both are worth more than the shape itself because they let the
+   `--bqp` offset come back down: the offset is currently paying for bits a 16x16
+   B macroblock has nowhere to put.  Spatial direct is deliberately *not* on the
+   list: it makes every direct macroblock depend on its neighbours' vectors, so
+   an encoder/decoder disagreement corrupts the picture instead of costing a few
+   bits.
+2. The motion-vector refinement desynchronises a partitioned macroblock.  Six
+   cases in the gate fail because of it (`--refine-mv` together with 8x16 or
+   P_8x8: `--partitions 1` is clean, `--partitions 5` is not), which is
+   documented at the end of *Verification*.  The refinement moves a partition's
+   vector after its neighbour's predictor was derived from the old one, so the
+   mvd sent no longer matches the mvd the decoder derives, and the two
+   reconstructions differ from that macroblock on.  Recomputing the predictors
+   after each refinement step was tried and made it *worse* (frame 1 went from
+   bit-exact to 23 000 wrong samples), so the derivation in
+   `predict_mv_at()` is not the whole story -- the decoder's own rules for which
+   neighbour is available at a sub-partition boundary are what to compare
+   against, with the `AEG_MBDBG` listing and an instrumented decoder as in bug
+   27.  Until then the refinement stays where it was: on presets 3 and 4, which
+   is where it already was, and the six failures are pre-existing, not a
+   regression.
+3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and
    0.1-2.0 on the others, off by default because it costs 19-40% of the time.
@@ -940,7 +1063,7 @@ pictures are the three obvious ways to close that; see *Next*.
      vector is refined by the coder's price (`--refine-mv`, presets 3-4).
      Refining inside the candidate loop with `aeg_cabac_coef_price()` is the
      natural next step and is a pure quality-for-time trade.
-3. GPU: every stage that can be batched is now wired to its kernel.  The plane
+4. GPU: every stage that can be batched is now wired to its kernel.  The plane
    build is `interp_plane`, both halves of the search are rounds through
    `sad_batch` and `satd_batch`, and the coefficient stages of an inter
    macroblock are one `tq_batch` + one `iq_idct_batch` per candidate (see the
@@ -963,10 +1086,10 @@ pictures are the three obvious ways to close that; see *Next*.
 4. Encoder features that need the profile to change: none left -- CABAC and the
    8x8 transform are both in (main profile and High profile respectively), and
    the encoder emits Main, High or Baseline depending on which tools a stream
-   uses.  Two tools of x264's *default* preset are still missing and both are
-   deliberate: B pictures (item 1, which needs a reordered stream) and multiple
-   reference pictures (an RD decision over several references, ~2 points on
-   moving content, and it multiplies the memory search).  MB-tree was
+   uses.  Of x264's *default* preset, only multiple reference pictures is still
+   missing (an RD decision over several references, ~2 points on moving
+   content, and it multiplies the memory search); B pictures are in, and only
+   their partitioned shapes are left (item 1).  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so
@@ -1047,6 +1170,18 @@ only the current source picture and the previous reconstruction:
 Both sums use every other sample in both directions (a quarter of the picture;
 the ratio of two such sums is within a percent or two of the whole one).  A cut
 is `p_sad > scenecut/100 * ac`, default `scenecut = 120`.
+
+The comparison is between two *consecutive display-order source pictures*, taken
+from the lookahead ring.  Without B pictures that is - and was - the previous
+reconstruction, which is exactly the prediction the P picture will use.  With B
+pictures it has to be the source ring: the reference standing behind an anchor is
+the anchor of the *previous* group, three or four frames back, and over four
+frames a fast pan and a cut look the same (measured ratio 2.2 for ordinary motion
+on the panning clip, where one frame of motion is 0.7).  With B pictures the
+decision is also made in `schedule()`, once the whole group is in the ring, so the
+group can be cut short at whichever picture is the cut instead of only at the
+anchor -- a cut that falls between two anchors is otherwise skipped entirely,
+because the next anchor compares two pictures that are both past it.
 
 Measured on the 60-frame clip that is two unrelated 30-frame clips back to back:
 the ratio is 0.67-0.75 on every ordinary picture and 2.92 exactly at the join, so
@@ -1515,6 +1650,14 @@ All the BD-rate numbers in this file are ours against the reference at matched
 PSNR, integrated over the shared span of the six QPs 22/25/28/31/34/37 by
 `tools/bdrate.py`: **negative means we need fewer bits**, so negative is better
 and positive is the gap.
+
+> **Where the numbers below were taken.**  Everything in this section except
+> *The result* under *B pictures* was measured **with B pictures off**, which was
+> the default when they were written.  B pictures are now on by default and are
+> worth 20 to 36 points on these same clips (q4: +18.6 -> +0.7 %, p2: +24.7 ->
+> -10.1 %, if you want two of them), so read the tables here as "what the P-only
+> part of the encoder is worth" -- which is what they isolate -- rather than as
+> the encoder's current standing.
 
 > **A correction.**  Until this round those numbers came from a throwaway
 > script that divided by the reference instead of by us and was then read with

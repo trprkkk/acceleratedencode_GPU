@@ -112,7 +112,16 @@ void aeg_params_default(aeg_params *p)
     /* the rate-distortion refinement of the winning motion vector follows the
      * preset (see aeg_encoder_create) */
     p->refine_mv = -1;
-    p->bframes = 0;
+    /* B pictures are on by default: three between two anchors, each quantised
+     * eight coarser than the anchors around it.  Both numbers come from the
+     * measurement in docs/STATUS.md -- on five test clips at six QPs that pair
+     * is between 7.8% and 19% *cheaper* than x264 medium at matched PSNR,
+     * against 9.6% to 27.8% more expensive with no B pictures at all.  The
+     * eight is large because a B picture here has only the four 16x16 shapes
+     * to spend its bits on, so the coarser QP costs less than it would in an
+     * encoder that partitions them; re-measure it when that changes. */
+    p->bframes = 3;
+    p->b_qp_offset = 8;
     p->trellis = -1;
     p->deblock = 1;
     p->deblock_alpha = 0;

@@ -284,6 +284,9 @@ struct aeg_encoder {
     double rc_bits_per_frame;
     double rc_spent;        /* bits used so far, all pictures               */
     double rc_debt;         /* budget - spent (positive = under budget)     */
+    double rc_target_sum;   /* the budget so far, all pictures               */
+    double rc_b_ratio;      /* measured B-picture cost relative to an anchor */
+    int    rc_anchor_bits;  /* the last anchor's size, for the ratio above   */
     int    rc_frames;       /* pictures coded so far, for the budget        */
     int    rc_active;
     int    rc_qp_offset;    /* user bias on the per-picture QP (two-pass)     */
@@ -303,6 +306,13 @@ struct aeg_encoder {
     int    vbv_clamps;
     int    last_pic_bits;   /* the previous picture, to predict this one    */
     int    last_pic_qp;
+    /* The previous *anchor*, for the VBV model: a B picture is much cheaper
+     * than the anchor before it and much cheaper than the one after it, so
+     * predicting a B picture from whatever picture happened to come last swings
+     * between over- and under-estimating by a factor of several, and the clamp
+     * would then fire on a buffer that is nowhere near empty. */
+    int    last_anchor_bits;
+    int    last_anchor_qp;
 };
 
 /* Which of the two batched coefficient code paths to use for this picture.
@@ -4687,18 +4697,25 @@ static double vbv_available(const struct aeg_encoder *e)
 static void vbv_clamp_qp(struct aeg_encoder *e)
 {
     double avail, pred, q_min;
+    int ref_bits = e->last_pic_bits, ref_qp = e->last_pic_qp;
 
-    if (!e->vbv_active || e->last_pic_bits <= 0 || e->last_pic_qp < 0)
+    /* A B picture is predicted from the last anchor rather than from the last
+     * picture, for the reason given at last_anchor_bits. */
+    if (e->cur_is_b && e->last_anchor_bits > 0 && e->last_anchor_qp >= 0) {
+        ref_bits = e->last_anchor_bits;
+        ref_qp = e->last_anchor_qp;
+    }
+    if (!e->vbv_active || ref_bits <= 0 || ref_qp < 0)
         return;
+    /* The B picture's QP already carries the B offset, so the prediction has to
+     * start from the QP the encoder will actually quantise with. */
     avail = vbv_available(e);
     if (avail < 1.0)
         avail = 1.0;
-    pred = (double)e->last_pic_bits *
-           pow(2.0, (double)(e->last_pic_qp - e->cur_qp) / 6.0);
+    pred = (double)ref_bits * pow(2.0, (double)(ref_qp - e->cur_qp) / 6.0);
     if (pred <= avail)
         return;
-    q_min = (double)e->last_pic_qp -
-            6.0 * log2(avail / (double)e->last_pic_bits);
+    q_min = (double)ref_qp - 6.0 * log2(avail / (double)ref_bits);
     if ((double)e->cur_qp < q_min) {
         int q = (int)ceil(q_min);
 
@@ -4717,6 +4734,10 @@ static void vbv_update(struct aeg_encoder *e, int bits)
 
     e->last_pic_bits = bits;
     e->last_pic_qp = e->cur_qp;
+    if (!e->cur_is_b) {
+        e->last_anchor_bits = bits;
+        e->last_anchor_qp = e->cur_qp;
+    }
     if (!e->vbv_active)
         return;
     level = vbv_available(e) - (double)bits;
@@ -4746,16 +4767,60 @@ static void vbv_update(struct aeg_encoder *e, int bits)
 #define RC_WINDOW 6.0
 #define RC_GAIN   1.2
 #define RC_DEBT_MAX 3.0
+
+/* How much of a frame's budget each picture is expected to take.
+ *
+ * Every picture cannot take the same share when they are coded with different
+ * quantisers on purpose: a B picture sits b_qp_offset coarser than the anchors
+ * around it, so it spends a fraction of what an anchor does, and a controller
+ * that asked it for a whole frame's worth would keep lowering the QP trying to
+ * reach a target the picture type cannot spend -- the stream then lands well
+ * under the requested bitrate (14% at 400 kb/s before this was accounted for)
+ * while the anchors get finer than they should.  The weights are normalised so
+ * that one group -- one anchor and bframes B pictures -- is worth exactly the
+ * pictures it contains.
+ *
+ * The fraction itself is *measured* rather than derived from the QP offset: the
+ * offset only bounds what a B picture may spend, and with three B pictures per
+ * group the anchors have to make up a share that no closed form gets right (the
+ * offset model leaves the stream 11% short at 400 kb/s where the measured
+ * ratio lands on it). */
+static double rc_weight(const struct aeg_encoder *e, int is_b)
+{
+    double wb, wa, g;
+
+    if (e->p.bframes <= 0)
+        return 1.0;
+    g = (double)(e->p.bframes + 1);
+    wb = e->rc_b_ratio;             /* measured: B bits / anchor bits      */
+    wa = 1.0 + (g - 1.0) * wb;      /* one group's bits / an anchor's      */
+    return (is_b ? wb : 1.0) * g / wa;
+}
+
 static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
 {
     double bpf = e->rc_bits_per_frame;
-    double want, ratio, adj;
+    double per, want, ratio, adj;
 
     if (!e->rc_active || bpf <= 0.0)
         return;
     e->rc_frames++;
     e->rc_spent += (double)bits;
-    e->rc_debt = e->rc_frames * bpf - e->rc_spent;
+    if (e->p.bframes > 0) {
+        /* keep the weight the two paths above agree on up to date */
+        if (e->cur_is_b && e->rc_anchor_bits > 0) {
+            double r = (double)bits / (double)e->rc_anchor_bits;
+
+            if (r < 0.02) r = 0.02;
+            if (r > 1.00) r = 1.00;
+            e->rc_b_ratio = 0.75 * e->rc_b_ratio + 0.25 * r;
+        } else if (!e->cur_is_b) {
+            e->rc_anchor_bits = bits;
+        }
+    }
+    per = rc_weight(e, e->cur_is_b) * bpf;
+    e->rc_target_sum += per;
+    e->rc_debt = e->rc_target_sum - e->rc_spent;
     /* One picture can be many times the target -- a keyframe, or any picture
      * after a scene cut -- and letting that single picture's overshoot follow
      * the controller for the next `RC_WINDOW` pictures is what turns one
@@ -4763,11 +4828,11 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
      * RC_DEBT_MAX pictures' worth: the overshoot is still repaid, just over a
      * window long enough that the quality does not collapse (the alternative,
      * a 20% target floor, lets the QP run away while the debt is large). */
-    if (e->rc_debt >  RC_DEBT_MAX * bpf) e->rc_debt =  RC_DEBT_MAX * bpf;
-    if (e->rc_debt < -RC_DEBT_MAX * bpf) e->rc_debt = -RC_DEBT_MAX * bpf;
-    want = bpf + e->rc_debt / RC_WINDOW;
-    if (want < 0.2 * bpf)          /* never ask for the impossible */
-        want = 0.2 * bpf;
+    if (e->rc_debt >  RC_DEBT_MAX * per) e->rc_debt =  RC_DEBT_MAX * per;
+    if (e->rc_debt < -RC_DEBT_MAX * per) e->rc_debt = -RC_DEBT_MAX * per;
+    want = per + e->rc_debt / RC_WINDOW;
+    if (want < 0.2 * per)          /* never ask for the impossible */
+        want = 0.2 * per;
     if (e->vbv_active) {
         /* ask for a picture the buffer can actually take, with a little room
          * left over so that the clamp in vbv_clamp_qp() is the exception */
@@ -4780,8 +4845,23 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
     }
     ratio = (double)(bits + 1) / want;
     adj = RC_GAIN * (ratio > 0.0 ? log2(ratio) : 0.0);
-    if (adj > 1.5)  adj = 1.5;     /* at most 1.5 QP per picture, so a scene */
-    if (adj < -1.5) adj = -1.5;    /* cut cannot make the quality collapse   */
+    {
+        /* Normally at most 1.5 QP per picture, so that a scene cut cannot make
+         * the quality collapse.  That cap is also what decides how long the
+         * stream takes to reach its target, and the whole group's error is
+         * repaid through the anchor alone: with three B pictures per group the
+         * equilibrium QP can be ten or more below where the controller starts
+         * (a B picture spends a fraction of a frame's budget, so the anchors
+         * have to be that much better to fill the rate), and 1.5 QP per picture
+         * then needs far more pictures than a short stream has.  A picture's
+         * worth of debt therefore buys a bigger step -- still bounded, and the
+         * debt clamp keeps it from running away. */
+        double cap = 1.5 + fabs(e->rc_debt) / per;
+
+        if (cap > 4.0) cap = 4.0;
+        if (adj >  cap) adj =  cap;
+        if (adj < -cap) adj = -cap;
+    }
     e->rc_qp += adj;
     if (e->rc_qp > 51.0) e->rc_qp = 51.0;
     if (e->rc_qp < 0.0)  e->rc_qp = 0.0;
@@ -4810,21 +4890,45 @@ static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
  * A cut also has to respect a minimum distance to the previous IDR (a tenth of
  * the GOP, clamped to [8, 32]): a flash or a hard pan would otherwise turn
  * every picture into a keyframe. */
-static int is_scene_cut(struct aeg_encoder *e, int is_idr)
+static int in_slots(const struct aeg_encoder *e);
+
+static int is_scene_cut(struct aeg_encoder *e, int is_idr, int display)
 {
-    const uint8_t *cur = e->srcp[0], *ref = e->refp[0];
+    int slots = in_slots(e);
+    const uint8_t *cur, *ref;
     int stride = e->stride[0];
     int64_t ac = 0, p_sad = 0;
     int bx, by, x, y;
 
-    if (e->p.scenecut <= 0 || is_idr || !e->has_ref || e->frame_count < 2)
+    /* Both sides of the comparison are pictures *one frame apart in display
+     * order*.  Without B pictures that is exactly "this picture against the
+     * reference it will predict from", which is what the first version of this
+     * test did.  With B pictures it cannot be: the most recent decoded picture
+     * when an anchor is decided is the group's own B tail, three or four frames
+     * back, and over four frames a fast pan has the same |cur - ref| as a cut
+     * between two unrelated clips -- the metric stops being able to tell them
+     * apart at all.  The source ring, on the other hand, still holds the
+     * picture that precedes this one, so the test keeps measuring a one-frame
+     * difference whatever the group structure is. */
+    if (e->p.bframes > 0) {
+        cur = e->in_plane[display % slots][0];
+        ref = e->in_plane[(display - 1) % slots][0];
+    } else {
+        cur = e->srcp[0];
+        ref = e->refp[0];
+    }
+    if (e->p.scenecut <= 0 || is_idr || display < 2)
+        return 0;
+    if (e->p.bframes <= 0 && !e->has_ref)
         return 0;
     {
         int min_gop = e->p.gop_size > 0 ? e->p.gop_size / 10 : 8;
 
         if (min_gop < 8) min_gop = 8;
         if (min_gop > 32) min_gop = 32;
-        if (e->frame_count - e->last_idr_frame < min_gop)
+        /* in display order, not in coding order: with B pictures the two
+         * differ, and the guard is about what the viewer sees */
+        if (display - e->last_idr_poc < min_gop)
             return 0;
     }
     /* every other sample in both directions: the ratio of two sums over a
@@ -4857,8 +4961,8 @@ static int is_scene_cut(struct aeg_encoder *e, int is_idr)
             p_sad += d < 0 ? -d : d;
         }
     if (getenv("AEG_SCDBG"))
-        fprintf(stderr, "SCD frame %d ac %lld p_sad %lld ratio %.3f\n",
-                e->frame_count, (long long)ac, (long long)p_sad,
+        fprintf(stderr, "SCD display %d ac %lld p_sad %lld ratio %.3f\n",
+                display, (long long)ac, (long long)p_sad,
                 ac ? (double)p_sad / (double)ac : 0.0);
     if (ac <= 0)
         return p_sad > 0;
@@ -5239,8 +5343,12 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     set_current_refs(e);
     /* A scene cut makes the picture an IDR: everything before it is dropped, so
      * coding it as a P picture would leave the following ones referring to
-     * pictures the decoder has just discarded. */
-    if (slice == AEG_SLICE_P && is_scene_cut(e, is_idr)) {
+     * pictures the decoder has just discarded.  With B pictures the decision is
+     * made in schedule() instead, before anything is queued: an IDR drops every
+     * reference before it, so the B pictures of its group could no longer be
+     * coded once it is in the queue. */
+    if (e->p.bframes <= 0 && slice == AEG_SLICE_P &&
+        is_scene_cut(e, is_idr, e->frame_count)) {
         is_idr = 1;
         slice = AEG_SLICE_I;
         e->scene_cuts++;
@@ -5270,6 +5378,16 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     }
     if (e->rc_qp_offset) {
         e->cur_qp += e->rc_qp_offset;
+        if (e->cur_qp < 0)  e->cur_qp = 0;
+        if (e->cur_qp > 51) e->cur_qp = 51;
+    }
+    /* A B picture is not a reference, so its quantiser never propagates: the
+     * anchors keep the QP the controller gave them and the B pictures in
+     * between can be rounded harder without costing the following pictures
+     * anything.  This is the cheapest half of what B pictures are for --
+     * x264 spends +2 by default for exactly this reason. */
+    if (e->cur_is_b && e->p.b_qp_offset) {
+        e->cur_qp += e->p.b_qp_offset;
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
@@ -5658,21 +5776,33 @@ static void schedule(struct aeg_encoder *e)
     nxt = e->anchor + G;
     if (e->in_count <= nxt)
         return;                       /* the next anchor has not arrived yet */
-    idr = idr_due(e, nxt);
-    if (!idr) {
-        /* The scene cut test needs the picture bound as if it were a P, and it
-         * has to run before anything is queued: an IDR drops every reference
-         * before it, so the B pictures of this group could no longer be coded
-         * after it. */
+    /* The scene cut test has to run before anything is queued: an IDR drops
+     * every reference before it, so the B pictures of its group could no longer
+     * be coded once it is in the queue.  It also decides *where* the group ends:
+     * every picture of the group is in the ring by now, so the cut can be
+     * looked for at any of them rather than only at the anchor it happens to
+     * fall near.  Testing only the anchor would miss a cut that falls between
+     * two anchors entirely -- the anchor after it compares two pictures that are
+     * both already past the cut.  The group is then cut short so that the cut
+     * picture becomes its IDR. */
+    idr = 0;
+    if (e->p.scenecut > 0) {
+        int c;
         bind_source(e, nxt);
         e->cur_is_b = 0;
         set_current_refs(e);
-        if (is_scene_cut(e, 0)) {
+        for (c = e->anchor + 1; c <= nxt; c++) {
+            if (!is_scene_cut(e, 0, c))
+                continue;
+            nxt = c;
             idr = 1;
             e->scene_cuts++;
             aeg_log(2, "aeg: scene cut at frame %d -> IDR", nxt);
+            break;
         }
     }
+    if (!idr)
+        idr = idr_due(e, nxt);
     if (idr) {
         /* No B pictures can precede an IDR, so the group's B pictures go out as
          * P pictures first, in display order, and the IDR comes last. */
@@ -5765,6 +5895,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->rc_bits_per_frame = (double)pp->bitrate_kbps * 1000.0 / fps;
         e->rc_spent = 0.0;
         e->rc_debt = 0.0;
+        e->rc_target_sum = 0.0;
+        e->rc_anchor_bits = 0;
+        /* the starting guess is the QP offset's own prediction */
+        e->rc_b_ratio = pow(0.5, (double)pp->b_qp_offset / 6.0);
         e->rc_frames = 0;
         aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
                 pp->bitrate_kbps, e->rc_bits_per_frame, fps, pp->qp);
@@ -5778,6 +5912,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             e->vbv_min_full = e->vbv_full;
             e->last_pic_bits = 0;
             e->last_pic_qp = -1;
+            e->last_anchor_bits = 0;
+            e->last_anchor_qp = -1;
             aeg_log(1, "aeg: VBV %d kb/s, buffer %d kbit -> level %.0f bits, "
                         "%.0f bits delivered per picture",
                     pp->vbv_maxrate_kbps, pp->vbv_bufsize_kbits,

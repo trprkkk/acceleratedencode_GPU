@@ -45,10 +45,13 @@ static void usage(void)
 "  --refine-mv <n>  0 = off, 1 = four quarter-pel neighbours of the winning\n"
 "                   vector, 2 = all eight (rate-distortion refined, slower;\n"
 "                   default 0, preset 3 uses 1 and preset 4 uses 2)\n"
-"  --bframes <n>    B pictures between two anchors, 0..3 (default 0).  The\n"
+"  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"
-"                   after n+1 frames; needs CABAC.\n"
+"                   after n+1 frames; needs CABAC.  0 codes P pictures only.\n"
+"  --bqp <n>        QP added to every B picture (default 8).  A B picture is\n"
+"                   never a reference, so a coarser quantiser in it costs the\n"
+"                   pictures that follow nothing.\n"
 "  --trellis <n>    rate-distortion level selection on the luma residual:\n"
 "                   0 = off (default), 1 = on (costs 15-35%% of the encode time\n"
 "                   for a BD-rate change inside the noise on the test clips)\n"
@@ -197,7 +200,7 @@ int main(int argc, char **argv)
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1;
     int trellis = -1;
-    int bframes = -1;
+    int bframes = -1, bqp = -1000;
     int64_t *pass1_bits = NULL;
     int pass1_n = 0;
     char stats_path[4096];
@@ -242,6 +245,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-mv")) refine_mv = atoi(argv[++i]);
         else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
+        else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
         else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
@@ -288,13 +292,17 @@ int main(int argc, char **argv)
     }
 
     /* Two-pass looks at one packet per picture, in display order.  With B
-     * pictures the packets come out in coding order, so the measurement of
-     * picture i would be applied to picture i of the bitstream, not of the
-     * source. */
-    if (pass && p.bframes > 0) {
+     * pictures the packets come out in coding order and the QP bias goes to
+     * whichever picture is coded next rather than to the one just submitted,
+     * so the measurement of picture i would end up on a different picture.
+     * Asking for B pictures *explicitly* in a two-pass run is therefore an
+     * error; leaving them at their default just turns them off for the run. */
+    if (pass && bframes > 0) {
         fprintf(stderr, "error: --pass and --bframes cannot be combined yet\n");
         return 1;
     }
+    if (pass)
+        p.bframes = 0;
     if (pass) {
         if (!stats_path[0]) {
             if (!outpath) {
@@ -357,6 +365,7 @@ int main(int argc, char **argv)
     if (subme >= 0) p.subme = subme;
     if (refine_mv >= 0) p.refine_mv = refine_mv;
     if (bframes >= 0) p.bframes = bframes;
+    if (bqp > -1000) p.b_qp_offset = bqp;
     if (trellis >= 0) p.trellis = trellis;
     if (partitions >= 0) p.partitions = partitions;
     aeg_log_level = verbose;
@@ -378,12 +387,30 @@ int main(int argc, char **argv)
             if (!e) { fprintf(stderr, "open failed\n"); return 1; }
             fseek(in, 0, SEEK_SET);
             t0 = aeg_now_ns();
-            while (n < (max_frames ? max_frames : 30) &&
-                   fread(frame, 1, fsize, in) == fsize) {
+            /* A picture is fed per iteration and counted per iteration, not
+             * per packet: with B pictures the first `bframes` pictures produce
+             * no packet at all (AEG_EAGAIN) and the rest come out one behind,
+             * so counting packets would report a fraction of the frames. */
+            for (;;) {
                 aeg_packet pkt;
-                if (aeg_encoder_encode(e, frame, fsize, pts++, &pkt) != 0) break;
-                bytes += (int64_t)pkt.size;
+                int r;
+                if (max_frames && n >= max_frames)
+                    break;
+                if (fread(frame, 1, fsize, in) != fsize)
+                    break;
+                r = aeg_encoder_encode(e, frame, fsize, pts++, &pkt);
                 n++;
+                if (r == AEG_EAGAIN)
+                    continue;
+                if (r != AEG_OK)
+                    break;
+                bytes += (int64_t)pkt.size;
+            }
+            for (;;) {
+                aeg_packet pkt;
+                if (aeg_encoder_flush(e, &pkt) != AEG_OK)
+                    break;
+                bytes += (int64_t)pkt.size;
             }
             tot = aeg_now_ns() - t0;
             t[k] = tot;

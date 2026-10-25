@@ -112,6 +112,10 @@ typedef struct aeg_params {
      * encoder holds `bframes` pictures of lookahead, so aeg_encoder_encode()
      * returns AEG_EAGAIN until it has them. */
     int bframes;
+    /* QP added to every B picture (it is never a reference, so the coarser
+     * quantiser cannot propagate; x264 spends +2 by default for the same
+     * reason).  Only meaningful with bframes > 0. */
+    int b_qp_offset;
     /* Scene-cut detection: insert an IDR when a picture's inter prediction is
      * worse than its intra prediction by more than `scenecut` percent (0 = off).
      * A scene change is exactly where a P picture costs more than the IDR it

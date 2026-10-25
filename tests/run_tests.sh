@@ -139,8 +139,12 @@ run_bcase() {
 run_case() {
     name=$1; w=$2; h=$3; n=$4; mode=$5; shift 5
     "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
+    # --bframes 0: the cases below compare the dump against the decoded stream
+    # frame by frame in *display* order, which is only the coding order when
+    # the stream has no B pictures.  The B path has its own cases (run_bcase)
+    # that rebuild the coding order before comparing.
     ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
-        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" "$@" \
+        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes 0 "$@" \
         >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
@@ -283,6 +287,10 @@ run_bcase bframes_idr   320 192 12 1 1 -q 26 --scenecut 0 -g 4
 run_bcase bframes_t8    320 192 10 2 4 -q 22 --scenecut 0
 run_bcase bframes_nodeb 320 192 10 2 1 -q 24 --scenecut 0 --no-deblock
 run_bcase bframes_q8x8  320 192 10 1 1 -q 24 --scenecut 0 --no-8x8dct
+#   the rate controller gives a picture its QP from the running bit count, and a
+#   B picture is coded coarser than the anchors around it: the mb_qp_delta that
+#   follows has to survive both, which is what this case is for
+run_bcase bframes_abr   320 192 12 2 1 -q 24 --scenecut 0 --bitrate 300
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in
@@ -359,11 +367,21 @@ echo "== scene cuts"
 "$BUILD/genyuv" 320 192 30 "$TMP/cutA.yuv" 0 >/dev/null
 "$BUILD/genyuv" 320 192 30 "$TMP/cutB.yuv" 4 >/dev/null
 cat "$TMP/cutA.yuv" "$TMP/cutB.yuv" > "$TMP/cut.yuv"
+# --bframes 0 for the reconstruction comparison (the dump is in coding order
+# when there are B pictures, see run_case), and the same clip once more with B
+# pictures for the IDR count: a cut still has to become an IDR when the group
+# structure puts B pictures around it.
 ./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
-    -o "$TMP/cut.264" -g 250 --dump-recon "$TMP/cut.recon" >"$TMP/cut.log" 2>&1 \
+    -o "$TMP/cut.264" -g 250 --bframes 0 --dump-recon "$TMP/cut.recon" \
+    >"$TMP/cut.log" 2>&1 \
     || { echo "   cut clip: encode failed"; FAIL=1; }
+./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+    -o "$TMP/cutb.264" -g 250 --bframes 3 >"$TMP/cutb.log" 2>&1 \
+    || { echo "   cut clip with B pictures: encode failed"; FAIL=1; }
 ./$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
-    -o "$TMP/nocut.264" -g 250 >/dev/null 2>&1
+    -o "$TMP/nocut.264" -g 250 --bframes 0 >/dev/null 2>&1
+./$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
+    -o "$TMP/nocutb.264" -g 250 --bframes 3 >/dev/null 2>&1
 if ! command -v "$FF" >/dev/null 2>&1; then
     echo "   scenecut: skipped (no ffmpeg)"
 else
@@ -376,7 +394,8 @@ else
     fi
     python3 "$TMP/cmp.py" "$TMP/cut.recon" "$TMP/cut.dec" 320 192 60 cut || FAIL=1
 fi
-python3 - "$TMP/cut.264" "$TMP/nocut.264" <<'PY2' || FAIL=1
+python3 - "$TMP/cut.264" "$TMP/nocut.264" "$TMP/cutb.264" "$TMP/nocutb.264" \
+    <<'PY2' || FAIL=1
 import sys
 
 def idr_count(path):
@@ -392,6 +411,8 @@ def idr_count(path):
 
 cut = idr_count(sys.argv[1])
 plain = idr_count(sys.argv[2])
+cutb = idr_count(sys.argv[3])
+plainb = idr_count(sys.argv[4])
 ok = True
 if cut != 2:
     print("   60 frame clip with one scene cut: %d IDR NALs, wanted 2  FAIL" % cut)
@@ -400,8 +421,16 @@ if plain != 1:
     print("   120 frame clip of ordinary motion: %d IDR NALs, wanted 1  FAIL"
           % plain)
     ok = False
+if cutb != 2:
+    print("   with B pictures: %d IDR NALs, wanted 2  FAIL" % cutb)
+    ok = False
+if plainb != 1:
+    print("   with B pictures, ordinary motion: %d IDR NALs, wanted 1  FAIL"
+          % plainb)
+    ok = False
 if ok:
-    print("   one cut -> 2 IDR NALs, ordinary motion -> 1 (no false positives)")
+    print("   one cut -> 2 IDR NALs, ordinary motion -> 1 (no false positives),"
+          " with and without B pictures")
 sys.exit(0 if ok else 1)
 PY2
 
@@ -504,8 +533,12 @@ echo "== two-pass rate control"
     -o "$TMP/2p2.264" --pass 2 --stats "$TMP/2p.stats" --bitrate 250 \
     --dump-recon "$TMP/2p.recon" >"$TMP/2p2.log" 2>&1 \
     || { echo "   pass 2 failed"; FAIL=1; }
+# The reference for "two-pass beats one-pass" has to be coded the same way the
+# two-pass run is: --pass 1 measures one packet per picture in display order, so
+# a two-pass run cannot use B pictures at all (the CLI turns them off), and the
+# one-pass stream has to be P-only for the comparison to mean anything.
 ./$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
-    -o "$TMP/1p.264" --bitrate 250 >"$TMP/1p.log" 2>&1 \
+    -o "$TMP/1p.264" --bitrate 250 --bframes 0 >"$TMP/1p.log" 2>&1 \
     || { echo "   one-pass control failed"; FAIL=1; }
 python3 - "$TMP/2p2.log" "$TMP/1p.log" <<'PY2' || FAIL=1
 import re, sys

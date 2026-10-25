@@ -96,14 +96,20 @@ def ref_point(args, clip, q, w, h, n, cache):
 
 
 def has_bframes(args):
-    """True when --extra asks for B pictures."""
+    """True when the extra options leave B pictures on.
+
+    The encoder's default is B pictures, so the answer is yes unless --extra
+    turns them off explicitly (`--bframes 0`) or asks for something that cannot
+    be combined with them (`--pass`, which the encoder refuses outright)."""
     toks = args.extra.split()
     for i, t in enumerate(toks):
         if t == '--bframes' and i + 1 < len(toks):
             return int(toks[i + 1]) > 0
         if t.startswith('--bframes='):
             return int(t.split('=', 1)[1]) > 0
-    return False
+        if t.startswith('--pass'):
+            return False
+    return True
 
 
 def ours(args, clip, q, w, h, n):

@@ -7,27 +7,27 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
-> **Status: conformant High-profile encoder core (I and P pictures,
+> **Status: conformant High-profile encoder core (I, P and B pictures,
 > Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
-> 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions and
-> P_Skip), quality work in progress.**
+> 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, P_Skip,
+> temporal direct mode and bi-prediction), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 57 clip cases (ten of them B pictures, compared
+> `make test` asserts it over 65 clip cases (ten of them B pictures, compared
 > after undoing the coding-order permutation), two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
-> any mismatch.  What
-> is *not* finished is speed, and B pictures are conformant but not yet a
-> rate-distortion win, so they stay off by default.  On the test clips, at matched
-> PSNR, a baseline-profile x264 spends 47 % more bits than this encoder, while
-> libx264's default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
-> quantisation, AQ, SIMD) spends 16–22 % fewer on the moving clips and 11 % more
-> on the still one.  Almost all of that is B pictures: with x264's own B
-> pictures disabled the gap on three of the four clips collapses to 2–6 % *in our
-> favour* (and 6.5 % against us on the panning clip), so P-picture coding is
-> within a few points of x264's — the last few points of it are the search
+> any mismatch (six preset-4 cases with the motion-vector refinement are the one
+> documented exception: `--refine-mv` desynchronises a partitioned macroblock,
+> see *Next* in `docs/STATUS.md`).  What
+> is *not* finished is speed.  B pictures are conformant and on by default (three
+> between two anchors, quantised eight coarser): at matched PSNR against libx264's
+> default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
+> quantisation, AQ, SIMD) the encoder now spends 7.8–21.5 % **fewer** bits on four
+> of the five test clips and 0.7 % more on the fifth, where P-only coding was
+> 9.6–27.8 % *more* on four of them.  What is left of the gap is the shape of a B
+> macroblock (four 16x16 types, no partitions, no `B_8x8`) and the search
 > (partition shapes and sub-pel vectors chosen by SATD rather than by the
 > coder's price).  Level selection priced by the coder is implemented and
 > measured, and stays off by default: it is worth 1.5–2.8 % BD-rate on the
