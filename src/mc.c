@@ -14,6 +14,7 @@
  * GPU and compare against these CPU versions.
  */
 #include "h264.h"
+#include <stdlib.h>
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -694,9 +695,12 @@ void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w, int mb_x, int mb
 /* ------------------------------------------------------------------ */
 int aeg_ue_bits(uint32_t v)
 {
-    int n = 0, t = (int)v;
+    /* ue(v) is 2 * bitlen(v + 1) - 1 bits long */
+    uint32_t t = v + 1;
+    int n = 0;
+
     while (t) { n++; t >>= 1; }
-    return 2 * n + 1;
+    return 2 * n - 1;
 }
 
 int aeg_se_bits(int32_t v)

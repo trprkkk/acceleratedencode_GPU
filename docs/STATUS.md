@@ -1408,7 +1408,15 @@ PSNR):
 | + I offset 3, `--bqp 4` | +23.95 | +4.93 | +5.75 | +6.11 | +9.32 | +10.01 |
 | + spatial direct | +22.77 | +5.11 | +6.80 | +5.30 | +8.95 | +9.79 |
 | + level selection on intra blocks | +19.62 | +4.34 | +5.39 | +5.27 | +7.10 | +8.34 |
-| **+ adaptive group length (the defaults now)** | **+5.28** | **+4.87** | **+4.25** | **-2.00** | **+9.63** | **+4.41** |
+| + adaptive group length | +5.28 | +4.87 | +4.25 | -2.00 | +9.63 | +4.41 |
+| + sub-pel search of the 16x8/8x16 partitions (P and B) | +2.81 | +2.71 | +1.71 | -5.29 | +9.01 | +2.19 |
+| **+ level selection on chroma AC and Intra_16x16 AC (the defaults now)** | **+1.56** | **+0.10** | **-0.16** | **-8.22** | **+3.51** | **-0.64** |
+
+x264's medium preset has its psychovisual options on (`psy-rd 1.0`), which
+trade PSNR for detail, so the table flatters this encoder by about three
+points: against `libx264 -preset medium -x264-params psy=0` (and both with
+`--scenecut 0`) the last row is +4.25 / +2.05 / +3.37 / -2.21 / +6.97, mean
+**+2.89%**.
 
 What each step is:
 
@@ -1433,6 +1441,18 @@ What each step is:
   inherited by everything that predicts from it).  At the full lambda vtest
   lost 2.2 points; at half, -1.06 points on average and no clip loses.
   `AEG_TINTRA=0` turns it off, `=1` uses the full lambda.
+* **Sub-pel search of the partitions**: the 16x8 and 8x16 candidates (P and
+  B) used to search integer-pel and inherit the 16x16 search's fractional
+  offset, so they competed with integer vectors against a quarter-pel 16x16
+  one and lost (83 of ~1500 P macroblocks on `cock`; x264 splits about one in
+  four).  Each partition now gets its own quarter-pel search from preset 2 up:
+  -2.3% P-only, -1.55% with B pictures, a further -0.65% from the B ones, for
+  6% of the time each (`AEG_PSUB=0|1|2`).
+* **Level selection on chroma AC** (cat 4, against the already decided DC) and
+  **Intra_16x16 AC** (cat 1): chroma is -2.65% on average (tree -5.05%) at no
+  measurable cost; Intra_16x16 is neutral (-0.06%) and kept for completeness.
+  The chroma lambda is the luma one (0.6x and 1.5x are both worse).
+  `AEG_TCHROMA=0` / `AEG_TI16=0` turn them off.
 * **Adaptive group length** (`--b-adapt 1`, the default): `--bframes` becomes
   the most a group gets.  The lookahead (src/lookahead.c) estimates, on
   half-resolution source pictures, the cost of each structure -- per 8x8 block
@@ -1458,10 +1478,11 @@ one reference; BD-rate of turning the feature *off*):
 | 8x8 transform | +5.4 | +4.8 |
 | trellis | +5.4 | +1.1 (inter luma only at the time) |
 
-so what remains of the gap is mostly the B pictures themselves (on `cock` at
-QP 28 ours spend 40% more bits per B picture than x264's for +0.6 dB), the
-partition search, and the level selection, which still does not reach chroma
-or Intra_16x16.
+(measured before the partition and level-selection rows of the table above,
+which are the answers to the last two lines).  What remains: on `cock` at QP 28
+with the fixed 3-B structure, against x264 with the same structure, each picture
+type spends more bits for more PSNR -- I +4.5% for +0.6 dB, P +19% for +0.5 dB,
+B +32% for +0.8 dB -- i.e. the B pictures are the least efficient part.
 
 Tools for this: `tools/bdrate.py` (ours against x264) and `tools/abbd.py`
 (ours against ours, any two option sets, with per-side environment).

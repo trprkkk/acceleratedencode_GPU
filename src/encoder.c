@@ -770,6 +770,10 @@ static int luma_ac_nc(struct aeg_encoder *e, int mbx, int mby,
                        mby > e->top_row || by > 0);
 }
 
+static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                           int blk, const uint8_t *src, int stride,
+                           const uint8_t *pred, int qp, const int32_t *dcv);
+
 static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
@@ -807,6 +811,9 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         const uint8_t *pr = pred + by * 16 + bx;
         int32_t dcv = dchad[blk];
         int nz = 0;
+        if (e->p.trellis > 0 && e->p.cabac)
+            trellis_i16_ac(e, mbx, mby, c, blk, src + by * e->stride[0] + bx,
+                           e->stride[0], pr, qp, &dcv);
         for (i = 0; i < 16; i++)
             nz += c->level[blk][i] != 0;
         c->nz[blk] = (int8_t)nz;
@@ -946,6 +953,9 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
 static int cab_cbf_ctx(int cat, int a, int b, int va, int vb, int intra);
 static void cab_nz4_luma(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
                          int blk, int *a, int *b, int *va, int *vb);
+static void cab_nz4_chroma(struct aeg_encoder *e, int mbx, int mby,
+                           const mbenc *c, int pl, int k,
+                           int *a, int *b, int *va, int *vb);
 
 /* ------------------------------------------------------------------ */
 /* Rate-distortion level selection                                     */
@@ -989,6 +999,7 @@ struct trel {
     const uint8_t *scan;      /* scan position -> natural (raster) index */
     int cat;                  /* ctxBlockCat for the price */
     int cbf_ctx;              /* coded_block_flag context, -1 when there is none */
+    const int32_t *dc;        /* AC blocks: the dequantised DC, else NULL */
 };
 
 static int64_t trel_sse(const struct trel *t, const uint8_t *src, int stride,
@@ -1000,7 +1011,7 @@ static int64_t trel_sse(const struct trel *t, const uint8_t *src, int stride,
 
     if (t->side == 4) {
         uint8_t r[16];
-        aeg_idct_add_block(r, 4, lev, qp, pred, pred_stride, NULL);
+        aeg_idct_add_block(r, 4, lev, qp, pred, pred_stride, t->dc);
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++) {
                 int d = (int)r[y * 4 + x] - (int)src[y * stride + x];
@@ -1173,6 +1184,45 @@ static int trellis_intra_mode(void)
     trellis_intra_mode() == 3)
 #define trellis_intra_lambda(l) (trellis_intra_mode() == 3 ? (l) * 0.5 : (l))
 
+/* Whether the chroma AC blocks get the level selection.  AEG_TCHROMA. */
+static int trellis_chroma_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_TCHROMA");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
+/* The AC levels of one Intra_16x16 block (cat 1) against the DC that is
+ * already decided; raster order is also the order the flags' neighbours
+ * become final in.  AEG_TI16=0 turns it off. */
+static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                           int blk, const uint8_t *src, int stride,
+                           const uint8_t *pred, int qp, const int32_t *dcv)
+{
+    static int on = -1;
+    struct trel t;
+    int a, b, va, vb;
+
+    if (on < 0) {
+        const char *ev = getenv("AEG_TI16");
+        on = ev ? atoi(ev) != 0 : 1;
+    }
+    if (!on)
+        return;
+    cab_nz4_luma(e, mbx, mby, c, blk, &a, &b, &va, &vb);
+    t.side = 4;
+    t.n = 15;
+    t.scan = aeg_scan4x4 + 1;
+    t.cat = 1;
+    t.cbf_ctx = cab_cbf_ctx(1, a, b, va, vb, 1);
+    t.dc = dcv;
+    trel_descent(&e->cab_shadow, &t, c->level[blk], src, stride, pred, 16, qp,
+                 trellis_intra_lambda(AEG_LAMBDA(qp)), 2, 1);
+}
+
 /* One macroblock's luma 4x4 blocks of an inter macroblock, whose prediction is
  * in e->pred_l and whose levels are `lev[block][natural]`. */
 static void trellis_luma4(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
@@ -1203,6 +1253,7 @@ static void trellis_luma4(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         t.scan = aeg_scan4x4;
         t.cat = 2;
         t.cbf_ctx = cab_cbf_ctx(2, a, b, va, vb, 0);
+        t.dc = NULL;
         trel_descent(&e->cab_shadow, &t, lev[blk],
                      src + (blk >> 2) * 4 * s + (blk & 3) * 4, s,
                      e->pred_l + (blk >> 2) * 4 * 16 + (blk & 3) * 4, 16,
@@ -1226,6 +1277,7 @@ static void trellis_luma8(struct aeg_encoder *e, const uint8_t *src, int stride,
     t.scan = aeg_zigzag8x8;
     t.cat = 5;
     t.cbf_ctx = -1;
+    t.dc = NULL;
     trel_descent(&e->cab_shadow, &t, lev, src, stride, pred, pred_stride, qp,
                  lambda, 1, 0);
 }
@@ -1503,6 +1555,27 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
             int32_t dcv = dcout[blk];
             int nz = 0;
 
+            if (e->p.trellis > 0 && e->p.cabac && trellis_chroma_on()) {
+                /* the AC levels, against the DC that is already decided; the
+                 * earlier blocks of the plane are final, so the flag's
+                 * context is the one the coder will use */
+                struct trel t;
+                int a, b, va, vb;
+                double lam = AEG_LAMBDA(c->qp);   /* 0.6x and 1.5x: worse */
+
+                cab_nz4_chroma(e, mbx, mby, c, pl, blk, &a, &b, &va, &vb);
+                t.side = 4;
+                t.n = 15;
+                t.scan = aeg_scan4x4 + 1;
+                t.cat = 4;
+                t.cbf_ctx = cab_cbf_ctx(4, a, b, va, vb, !inter);
+                t.dc = &dcv;
+                trel_descent(&e->cab_shadow, &t,
+                             c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
+                             src + bxy[blk][1] * e->stride[1] + bxy[blk][0],
+                             e->stride[1], pr, 8, qpc,
+                             inter ? lam : trellis_intra_lambda(lam), 2, 1);
+            }
             for (i = 0; i < 16; i++)
                 nz += c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk][i] != 0;
             c->nz[AEG_BLK_CHROMA_CB + pl * 4 + blk] = (int8_t)nz;
@@ -2653,6 +2726,26 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     }
 }
 
+/* Whether the 16x8 / 8x16 partitions get their own sub-pel search instead of
+ * the integer search plus the 16x16 fractional offset: 0 = neither, 1 = the P
+ * ones, 2 = the P and the B ones.  With the inherited offset a partition was
+ * competing with an integer vector against a quarter-pel 16x16 one, and lost:
+ * 16x8/8x16 won 83 of 1500 P macroblocks on cock against x264's ~1 in 4.  On
+ * the five real clips (docs/STATUS.md) the P search is worth -2.3% of BD-rate
+ * P-only and -1.55% with B pictures, the B one a further -0.65%, for 6% of
+ * the time each.  From preset 2 up; AEG_PSUB overrides. */
+static int part_subpel(const struct aeg_encoder *e)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_PSUB");
+        v = ev ? atoi(ev) : -1;
+    }
+    if (v >= 0)
+        return v;
+    return e->p.preset >= 2 ? 2 : 0;
+}
+
 /* One partition of a partitioned B macroblock (16x8 or 8x16).
  *
  * Both lists are searched independently and then list 0, list 1 and the average
@@ -2694,11 +2787,12 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                      e->stride[0],
                      e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                          mbx * 16 + geo[0],
-                     e->stride[0], geo[2], geo[3], range, 0,
+                     e->stride[0], geo[2], geo[3], range,
+                     part_subpel(e) >= 2 ? e->p.subme : 0,
                      pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
                      &mv[l][0], &mv[l][1],
                      &sad);
-        if (e->p.subme > 0) {
+        if (e->p.subme > 0 && part_subpel(e) < 2) {
             int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
             int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
             int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
@@ -2963,7 +3057,7 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
                 int pmvx, pmvy, mvx, mvy, sad, satd, bits, cost;
                 predict_mv_at_ref(e, mbx, mby, (const int16_t (*)[2])cur, cur_ref, avail, type, p,
                                   geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, ref, &pmvx, &pmvy);
-                me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, ref, &mvx, &mvy, &sad, 0);
+                me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, ref, &mvx, &mvy, &sad, part_subpel(e));
                 satd = part_satd_ref(e, mbx, mby, geo, mvx, mvy, ref);
                 bits = aeg_mvd_bits(mvx - pmvx, mvy - pmvy) + 1; /* ref_idx bit */
                 cost = satd + 8 * bits;
@@ -2987,7 +3081,8 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
             int pmvx, pmvy, mvx, mvy, sad;
             predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, type, p,
                           geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, &pmvx, &pmvy);
-            me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad, 0);
+            me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad,
+                         part_subpel(e));
             cand_publish(&e->mb_cand[slot], geo, mvx, mvy);
             cand_publish_ref(&e->mb_cand[slot], geo, 0);
             e->mb_cand[slot].pmv[b0][0] = pmvx;
@@ -4062,6 +4157,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                 tr.scan = aeg_scan4x4;
                 tr.cat = 2;
                 tr.cbf_ctx = cab_cbf_ctx(2, a, b, va, vb, 1);
+                tr.dc = NULL;
                 trel_descent(&e->cab_shadow, &tr, t->level[rb], sb, s, pred, 4,
                              t->qp, trellis_intra_lambda(lambda), 2, 1);
             }
