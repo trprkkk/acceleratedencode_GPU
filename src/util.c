@@ -135,6 +135,7 @@ void aeg_params_default(aeg_params *p)
     p->b_adapt = -1;
     p->trellis = -1;
     p->refs = -1;
+    p->weightp = -1;
     p->deblock = 1;
     p->deblock_alpha = 0;
     p->deblock_beta = 0;

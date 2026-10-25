@@ -1522,6 +1522,47 @@ right one.  Added, each measured with ab.sh against the previous step:
 Tried and not adopted: evaluating the exact fractional predictor in the
 quarter-pel stage (x264 does, at subme >= 3): +0.04%, `AEG_MEPMV=1`.
 
+**Explicit weighted prediction of P pictures** (`--weightp`, on from preset
+2).  wp_analyse() guesses, per P picture, x264's two candidates -- the gain
+matching the standard deviations plus the offset matching the means, and the
+offset alone -- for luma and (one denominator for both planes) chroma, and
+measures each on a half-resolution picture: every 8x8 block's best SAD over
+a +-4 integer search against the weighted reference, floored by a crude intra
+estimate so that new content does not vote.  A candidate is kept when it saves
+5% of that sum (`AEG_WPTH`, percent) *and* a quarter of a sample per pixel
+(a near-black picture otherwise takes any offset).  The weighted pictures
+refer to PPS 1, a twin of PPS 0 with weighted_pred_flag set, so the pictures
+without weights do not carry a pred_weight_table.  With the luma weighted the
+motion search runs on a weighted copy of the reference (refp[0] points at
+it), while the prediction interpolates the real reference and weights the
+result, which is the order of 8.4.2.3 and what keeps it bit-exact.  B pictures
+stay unweighted (weighted_bipred_idc 0); list0[1] of a two-reference P
+picture is never weighted.  Conformance cases `weightp`, `weightp_cavlc`,
+`weightp_ref2` (2 slices, 2 threads) and `weightp_b` on genyuv mode 5 (a
+fading pan).
+
+| | fade (vtest x 0.5..1, 30 f) | cock | vtest | mega | short | tree | mean of 5 |
+|---|---|---|---|---|---|---|---|
+| vs x264 psy=0, `--weightp 0` | +137.9 | | | | | | |
+| vs x264 psy=0, `--weightp 1` | +1.6 | | | | | | |
+| vs x264, global PSNR, `--weightp 0` | | +5.64 | -0.25 | +0.24 | -2.69 | -0.07 | +0.57 |
+| vs x264, global PSNR, `--weightp 1` | | +5.65 | -0.23 | +0.29 | -3.67 | -0.04 | +0.40 |
+
+The per-picture-mean PSNR (what every other table here uses) reports mega at
++2.8% for this change, which is an artefact: mega opens with two black
+pictures, at QP 34 the second one now gets a +1 luma offset that cancels the
+I picture's DC error and is reconstructed *losslessly*, and a lossless picture
+counts as ~170 dB in the per-picture mean -- one rate point jumps, the curve
+stops being monotonic, and the BD integral goes wrong.  The sequence PSNR
+moves 39.095 -> 39.116 dB for +0.5% bits there.  `tools/bdrate.py` (BD_GLOBAL=1)
+and `tools/abbd.py` / `tools/real/ab.sh` (ABBD_GLOBAL=1) now offer the PSNR of
+the sequence MSE for this reason; with it, ours against ours: short -0.94%,
+the other four +0.01..+0.04% (the second PPS).
+
+Not done yet: the weight guess is only refined by the two candidates; on the
+synthetic fading pan (3 px/frame) the half-resolution integer search misses
+the half-pel alignment and rejects the luma weight on half the pictures.
+
 ## Next
 
 1. The B *search*, now that the macroblock layer is complete and its vectors are

@@ -36,6 +36,11 @@ def psnr(a, b, fs):
         A = np.frombuffer(a[:m * fs], dtype=np.uint8).reshape(m, fs).astype(np.int32)
         B = np.frombuffer(b[:m * fs], dtype=np.uint8).reshape(m, fs).astype(np.int32)
         mse = ((A - B) ** 2).mean(axis=1)
+        if os.environ.get('ABBD_GLOBAL'):
+            # PSNR of the whole sequence's MSE: a picture coded losslessly
+            # (a black frame) cannot dominate it the way it dominates the
+            # per-picture average, where it counts as ~100+ dB
+            return float(10 * np.log10(255.0 * 255.0 / max(mse.mean(), 1e-12)))
         return float(np.mean(10 * np.log10(255.0 * 255.0 / np.maximum(mse, 1e-12))))
     except ImportError:
         pass

@@ -215,18 +215,21 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     return aeg_bw_finish(&bw);
 }
 
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac)
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac,
+                     int weighted_pred)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, rbsp, cap, 0);
-    aeg_bw_ue(&bw, 0);          /* pic_parameter_set_id                    */
+    /* PPS 1 is the weighted-prediction twin of PPS 0 (see the slice
+     * header): only the pictures that use weights pay for the table. */
+    aeg_bw_ue(&bw, weighted_pred ? 1u : 0u); /* pic_parameter_set_id      */
     aeg_bw_ue(&bw, 0);          /* seq_parameter_set_id                    */
     aeg_bw_put(&bw, 1, cabac ? 1u : 0u); /* entropy_coding_mode_flag        */
     aeg_bw_put(&bw, 1, 0);      /* bottom_field_pic_order_in_frame_present */
     aeg_bw_ue(&bw, 0);          /* num_slice_groups_minus1                 */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l0_default_active_minus1    */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l1_default_active_minus1    */
-    aeg_bw_put(&bw, 1, 0);      /* weighted_pred_flag                      */
+    aeg_bw_put(&bw, 1, weighted_pred ? 1u : 0u); /* weighted_pred_flag */
     aeg_bw_put(&bw, 2, 0);      /* weighted_bipred_idc                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qp_minus26                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qs_minus26                     */
@@ -247,17 +250,42 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac)
 /* ------------------------------------------------------------------ */
 /* Slice header                                                        */
 /* ------------------------------------------------------------------ */
+/* pred_weight_table() (7.3.3.2) of a P slice: present whenever the PPS sets
+ * weighted_pred_flag, one entry per active list 0 reference, 4:2:0 chroma. */
+static void write_pred_weight_table(aeg_bitwriter *bw, const aeg_pwt *t,
+                                    int nref)
+{
+    int i, c;
+
+    aeg_bw_ue(bw, (uint32_t)t->luma_denom);
+    aeg_bw_ue(bw, (uint32_t)t->chroma_denom);
+    for (i = 0; i < nref; i++) {
+        aeg_bw_put(bw, 1, t->lflag[i] ? 1u : 0u);
+        if (t->lflag[i]) {
+            aeg_bw_se(bw, t->lw[i]);
+            aeg_bw_se(bw, t->lo[i]);
+        }
+        aeg_bw_put(bw, 1, t->cflag[i] ? 1u : 0u);
+        if (t->cflag[i])
+            for (c = 0; c < 2; c++) {
+                aeg_bw_se(bw, t->cw[i][c]);
+                aeg_bw_se(bw, t->co[i][c]);
+            }
+    }
+}
+
 /* Written into an in-progress writer so that slice data follows the
  * header without any alignment or trailing bits. */
 void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                             int frame_num_bits, int idr, int idr_pic_id,
                             int cabac_init_idc, int slice_qp_delta,
                             int deblock_alpha, int deblock_beta,
-                            int deblock_idc, int first_mb, int num_ref_idx_l0_active)
+                            int deblock_idc, int first_mb, int num_ref_idx_l0_active,
+                            const aeg_pwt *pwt)
 {
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type);
-    aeg_bw_ue(bw, 0);                 /* pic_parameter_set_id               */
+    aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
     aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
@@ -269,6 +297,8 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
             aeg_bw_put(bw, 1, 0);     /* num_ref_idx_active_override_flag   */
         }
         aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
+        if (pwt)
+            write_pred_weight_table(bw, pwt, num_ref_idx_l0_active);
     }
     if (idr) {
         aeg_bw_put(bw, 1, 0);         /* no_output_of_prior_pics_flag       */
@@ -300,13 +330,14 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
                                 int is_ref, int cabac_init_idc,
                                 int slice_qp_delta, int deblock_alpha,
                                 int deblock_beta, int deblock_idc, int first_mb,
-                                int num_ref_idx_l0_active, int direct_spatial)
+                                int num_ref_idx_l0_active, int direct_spatial,
+                                const aeg_pwt *pwt)
 {
     int nos = slice_type_in % 5;      /* 0 = P, 1 = B, 2 = I */
 
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type_in);
-    aeg_bw_ue(bw, 0);                 /* pic_parameter_set_id               */
+    aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
     aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
@@ -329,6 +360,8 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         if (nos == 1)
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
     }
+    if (nos == 0 && pwt)
+        write_pred_weight_table(bw, pwt, num_ref_idx_l0_active);
     if (is_ref) {
         if (idr) {
             aeg_bw_put(bw, 1, 0);     /* no_output_of_prior_pics_flag       */

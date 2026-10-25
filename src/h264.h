@@ -281,15 +281,22 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
                      int long_start_code);
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
+/* pred_weight_table() of a P slice (7.3.3.2): list 0 only, one entry per
+ * active reference.  A flag of 0 means the default (unweighted) prediction. */
+typedef struct aeg_pwt {
+    int luma_denom, chroma_denom;
+    int lflag[2], lw[2], lo[2];
+    int cflag[2], cw[2][2], co[2][2];
+} aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8,
-                     int cabac);
+                     int cabac, int weighted_pred);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header. */
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int cabac_init_idc, int slice_qp_delta,
                               int deblock_alpha, int deblock_beta,
                               int deblock_idc, int first_mb,
-                              int num_ref_idx_l0_active);
+                              int num_ref_idx_l0_active, const aeg_pwt *pwt);
 /* The same, plus the picture order count, for a stream with B pictures (see
  * bitstream.c). */
 void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
@@ -300,7 +307,7 @@ void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
                                   int deblock_alpha, int deblock_beta,
                                   int deblock_idc, int first_mb,
                                   int num_ref_idx_l0_active,
-                                  int direct_spatial);
+                                  int direct_spatial, const aeg_pwt *pwt);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma

@@ -174,6 +174,11 @@ typedef struct aeg_params {
      * reference is the anchor before the previous one; a whole-macroblock
      * 16x16 candidate on it competes in the rate-distortion decision. */
     int refs;
+    /* Explicit weighted prediction of P pictures (fades): 0 = off, 1 = a
+     * weight and offset per picture for luma and chroma, chosen by a small
+     * motion-compensated test of the reference against the picture.  -1 = as
+     * the preset says (on from preset 2 up). */
+    int weightp;
     /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */

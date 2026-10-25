@@ -293,6 +293,14 @@ run_bcase bframes3     320 192 12 3 4 -q 24 --scenecut 0
 #   a still clip: every B macroblock collapses into direct-skip, which is the
 #   skip flag and direct prediction with no residual at all
 run_bcase bframes_still 320 192  8 2 3 -q 24 --scenecut 0
+# Explicit weighted prediction on a fade (genyuv mode 5): the P pictures send
+# a luma and chroma weight/offset through PPS 1, the prediction is
+# interpolated first and weighted afterwards, as 8.4.2.3 has it.  P only,
+# CAVLC, two references, and with B pictures (which stay unweighted).
+run_case  weightp       320 192 10 5 -q 26 -p 3 --scenecut 0
+run_case  weightp_cavlc 320 192 10 5 -q 26 -p 3 --scenecut 0 --no-cabac
+run_case  weightp_ref2  320 192 10 5 -q 26 -p 3 --scenecut 0 --ref 2 --slices 2 -t 2
+run_bcase weightp_b     320 192 12 3 5 -q 26 -p 3 --scenecut 0
 #   the lowest and highest rate: at q 51 every macroblock is a skip, at q 12
 #   all of them carry residuals and the bi-predictive average is at its most
 #   visible

@@ -35,11 +35,20 @@ build = os.environ.get('BUILD', './build')
 
 
 def psnr(a, b, fs):
-    """Mean per-frame PSNR of two I420 files over whole frames."""
+    """Mean per-frame PSNR of two I420 files over whole frames.  BD_GLOBAL=1:
+    the PSNR of the whole sequence's MSE instead -- a picture coded
+    losslessly (a black one) counts as ~170 dB in the per-frame mean, makes
+    one rate point jump and the curve non-monotonic."""
     m = min(len(a), len(b)) // fs
     if m <= 0:
         return float('nan')
     total = 0.0
+    if os.environ.get('BD_GLOBAL'):
+        se = 0
+        for i in range(m * fs):
+            d = a[i] - b[i]
+            se += d * d
+        return 10 * math.log10(255 * 255 / max(se / (m * fs), 1e-12))
     for i in range(m):
         off = i * fs
         se = 0
@@ -56,7 +65,7 @@ def decode(ffmpeg, path, w, h, out):
     return open(out, 'rb').read()
 
 
-CACHE = '/tmp/aegenc_bdref.json'
+CACHE = '/tmp/aegenc_bdref%s.json' % ('_global' if os.environ.get('BD_GLOBAL') else '')
 
 
 def cache_load():

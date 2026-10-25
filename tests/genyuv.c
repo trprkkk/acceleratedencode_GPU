@@ -9,7 +9,9 @@
  * partitions worth coding; mode 3 keeps the picture still after the first
  * frame so that P_Skip macroblocks get exercised; mode 4 moves the four
  * quadrants in four directions, which is what makes P_8x8 (one motion vector
- * per 8x8 block) worth coding.
+ * per 8x8 block) worth coding; mode 5 is mode 0 fading out (every sample
+ * drawn towards black, chroma towards grey), which is what explicit weighted
+ * prediction is for.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,14 +49,18 @@ int main(int argc, char **argv)
                         ((cx / 24 + cy / 24) & 1) * 30;
                 if (v < 16) v = 16;
                 if (v > 235) v = 235;
+                if (mode == 5)
+                    v = 16 + (v - 16) * (100 - 4 * t) / 100;
                 fputc(v, f);
             }
         for (y = 0; y < h / 2; y++)
             for (x = 0; x < w / 2; x++)
-                fputc(128 + (int)(40 * sin((x + (mode == 3 ? 0 : t)) * 0.05)), f);
+                fputc(128 + (int)(40 * sin((x + (mode == 3 ? 0 : t)) * 0.05) *
+                                  (mode == 5 ? (100 - 4 * t) / 100.0 : 1.0)), f);
         for (y = 0; y < h / 2; y++)
             for (x = 0; x < w / 2; x++)
-                fputc(128 + (int)(40 * cos((y + (mode == 3 ? 0 : t)) * 0.07)), f);
+                fputc(128 + (int)(40 * cos((y + (mode == 3 ? 0 : t)) * 0.07) *
+                                  (mode == 5 ? (100 - 4 * t) / 100.0 : 1.0)), f);
     }
     fclose(f);
     printf("wrote %s (%dx%d, %d frames, mode %d)\n", path, w, h, n, mode);

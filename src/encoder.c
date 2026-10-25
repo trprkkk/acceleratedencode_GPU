@@ -248,6 +248,15 @@ struct aeg_encoder {
      * reference are both in list0 (H.264 7.4.3: num_ref_idx_active_override).
      * B keeps one per list. */
     int cur_l0_active;
+    /* Explicit weighted prediction of the current P picture (list 0 only;
+     * see wp_analyse).  When the luma of reference 0 is weighted, refp[0]
+     * points at a weighted copy -- the motion search then compares against
+     * what the prediction will roughly be -- and wp_orig[0] at the real
+     * reference, which the exact prediction interpolates first and weights
+     * afterwards, as the decoder does (8.4.2.3). */
+    aeg_pwt wp;
+    uint8_t *wp_mem, *wp_plane[3];
+    const uint8_t *wp_orig0;
     int cur_is_p;           /* the picture being coded is a P slice */
     int cur_is_b;           /* ... is a B slice                     */
     int cur_is_ref;         /* ... is a reference picture           */
@@ -1652,6 +1661,27 @@ static int chroma_sad(struct aeg_encoder *e, int mbx, int mby, int pl, int mode)
  * the destination all have to be selectable: the second list's predictor has to
  * be built somewhere other than on top of the first one, because the two are
  * averaged afterwards. */
+/* 8.4.2.3.2, one list: weight, round, offset, clip. */
+static void wp_apply(uint8_t *d, int stride, int w, int h, int wt, int off,
+                     int denom)
+{
+    int x, y;
+    int rnd = denom ? 1 << (denom - 1) : 0;
+
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int v = ((d[y * stride + x] * wt + rnd) >> denom) + off;
+            d[y * stride + x] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+}
+
+/* Whether the current picture sends a pred_weight_table (and so refers to
+ * the weighted twin of the picture parameter set). */
+static int wp_used(const struct aeg_encoder *e)
+{
+    return e->cur_is_p && (e->wp.lflag[0] || e->wp.cflag[0]);
+}
+
 static void mc_rect_luma_to(struct aeg_encoder *e, int list, uint8_t *dl,
                             int mbx, int mby, int x, int y, int w, int h,
                             int mvx, int mvy)
@@ -1660,6 +1690,15 @@ static void mc_rect_luma_to(struct aeg_encoder *e, int list, uint8_t *dl,
     const aeg_mc_ctx *mc = list ? &e->mc1 : &e->mc;
     const uint8_t *r = ref + (mby * 16 + y + (mvy >> 2)) * e->stride[0] +
                        mbx * 16 + x + (mvx >> 2);
+    if (e->cur_is_p && !list && e->wp.lflag[0]) {
+        /* the real reference, interpolated, then weighted */
+        r = e->wp_orig0 + (r - ref);
+        aeg_mc_luma(dl + y * 16 + x, 16, r, e->stride[0], w, h,
+                    mvx & 3, mvy & 3);
+        wp_apply(dl + y * 16 + x, 16, w, h, e->wp.lw[0], e->wp.lo[0],
+                 e->wp.luma_denom);
+        return;
+    }
     if (mc->ready)
         aeg_mc_luma_p(dl + y * 16 + x, 16, mc, r, w, h, mvx & 3, mvy & 3);
     else
@@ -1678,6 +1717,9 @@ static void mc_rect_chroma_to(struct aeg_encoder *e, int list, uint8_t *dc[2],
                             mbx * 8 + cx + (mvx >> 3);
         aeg_mc_chroma(dc[pl] + cy * 8 + cx, 8, rc, e->stride[1],
                       cw, ch, mvx & 7, mvy & 7);
+        if (e->cur_is_p && e->wp.cflag[list & 1])
+            wp_apply(dc[pl] + cy * 8 + cx, 8, cw, ch, e->wp.cw[list & 1][pl],
+                     e->wp.co[list & 1][pl], e->wp.chroma_denom);
     }
 }
 
@@ -6729,7 +6771,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->p.cabac ? e->cabac_init_idc : -1,
                                    e->cur_qp - 26, 0, 0,
                                    e->p.deblock ? 0 : 1, first_row * e->mb_w,
-                                   e->cur_l0_active, e->p.direct == 1);
+                                   e->cur_l0_active, e->p.direct == 1,
+                                   wp_used(e) ? &e->wp : NULL);
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
@@ -6737,7 +6780,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                e->p.cabac ? e->cabac_init_idc : -1,
                                e->cur_qp - 26, 0, 0,
                                e->p.deblock ? 0 : 1, first_row * e->mb_w,
-                               e->cur_l0_active);
+                               e->cur_l0_active,
+                               wp_used(e) && slice == AEG_SLICE_P ? &e->wp : NULL);
     }
 
     /* The decision pass left `last_qp`/`last_dqp` at the values its shadow
@@ -6991,6 +7035,323 @@ static void *slice_thread(void *arg)
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* Weighted prediction (fades)                                         */
+/* ------------------------------------------------------------------ */
+/* A fade changes every sample of the picture by roughly the same gain and
+ * offset, which no motion vector can follow: the residual of every block
+ * then carries the brightness change.  An explicit weight and offset per
+ * reference (pred_weight_table, 8.4.2.3) takes it out of the residual for a
+ * few bits per slice.
+ *
+ * The guess is x264's: the gain that matches the standard deviations, the
+ * offset that then matches the means, or the offset alone.  Whether either is
+ * worth sending is measured: a small integer search of every 8x8 block of a
+ * half-resolution picture against the reference weighted each way, and a
+ * weighting is kept only when it saves enough of the summed SAD (motion moves
+ * the means of a picture too; on such a picture the weighted reference does
+ * not predict better and is not used).  Chroma is decided the same way, on
+ * the block vectors the luma test found. */
+#define WP_R    4   /* search radius, half-resolution samples */
+#define WP_LPAD 8
+
+typedef struct { int w, o, d; } wp_cand;
+
+/* What an 8x8 block would cost coded without the reference: its deviation
+ * from its own mean.  A block whose content is new (an object entering, a
+ * flash over part of the picture) is coded intra whatever the weights are,
+ * so it must not vote for them. */
+static int wp_intra_est(const uint8_t *p, int stride)
+{
+    int x, y, s = 0, m, d = 0;
+
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            s += p[y * stride + x];
+    m = (s + 32) >> 6;
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            d += abs(p[y * stride + x] - m);
+    return d + 64;   /* ~ the mode and DC it still has to send */
+}
+
+static void plane_stats(const uint8_t *p, int stride, int w, int h,
+                        double *mean, double *var)
+{
+    int64_t s = 0, s2 = 0;
+    int x, y;
+
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int v = p[y * stride + x];
+            s += v;
+            s2 += v * v;
+        }
+    *mean = (double)s / ((double)w * h);
+    *var = (double)s2 / ((double)w * h) - *mean * *mean;
+}
+
+static wp_cand wp_guess(double mc, double vc, double mr, double vr, int scaled)
+{
+    wp_cand c;
+    double s = 1.0, o;
+
+    if (scaled && vr > 1.0 && vc > 0.0)
+        s = sqrt(vc / vr);
+    c.d = 6;
+    for (;;) {
+        c.w = (int)floor(s * (1 << c.d) + 0.5);
+        if (c.w <= 127 || c.d == 0)
+            break;
+        c.d--;
+    }
+    if (c.w > 127) c.w = 127;
+    if (c.w < 0) c.w = 0;
+    o = mc - (double)c.w * mr / (1 << c.d);
+    c.o = (int)floor(o + 0.5);
+    if (c.o > 127) c.o = 127;
+    if (c.o < -128) c.o = -128;
+    return c;
+}
+
+static int wp_identity(wp_cand c) { return c.w == (1 << c.d) && c.o == 0; }
+
+static uint8_t wp_px(int v, wp_cand c)
+{
+    int r = ((v * c.w + (c.d ? 1 << (c.d - 1) : 0)) >> c.d) + c.o;
+    return (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+}
+
+/* Summed best SAD of the 8x8 blocks of `cur` (lw x lh) against `ref`
+ * (padded by WP_LPAD, stride ls) weighted by `c`; the block vectors go to
+ * `mv` when non-NULL. */
+static int64_t wp_cost(const uint8_t *cur, int lw, int lh, const uint8_t *ref,
+                       int ls, uint8_t *tmp, wp_cand c, int8_t *mv)
+{
+    const uint8_t *r = ref;
+    int64_t tot = 0;
+    int bx, by, i, n = 0;
+
+    if (!wp_identity(c)) {
+        for (i = 0; i < ls * (lh + 2 * WP_LPAD); i++)
+            tmp[i] = wp_px(ref[i], c);
+        r = tmp;
+    }
+    for (by = 0; by + 8 <= lh; by += 8)
+        for (bx = 0; bx + 8 <= lw; bx += 8, n++) {
+            int best = 1 << 30, bdx = 0, bdy = 0, dx, dy;
+            for (dy = -WP_R; dy <= WP_R; dy++)
+                for (dx = -WP_R; dx <= WP_R; dx++) {
+                    int s = aeg_sad(8, 8, cur + by * lw + bx, lw,
+                                    r + (by + dy + WP_LPAD) * ls + bx + dx +
+                                        WP_LPAD, ls);
+                    if (s < best) { best = s; bdx = dx; bdy = dy; }
+                }
+            if (mv) { mv[n * 2] = (int8_t)bdx; mv[n * 2 + 1] = (int8_t)bdy; }
+            {
+                int ie = wp_intra_est(cur + by * lw + bx, lw);
+                tot += best < ie ? best : ie;
+            }
+        }
+    return tot;
+}
+
+/* Chroma plane cost of `c` with the block vectors of the luma test. */
+static int64_t wp_cost_chroma(const struct aeg_encoder *e, int pl, int lw,
+                              int lh, const int8_t *mv, wp_cand c)
+{
+    const uint8_t *src = e->srcp[1 + pl], *ref = e->refp[1 + pl];
+    int cs = e->stride[1], bx, by, n = 0, x, y;
+    int64_t tot = 0;
+    uint8_t blk[64];
+
+    for (by = 0; by + 8 <= lh; by += 8)
+        for (bx = 0; bx + 8 <= lw; bx += 8, n++) {
+            const uint8_t *r = ref + (by + mv[n * 2 + 1]) * cs + bx + mv[n * 2];
+            for (y = 0; y < 8; y++)
+                for (x = 0; x < 8; x++)
+                    blk[y * 8 + x] = wp_px(r[y * cs + x], c);
+            {
+                int s = aeg_sad(8, 8, blk, 8, src + by * cs + bx, cs);
+                int ie = wp_intra_est(src + by * cs + bx, cs);
+                tot += s < ie ? s : ie;
+            }
+        }
+    return tot;
+}
+
+static int wp_threshold(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_WPTH");
+        v = ev ? atoi(ev) : 95;
+    }
+    return v;
+}
+
+static void wp_analyse(struct aeg_encoder *e)
+{
+    int lw = e->w / 2, lh = e->h / 2, ls = lw + 2 * WP_LPAD;
+    int x, y, i, pl, nblk = (lw / 8) * (lh / 8);
+    double mc, vc, mr, vr;
+    uint8_t *cur = NULL, *ref = NULL, *tmp = NULL;
+    int8_t *mv = NULL, *mvb = NULL;
+    wp_cand cand[2], none = { 64, 0, 6 };
+    int64_t c0, cb[2];
+    int th = wp_threshold(), best = -1;
+
+    memset(&e->wp, 0, sizeof(e->wp));
+    if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8)
+        return;
+
+    plane_stats(e->srcp[0], e->stride[0], e->w, e->h, &mc, &vc);
+    plane_stats(e->refp[0], e->stride[0], e->w, e->h, &mr, &vr);
+    cand[0] = wp_guess(mc, vc, mr, vr, 1);
+    cand[1] = wp_guess(mc, vc, mr, vr, 0);
+    if (wp_identity(cand[0]) && wp_identity(cand[1]))
+        goto chroma_only;
+
+    cur = (uint8_t *)malloc((size_t)lw * lh);
+    ref = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
+    tmp = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
+    mv = (int8_t *)malloc((size_t)nblk * 2 + 2);
+    mvb = (int8_t *)malloc((size_t)nblk * 2 + 2);
+    if (!cur || !ref || !tmp || !mv || !mvb)
+        goto done;
+    for (y = 0; y < lh; y++)
+        for (x = 0; x < lw; x++) {
+            const uint8_t *s = e->srcp[0] + 2 * y * e->stride[0] + 2 * x;
+            cur[y * lw + x] = (uint8_t)((s[0] + s[1] + s[e->stride[0]] +
+                                         s[e->stride[0] + 1] + 2) >> 2);
+        }
+    for (y = -WP_LPAD; y < lh + WP_LPAD; y++)
+        for (x = -WP_LPAD; x < lw + WP_LPAD; x++) {
+            const uint8_t *s = e->refp[0] + 2 * y * e->stride[0] + 2 * x;
+            ref[(y + WP_LPAD) * ls + x + WP_LPAD] =
+                (uint8_t)((s[0] + s[1] + s[e->stride[0]] +
+                           s[e->stride[0] + 1] + 2) >> 2);
+        }
+    c0 = wp_cost(cur, lw, lh, ref, ls, tmp, none, mv);
+    for (i = 0; i < 2; i++) {
+        cb[i] = wp_identity(cand[i]) ? c0
+                                     : wp_cost(cur, lw, lh, ref, ls, tmp,
+                                               cand[i], NULL);
+        /* a relative and an absolute saving: on a nearly flat picture
+         * (black) any offset is a large fraction of almost nothing */
+        if (cb[i] * 100 < c0 * th && c0 - cb[i] >= (int64_t)lw * lh / 4 &&
+            (best < 0 || cb[i] < cb[best]))
+            best = i;
+    }
+    if (getenv("AEG_WPDBG"))
+        fprintf(stderr, "WPC c0 %lld s(%d,%d/%d) %lld o(%d,%d/%d) %lld\n",
+                (long long)c0, cand[0].w, cand[0].o, cand[0].d, (long long)cb[0],
+                cand[1].w, cand[1].o, cand[1].d, (long long)cb[1]);
+    if (best >= 0) {
+        wp_cost(cur, lw, lh, ref, ls, tmp, cand[best], mv);
+        e->wp.lflag[0] = 1;
+        e->wp.luma_denom = cand[best].d;
+        e->wp.lw[0] = cand[best].w;
+        e->wp.lo[0] = cand[best].o;
+    }
+
+chroma_only:
+    if (!mv) {
+        /* the luma did not move: vectors of the unweighted test */
+        if (!cur) {
+            cur = (uint8_t *)malloc((size_t)lw * lh);
+            ref = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
+            tmp = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
+            mv = (int8_t *)malloc((size_t)nblk * 2 + 2);
+        }
+        if (!cur || !ref || !tmp || !mv)
+            goto done;
+        /* identical guesses mean identical statistics: skip the search and
+         * test chroma at zero motion */
+        memset(mv, 0, (size_t)nblk * 2 + 2);
+    }
+    {
+        wp_cand cc[2][2];
+        int64_t cn = 0, cs[2] = { 0, 0 };
+        int cbest = -1, k;
+
+        for (pl = 0; pl < 2; pl++) {
+            double m1, v1, m2, v2;
+            plane_stats(e->srcp[1 + pl], e->stride[1], lw, lh, &m1, &v1);
+            plane_stats(e->refp[1 + pl], e->stride[1], lw, lh, &m2, &v2);
+            cc[0][pl] = wp_guess(m1, v1, m2, v2, 1);
+            cc[1][pl] = wp_guess(m1, v1, m2, v2, 0);
+        }
+        /* one denominator for both chroma planes */
+        for (k = 0; k < 2; k++)
+            if (cc[k][0].d != cc[k][1].d) {
+                int d = cc[k][0].d < cc[k][1].d ? cc[k][0].d : cc[k][1].d;
+                for (pl = 0; pl < 2; pl++)
+                    while (cc[k][pl].d > d) {
+                        cc[k][pl].w = (cc[k][pl].w + 1) >> 1;
+                        cc[k][pl].d--;
+                    }
+            }
+        if ((wp_identity(cc[0][0]) && wp_identity(cc[0][1])) &&
+            (wp_identity(cc[1][0]) && wp_identity(cc[1][1])))
+            goto done;
+        for (pl = 0; pl < 2; pl++) {
+            cn += wp_cost_chroma(e, pl, lw, lh, mv, none);
+            for (k = 0; k < 2; k++)
+                cs[k] += wp_cost_chroma(e, pl, lw, lh, mv, cc[k][pl]);
+        }
+        for (k = 0; k < 2; k++)
+            if (cs[k] * 100 < cn * th && cn - cs[k] >= (int64_t)lw * lh / 2 &&
+                (cbest < 0 || cs[k] < cs[cbest]))
+                cbest = k;
+        if (cbest >= 0) {
+            e->wp.cflag[0] = 1;
+            e->wp.chroma_denom = cc[cbest][0].d;
+            for (pl = 0; pl < 2; pl++) {
+                e->wp.cw[0][pl] = cc[cbest][pl].w;
+                e->wp.co[0][pl] = cc[cbest][pl].o;
+            }
+        }
+    }
+
+done:
+    free(cur); free(ref); free(tmp); free(mv); free(mvb);
+    if (e->wp.lflag[0]) {
+        /* the weighted copy the motion search works on */
+        size_t ls0 = (size_t)e->stride[0], lh0 = (size_t)(e->h + 2 * AEG_PAD);
+        wp_cand c = { e->wp.lw[0], e->wp.lo[0], e->wp.luma_denom };
+        const uint8_t *s;
+        uint8_t *d;
+        size_t k;
+
+        if (!e->wp_mem && enc_alloc_picture(e, &e->wp_mem, e->wp_plane) != AEG_OK) {
+            e->wp_mem = NULL;
+            memset(&e->wp, 0, sizeof(e->wp));
+            return;
+        }
+        s = e->refp[0] - AEG_PAD * ls0 - AEG_PAD;
+        d = e->wp_plane[0] - AEG_PAD * ls0 - AEG_PAD;
+        for (k = 0; k < ls0 * lh0; k++)
+            d[k] = wp_px(s[k], c);
+        e->wp_orig0 = e->refp[0];
+        e->refp[0] = e->wp_plane[0];
+    }
+    if (getenv("AEG_WPDBG"))
+        fprintf(stderr, "WP poc %d luma %d (%d,%d/%d) chroma %d (%d,%d %d,%d /%d)\n",
+                e->cur_poc, e->wp.lflag[0], e->wp.lw[0], e->wp.lo[0],
+                e->wp.luma_denom, e->wp.cflag[0], e->wp.cw[0][0],
+                e->wp.co[0][0], e->wp.cw[0][1], e->wp.co[0][1],
+                e->wp.chroma_denom);
+}
+
+/* Undo wp_analyse's substitution once the picture is coded. */
+static void wp_finish(struct aeg_encoder *e)
+{
+    if (e->wp.lflag[0])
+        e->refp[0] = (uint8_t *)e->wp_orig0;
+    memset(&e->wp, 0, sizeof(e->wp));
+}
+
 /* Code one picture.  `slice` is AEG_SLICE_I/P/B, `poc` its picture order count
  * -- the display index, which is what direct mode scales its vectors by.  The
  * caller has already bound e->srcp to the picture's source samples (see
@@ -7097,6 +7458,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
 
     resolve_coef_stages(e);
     aq_compute(e);
+    wp_analyse(e);
     if ((is_p || e->cur_is_b) && e->p.subme > 0) {
         /* Build the fractional-pel planes of the reference picture once for the
          * whole picture (AEG_STAGE_INTER_PRED).  Every subpel candidate of every
@@ -7151,11 +7513,19 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
         size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                                   e->frame_num_bits, e->level_idc);
         size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8,
-                                  e->p.cabac);
+                                  e->p.cabac, 0);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 7,
                                  sps, sl, 1);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 8,
                                  pps, pl, 0);
+        if (e->p.weightp) {
+            /* PPS 1: the same with weighted_pred_flag, for the P pictures
+             * that send weights (the others keep referring to PPS 0) */
+            pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8,
+                               e->p.cabac, 1);
+            out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
+                                     3, 8, pps, pl, 0);
+        }
     }
     {
         size_t lens[AEG_MAX_SLICES];
@@ -7346,6 +7716,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     /* The reconstruction becomes a reference picture and the buffer it occupied
      * is handed to the next picture (or, for a B picture, kept: a B is not a
      * reference, so its buffer is simply reused). */
+    wp_finish(e);
     picture_rotate(e, !e->cur_is_b, is_idr);
     e->pic.plane[0] = e->recp[0];
     e->pic.plane[1] = e->recp[1];
@@ -7711,6 +8082,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->direct = 1;
     if (pp->b_adapt < 0 || pp->b_adapt > 1)
         pp->b_adapt = 1;
+    if (pp->weightp < 0)
+        pp->weightp = pp->preset >= 2;
     if (pp->refs < 1)
         pp->refs = 1;
     if (pp->refs > 2)
@@ -8120,6 +8493,7 @@ void aeg_encoder_close(aeg_encoder *enc)
         aeg_free(e->la_scratch);
         for (i = 0; i < 3; i++)
             aeg_free(e->pic_mem[i]);
+        aeg_free(e->wp_mem);
     }
     aeg_free(e->src_mem);
     {
