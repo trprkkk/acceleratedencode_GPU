@@ -1453,6 +1453,17 @@ What each step is:
   measurable cost; Intra_16x16 is neutral (-0.06%) and kept for completeness.
   The chroma lambda is the luma one (0.6x and 1.5x are both worse).
   `AEG_TCHROMA=0` / `AEG_TI16=0` turn them off.
+* **The skipped macroblock priced as itself** (after the table: -1.80% on
+  average, tree -6.13%, no clip loses, no measurable time).  The candidates
+  are compared on luma alone, each with whatever residual its quantiser
+  leaves, so a skip was only reached when every block of both planes
+  quantised to nothing.  On a picture that repeats the previous one (tree has
+  runs of identical frames) the re-coded quantisation error always won the
+  luma comparison -- our PSNR kept creeping up over a run of identical frames
+  while x264's stayed flat -- and cost more than it bought once header and
+  chroma were added.  code_mb() now prices the winner, chroma included,
+  against P_Skip / B_Skip (prediction only) and keeps the cheaper.
+  `AEG_SKIPCHK=0` turns it off.
 * **Adaptive group length** (`--b-adapt 1`, the default): `--bframes` becomes
   the most a group gets.  The lookahead (src/lookahead.c) estimates, on
   half-resolution source pictures, the cost of each structure -- per 8x8 block

@@ -4603,6 +4603,18 @@ static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
     e->mb_cand[slot] = ok ? win : save;
 }
 
+/* Whether code_mb() prices the skipped macroblock against the winner.
+ * AEG_SKIPCHK=0 turns it off. */
+static int skip_check_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_SKIPCHK");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -4906,6 +4918,80 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         snap_chroma(e, mbx, mby, snap_c);
     }
     restore_chroma(e, mbx, mby, snap_c);
+    /* The skipped macroblock, priced as what it is.  The candidates above
+     * are compared on luma alone, each with whatever residual its
+     * quantiser and level selection leave, so the cheapest macroblock there
+     * is -- the skip flag, no header, no residual in either plane -- is only
+     * reached when every block of both planes happens to quantise to
+     * nothing.  A residual that buys back a little of the quantisation error
+     * (a picture that repeats the previous one, re-coded at the same QP)
+     * always wins the luma comparison and still costs more than it is
+     * worth once the header and the chroma are added; x264 avoids it with
+     * its early skip test.  Here the whole macroblock is priced both ways. */
+    if (e->p.cabac && (e->cur_is_p || e->cur_is_b) && best.cbp != 0 &&
+        skip_check_on()) {
+        mbenc s;
+        int ok = 0;
+
+        if (e->cur_is_p) {
+            int sx, sy, b;
+
+            reset_mb_enc(&s, c->qp);
+            s.type = AEG_MB_P16x16;
+            s.nparts = 1;
+            pskip_mv(e, mbx, mby, &sx, &sy);
+            for (b = 0; b < 16; b++) {
+                s.mv[b][0] = (int16_t)sx;
+                s.mv[b][1] = (int16_t)sy;
+                s.pmv[b][0] = (int16_t)sx;
+                s.pmv[b][1] = (int16_t)sy;
+            }
+            ok = 1;
+        } else {
+            int k;
+
+            for (k = 0; k < e->mb_ncand; k++)
+                if (e->mb_cand[k].type == AEG_MB_B_DIRECT) {
+                    cand_enc(e, k, c->qp, &s);
+                    ok = 1;
+                    break;
+                }
+        }
+        if (ok) {
+            int64_t full = rd_price(e, mbx, mby, &best, 0, lambda);
+            int64_t sk;
+            uint8_t cbuf[128];
+            int pl, x, y;
+
+            inter_predict_typed(e, mbx, mby, &s);
+            s.chroma_mode = 0;
+            s.cbp = 0;
+            s.sse = 0;
+            for (y = 0; y < 16; y++)
+                for (x = 0; x < 16; x++) {
+                    int d = (int)e->pred_l[y * 16 + x] -
+                            (int)e->srcp[0][(mby * 16 + y) * e->stride[0] +
+                                            mbx * 16 + x];
+                    s.sse += d * d;
+                }
+            for (pl = 0; pl < 2; pl++)
+                for (y = 0; y < 8; y++)
+                    for (x = 0; x < 8; x++) {
+                        int d = (int)e->pred_c[pl][y * 8 + x] -
+                                (int)e->srcp[1 + pl][(mby * 8 + y) *
+                                                     e->stride[1] +
+                                                     mbx * 8 + x];
+                        s.sse += d * d;
+                        cbuf[pl * 64 + y * 8 + x] = e->pred_c[pl][y * 8 + x];
+                    }
+            sk = rd_price(e, mbx, mby, &s, 0, lambda);
+            if (sk < full) {
+                best = s;
+                restore_luma(e, mbx, mby, e->pred_l);
+                restore_chroma(e, mbx, mby, cbuf);
+            }
+        }
+    }
     *c = best;
     /* Hand the macroblock to the shadow coder: its context states, its
      * mb_qp_delta history and its per-block motion vectors are what the next
