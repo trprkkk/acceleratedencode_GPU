@@ -2580,6 +2580,69 @@ static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
     return part_satd_ref(e, mbx, mby, geo, mvx, mvy, 0);
 }
 
+/* Extra integer start points for the 16x16 search: the vectors of the left,
+ * top and top-right neighbours on list 0 / reference 0 (the median predictor
+ * is already a start point, but on a motion boundary the median is none of
+ * them).  AEG_MENB=0 turns them off. */
+static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
+                              int list, int nb[3][2])
+{
+    static int on = -1;
+    const aeg_mb *m;
+    int n = 0;
+
+    if (on < 0) {
+        const char *ev = getenv("AEG_MENB");
+        on = ev ? atoi(ev) != 0 : 1;
+    }
+    if (!on)
+        return 0;
+#define NB_ADD(M, B) do {                                                   \
+        if (!is_intra_type((M)->type) && !(M)->ref_idx[B]) {               \
+            const int16_t *v_ = list ? (M)->mv1[B] : (M)->mv[B];            \
+            nb[n][0] = v_[0]; nb[n][1] = v_[1]; n++;                        \
+        }                                                                   \
+    } while (0)
+    if (mbx > 0) {
+        m = &e->mbs[mby * e->mb_w + mbx - 1];
+        NB_ADD(m, 3);
+    }
+    if (mby > e->top_row) {
+        m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+        NB_ADD(m, 12);
+        if (mbx + 1 < e->mb_w) {
+            m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
+            NB_ADD(m, 12);
+        }
+    }
+#undef NB_ADD
+    return n;
+}
+
+static int env_flag(const char *name, int dflt)
+{
+    const char *ev = getenv(name);
+    return ev ? atoi(ev) != 0 : dflt;
+}
+static int me_bnb_on(void)
+{
+    static int v = -1;
+    if (v < 0) v = env_flag("AEG_MEBNB", 1);
+    return v;
+}
+static int env_flag_cached_bscale(void)
+{
+    static int v = -1;
+    if (v < 0) v = env_flag("AEG_MEBSCALE", 1);
+    return v;
+}
+static int me_part_on(void)
+{
+    static int v = -1;
+    if (v < 0) v = env_flag("AEG_MEPART", 1);
+    return v;
+}
+
 /* Motion search for one partition: its own search window, centred on its own
  * MV predictor.  `refine` selects the quarter-pel stage: the P_8x8 shape trials
  * run integer only (they compare shapes, not vectors) and the winning shape is
@@ -2591,14 +2654,17 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
     const uint8_t *rp = (ref ? e->ref2p[0] : e->refp[0]) + (mby * 16 + geo[1]) * e->stride[0] +
                         mbx * 16 + geo[0];
     const aeg_mc_ctx *mc = ref ? &e->mc1 : &e->mc;
+    /* the whole-macroblock vector is where a partition usually ends up near */
+    int whole[1][2] = { { e->mb_mv[0], e->mb_mv[1] } };
+    int nwhole = (!ref && e->mb_inter_ok && me_part_on()) ? 1 : 0;
     aeg_me_block_l(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, NULL, 0,
-                 e->me_lambda, mc,
+                 refine ? e->p.subme : 0, pmvx, pmvy, NULL,
+                 (const int (*)[2])whole, nwhole, e->me_lambda, mc,
                  mvx, mvy, sad);
     if (!refine && e->p.subme > 0) {
         int fx = e->mb_frac[0], fy = e->mb_frac[1];
@@ -3503,8 +3569,20 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         const uint8_t *ref = (list ? e->ref2p[0] : e->refp[0]) +
                              mby * 16 * e->stride[0] + mbx * 16;
         const aeg_mc_ctx *mc = list ? &e->mc1 : &e->mc;
-        int seed[2];
+        int seed[2], nb[4][2], nnb = 0;
 
+        if (me_bnb_on())
+            nnb = me_neighbour_cands(e, mbx, mby, list, nb);
+        /* list 1: the list 0 vector carried on through the current picture
+         * at constant velocity (the sign flips: list 1 looks forward) */
+        if (list && env_flag_cached_bscale()) {
+            int d0 = e->cur_poc - e->ref_poc[0], d1 = e->cur_poc - e->ref_poc[1];
+            if (d0) {
+                nb[nnb][0] = mv[0][0] * d1 / d0;
+                nb[nnb][1] = mv[0][1] * d1 / d0;
+                nnb++;
+            }
+        }
         /* The list 0 search starts from the previous picture's vector for this
          * macroblock (always zero here: the whole-frame seed pass only runs for
          * P pictures); the list 1 search starts from the list 0 vector, which
@@ -3512,8 +3590,8 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         seed[0] = list ? mv[0][0] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2];
         seed[1] = list ? mv[0][1] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
         aeg_me_block_l(ref, e->stride[0], src, e->stride[0], 16, 16, range,
-                     e->p.subme, pmv[list][0], pmv[list][1], seed, NULL, 0,
-                     e->me_lambda, mc,
+                     e->p.subme, pmv[list][0], pmv[list][1], seed,
+                     (const int (*)[2])nb, nnb, e->me_lambda, mc,
                      &mv[list][0], &mv[list][1], &sad[list]);
         if (!list) {
             /* the smaller partitions would inherit this alignment */
@@ -3660,16 +3738,18 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             mvy = e->par_mv[idx * 2 + 1];
             sad = e->par_cost[idx];
         } else {
-            int seed[2];
+            int seed[2], nb[3][2], nnb;
             seed[0] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 0];
             seed[1] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
+            nnb = me_neighbour_cands(e, mbx, mby, 0, nb);
             aeg_me_block_l(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0],
                          e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0], 16, 16,
                          e->p.search_range ? e->p.search_range : 16,
                          e->p.subme, e->mb_pmv[0], e->mb_pmv[1], seed,
-                         NULL, 0, e->me_lambda, &e->mc, &mvx, &mvy, &sad);
+                         (const int (*)[2])nb, nnb, e->me_lambda, &e->mc,
+                         &mvx, &mvy, &sad);
         }
         e->mb_mv[0] = mvx;
         e->mb_mv[1] = mvy;

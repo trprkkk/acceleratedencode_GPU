@@ -1497,6 +1497,30 @@ B +32% for +0.8 dB -- i.e. the B pictures are the least efficient part.
 
 Tools for this: `tools/bdrate.py` (ours against x264) and `tools/abbd.py`
 (ours against ours, any two option sets, with per-side environment).
+`tools/real/` reproduces the five clips (`fetch.sh`: ffmpeg from pip, sources
+via the GitHub API, 30-frame I420 in /tmp/real) and wraps the comparisons:
+`bdx.sh` (against x264 medium, psy off), `ab.sh` (ours against ours, options
+or `VAR=value` environment on either side) and `exact.sh` (bit-exactness
+against FFmpeg over the clips).  The clip preparation differs slightly from
+the table above, so its numbers start from a new baseline: at 818a739, preset
+3, against x264 `psy=0`: cock +6.21, vtest -0.11, mega -2.32, short -3.07,
+tree -1.48, mean -0.15%.
+
+**More motion-search start points** (mean -0.15% -> -0.62%, cock +6.21 ->
++4.52, no measurable time).  The search started from the predictor, zero, its
+rounding and the whole-frame seed only; on a motion boundary the median
+predictor is none of the neighbours' vectors and the hexagon never reached the
+right one.  Added, each measured with ab.sh against the previous step:
+
+| start point | mean | cock | switch |
+|---|---|---|---|
+| P 16x16: left / top / top-right vectors (ref 0) | -0.13 | -0.60 | `AEG_MENB` |
+| B 16x16: the same, per list | -0.19 | -0.87 | `AEG_MEBNB` |
+| partitions: the 16x16 vector | -0.07 | -0.15 | `AEG_MEPART` |
+| B list 1: list 0 vector scaled by -d1/d0 | -0.04 | -0.07 | `AEG_MEBSCALE` |
+
+Tried and not adopted: evaluating the exact fractional predictor in the
+quarter-pel stage (x264 does, at subme >= 3): +0.04%, `AEG_MEPMV=1`.
 
 ## Next
 

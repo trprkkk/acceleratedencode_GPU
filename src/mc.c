@@ -476,6 +476,16 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
     return best;
 }
 
+static int me_try_pmv(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_MEPMV");
+        v = ev ? atoi(ev) != 0 : 0;
+    }
+    return v;
+}
+
 /* subpel refinement: quarter-pel, SATD (+ lambda * mvd bits) driven */
 static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                          int cstride, int bw, int bh, int range,
@@ -498,6 +508,28 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
     bd = aeg_satd(bw, bh, cur, cstride,
                   ref + (cy >> 2) * rstride + (cx >> 2), rstride);
     best = bd + me_mv_cost(rt, cx, cy);
+    /* The predictor itself, at its own fractional position: it costs no mvd
+     * bits at all, and the integer search can only reach its rounded
+     * neighbourhood (x264 tries it the same way). */
+    if (me_try_pmv() && (rt->px != cx || rt->py != cy) &&
+        ((rt->px | rt->py) & 3) &&
+        abs(rt->px - cx) <= 8 && abs(rt->py - cy) <= 8) {
+        int nx = rt->px, ny = rt->py, ix = nx >> 2, iy = ny >> 2;
+        if (ix >= -range && ix <= range && iy >= -range && iy <= range) {
+            int d, cost;
+            if (mc && mc->ready)
+                aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
+                              nx & 3, ny & 3);
+            else
+                aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
+                            bh, nx & 3, ny & 3);
+            d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+            cost = d + me_mv_cost(rt, nx, ny);
+            if (cost < best) {
+                best = cost; bd = d; bx = cx = nx; by = cy = ny;
+            }
+        }
+    }
 
     /* Two passes: half-pel then quarter-pel steps.  Each pass walks until it
      * stops improving, but at most `iters` steps: past the second step the
