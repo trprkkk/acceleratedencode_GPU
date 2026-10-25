@@ -1376,12 +1376,13 @@ blocks are the expensive half: 64 coefficients, two directions apiece, one
 inverse transform per candidate), which is more than the last 1-2 points are
 worth at a given preset; `--trellis 1` buys them for anyone who wants to pay.
 
-The earlier measurement of this pass had two of its rows reversed -- it
-reported the skip-heavy still clip as a 3-3.7 point *loss*.  Part of that was
-the sign error the section on the reference encoder now describes, and part of
-it was the pass covering only the 4x4 blocks; with the 8x8 blocks in, the still
-clip gains rather than loses.  The drift argument below is still real, it was
-just smaller than the measurement noise it was being read through.
+The earlier measurement of this pass was read in the wrong direction: it
+reported the skip-heavy still clip as a 3-3.7 point *loss*, where the same six
+QPs say it gains 2.8 and 1.1 (that table also carried the preset-4 column of the
+still clip as the same number twice, which should have been the warning).  The
+drift argument below is still real -- the block-local price cannot see what its
+levels cost the next picture -- it is just smaller than the measurement noise it
+was being read through.
 
 Why the full search does not pay here, when it is worth several percent in x264:
 this encoder's deadzone and lambda already sit near the RD optimum for these
