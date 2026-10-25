@@ -1154,7 +1154,7 @@ This is also where the coder-priced decision pass pays off twice: the same
 candidate priced by the CAVLC estimate is still worth coding (the estimate
 charges *more* for the residual than the coder does, so it prefers the skip
 less than it should), and it is the combination that shows in the BD-rate
-table above (mode 3: 21.7% more bits before either change, 11.3% fewer with
+table above (mode 3: 27.7% more bits before either change, 10.2% fewer with
 both).
 
 ## Rate-distortion refinement of the motion vector
