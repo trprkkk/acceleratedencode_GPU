@@ -1303,8 +1303,8 @@ full B macroblock layer.
    are pure quality-for-time trades and belong behind the same preset gate.
 3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
-   distortion, worth 1.5-2.8 points on the clips with the most residual and
-   0.1-2.0 on the others, off by default because it costs 19-40% of the time.
+   distortion, worth 0.15-2.2 points (1.0-1.2 on average) for 12-14% of the
+   time, and on from preset 3 up.
    What is left of the quality gap on P pictures is the search, not the
    coefficients:
    * the *partition shapes* (which of 16x16/16x8/8x16/P_8x8 to price, and the

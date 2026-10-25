@@ -31,10 +31,9 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > rather than the syntax (partition shapes, per-partition lists and sub-pel
 > vectors are chosen by SATD rather than by the coder's price; `B_8x8` measured
 > neutral for exactly that reason and is enabled from preset 3).  Level selection priced by the coder is implemented and
-> measured, and stays off by default: it is worth 1.5–2.8 % BD-rate on the
-> clips with the most residual and 0.1–2 % on the others, for 19–40 % more
-> time.  Speed is the
-> real gap: 69 fps (preset 2) or 40 fps (preset 4) against x264's ~400 fps on
+> measured, and from preset 3 up it is on: 0.15–2.2 points of BD-rate
+> (1.0–1.2 on average) for 12–14 % of the time.  Speed is the
+> real gap: 97 fps (preset 2) or 49 fps (preset 4) against x264's ~400 fps on
 > two cores at 320x192 QP 24, and 68 % of the CPU time is now the
 > transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
 > the motion search (80 %/19 % at preset 4), which is exactly what the GPU
