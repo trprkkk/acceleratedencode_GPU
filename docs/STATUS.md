@@ -592,7 +592,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 66 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 67 clip cases
 ```
 
 `make test` runs seven things:
@@ -639,7 +639,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 66 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — sixty-six cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — sixty-seven cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -648,10 +648,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 66 clip cases
    P_Skip runs at two QPs, and level selection on both transforms, through the
    slice threads and through the batched coefficient path, the vector
    refinement of both a 16x16 and a 16x8 winner -- all of them with the 8x8
-   transform and CABAC enabled, which are the defaults; eleven of them with B
+   transform and CABAC enabled, which are the defaults; twelve of them with B
    pictures, one, two and three between two anchors, at QP 12 and 51, on a
    still clip, with a short GOP, without deblocking, without the 8x8 transform,
-   under the rate controller, and the last one with B_8x8 at preset 3)
+   under the rate controller, one with B_8x8 at preset 3 and one with a
+   `B_L0_Bi_8x16` macroblock, whose mb_type is 13 -- the same number the CABAC
+   tree uses for its intra branch)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -708,18 +710,29 @@ with `--refine-mv 0` before its failure means anything about the B layer.  With
 the refinement off, preset 3 decodes bit-exactly for `--bframes` 1/2/3, QP
 12/24/37 and every `--partitions` value, which is how B_8x8 was verified.
 
-One more pre-existing failure is *not* in the gate because it takes a
-combination the suite does not use: `--bframes 3 -q 24 -p 2 --partitions 5` (or
-`13`) on the panning clip desynchronises 66 666 samples, and `ed0801f`
-reproduces it exactly -- it is not a B_8x8 regression either.  `--no-deblock`
-*or* `--no-8x8dct` makes it bit-exact, so the syntax and the reconstruction are
-right and only the *deblocking model* disagrees with the decoder about a B 8x16
-macroblock inside a three-B group: either the per-block list mask the decision
-pass publishes or the per-block vector the filter reads is not what the decoder
-has cached.  It wants the same treatment as the two B_8x8 publish bugs above --
-compare `aeg_mb_block_lists()` and `mv[]`/`mv1[]` block by block against a
-decoder's cache -- and the new `bframes_8x8` case stays at `--partitions 1` so
-that it is a test of the B_8x8 layer and not of this.
+One more failure was found and fixed while isolating the refinement bug, and it
+was a *syntax* bug of the nastiest kind: **mb_type 13 is B_L0_Bi_8x16, and the
+four-bit value 13 in the CABAC mb_type tree means intra**.  The writer's
+mb_type table is indexed by Table 7-14, where every partitioned shape is a
+pair (`12`/`13` = B_L0_Bi_16x8/B_L0_Bi_8x16), and it had a special case that
+sent the index 13 to the intra branch -- correct-looking, because the intra
+branch *is* reached by the value 13, but the value is a code, not an index.  So
+a B_L0_Bi_8x16 macroblock went out as an intra one.  Only the 8x16 shape can
+hit it (its 16x8 twin is 12), which is why `--partitions 5` and `13`
+desynchronised while `--partitions 7` did not, and why the thing looked like a
+deblocking problem: the decoder did not reject the slice, it decoded garbage
+from that macroblock on, and `--no-deblock`/`--no-8x8dct` merely changed the
+decisions enough to avoid selecting the type.  The decoder's own log says what
+happened ("left block unavailable for requested intra4x4 mode", then "error
+while decoding MB 0 5"), and the way to read that message is: the *syntax* is
+wrong, not the filter.  The sentinel is now `CAB_B_TYPE_INTRA = 23`, an index
+the writer can never produce, and the gate has a case of its own
+(`bframes_8x16`, three B pictures at QP 24 with 8x16 enabled).
+
+With that fixed, the matrix that used to fail is exact: 630/630 bit-exact
+decode cases -- three clips x `--bframes` 1/2/3 x QP 12/20/24/28/37 x
+`--partitions` 1/3/5/7/9/13/15 x preset 2/3 with `--refine-mv 0` -- and no
+decoder errors anywhere.
 
 With a GPU present, `tools/gpu_validate.sh clip.yuv W H FRAMES QP` runs the same
 comparison over every device code path at once (CPU stream against dispatcher
@@ -909,6 +922,24 @@ has to be caught before an external decoder is the only witness.
 
 ## B pictures
 
+42. **mb_type 13 is B_L0_Bi_8x16 and the CABAC intra branch is the four-bit
+    code 13.**  The writer's mb_type table is indexed by Table 7-14, where a
+    partitioned B shape is a pair of indices (`12`/`13` = B_L0_Bi_16x8 /
+    B_L0_Bi_8x16); the tree's intra branch, on the other hand, is reached by
+    the four-bit *value* 13, which is not an index at all.  A special case on
+    the index 13 sent the macroblock down the intra branch, so a
+    B_L0_Bi_8x16 went out as an intra macroblock: the decoder parsed an intra
+    mode list where the residual of a bi-predictive 8x16 partition should have
+    been and gave up ninety macroblocks later ("left block unavailable for
+    requested intra4x4 mode", "error while decoding MB 0 5").  Two things made
+    this hard to see: only the 8x16 member of every pair can collide (its 16x8
+    twin is 12), so it needed `--partitions 5`/`13` to appear at all; and
+    turning the deblocking filter or the 8x8 transform off made the case pass,
+    because that changed the mode decisions enough to stop selecting the type
+    -- a "the filter is wrong" signature over a syntax bug.  Intra now has the
+    sentinel `CAB_B_TYPE_INTRA = 23`, and the gate runs a case that selects the
+    type (`bframes_8x16`).
+
 `--bframes N` (0..3) codes N B pictures between two anchors; the default is
 **three**, with `--bqp 8` (see *Making them pay* below) -- this is the one place
 where a default changed because a measurement said so.
@@ -1080,11 +1111,12 @@ predictor's `NB_OK` / `NB_NOTUSED` / `NB_UNAVAIL`.  The lesson generalises: any
 per-block table shared with the decoder needs the decoder's *three* cache states,
 not a boolean, and "coded but not from this list" is the one that gets lost.
 
-Verification: 135/135 decode cases bit-exact at preset 3 with `--refine-mv 0`
-(three clips x `--bframes` 1/2/3 x QP 12/24/37 x `--partitions` 1/3/5/9/15),
-which is the matrix that isolates B_8x8 from the pre-existing refinement bug of
-*Next* item 2 -- preset 3 turns that refinement on, so a preset-3 case at
-`--partitions 3/5/15` fails for B_8x8-unrelated reasons at `ed0801f` too.
+Verification: 630/630 decode cases bit-exact (three clips x `--bframes` 1/2/3 x
+QP 12/20/24/28/37 x `--partitions` 1/3/5/7/9/13/15 x preset 2/3), all with
+`--refine-mv 0` so that the matrix isolates the B layer from the pre-existing
+refinement bug of *Next* item 2 -- preset 3 turns that refinement on, so a
+preset-3 case at `--partitions 3/5/15` fails for B_8x8-unrelated reasons at
+`ed0801f` too.  That matrix is also what found bug 42.
 
 ### Making them pay
 
@@ -1237,11 +1269,9 @@ full B macroblock layer.
    against, with the `AEG_MBDBG` listing and an instrumented decoder as in bug
    27.  Until then the refinement stays where it was: on presets 3 and 4, which
    is where it already was, and the six failures are pre-existing, not a
-   regression.  A separate, smaller correctness debt sits next to it: the
-   *deblocking model* is wrong for one B 8x16 combination
-   (`--bframes 3 --partitions 5`, end of *Verification*), which is a publish/
-   read mismatch rather than a search problem and should be fixed with the same
-   per-block comparison the B_8x8 bugs used.
+   regression.  (The failure that looked like a third bug in that area --
+   `--bframes 3 --partitions 5` decoding into garbage -- was bug 42, the
+   B_L0_Bi_8x16 / intra code collision, and is fixed.)
 3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and

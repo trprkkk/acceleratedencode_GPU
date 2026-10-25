@@ -296,6 +296,12 @@ run_bcase bframes_abr   320 192 12 2 1 -q 24 --scenecut 0 --bitrate 300
 #   keeps the P pictures at 16x16 -- the point of the case is the B macroblock
 #   layer, including the sub_mb_type tree and the per-group mvd suppression
 run_bcase bframes_8x8   320 192 12 2 4 -q 24 --scenecut 0 -p 3 --partitions 1
+#   B_L0_Bi_8x16 is Table 7-14's mb_type 13, and the CABAC tree's *intra* branch
+#   is the four-bit code 13 -- the same number for two different things.  Only
+#   the 8x16 shape reaches it (its 16x8 twin is 12), so this case runs three B
+#   pictures between two anchors with 8x16 enabled and QP 24, which is the
+#   combination that selects it.
+run_bcase bframes_8x16  320 192 12 3 4 -q 24 --scenecut 0 -p 2 --partitions 5
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

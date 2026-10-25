@@ -17,7 +17,7 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 66 clip cases (eleven of them B pictures, compared
+> `make test` asserts it over 67 clip cases (twelve of them B pictures, compared
 > after undoing the coding-order permutation), two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch (six preset-4 cases with the motion-vector refinement are the one

@@ -4337,6 +4337,10 @@ enum {
     CAB_P_16X8      = 17,   /* P: 16x8 vs 8x16                         */
     CAB_P_I16       = 17,   /* P: Intra_16x16 fields, offset by 14     */
     CAB_SUB_TYPE    = 21,   /* P: sub_mb_type                          */
+    /* Not an mb_type: the sentinel that makes the B mb_type tree take its
+     * intra branch (four-bit code 13).  It has to be distinct from every
+     * Table 7-14 index the writer can produce, 13 (B_L0_Bi_8x16) included. */
+    CAB_B_TYPE_INTRA = 23,
     CAB_BSUB_DIRECT = 36,   /* B: sub_mb_type, "direct"                */
     CAB_BSUB_L0L1   = 37,   /* B: sub_mb_type, L0/L1 8x8 vs the rest   */
     CAB_BSUB_SHAPE  = 38,   /* B: sub_mb_type, 8x4/4x8/4x4 family      */
@@ -4844,16 +4848,21 @@ static void code_b_mb_type(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
     aeg_cabac_decision(cb, 27 + 3, 1);
     /* The four-bit code the decoder reads next, and whether a fifth bin follows
      * it.  Codes 3..10 use their own four bits (0..7); 11 and B_8x8 (22) are
-     * 14 and 15; intra is *not* a code of its own but the value 13, which the
-     * decoder recognises before it would look for a fifth bin; and 12..21 share
-     * a code in pairs with the fifth bin picking the odd one. */
-    if (code >= 12 && code <= 21) {
-        if (code == 13) {
-            fourbit = 13;                     /* intra */
-        } else {
-            fourbit = 8 + (code - 12) / 2;
-            fifth = 1;
-        }
+     * 14 and 15; 12..21 share a code in pairs with the fifth bin picking the
+     * odd one; and intra is *not* one of those values at all but the four-bit
+     * code 13, which the decoder takes before it would look for a fifth bin.
+     *
+     * That 13 is a code *value*, not an mb_type index, and mb_type 13 is
+     * B_L0_Bi_8x16 -- so it must not be routed to the intra branch.  Telling
+     * the two apart is what an "intra" sentinel above 22 is for; using 13 for
+     * both is what once made a B_L0_Bi_8x16 macroblock decode as an intra one,
+     * and the decoder said so in as many words ("left block unavailable for
+     * requested intra4x4 mode") a hundred macroblocks later. */
+    if (code == CAB_B_TYPE_INTRA) {
+        fourbit = 13;                         /* intra */
+    } else if (code >= 12 && code <= 21) {
+        fourbit = 8 + (code - 12) / 2;
+        fifth = 1;
     } else if (code == 11) {
         fourbit = 14;
     } else if (code == 22) {
@@ -4911,8 +4920,9 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
         if (intra) {
             int cond = 0;
             /* Intra in a B slice is reached through the mb_type tree; the
-             * "13" code is followed by the non-I slice intra binarization. */
-            code_b_mb_type(e, cb, mbx, mby, 13);
+             * four-bit code 13 is followed by the non-I slice intra
+             * binarization (contexts 32..35). */
+            code_b_mb_type(e, cb, mbx, mby, CAB_B_TYPE_INTRA);
             cabac_type_intra(cb, cab_i16_ctx_b, cond, c);
         } else {
             int code = b_mb_type_code(c);
