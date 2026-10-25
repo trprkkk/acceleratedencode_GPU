@@ -21,7 +21,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs forty-seven encoded clip cases
+fails (non-zero exit) on any mismatch; it runs forty-eight encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -636,7 +636,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — forty-seven cases (QP 12/23/26/40, presets 0 and 4,
+7. `tests/run_tests.sh` — forty-eight cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -847,7 +847,11 @@ has to be caught before an external decoder is the only witness.
 
 1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
    the last non-zero coefficient).  The rate term is now the coder's own price,
-   so the level decision has the model it needs.  Measured against x264 (which has trellis=1
+   so the level decision has the model it needs.  The same machinery would let
+   the *partition* shapes (16x8/8x16/P_8x8 and the sub_mb_type inside P_8x8) be
+   decided by the coder's price instead of by SAD: today the whole macroblock is
+   priced exactly, but which shape to price at all is still a SAD decision, and
+   on the partitioned clip that is where the remaining 20% sits.  Measured against x264 (which has trellis=1
    by default) on the panning clip at QP 24: trellis off 60 047 B / 45.95 dB,
    trellis 1 61 495 B / 46.26 dB, trellis 2 61 106 B / 46.24 dB -- i.e. it buys
    quality with bits at a fixed QP and is a wash in PSNR-per-bit here, which is
@@ -1127,6 +1131,44 @@ less than it should), and it is the combination that shows in the BD-rate
 table above (mode 3: 21.7% more bits before either change, 11.3% fewer with
 both).
 
+## Rate-distortion refinement of the motion vector
+
+The motion search picks a vector by the SATD of the *prediction*, which cannot
+see what the residual will cost or what the mvd will cost: a vector half a
+pel away can have a marginally worse prediction and a much cheaper bitstream
+(x264's `subme` scale is exactly this idea).  The slow presets therefore re-code
+the winning P16x16 macroblock with each neighbour of its vector in quarter-pel
+steps and keep whichever the coder's own price prefers -- `SSD + lambda * bits`
+with `bits` from the shadow coder, so the mvd, the residual and the
+macroblock's own syntax are all in the comparison.  Preset 3 tries the four
+axial neighbours, preset 4 all eight; `--refine-mv 0|1|2` overrides it, and
+preset 2 and below do not refine at all.
+
+Measured as BD-rate against libx264 medium over QP 22..37 (bits at matched
+PSNR):
+
+| clip | preset 2 (off) | preset 3 (4 neighbours) | preset 4 (8 neighbours) |
+|---|---|---|---|
+| mode 4, 320x240, 8 frames | 12.6% more | 9.3% more | 9.8% more |
+| mode 2, 320x192, 30 frames | 21.0% more | 20.3% more | 20.4% more |
+| mode 3 (still), 320x192, 30 frames | 11.3% fewer | 13.7% fewer | 18.3% fewer |
+
+and the cost is one full candidate evaluation per neighbour: 320x192 preset 2
+runs at 77 fps, preset 3 at 56 and preset 4 at 45 on this machine.  The two
+MIDDLE rows are where the idea is weakest (0.6 points for 27% of the time on
+the partitioned clip) and the still clip is where it is strongest: on content
+that barely moves, the search's vector is a quarter pel off, and the price --
+which knows that a vector that is exactly the neighbour median costs no mvd at
+all -- is what finds that out.
+
+The refinement runs before the chroma decision (the chroma prediction follows
+the luma vector) and restores the luma plane afterwards, because every trial
+wrote its own reconstruction there; the winner's reconstruction is re-snapshotted
+each time it wins, so what the caller codes is the reconstruction the price was
+computed from.  Only the whole-macroblock 16x16 case is refined: refining each
+partition of a 16x8 / 8x16 / P_8x8 winner would need the price of a *sub*
+region, and this encoder prices a macroblock, not a partition.
+
 ## P_8x8 sub-macroblock partitions
 
 P_8x8 (mb_type 3) splits the macroblock into four 8x8 partitions, each with its
@@ -1340,11 +1382,16 @@ factor cannot fix it.  The rate term is now the coder's own price -- see
 *Pricing the decision pass with the coder* under *CABAC* -- and the three clips
 below are the measurement of it:
 
-| clip | before | coder-priced | + the skip candidate |
-|---|---|---|---|
-| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | **12.6% more** |
-| mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | **21.0% more** |
-| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | **11.3% fewer** |
+| clip | before | coder-priced | + the skip candidate | preset 3 | preset 4 |
+|---|---|---|---|---|---|
+| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | 12.6% more | 9.3% more | 9.8% more |
+| mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | 21.0% more | 20.3% more | 20.4% more |
+| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | 11.3% fewer | 13.7% fewer | **18.3% fewer** |
+
+The last two columns are the slow presets, which since this round also refine
+the winning motion vector by rate-distortion (*Rate-distortion refinement of the
+motion vector*): 2.2-2.8 points on two of the three clips and 7 points on the
+still one, for 27% / 40% more time than preset 2.
 
 The clip that gains most is the one whose decisions are dominated by skip and
 by near-zero residuals, which is exactly where the CAVLC estimate is furthest
@@ -1472,12 +1519,19 @@ partitions are worth coding):
 
 | encoder | fps | bytes | PSNR |
 |---|---|---|---|
-| ours, preset 0, before / after the coder-priced decision pass | 584 / 537 | 118 680 / 118 680 | 43.74 / 43.74 (YUV) |
-| ours, preset 2 | 86 / 75 | 49 335 / 47 687 | 46.33 / 46.54 (YUV) |
-| ours, preset 4 | 82 / 68 | 49 537 / 47 665 | 46.29 / 46.55 (YUV) |
+| ours, preset 0, before / after the coder-priced decision pass | 584 / 527 | 118 680 / 118 680 | 43.74 / 43.74 (YUV) |
+| ours, preset 2 | 86 / 76 | 49 335 / 47 928 | 46.33 / 46.59 (YUV) |
+| ours, preset 3 (four-neighbour vector refinement) | 82 / 58 | 49 537 / 47 512 | 46.29 / 46.62 (YUV) |
+| ours, preset 4 (eight-neighbour vector refinement) | 82 / 46 | 49 537 / 47 390 | 46.29 / 46.64 (YUV) |
 | x264 baseline (no asm), earlier round | 175 | 78 664 | 45.16 (Y) |
 | libx264 baseline, this machine, asm | 385 | 78 692 | 46.30 (YUV) |
 | libx264 medium, this machine, asm | 395 | 34 612 | 46.39 (YUV) |
+
+The preset rows now differ by more than "a wider search": the coder-priced
+decision pass costs 12% (preset 0 is unaffected -- it takes the SAD path and
+codes each macroblock once) and the vector refinement another 27% / 40% on top
+of that at presets 3 and 4, which is why the slow presets are 1.6x and 2x
+slower than preset 2 for 2-7 points of BD-rate.
 
 The three x264 rows are on the same clip and QP but from different builds and
 PSNR conventions (the first row predates this table's rewrite and averages Y

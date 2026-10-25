@@ -77,6 +77,12 @@ run_case highqp       320 192  6 0 -q 40
 run_case nodeblock    320 192  6 0 -q 23 --no-deblock
 run_case preset0      320 192  6 0 -q 23 -p 0
 run_case preset4      320 192  6 0 -q 23 -p 4
+# The slow presets refine the winning inter vector by rate-distortion, and the
+# refinement reads the neighbours' mvd and writes its own, so it has to be run
+# through the slice threads as well: the threaded path codes a slice on a copy
+# of the encoder, and a refinement that kept its state outside that copy would
+# produce a different stream there.
+run_case refine_thr    320 192  6 1 -q 26 -p 4 --slices 2 -t 2
 # Preset 3/4 choose the Intra_4x4 mode by exact rate-distortion (quantise,
 # reconstruct, count the real bits), which is a different code path from the
 # SATD approximation the faster presets use.

@@ -2722,6 +2722,48 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     restore_luma(e, mbx, mby, snap_l);
     inter = is_inter_type(best.type);
 
+    /* Rate-distortion refinement of the winning 16x16 vector.  The search
+     * chooses the vector by the SATD of the prediction alone, which cannot see
+     * what the residual or the mvd will cost; this re-codes the macroblock
+     * with each of the eight quarter-pel neighbours of the winner and keeps
+     * whichever the coder's own price prefers.  It runs before the chroma
+     * decision because the chroma prediction follows the luma vector, and it
+     * restores the luma plane afterwards because every trial wrote its own
+     * reconstruction there.  Eight full candidate evaluations per macroblock,
+     * so it belongs to the slow presets (AEG_MVREF=1 forces it on for
+     * measurement). */
+    if (e->p.cabac && e->p.refine_mv > 0 && best.type == AEG_MB_P16x16 && inter) {
+        static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+        static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+        static const int cross[4] = { 1, 3, 4, 6 };
+        const int cheap = e->p.refine_mv < 2;
+        const int nn = cheap ? 4 : 8;
+        mbcand save = e->mb_cand[0];
+        int b, j;
+        for (j = 0; j < nn; j++) {
+            int k = cheap ? cross[j] : j;
+            int64_t cost;
+            e->mb_cand[0] = save;
+            e->mb_cand[0].type = AEG_MB_P16x16;
+            e->mb_cand[0].nparts = 1;
+            for (b = 0; b < 16; b++) {
+                e->mb_cand[0].mv[b][0] = best.mv[0][0] + dx[k];
+                e->mb_cand[0].mv[b][1] = best.mv[0][1] + dy[k];
+                e->mb_cand[0].pmv[b][0] = best.pmv[0][0];
+                e->mb_cand[0].pmv[b][1] = best.pmv[0][1];
+            }
+            cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_P16x16, 0, lambda, 0);
+            cost = rd_price(e, mbx, mby, &t, cost, lambda);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = t;
+                snap_luma(e, mbx, mby, snap_l);
+            }
+        }
+        e->mb_cand[0] = save;
+        restore_luma(e, mbx, mby, snap_l);
+    }
+
     /* chroma: every legal intra mode, or the motion-compensated prediction */
     if (!inter) {
         int64_t best_chroma = INT64_MAX;
@@ -4441,6 +4483,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->search_range = rng[pp->preset];
     }
     if (pp->subme < 0) pp->subme = pp->preset <= 0 ? 0 : 1;
+    /* Refining the winning vector by rate-distortion costs one full macroblock
+     * candidate per neighbour, so it scales with the preset like the search
+     * range does: the two slow presets are where the quality is wanted. */
+    if (pp->refine_mv < 0)
+        pp->refine_mv = pp->preset >= 4 ? 2 : (pp->preset >= 3 ? 1 : 0);
     if (pp->gop_size < 0) pp->gop_size = 250;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns

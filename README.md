@@ -105,7 +105,11 @@ constant QP to one-pass average-bitrate rate control (it lands within 0.2 % of
 the target over 90 frames), `--aq <tenths>` turns on variance-based adaptive
 quantisation (off by default: it is worth its PSNR cost only perceptually, see
 `docs/STATUS.md`), `-p 0..4` is the speed/quality
-preset (it scales the search range and the subpel refinement), `--partitions`
+preset (it scales the search range, the subpel refinement and, from 3 up, the
+rate-distortion refinement of the winning motion vector), `--refine-mv 0|1|2`
+controls that last one on its own (0 off, 1 the four axial quarter-pel
+neighbours, 2 all eight; 2-7 points of BD-rate against x264 medium for 27-40 %
+more time, see `docs/STATUS.md`), `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
 default), `--dump-recon` writes what the encoder itself

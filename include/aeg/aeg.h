@@ -132,6 +132,12 @@ typedef struct aeg_params {
     int deblock_beta;         /* slice_beta_offset_div2, -6..6          */
     int search_range;         /* integer pel search range, 0 = preset   */
     int subme;                /* 0..9: subpel refinement quality        */
+    /* Rate-distortion refinement of the winning inter vector: 0 = off (the
+     * vector is the one the SATD search returned), 1 = the four quarter-pel
+     * neighbours, 2 = all eight.  Each step is one more full macroblock
+     * candidate priced by the coder, so it is a slow-preset tool.  -1 means
+     * "as the preset says" (3 -> 1, 4 -> 2, below that off). */
+    int refine_mv;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8  */
     int chroma_me;            /* include chroma in motion SAD           */
     int verbose;              /* log verbosity                          */
