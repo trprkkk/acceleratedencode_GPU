@@ -178,6 +178,9 @@ typedef struct aeg_stats {
      * were written and how many of them as a skip. */
     int64_t macroblocks;
     int64_t skipped;
+    /* How many macroblocks were coded with each type, indexed by the internal
+     * AEG_MB_* enumeration (0 = skip ... 8 = Intra_8x8). */
+    int64_t mb_types[9];
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

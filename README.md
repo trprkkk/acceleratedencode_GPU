@@ -176,7 +176,8 @@ preset.
   miss entirely (see *The skip candidate* in `docs/STATUS.md`).
 * `--bench` prints per-stage CPU/GPU timings and how the dispatcher voted.
 * `-v 1` (the default) also prints how many macroblocks of the stream are
-  skips, which is the quickest way to see whether the mode decision is finding
+  skips and the full type breakdown (P16x16 / 16x8 / 8x16 / P_8x8 / the intra
+  types), which is the quickest way to see whether the mode decision is finding
   the cheapest macroblock the standard has.
 
 ## Layout

@@ -443,12 +443,23 @@ int main(int argc, char **argv)
                    n, secs, secs > 0 ? n / secs : 0.0, st.bytes);
             /* the stream's rate is a property of the file and the frame rate,
              * not of how fast this machine happened to encode it */
-            if (st.macroblocks > 0)
+            if (st.macroblocks > 0) {
+                static const char *const names[9] = {
+                    "skip", "P16x16", "P16x8", "P8x16", "P_8x8",
+                    "I4x4", "I16x16", "I_PCM", "I8x8"
+                };
+                int k;
                 printf("macroblock types: %" PRId64 " skip of %" PRId64
                        " (%.0f%%), %" PRId64 " coded\n",
                        st.skipped, st.macroblocks,
                        100.0 * (double)st.skipped / (double)st.macroblocks,
                        st.macroblocks - st.skipped);
+                printf("  breakdown:");
+                for (k = 0; k < 9; k++)
+                    if (st.mb_types[k])
+                        printf(" %s %" PRId64, names[k], st.mb_types[k]);
+                printf("\n");
+            }
             printf("bitrate %.1f kb/s at %d fps, PSNR %.2f dB (Y+U+V average)\n",
                    st.frames > 0
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0

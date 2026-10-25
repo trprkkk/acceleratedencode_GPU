@@ -118,6 +118,7 @@ struct aeg_encoder {
      * on still content (it is also what the pskip_still case asserts). */
     int64_t stat_mbs;
     int64_t stat_skipped;
+    int64_t stat_type[AEG_MB_TYPE_COUNT];
     int frame_num;           /* frame_num of the current picture (8.2.1) */
     int idr_pic_id;
     int last_qp;
@@ -3991,6 +3992,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 m->skip = (uint8_t)skipped;
                 e->stat_mbs++;
                 e->stat_skipped += skipped;
+                e->stat_type[skipped ? AEG_MB_SKIP : (int)tmp->type]++;
                 /* A skipped macroblock carries no mb_qp_delta, so the decoder
                  * forgets the previous delta's value: the next macroblock tests
                  * its first bin against context 60, not 61 (9.3.2.7). */
@@ -4006,9 +4008,10 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 if (e->dbg_cabac) {
                     int k;
                     fprintf(stderr, "ENCMB %d,%d type %d cbp %d t8 %d qp %d "
-                            "i16 %d ch %d skip %d i4", mbx, mby, tmp->type,
-                            tmp->cbp, tmp->t8, tmp->qp, tmp->i16_mode,
-                            tmp->chroma_mode, skipped);
+                            "i16 %d ch %d skip %d mv %d,%d i4", mbx, mby,
+                            tmp->type, tmp->cbp, tmp->t8, tmp->qp,
+                            tmp->i16_mode, tmp->chroma_mode, skipped,
+                            tmp->mv[0][0], tmp->mv[0][1]);
                     for (k = 0; k < 16; k++)
                         fprintf(stderr, " %d", tmp->intra4[k]);
                     fprintf(stderr, " i8");
@@ -4073,6 +4076,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 }
                 e->stat_mbs++;
                 e->stat_skipped += skipped;
+                e->stat_type[skipped ? AEG_MB_SKIP : (int)tmp->type]++;
                 if (skipped)
                     skip_run++;
                 else {
@@ -4730,6 +4734,8 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->scene_cuts = e->scene_cuts;
     out->macroblocks = e->stat_mbs;
     out->skipped = e->stat_skipped;
+    for (i = 0; i < AEG_MB_TYPE_COUNT; i++)
+        out->mb_types[i] = e->stat_type[i];
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         out->stage_use_gpu[i] = e->d.use_gpu[i];
         out->stage_cpu_ns[i] = e->d.cpu_ns[i][1];

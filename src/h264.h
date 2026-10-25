@@ -42,7 +42,8 @@ enum {
     AEG_MB_IPCM,
     /* Intra_8x8 (High profile): I_NxN with transform_size_8x8_flag = 1 and one
      * prediction mode per 8x8 luma block. */
-    AEG_MB_I8x8
+    AEG_MB_I8x8,
+    AEG_MB_TYPE_COUNT          /* number of entries above, for the statistics */
 };
 
 enum { AEG_MB_I_V = 0, AEG_MB_I_H = 1, AEG_MB_I_DC = 2, AEG_MB_I_P = 3 };

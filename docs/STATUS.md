@@ -653,7 +653,14 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
    The script also asserts the skip statistics on a still clip (74% of its
    macroblocks, 85% of the P ones, must be skips), because a mode decision that
    stops finding `P_Skip` produces a conformant stream that is 45% larger, and
-   no bit-exactness check can see that.
+   no bit-exactness check can see that.  The encoder reports the full type
+   breakdown (`skip`, `P16x16`, `P16x8`, `P8x16`, `P_8x8`, the three intra
+   types), which is what the gap analysis below is read from: on the
+   two-quadrant clip at QP 28 it codes 65% P16x16, 24% skip, 5.6% Intra_16x16
+   and 3.8% 8x16 -- i.e. the content is genuinely mostly 16x16 (the picture
+   translates as two halves of 160 px each, so only the two columns at the
+   boundary need a split), and the 21% of rate the clip still costs against
+   x264 is in the residual, not in the partition decision.
 
 `reconstruction vs decode` must be `max abs diff 0`.
 
