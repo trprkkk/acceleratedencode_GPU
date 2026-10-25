@@ -83,6 +83,11 @@ run_case preset4      320 192  6 0 -q 23 -p 4
 # of the encoder, and a refinement that kept its state outside that copy would
 # produce a different stream there.
 run_case refine_thr    320 192  6 1 -q 26 -p 4 --slices 2 -t 2
+# A 16x8 or 8x16 winner has two vectors and each is refined on its own,
+# so the refinement now runs once per partition instead of once per
+# macroblock; mode 1 moves the halves of the picture in opposite
+# directions, which is what makes the encoder pick those shapes.
+run_case refine_part   320 192  6 1 -q 26 -p 4 --slices 2 -t 2
 # Level selection (--trellis) changes the coefficients *after* the quantiser,
 # so everything the macroblock layer derives from them -- the coded block
 # pattern, the counts the neighbours' contexts are built from, the

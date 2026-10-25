@@ -15,23 +15,23 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 53 clip cases, two CABAC round-trips, a
+> `make test` asserts it over 54 clip cases, two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch.  What
 > is *not* finished is speed and B pictures.  On the test clips, at matched
 > PSNR, a baseline-profile x264 spends 47 % more bits than this encoder, while
 > libx264's default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
-> quantisation, AQ, SIMD) spends 15–22 % fewer on the moving clips and 11 % more
+> quantisation, AQ, SIMD) spends 16–22 % fewer on the moving clips and 11 % more
 > on the still one.  Almost all of that is B pictures: with x264's own B
-> pictures disabled the gap on two of the three moving clips collapses to 2.6 %
-> *in our favour* (and 7 % against us on the panning clip), so P-picture coding is
+> pictures disabled the gap on three of the four clips collapses to 2–6 % *in our
+> favour* (and 6.5 % against us on the panning clip), so P-picture coding is
 > within a few points of x264's — the last few points of it are the search
 > (partition shapes and sub-pel vectors chosen by SATD rather than by the
 > coder's price).  Level selection priced by the coder is implemented and
-> measured, and stays off by default: it is worth 1.1–1.4 % BD-rate on the
-> four-quadrant clip, nothing on two of the others and a 3-point *loss* on
-> skip-heavy content.  Speed is the
-> real gap: 69 fps (preset 2) or 43 fps (preset 4) against x264's ~400 fps on
+> measured, and stays off by default: it is worth 1.5–2.8 % BD-rate on the
+> clips with the most residual and 0.1–2 % on the others, for 19–40 % more
+> time.  Speed is the
+> real gap: 69 fps (preset 2) or 40 fps (preset 4) against x264's ~400 fps on
 > two cores at 320x192 QP 24, and 68 % of the CPU time is now the
 > transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
 > the motion search (80 %/19 % at preset 4), which is exactly what the GPU
@@ -115,11 +115,12 @@ quantisation (off by default: it is worth its PSNR cost only perceptually, see
 preset (it scales the search range, the subpel refinement and, from 3 up, the
 rate-distortion refinement of the winning motion vector), `--refine-mv 0|1|2`
 controls that last one on its own (0 off, 1 the four axial quarter-pel
-neighbours, 2 all eight; 2-7 points of BD-rate against x264 medium for 27-40 %
-more time, see `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
+neighbours, 2 all eight; 1.2-4.2 points of BD-rate against x264 medium for
+30-45 % more time, and from preset 3 up it also refines each partition of a
+16x8 / 8x16 winner, see `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
 level selection on the luma residual (priced by the CABAC coder; off by default
-because it measured as a wash on residual-heavy content and a 3-point loss on
-skip-heavy content, see *Rate-distortion level selection* in `docs/STATUS.md`),
+because it costs 19-40 % of the encode time for 0.1-2.8 points, see
+*Rate-distortion level selection* in `docs/STATUS.md`),
 `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
@@ -168,6 +169,13 @@ preset.
   to get right, because a wrong one produces a *valid* stream that simply
   reconstructs differently; the reference has to be written twice, from the
   spec, to catch it.
+* `tools/bdrate.py --clip clip.yuv W H FRAMES [-q 22,25,28,31,34,37]` is the
+  quality meter: it runs both encoders at the same QPs on the same source,
+  compares the decoded streams (never an encoder's own PSNR summary, which uses
+  a different convention), and prints the BD-rate with the PSNR range it was
+  integrated over, flagging the result when one curve does not span the other.
+  The BD-rate is the standard one: negative means this encoder needs fewer bits
+  at matched PSNR.
 * `tools/gpu_validate.sh clip.yuv W H FRAMES QP` is the hardware check: it
   encodes with the CPU backend, with the dispatcher free, and with each batched
   device path forced on, then requires the coefficient paths to be the *same
@@ -175,7 +183,7 @@ preset.
   independent decode.  Run it on the machine that has the GPU; on a CPU-only
   machine everything passes trivially, because the batch entry points fall back
   to the reference ops.
-* `tests/run_tests.sh` encodes forty-seven synthetic cases (QP 12/23/26/40,
+* `tests/run_tests.sh` encodes fifty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
   integer-only and quarter-pel search, the forced whole-frame search seed,

@@ -3025,32 +3025,53 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * reconstruction there.  Eight full candidate evaluations per macroblock,
      * so it belongs to the slow presets (AEG_MVREF=1 forces it on for
      * measurement). */
-    if (e->p.cabac && e->p.refine_mv > 0 && best.type == AEG_MB_P16x16 && inter) {
+    if (e->p.cabac && e->p.refine_mv > 0 && inter &&
+        mb_part_count(&best) <= 2) {
         static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
         static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
         static const int cross[4] = { 1, 3, 4, 6 };
         const int cheap = e->p.refine_mv < 2;
         const int nn = cheap ? 4 : 8;
+        const int npart = mb_part_count(&best);
         mbcand save = e->mb_cand[0];
-        int b, j;
-        for (j = 0; j < nn; j++) {
-            int k = cheap ? cross[j] : j;
-            int64_t cost;
-            e->mb_cand[0] = save;
-            e->mb_cand[0].type = AEG_MB_P16x16;
-            e->mb_cand[0].nparts = 1;
-            for (b = 0; b < 16; b++) {
-                e->mb_cand[0].mv[b][0] = best.mv[0][0] + dx[k];
-                e->mb_cand[0].mv[b][1] = best.mv[0][1] + dy[k];
-                e->mb_cand[0].pmv[b][0] = best.pmv[0][0];
-                e->mb_cand[0].pmv[b][1] = best.pmv[0][1];
-            }
-            cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_P16x16, 0, lambda, 0);
-            cost = rd_price(e, mbx, mby, &t, cost, lambda);
-            if (cost < best_cost) {
-                best_cost = cost;
-                best = t;
-                snap_luma(e, mbx, mby, snap_l);
+        int p, b, j;
+        /* One partition at a time: a 16x8 or 8x16 winner has two vectors and
+         * they are searched independently, so each is refined with the other
+         * held at the value the search returned.  (P_8x8 is left alone: four
+         * partitions times eight neighbours is 32 full candidate evaluations,
+         * which is more than the rest of the macroblock costs.) */
+        for (p = 0; p < npart; p++) {
+            int geo[4], b0;
+            mb_part_geom(&best, p, geo, &b0);
+            for (j = 0; j < nn; j++) {
+                int k = cheap ? cross[j] : j;
+                int64_t cost;
+                e->mb_cand[0] = save;
+                e->mb_cand[0].type = best.type;
+                e->mb_cand[0].nparts = best.nparts;
+                memcpy(e->mb_cand[0].sub_type, best.sub_type,
+                       sizeof(e->mb_cand[0].sub_type));
+                for (b = 0; b < 16; b++) {
+                    e->mb_cand[0].mv[b][0] = best.mv[b][0];
+                    e->mb_cand[0].mv[b][1] = best.mv[b][1];
+                    e->mb_cand[0].pmv[b][0] = best.pmv[b][0];
+                    e->mb_cand[0].pmv[b][1] = best.pmv[b][1];
+                }
+                for (b = 0; b < 16; b++) {
+                    int bx = (b & 3) * 4, by = (b >> 2) * 4;
+                    if (bx < geo[0] || bx >= geo[0] + geo[2] ||
+                        by < geo[1] || by >= geo[1] + geo[3])
+                        continue;
+                    e->mb_cand[0].mv[b][0] = best.mv[b][0] + dx[k];
+                    e->mb_cand[0].mv[b][1] = best.mv[b][1] + dy[k];
+                }
+                cost = rd_luma(e, mbx, mby, &t, c->qp, best.type, 0, lambda, 0);
+                cost = rd_price(e, mbx, mby, &t, cost, lambda);
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = t;
+                    snap_luma(e, mbx, mby, snap_l);
+                }
             }
         }
         e->mb_cand[0] = save;
