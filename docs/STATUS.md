@@ -21,8 +21,8 @@ The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs sixty-nine encoded clip cases
-frame by frame, all of them bit-exact, thirteen of them with B pictures compared
+fails (non-zero exit) on any mismatch; it runs seventy-one encoded clip cases
+frame by frame, all of them bit-exact, fourteen of them with B pictures compared
 through a coding-order map.  It also
 checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
@@ -591,7 +591,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 69 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 71 clip cases
 ```
 
 `make test` runs seven things:
@@ -1106,8 +1106,12 @@ in the per-block table: the *next* macroblock builds its contexts from it.
 **It measured neutral, and that is why it is behind the preset.**  With
 `--bframes 3 --bqp 12` on five clips at six QPs, enabling B_8x8 moves the
 BD-rate by -0.01, -0.10, -0.01, -0.00 and -0.07 points -- i.e. nothing -- while
-costing about a tenth of the encode time (eight extra integer searches per B
-macroblock) and only eight of 14 400 macroblocks select it.  It is therefore
+costing eight extra integer searches per B macroblock and only eight of 14 400
+macroblocks select it.  Re-measured after the B pictures' vectors started being
+refined (*The same refinement in a B picture*) it is *exactly* neutral -- the
+BD-rate of preset 3 with and without it agrees to two decimals on four clips --
+because two macroblocks in 2400 choose it, and the cost is then 1-3 % of the
+encode time rather than a tenth.  It is therefore
 enabled from *preset 3*, where the encoder is already spending its time on
 refinement, and the gate has a case of its own (`bframes_8x8`, preset 3 with
 the P partitions held at 16x16 so that the case is about the B macroblock layer
@@ -1289,13 +1293,14 @@ full B macroblock layer.
    deliberately *not* on the list: it makes every direct macroblock depend on
    its neighbours' vectors, so an encoder/decoder disagreement corrupts the
    picture instead of costing a few bits.
-2. The motion-vector refinement is exact now (bug 43) but still only refines
-   the winning candidate, one partition at a time, and prices its trials with
-   the predictor the search happened to store.  Two cheap follow-ups: re-derive
-   the predictors *inside* the trial loop so the mvd priced is the mvd coded
-   (the difference is one or two bits per trial), and refine the chroma vector
-   with the luma one instead of copying it.  Both are pure quality-for-time
-   trades and belong behind the same preset gate.
+2. The motion-vector refinement is exact now (bug 43) and reaches the
+   candidates as well as the winner (`--refine-cand`, see *Refining every
+   candidate*), but its trials are still priced with the predictor the search
+   happened to store.  Two cheap follow-ups: re-derive the predictors *inside*
+   the trial loop so the mvd priced is the mvd coded (the difference is one or
+   two bits per trial, and `--refine-cand` makes it four times as many trials),
+   and refine the chroma vector with the luma one instead of copying it.  Both
+   are pure quality-for-time trades and belong behind the same preset gate.
 3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and
@@ -1306,10 +1311,12 @@ full B macroblock layer.
      `sub_mb_type` inside P_8x8) are still chosen by SAD plus an 8-bit rate
      guess; the shapes that make it into the list are therefore a SATD decision
      even though the comparison between them is exact;
-   * the sub-pel vector is chosen by SATD, then only the *winning* macroblock's
-     vector is refined by the coder's price (`--refine-mv`, presets 3-4).
-     Refining inside the candidate loop with `aeg_cabac_coef_price()` is the
-     natural next step and is a pure quality-for-time trade.
+   * the sub-pel vector is chosen by SATD and then refined by the coder's
+     price: the winner's from preset 3 (`--refine-mv`), every close candidate's
+     with `--refine-cand 1`.  What neither reaches is the *search* itself -- the
+     integer-pel point, the fractional offset and the partition shape are still
+     SATD decisions, so a vector more than a quarter pel from the right one
+     never becomes a candidate at all.
 4. GPU: every stage that can be batched is now wired to its kernel.  The plane
    build is `interp_plane`, both halves of the search are rounds through
    `sad_batch` and `satd_batch`, and the coefficient stages of an inter
@@ -1703,6 +1710,63 @@ B_8x8 remains nearly unused (2 of 2400 macroblocks on the quadrant clip) even
 with the refinement in place, so its problem is not the pricing of its groups
 either: its vectors are searched per 8x8 with the macroblock's fractional
 offset and, unlike the 16x16 candidates, they are not refined.
+
+### Refining every candidate, not just the winner
+
+The refinement above runs *after* the comparison: the candidate that won is
+re-coded with the neighbours of its vector.  That leaves the rest of the list
+untouched, and a candidate whose vector is a quarter pel off loses the
+comparison by a margin the refinement never gets to see -- the search that
+produced its vector was SATD-ranked, and SATD is the same proxy the whole
+comparison is trying to beat.  `--refine-cand 1` moves the refinement *into*
+the candidate loop: each inter candidate is re-coded with its four axial
+quarter-pel neighbours per partition and list before it is priced against the
+others, and the candidate that then wins carries the refined vector into the
+bitstream.
+
+The trial is the same shape as the winner's: the whole macroblock is re-coded,
+priced by the coder (`SSD + lambda * bits` on the shadow coder), one partition
+and one list at a time with the rest held at the searched values, so what is
+priced is always a whole macroblock.  It needs `--refine-mv` on (the neighbour
+set and the quarter-pel convention come from it), skips direct macroblocks for
+the same reason the B refinement does, and skips shapes with more than two
+partitions, which is the same budget the winner refinement works within.
+
+BD-rate against libx264 medium, preset 4, `--bframes 3 --scenecut 0`, QP 22..37,
+negative = we spend fewer bits at matched PSNR:
+
+| clip | preset 4 | preset 4, `--refine-cand 1` |
+|---|---|---|
+| mode 0, 320x192, 60 frames | -24.38% | **-24.97%** |
+| mode 1, 320x192, 30 frames | -12.58% | **-12.91%** |
+| mode 4, 320x192, 10 frames | -7.52% | **-7.68%** |
+| mode 3 (still), 320x192, 30 frames | -22.36% | **-22.81%** |
+| mode 0, 320x192, 30 frames | -23.63% | **-23.86%** |
+
+Every clip gains, 0.3 points on average, for 40 % of the encode time (0.84 s ->
+1.18 s for 60 frames at 320x192 QP 28).  That is a worse exchange rate than the
+winner refinement's (1.2-4.2 points for 30-45 %), which is why the winner
+refinement follows the preset and this one does not: a candidate costs eleven
+macroblock evaluations once its four neighbours are tried, and most of the
+candidates are not close enough to the winner for a quarter pel to change the
+outcome.
+
+Which candidates are close enough is the one tuning decision in it.  Refining
+*every* candidate costs 2.6x the encode time of the base and measured the same
+as the gated version; refining the ones within 12 % of the best so far
+(`cost <= best_cost + best_cost / 8`) or within 3 % was also the same, inside
+each clip's noise (-13.13% vs -12.92% on the mode-1 clip, +0.1 on the mode-0
+one).  The rule kept is the strictest and cheapest to explain: a candidate is
+refined while it is at least as good as the best one before it, so the first
+candidate of every macroblock is always refined and the ones that arrive
+behind are priced as the search found them.
+
+The conformance gate runs it both ways -- one P case and one B case with
+`--refine-cand 1` at preset 4 and every partition shape enabled -- because the
+risk here is specific: the refined vector is the one the bitstream carries, so
+the predictor refresh after an accepted move has to happen exactly as it does
+for the winner.  The 252-case matrix (three clips x bframes 0/1/3 x QP 20/26/32
+x preset 3/4 x partitions 1/5/7/15) is bit-exact with it on.
 
 ## P_8x8 sub-macroblock partitions
 

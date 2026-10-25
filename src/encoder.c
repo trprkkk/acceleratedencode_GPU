@@ -3994,6 +3994,79 @@ static int64_t rd_price(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                                              0) / 256.0) + 0.5);
 }
 
+/* Rate-distortion refinement of one *candidate*, before it is compared.
+ *
+ * The winner refinement (below, in code_mb) re-codes the macroblock type that
+ * already won; this does the same for every candidate as it is priced, which is
+ * what x264's subpel stage does and the only way a vector that is off by a
+ * quarter pel can be rescued for a candidate that would otherwise lose on
+ * prediction quality alone.  It costs a whole macroblock evaluation per
+ * neighbour per candidate, so it belongs to the slowest preset.
+ *
+ * Only the 16x16, 16x8 and 8x16 shapes are reached (two partitions at most: the
+ * 8x8 shapes are four groups with a list mask each, which is the same budget
+ * the winner refinement works within).  That is also what makes the stored
+ * predictors reusable after a move: those partitions predict their vectors from
+ * *other* macroblocks, so refining one does not invalidate another's mvd.  The
+ * 8x8 shapes are the ones whose sub-partitions predict from each other, and
+ * they are exactly the ones left out; if they are ever let in, the predictors
+ * have to be re-derived between partitions, as refresh_pmvs() does for the
+ * winner.
+ */
+static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
+                        int qp, double lambda)
+{
+    static const int dx[4] = { 0, -1, 1, 0 };
+    static const int dy[4] = { -1, 0, 0, 1 };
+    mbcand save = e->mb_cand[slot], win;
+    mbenc base;
+    int64_t best = INT64_MAX;
+    int p, l, j, n, lists, ok = 0;
+
+    cand_enc(e, slot, qp, &base);
+    if (!is_inter_type(base.type) || base.type == AEG_MB_B_DIRECT)
+        return;
+    n = mb_part_count(&base);
+    if (n > 2)
+        return;                     /* P_8x8 and B_8x8: too many candidates */
+    lists = is_b_type(base.type) ? 2 : 1;
+    for (p = 0; p < n; p++) {
+        int geo[4], b0, masks = lists == 1 ? 1 : mb_part_lists(&base, p);
+
+        mb_part_geom(&base, p, geo, &b0);
+        for (l = 0; l < lists; l++) {
+            int x, y, x0 = geo[0] / 4, y0 = geo[1] / 4;
+            int x1 = x0 + geo[2] / 4, y1 = y0 + geo[3] / 4;
+
+            if (!(masks & (1 << l)))
+                continue;
+            for (j = 0; j < 4; j++) {
+                int64_t cost;
+                e->mb_cand[slot] = save;
+                for (y = y0; y < y1; y++)
+                    for (x = x0; x < x1; x++) {
+                        int bb = (y << 2) + x;
+                        if (l == 0) {
+                            e->mb_cand[slot].mv[bb][0] = base.mv[b0][0] + dx[j];
+                            e->mb_cand[slot].mv[bb][1] = base.mv[b0][1] + dy[j];
+                        } else {
+                            e->mb_cand[slot].mv1[bb][0] = base.mv1[b0][0] + dx[j];
+                            e->mb_cand[slot].mv1[bb][1] = base.mv1[b0][1] + dy[j];
+                        }
+                    }
+                cost = rd_luma(e, mbx, mby, &base, qp, save.type, 0, lambda, slot);
+                cost = rd_price(e, mbx, mby, &base, cost, lambda);
+                if (cost < best) {
+                    best = cost;
+                    win = e->mb_cand[slot];
+                    ok = 1;
+                }
+            }
+        }
+    }
+    e->mb_cand[slot] = ok ? win : save;
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -4049,6 +4122,18 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
                                    lambda, i);
             cost = rd_price(e, mbx, mby, &t, cost, lambda);
+            /* Refining a candidate costs a macroblock evaluation per
+             * neighbour, so only the candidates that are still in the running
+             * get it: one that is already worse than the best so far cannot be
+             * rescued by a quarter pel, and a looser test than this one
+             * measured no better (see docs/STATUS.md). */
+            if (e->p.cabac && e->p.refine_cand > 0 && e->p.refine_mv > 0 &&
+                cost <= best_cost) {
+                refine_cand(e, mbx, mby, i, c->qp, lambda);
+                cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
+                               lambda, i);
+                cost = rd_price(e, mbx, mby, &t, cost, lambda);
+            }
             if (cost < best_cost) {
                 best_cost = cost;
                 best = t;
@@ -6573,6 +6658,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * range does: the two slow presets are where the quality is wanted. */
     if (pp->refine_mv < 0)
         pp->refine_mv = pp->preset >= 4 ? 2 : (pp->preset >= 3 ? 1 : 0);
+    /* Refining every candidate is a large amount of work (one macroblock
+     * evaluation per neighbour per candidate) for a change that measured
+     * between 0.1 and 0.6 points, so it is off unless asked for -- the same
+     * rule the level selection follows. */
+    if (pp->refine_cand < 0)
+        pp->refine_cand = 0;
     /* Level selection is off unless asked for: it is a large amount of work
      * (a price and an inverse transform per candidate level) for a BD-rate
      * change that measured inside the noise on every clip of the test set. */

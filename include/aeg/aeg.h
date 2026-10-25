@@ -148,6 +148,13 @@ typedef struct aeg_params {
      * candidate priced by the coder, so it is a slow-preset tool.  -1 means
      * "as the preset says" (3 -> 1, 4 -> 2, below that off). */
     int refine_mv;
+    /* Refine every inter candidate's vectors before the candidates are
+     * compared, not just the winner's afterwards: 0 = off (the default),
+     * 1 = on, the four axial quarter-pel neighbours per partition and list,
+     * with the candidates that are already too expensive to win skipped.
+     * Costs about a third of the encode time at preset 4 for 0.1-0.6 points of
+     * BD-rate (see docs/STATUS.md, "Refining every candidate"). */
+    int refine_cand;
     /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */

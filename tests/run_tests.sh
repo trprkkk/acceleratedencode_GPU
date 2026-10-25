@@ -318,6 +318,14 @@ run_bcase bframes_8x16  320 192 12 3 4 -q 24 --scenecut 0 -p 2 --partitions 5
 #   picture.  Mode 4 (four quadrants) with the partitioned shapes enabled picks
 #   direct, single-list and bi-predictive blocks next to each other.
 run_bcase bframes_refine 320 192 12 3 4 -q 24 --scenecut 0 -p 4 --partitions 7
+#   `--refine-cand 1` refines a candidate *before* it is compared with the
+#   others, so the vector the bitstream carries is the refined one and the
+#   reconstruction has to follow it -- an off-by-one here is another silent
+#   desync.  One P-picture case (the quadrant clip is all partitions and
+#   motion) and one B-picture case, both at the slowest preset.
+run_case refine_cand   320 192 10 4 -q 24 -p 4 --partitions 15 --refine-cand 1
+run_bcase bframes_rcand 320 192 10 3 4 -q 24 --scenecut 0 -p 4 --partitions 15 \
+    --refine-cand 1
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

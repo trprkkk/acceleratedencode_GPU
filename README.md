@@ -17,7 +17,7 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 69 clip cases (thirteen of them B pictures, compared
+> `make test` asserts it over 71 clip cases (fourteen of them B pictures, compared
 > after undoing the coding-order permutation), two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch: every case is bit-exact, including the preset-3/4
@@ -121,7 +121,11 @@ controls that last one on its own (0 off, 1 the four axial quarter-pel
 neighbours, 2 all eight; 1.2-4.2 points of BD-rate against x264 medium for
 30-45 % more time, and from preset 3 up it also refines each partition of a
 16x8 / 8x16 winner and both lists of every B-picture partition (worth 0.4-0.9
-points there, see `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
+points there, see `docs/STATUS.md`), `--refine-cand 0|1`
+refines *every* inter candidate's vectors rather than only the winner's, so a
+candidate that lost on a quarter-pel error gets a second chance (0.3-0.6 points
+of BD-rate for about 40 % more time at preset 4; off by default, see
+*Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
 level selection on the luma residual (priced by the CABAC coder; off by default
 because it costs 19-40 % of the encode time for 0.1-2.8 points, see
 *Rate-distortion level selection* in `docs/STATUS.md`),
