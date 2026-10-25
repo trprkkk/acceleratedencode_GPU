@@ -146,6 +146,10 @@ typedef struct aeg_mb {
      * the encoder has to reconstruct with) and its mask is 3. */
     int16_t  mv1[16][2];
     uint8_t  blist[4];
+    /* P multi-reference: which of the two list0 pictures each 4x4 predicts
+     * from (0 = newest, 1 = oldest).  One reference per list for B, so this
+     * is 0 there. */
+    uint8_t  ref_idx[16];
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     uint8_t  skip;            /* P slice: coded as a skip run / flag      */
@@ -282,7 +286,8 @@ void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int cabac_init_idc, int slice_qp_delta,
                               int deblock_alpha, int deblock_beta,
-                              int deblock_idc, int first_mb);
+                              int deblock_idc, int first_mb,
+                              int num_ref_idx_l0_active);
 /* The same, plus the picture order count, for a stream with B pictures (see
  * bitstream.c). */
 void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
@@ -291,7 +296,8 @@ void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
                                   int poc_lsb_bits, int is_ref,
                                   int cabac_init_idc, int slice_qp_delta,
                                   int deblock_alpha, int deblock_beta,
-                                  int deblock_idc, int first_mb);
+                                  int deblock_idc, int first_mb,
+                                  int num_ref_idx_l0_active);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma

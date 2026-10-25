@@ -33,6 +33,7 @@ typedef struct mbenc {
     int8_t   nz8[4];
     int      t8;
     int16_t  mv[16][2];             /* per 4x4 block, 1/4 pel, list 0        */
+    uint8_t  ref[16];              /* P list0 reference index per 4x4 (0/1) */
     /* B pictures: the list 1 vector of each 4x4 block and, per partition, which
      * lists predict it (1 = list 0, 2 = list 1, 3 = both). */
     int16_t  mv1[16][2];
@@ -86,6 +87,8 @@ typedef struct {
     int     pmv[16][2];
     int     pmv1[16][2];
     uint8_t blist[4];
+    /* P list0 reference index per 4x4 block (0 or 1).  B pictures keep 0. */
+    uint8_t ref[16];
 } mbcand;
 
 struct aeg_encoder {
@@ -239,6 +242,10 @@ struct aeg_encoder {
     aeg_mc_ctx mc1;         /* fractional planes of ref2p[0] (list 1) */
     int has_ref;
     int has_ref2;
+    /* P slice with two active list0 entries: the newest and the oldest
+     * reference are both in list0 (H.264 7.4.3: num_ref_idx_active_override).
+     * B keeps one per list. */
+    int cur_l0_active;
     int cur_is_p;           /* the picture being coded is a P slice */
     int cur_is_b;           /* ... is a B slice                     */
     int cur_is_ref;         /* ... is a reference picture           */
@@ -596,7 +603,26 @@ static void picture_rotate(struct aeg_encoder *e, int is_ref)
  * *before* this one and list1[0] the nearest that comes after it; with one
  * reference picture per anchor direction that is exactly the older and the
  * newer of the two references still alive.  A P picture only uses list 0, and
- * its nearest-past reference is always the newer of the two. */
+ * its nearest-past reference is always the newer of the two.  With two active
+ * list0 entries (P multi-reference) the older one is list0[1] and lives in
+ * ref2p for the motion compensation to find. */
+static int p_should_use_2refs(const struct aeg_encoder *e)
+{
+    /* Gated on preset so that ultrafast stays 1-ref and bit-exact to the old
+     * stream: the second reference only pays at the RD stage.  The override
+     * itself costs < 5 bits per P slice, so the gate is the only place that
+     * has to care. */
+    /* Multi-reference is wired but not yet advertised: the slice header
+     * would need to count the extra reference and every P macroblock would
+     * then need its ref_idx_l0 syntax (CABAC context 54 and CAVLC te(v)),
+     * which is not in yet.  Leaving the override at 1 would desynchronise the
+     * decoder at the first mvd.  Gate it on the environment so that the
+     * conformance suite stays bit-exact until the syntax is there. */
+    if (getenv("AEG_REF2"))
+        return e->cur_is_p && e->nrefs > 1 && e->p.bframes > 0 &&
+               e->p.preset >= 3;
+    return 0;
+}
 static void set_current_refs(struct aeg_encoder *e)
 {
     int list0 = e->cur_is_b ? e->role_ref0 : (e->nrefs > 1 ? e->role_ref1
@@ -604,6 +630,24 @@ static void set_current_refs(struct aeg_encoder *e)
     int list1 = e->cur_is_b ? e->role_ref1 : -1;
     int i;
 
+    /* P with two list0 entries: list0[0] = newest (role_ref1), list0[1] =
+     * oldest (role_ref0).  No reordering syntax is needed: the decoder's
+     * default list0 is decreasing frame_num, which is exactly [newest, oldest]
+     * for two sliding-window references, so num_ref_idx_active_override is all
+     * that has to be sent. */
+    if (p_should_use_2refs(e) && e->nrefs > 1) {
+        int l0a = e->role_ref1, l0b = e->role_ref0;
+        for (i = 0; i < 3; i++) {
+            e->refp[i] = e->pic_plane[l0a][i];
+            e->ref2p[i] = e->pic_plane[l0b][i];
+        }
+        e->ref_poc[0] = e->pic_poc[l0a];
+        e->ref_poc[1] = e->pic_poc[l0b];
+        e->has_ref = 1;
+        e->has_ref2 = 1;               /* second list0 entry lives in ref2p */
+        e->cur_l0_active = 2;
+        return;
+    }
     for (i = 0; i < 3; i++) {
         e->refp[i] = list0 >= 0 ? e->pic_plane[list0][i] : NULL;
         e->ref2p[i] = list1 >= 0 ? e->pic_plane[list1][i] : NULL;
@@ -612,6 +656,7 @@ static void set_current_refs(struct aeg_encoder *e)
     e->ref_poc[1] = list1 >= 0 ? e->pic_poc[list1] : 0;
     e->has_ref = list0 >= 0;
     e->has_ref2 = list1 >= 0;
+    e->cur_l0_active = 1;
 }
 
 static void copy_plane_pad(uint8_t *dst, int dstride, const uint8_t *src,
@@ -1563,12 +1608,15 @@ static void p_predict_typed(struct aeg_encoder *e, int mbx, int mby,
 {
     int p, n = mb_part_count(c);
     for (p = 0; p < n; p++) {
-        int geo[4], b0;
+        int geo[4], b0, ref = 0;
         mb_part_geom(c, p, geo, &b0);
-        mc_rect_luma(e, mbx, mby, geo[0], geo[1], geo[2], geo[3],
-                     c->mv[b0][0], c->mv[b0][1]);
-        mc_rect_chroma(e, mbx, mby, geo[0] / 2, geo[1] / 2,
-                       geo[2] / 2, geo[3] / 2, c->mv[b0][0], c->mv[b0][1]);
+        if (e->cur_l0_active > 1)
+            ref = c->ref[b0] & 1;
+        mc_rect_luma_to(e, ref, e->pred_l, mbx, mby, geo[0], geo[1], geo[2],
+                        geo[3], c->mv[b0][0], c->mv[b0][1]);
+        mc_rect_chroma_to(e, ref, (uint8_t *[]){e->pred_c[0], e->pred_c[1]}, mbx,
+                          mby, geo[0] / 2, geo[1] / 2, geo[2] / 2, geo[3] / 2,
+                          c->mv[b0][0], c->mv[b0][1]);
     }
 }
 
@@ -2162,6 +2210,14 @@ static void cand_publish(mbcand *c, const int geo[4], int mvx, int mvy)
             c->mv[(y << 2) + x][1] = mvy;
         }
 }
+static void cand_publish_ref(mbcand *c, const int geo[4], int ref)
+{
+    int x, y, x0 = geo[0] / 4, y0 = geo[1] / 4;
+    int x1 = x0 + geo[2] / 4, y1 = y0 + geo[3] / 4;
+    for (y = y0; y < y1; y++)
+        for (x = x0; x < x1; x++)
+            c->ref[(y << 2) + x] = (uint8_t)ref;
+}
 
 /* Publish one partition's vector in the 4x4 MV table of the macroblock being
  * searched, so that the following partitions can predict from it. */
@@ -2644,6 +2700,7 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
     memset(cur, 0, sizeof(cur));
     memset(avail, 0, sizeof(avail));
     memset(e->mb_cand[slot].sub_type, 0, sizeof(e->mb_cand[slot].sub_type));
+    memset(e->mb_cand[slot].ref, 0, sizeof(e->mb_cand[slot].ref));
     e->mb_cand[slot].type = type;
     e->mb_cand[slot].nparts = n;
     for (p = 0; p < n; p++) {
@@ -2684,6 +2741,7 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
     memset(cand->sub_type, 0, sizeof(cand->sub_type));
     memset(cand->mv, 0, sizeof(cand->mv));
     memset(cand->pmv, 0, sizeof(cand->pmv));
+    memset(cand->ref, 0, sizeof(cand->ref));
 
     for (sub = 0; sub < 4; sub++) {      /* sub-macroblocks in raster order */
         int bx = (sub & 1) * 2, by = (sub >> 1) * 2;
@@ -2759,6 +2817,8 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                          &best_mv[k][0], &best_mv[k][1], &sad,
                          best_geo[k][2] >= 8 && best_geo[k][3] >= 8);
             cand_publish(cand, best_geo[k], best_mv[k][0], best_mv[k][1]);
+            /* P_8x8 sub-macroblocks keep the single reference path for now. */
+            cand_publish_ref(cand, best_geo[k], 0);
             cand->pmv[b0][0] = pmvx;
             cand->pmv[b0][1] = pmvy;
             me_publish(cur, best_geo[k], best_mv[k][0], best_mv[k][1]);
@@ -3203,6 +3263,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             for (b = 0; b < 16; b++) {
                 e->mb_cand[0].mv[b][0] = mvx;
                 e->mb_cand[0].mv[b][1] = mvy;
+                e->mb_cand[0].ref[b] = 0;
             }
             e->mb_cand[0].pmv[0][0] = e->mb_pmv[0];
             e->mb_cand[0].pmv[0][1] = e->mb_pmv[1];
@@ -3228,6 +3289,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 for (b = 0; b < 16; b++) {
                     sc->mv[b][0] = sx;
                     sc->mv[b][1] = sy;
+                    sc->ref[b] = 0;
                 }
                 sc->pmv[0][0] = e->mb_pmv[0];
                 sc->pmv[0][1] = e->mb_pmv[1];
@@ -5793,14 +5855,16 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->cur_is_ref,
                                    e->p.cabac ? e->cabac_init_idc : -1,
                                    e->cur_qp - 26, 0, 0,
-                                   e->p.deblock ? 0 : 1, first_row * e->mb_w);
+                                   e->p.deblock ? 0 : 1, first_row * e->mb_w,
+                                   e->cur_l0_active);
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
                                e->frame_num_bits, is_idr, e->idr_pic_id,
                                e->p.cabac ? e->cabac_init_idc : -1,
                                e->cur_qp - 26, 0, 0,
-                               e->p.deblock ? 0 : 1, first_row * e->mb_w);
+                               e->p.deblock ? 0 : 1, first_row * e->mb_w,
+                               e->cur_l0_active);
     }
 
     /* ---- decision pass -------------------------------------------------
@@ -6212,7 +6276,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             /* the planes are what the GPU stage is for: one launch per plane,
              * every output sample independent, and the kernel is checked
              * against aeg_hpel_plane_fill() by tests/kernel_check.c */
-            for (list = 0; list < 1 + e->cur_is_b; list++) {
+            for (list = 0; list < (e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1); list++) {
                 aeg_mc_ctx *ctx = list ? &e->mc1 : &e->mc;
                 const uint8_t *ref = list ? e->ref2p[0] : e->refp[0];
                 int i;
@@ -6226,7 +6290,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             }
         } else {
             aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
-            if (e->cur_is_b)
+            if (e->cur_is_b || e->cur_l0_active > 1)
                 aeg_mc_ctx_refresh(&e->mc1, e->ref2p[0], e->w, e->h);
         }
         aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,

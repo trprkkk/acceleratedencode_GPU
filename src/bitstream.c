@@ -249,7 +249,7 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                             int frame_num_bits, int idr, int idr_pic_id,
                             int cabac_init_idc, int slice_qp_delta,
                             int deblock_alpha, int deblock_beta,
-                            int deblock_idc, int first_mb)
+                            int deblock_idc, int first_mb, int num_ref_idx_l0_active)
 {
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type);
@@ -258,7 +258,12 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     if (slice_type % 5 == 0) {        /* P slice                            */
-        aeg_bw_put(bw, 1, 0);         /* num_ref_idx_active_override_flag   */
+        if (num_ref_idx_l0_active > 1) {
+            aeg_bw_put(bw, 1, 1);     /* num_ref_idx_active_override_flag   */
+            aeg_bw_ue(bw, (uint32_t)(num_ref_idx_l0_active - 1));
+        } else {
+            aeg_bw_put(bw, 1, 0);     /* num_ref_idx_active_override_flag   */
+        }
         aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
     }
     if (idr) {
@@ -290,7 +295,8 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
                                 int idr_pic_id, int poc_lsb, int poc_lsb_bits,
                                 int is_ref, int cabac_init_idc,
                                 int slice_qp_delta, int deblock_alpha,
-                                int deblock_beta, int deblock_idc, int first_mb)
+                                int deblock_beta, int deblock_idc, int first_mb,
+                                int num_ref_idx_l0_active)
 {
     int nos = slice_type_in % 5;      /* 0 = P, 1 = B, 2 = I */
 
@@ -312,7 +318,12 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
     if (nos == 1)
         aeg_bw_put(bw, 1, 0);         /* direct_spatial_mv_pred_flag = 0    */
     if (nos == 0 || nos == 1) {
-        aeg_bw_put(bw, 1, 0);         /* num_ref_idx_active_override_flag   */
+        if (nos == 0 && num_ref_idx_l0_active > 1) {
+            aeg_bw_put(bw, 1, 1);     /* num_ref_idx_active_override_flag   */
+            aeg_bw_ue(bw, (uint32_t)(num_ref_idx_l0_active - 1));
+        } else {
+            aeg_bw_put(bw, 1, 0);     /* num_ref_idx_active_override_flag   */
+        }
         aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
         if (nos == 1)
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
