@@ -48,6 +48,8 @@ static void usage(void)
 "  --refine-cand <n> refine every inter candidate's vectors, not only the\n"
 "                   winner's: 0 = off (default), 1 = on (costs about a third of\n"
 "                   the encode time at preset 4 for 0.3-0.6 points of BD-rate)\n"
+"  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
+"                   0 = off, 1 = on (default from preset 2)\n"
 "  --ref <n>        reference pictures for P pictures, 1 or 2 (default 2 from\n"
 "                   preset 3 up when --bframes is 0, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"

@@ -26,5 +26,19 @@ cv vtest.avi     vtest "-vf scale=384:288"
 cv Megamind.avi  mega  "-vf scale=360:264,crop=352:256"
 cv realshort.mp4 short ""
 cv tree.avi      tree  ""
+# fade.yuv: vtest fading to half brightness over 20 frames and back (the
+# weighted-prediction test; not part of clips.txt)
+PYTHONPATH=$DL/ext python3 - "$REAL" <<'PY'
+import sys, numpy as np
+real = sys.argv[1]; w, h = 384, 288; fs = w * h * 3 // 2
+d = np.fromfile(real + '/vtest.yuv', np.uint8)
+out = []
+for k in range(30):
+    f = d[k * fs:(k + 1) * fs].astype(np.float32)
+    g = 1.0 - 0.025 * k if k < 20 else 0.5 + 0.04 * (k - 20)
+    y = f[:w * h] * g; c = (f[w * h:] - 128) * g + 128
+    out.append(np.clip(np.concatenate([y, c]) + 0.5, 0, 255).astype(np.uint8))
+np.concatenate(out).tofile(real + '/fade.yuv')
+PY
 echo "--clip $REAL/cock.yuv 640x352 --clip $REAL/vtest.yuv 384x288 --clip $REAL/mega.yuv 352x256 --clip $REAL/short.yuv 320x240 --clip $REAL/tree.yuv 320x240" > "$REAL/clips.txt"
 echo "FFMPEG=$FF"
