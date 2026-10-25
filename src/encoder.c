@@ -4603,6 +4603,46 @@ static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
     e->mb_cand[slot] = ok ? win : save;
 }
 
+/* The price the macroblock decision compares: the luma candidate in `t` with
+ * its chroma coded too (the motion-compensated chroma for an inter candidate,
+ * mode `cmode` for an intra one, whose own chroma decision comes after).  The
+ * candidates used to be compared on luma alone, which cannot see that a
+ * vector predicting luma a little better can predict chroma a lot worse, or
+ * that a candidate's chroma residual costs bits.  `t` itself is left as it
+ * was (luma only): the winner's chroma is coded once more afterwards, and the
+ * chroma reconstruction this writes is overwritten then.  Preset 4;
+ * AEG_CDECIDE=0/1 overrides. */
+static int chroma_decide_on(const struct aeg_encoder *e)
+{
+    /* -0.34% of BD-rate for 10% of the time on the real clips, so it sits
+     * with the slowest preset */
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_CDECIDE");
+        v = ev ? atoi(ev) != 0 : -1;
+    }
+    return v >= 0 ? v : e->p.preset >= 4;
+}
+
+static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
+                          const mbenc *t, int64_t est, int cmode, double lambda,
+                          int64_t bound)
+{
+    mbenc f;
+    int64_t dc;
+
+    if (!chroma_decide_on(e))
+        return rd_price(e, mbx, mby, (mbenc *)t, est, lambda);
+    /* the luma distortion alone is a lower bound of the price: a candidate
+     * it already rules out needs no chroma (and no coder) at all */
+    if (e->p.cabac && t->sse >= bound)
+        return t->sse;
+    f = *t;
+    dc = rd_chroma(e, mbx, mby, &f, is_inter_type(t->type),
+                   is_inter_type(t->type) ? t->chroma_mode : cmode, lambda);
+    return rd_price(e, mbx, mby, &f, est + dc, lambda);
+}
+
 /* Whether code_mb() prices the skipped macroblock against the winner.
  * AEG_SKIPCHK=0 turns it off. */
 static int skip_check_on(void)
@@ -4650,7 +4690,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     for (i = 0; i < (e->p.preset >= 2 ? e->mb_nmodes : 1); i++) {
         int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
                                e->mb_modes[i], lambda, -1);
-        cost = rd_price(e, mbx, mby, &t, cost, lambda);
+        cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
@@ -4664,12 +4704,12 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
          * estimate; the winner is then priced with the coder's own model, so
          * that comparing it with the intra candidates is like for like. */
         if (e->p.cabac && best_cost != INT64_MAX)
-            best_cost = rd_price(e, mbx, mby, &best, best_cost, lambda);
+            best_cost = full_price(e, mbx, mby, &best, best_cost, c->chroma_mode, lambda, INT64_MAX);
     } else {
         for (i = 0; i < e->mb_ncand; i++) {
             int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
                                    lambda, i);
-            cost = rd_price(e, mbx, mby, &t, cost, lambda);
+            cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
             /* Refining a candidate costs a macroblock evaluation per
              * neighbour, so only the candidates that are still in the running
              * get it: one that is already worse than the best so far cannot be
@@ -4680,7 +4720,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 refine_cand(e, mbx, mby, i, c->qp, lambda);
                 cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
                                lambda, i);
-                cost = rd_price(e, mbx, mby, &t, cost, lambda);
+                cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
             }
             if (cost < best_cost) {
                 best_cost = cost;
@@ -4698,7 +4738,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * where most of the encode time of the candidate goes. */
     if (!(e->mb_inter_ok && e->mb_inter_sad * 2 < e->mb_sad)) {
         int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
-        cost = rd_price(e, mbx, mby, &t, cost, lambda);
+        cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
         if (cost < best_cost) {
             best_cost = cost;
             best = t;
@@ -4711,7 +4751,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
          * transform. */
         if (e->p.transform_8x8) {
             cost = rd_luma_i8x8(e, mbx, mby, &t, c->qp, lambda);
-            cost = rd_price(e, mbx, mby, &t, cost, lambda);
+            cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
             if (cost < best_cost) {
                 best_cost = cost;
                 best = t;
@@ -4776,7 +4816,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                     e->mb_cand[0].mv[b][1] = best.mv[b][1] + dy[k];
                 }
                 cost = rd_luma(e, mbx, mby, &t, c->qp, best.type, 0, lambda, 0);
-                cost = rd_price(e, mbx, mby, &t, cost, lambda);
+                cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
                 if (cost < best_cost) {
                     best_cost = cost;
                     best = t;
@@ -4872,7 +4912,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                         e->mb_cand[0].pmv1[b][1] = retry.pmv1[b][1];
                     }
                     cost = rd_luma(e, mbx, mby, &t, mb_qp, best.type, 0, lambda, 0);
-                    cost = rd_price(e, mbx, mby, &t, cost, lambda);
+                    cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
                     if (cost < best_cost) {
                         best_cost = cost;
                         best = t;
