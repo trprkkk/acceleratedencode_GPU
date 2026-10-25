@@ -45,6 +45,9 @@ static void usage(void)
 "  --refine-mv <n>  0 = off, 1 = four quarter-pel neighbours of the winning\n"
 "                   vector, 2 = all eight (rate-distortion refined, slower;\n"
 "                   default 0, preset 3 uses 1 and preset 4 uses 2)\n"
+"  --trellis <n>    rate-distortion level selection on the luma residual:\n"
+"                   0 = off (default), 1 = on (costs 15-35%% of the encode time\n"
+"                   for a BD-rate change inside the noise on the test clips)\n"
 "  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
 "  --vbv-maxrate <kbps>  VBV/HRD channel rate (implies ABR)\n"
 "  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
@@ -158,6 +161,7 @@ int main(int argc, char **argv)
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1;
+    int trellis = -1;
     int64_t *pass1_bits = NULL;
     int pass1_n = 0;
     char stats_path[4096];
@@ -200,6 +204,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-mv")) refine_mv = atoi(argv[++i]);
+        else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
         else if (!strcmp(a, "--aq")) aq = atoi(argv[++i]);
@@ -305,6 +310,7 @@ int main(int argc, char **argv)
     if (range) p.search_range = range;
     if (subme >= 0) p.subme = subme;
     if (refine_mv >= 0) p.refine_mv = refine_mv;
+    if (trellis >= 0) p.trellis = trellis;
     if (partitions >= 0) p.partitions = partitions;
     aeg_log_level = verbose;
 

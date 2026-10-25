@@ -83,6 +83,18 @@ run_case preset4      320 192  6 0 -q 23 -p 4
 # of the encoder, and a refinement that kept its state outside that copy would
 # produce a different stream there.
 run_case refine_thr    320 192  6 1 -q 26 -p 4 --slices 2 -t 2
+# Level selection (--trellis) changes the coefficients *after* the quantiser,
+# so everything the macroblock layer derives from them -- the coded block
+# pattern, the counts the neighbours' contexts are built from, the
+# reconstruction the next picture predicts from -- has to follow.  A stream
+# that is off by one level still decodes, just not into what the encoder
+# reconstructed, so it is checked like any other path.  Preset 3 covers the
+# 4x4 blocks, preset 4 the 8x8 transform, and the threaded/ batched variants
+# cover the copies of the shadow coder the slices and the batch path use.
+run_case trellis4      320 192  8 1 -q 26 -p 3 --trellis 1
+run_case trellis8      320 192  8 4 -q 24 -p 4 --trellis 1
+run_case trellis_thr   320 192  6 1 -q 26 -p 4 --trellis 1 --slices 2 -t 2
+AEG_COEF_BATCH=1 run_case trellis_batch 320 192 6 1 -q 26 -p 4 --trellis 1 --partitions 15
 # Preset 3/4 choose the Intra_4x4 mode by exact rate-distortion (quantise,
 # reconstruct, count the real bits), which is a different code path from the
 # SATD approximation the faster presets use.

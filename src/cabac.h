@@ -158,4 +158,9 @@ extern const uint8_t aeg_cabac_last8[63];
 int aeg_cabac_residual(aeg_cabac *c, const int16_t *coef, int n, int cat,
                        int cbf_ctx);
 
+/* Price in 1/256 bit of one coefficient of a residual block (see cabac.c):
+ * `pos` is the scan position, `n` the block's coefficient count. */
+int64_t aeg_cabac_coef_price(const aeg_cabac *c, int cat, int n, int pos,
+                             int level, int is_last, int with_sig);
+
 #endif

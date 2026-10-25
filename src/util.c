@@ -112,6 +112,7 @@ void aeg_params_default(aeg_params *p)
     /* the rate-distortion refinement of the winning motion vector follows the
      * preset (see aeg_encoder_create) */
     p->refine_mv = -1;
+    p->trellis = -1;
     p->deblock = 1;
     p->deblock_alpha = 0;
     p->deblock_beta = 0;

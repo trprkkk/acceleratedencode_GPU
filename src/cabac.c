@@ -529,6 +529,57 @@ static const uint8_t cab_lvl_next[2][8] = {
     { 4, 4, 4, 4, 5, 6, 7, 7 }      /* after a level above 1  */
 };
 
+/* Price of a single coefficient within a residual block, for the level
+ * search: optionally the significance bin at scan position `pos`, and when the
+ * level is not zero the last-coefficient bin (the caller knows whether this
+ * position is the block's last significant one), the level prefix and the
+ * sign.  The level-prefix context is the first node of the state machine,
+ * which is what the block's *first* coded level uses; a coefficient in the
+ * middle of a block with a large level above it would be priced slightly
+ * optimistically.  That is the one approximation of the search: it makes the
+ * price local, so changing one level costs O(1) instead of a walk over the
+ * whole list, and the block that comes out of the search is priced exactly
+ * before it is accepted.  Returns 1/256 bit. */
+int64_t aeg_cabac_coef_price(const aeg_cabac *st, int cat, int n, int pos,
+                             int level, int is_last, int with_sig)
+{
+    const struct cab_cat_ctx *k = &cab_cat[cat];
+    aeg_cabac cb = *st;
+    int abs = level < 0 ? -level : level;
+    int sig_last = n == 64;
+
+    cb.cost = 1;
+    cb.cost256 = 0;
+    if (with_sig)
+        aeg_cabac_decision(&cb, k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos),
+                           abs != 0);
+    if (abs) {
+        int cnt;
+        aeg_cabac_decision(&cb, k->last + (sig_last ? aeg_cabac_last8[pos] : pos),
+                           is_last);
+        aeg_cabac_decision(&cb, k->level + cab_lvl1[0], abs > 1);
+        if (abs > 1) {
+            int ctx = k->level + cab_gt1[0];
+            for (cnt = 2; cnt < 15 && cnt < abs; cnt++)
+                aeg_cabac_decision(&cb, ctx, 1);
+            if (cnt < 15) {
+                aeg_cabac_decision(&cb, ctx, 0);
+            } else {
+                int rest = abs - 14, j = 0;
+                while (rest >= (1 << (j + 1)))
+                    j++;
+                for (cnt = 0; cnt < j; cnt++)
+                    aeg_cabac_bypass(&cb, 1);
+                aeg_cabac_bypass(&cb, 0);
+                for (cnt = j - 1; cnt >= 0; cnt--)
+                    aeg_cabac_bypass(&cb, (rest >> cnt) & 1);
+            }
+        }
+        aeg_cabac_bypass(&cb, level < 0);
+    }
+    return (int64_t)cb.cost256;
+}
+
 /* One residual block: coded_block_flag (when the category has one), the
  * significance map with the last-coefficient flag, then the levels backwards
  * from the last significant coefficient.  `coef[i]` is the coefficient at scan

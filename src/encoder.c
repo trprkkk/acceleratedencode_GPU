@@ -682,6 +682,277 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     }
 }
 
+static int cab_cbf_ctx(int cat, int a, int b, int va, int vb, int intra);
+static void cab_nz4_luma(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
+                         int blk, int *a, int *b, int *va, int *vb);
+
+/* ------------------------------------------------------------------ */
+/* Rate-distortion level selection                                     */
+/* ------------------------------------------------------------------ */
+/* The quantiser rounds each coefficient into a deadzone and that is the end of
+ * it: nothing asks whether the bits a level costs are worth the distortion it
+ * removes, which is why the deadzone is widened on purpose (aeg_quant_bias(),
+ * 1.5x the rounding point) -- rounding has no way to answer the question.
+ *
+ * This pass answers it, block by block, with the price the CABAC coder really
+ * charges (aeg_cabac_residual() run in price-only mode against the slice's
+ * shadow state) and with the distortion the reconstruction really has (inverse
+ * transform, clip, SSE against the source), not a coefficient-domain estimate
+ * of it.
+ *
+ * The search is a coordinate descent over the levels: start from the levels
+ * the quantiser chose, consider emptying the block, then sweep the
+ * coefficients -- last to first, the order the coder sends them in -- and try
+ * each level one step towards zero and one step away from it, keeping a move
+ * whenever it lowers SSE + lambda * bits.  A second sweep lets the moves
+ * combine, which is the whole point: a level dropped here only pays for itself
+ * together with a level raised there, and no per-coefficient rule can see that.
+ */
+
+/* Price of one coefficient list in 1/256 bit, from the shadow coder. */
+static int64_t cabac_block_price(const aeg_cabac *st, const int16_t *scan,
+                                 int n, int cat, int cbf_ctx)
+{
+    aeg_cabac cb = *st;
+
+    cb.cost = 1;
+    cb.cost256 = 0;
+    aeg_cabac_residual(&cb, scan, n, cat, cbf_ctx);
+    return (int64_t)cb.cost256;
+}
+
+/* What a block of levels reconstructs to, and what that costs. */
+struct trel {
+    int side;                 /* 4 or 8 */
+    int n;                    /* coefficients in the block */
+    const uint8_t *scan;      /* scan position -> natural (raster) index */
+    int cat;                  /* ctxBlockCat for the price */
+    int cbf_ctx;              /* coded_block_flag context, -1 when there is none */
+};
+
+static int64_t trel_sse(const struct trel *t, const uint8_t *src, int stride,
+                        const uint8_t *pred, int pred_stride,
+                        const int16_t *lev, int qp)
+{
+    int64_t sse = 0;
+    int x, y;
+
+    if (t->side == 4) {
+        uint8_t r[16];
+        aeg_idct_add_block(r, 4, lev, qp, pred, pred_stride, NULL);
+        for (y = 0; y < 4; y++)
+            for (x = 0; x < 4; x++) {
+                int d = (int)r[y * 4 + x] - (int)src[y * stride + x];
+                sse += (int64_t)d * d;
+            }
+    } else {
+        uint8_t r[64];
+        aeg_idct_8x8_add(r, 8, lev, qp, pred, pred_stride);
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++) {
+                int d = (int)r[y * 8 + x] - (int)src[y * stride + x];
+                sse += (int64_t)d * d;
+            }
+    }
+    return sse;
+}
+
+/* What one coefficient's change does to the price of the block, with the levels
+ * the search currently holds in `cur`.  Only the coefficient itself and -- when
+ * it is the last significant one and the change empties it -- the new last
+ * coefficient cost anything, which is what makes the sweep cheap. */
+static int64_t trel_dbits(const aeg_cabac *sh, const struct trel *t,
+                          const int16_t *cur, int idx, int newlev, int last)
+{
+    int pos = t->scan[idx];
+    int oldlev = cur[pos];
+    int sig_last = idx == last;
+    int64_t d = aeg_cabac_coef_price(sh, t->cat, t->n, idx, newlev,
+                                     sig_last && newlev != 0, 1) -
+                aeg_cabac_coef_price(sh, t->cat, t->n, idx, oldlev,
+                                     sig_last, 1);
+
+    if (sig_last && newlev == 0) {
+        /* The block's last coefficient moves back: the next one has to say so. */
+        int j = idx - 1;
+        while (j >= 0 && !cur[t->scan[j]])
+            j--;
+        if (j >= 0)
+            d += aeg_cabac_coef_price(sh, t->cat, t->n, j, cur[t->scan[j]], 1,
+                                      0) -
+                 aeg_cabac_coef_price(sh, t->cat, t->n, j, cur[t->scan[j]], 0,
+                                      0);
+    }
+    return d;
+}
+
+/* Bits to distortion: the price the coder gave in 1/256 bit, converted with
+ * the same lambda the mode decisions exchange bits against SSE with. */
+static int64_t trel_price(int64_t bits256, double lambda)
+{
+    return (int64_t)(lambda * (double)bits256 / 256.0 + 0.5);
+}
+
+/* The sweep itself: returns the cost of the levels it settles on, which are
+ * written back through `lev`.  The moving cost is kept locally -- one inverse
+ * transform and one local price per candidate -- and the block that wins is
+ * priced exactly before it is accepted, so the local price can only cost
+ * choices, never correctness. */
+static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
+                            int16_t *lev, const uint8_t *src, int stride,
+                            const uint8_t *pred, int pred_stride, int qp,
+                            double lambda, int passes, int allow_empty)
+{
+    int16_t cur[64], trial[64], best[64], scan[64];
+    int i, pass, nnz = 0, last = -1;
+    int64_t bits, sse, cost, best_cost, orig_cost;
+
+    for (i = 0; i < t->n; i++) {
+        cur[i] = lev[i];
+        if (cur[i]) {
+            nnz++;
+            last = i;
+        }
+    }
+    if (!nnz)
+        return 0;
+    for (i = 0; i < t->n; i++)
+        scan[i] = cur[t->scan[i]];
+    bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
+    sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+    orig_cost = best_cost = cost = sse + trel_price(bits, lambda);
+    memcpy(best, cur, sizeof(int16_t) * t->n);
+
+    /* Emptying a block only pays when there is almost nothing in it: the flag
+     * it saves is one bin, the residual it throws away is up to sixteen. */
+    if (allow_empty && nnz <= 2) {
+        for (i = 0; i < t->n; i++)
+            trial[i] = 0;
+        for (i = 0; i < t->n; i++)
+            scan[i] = 0;
+        bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
+        sse = trel_sse(t, src, stride, pred, pred_stride, trial, qp);
+        cost = sse + trel_price(bits, lambda);
+        if (cost < best_cost) {
+            best_cost = cost;
+            memcpy(cur, trial, sizeof(int16_t) * t->n);
+            memcpy(best, trial, sizeof(int16_t) * t->n);
+            last = -1;
+        } else {
+            /* reprice the original, its bits were overwritten above */
+            for (i = 0; i < t->n; i++)
+                scan[i] = cur[t->scan[i]];
+            bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
+            sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+            cost = sse + trel_price(bits, lambda);
+        }
+    }
+    for (pass = 0; pass < passes; pass++) {
+        for (i = 0; i < t->n; i++) {
+            int pos = t->scan[i], step;
+            if (!cur[pos])
+                continue;
+            for (step = -1; step <= 1; step += 2) {
+                int newlev = (int)cur[pos] + step;
+                int last2 = last;
+                int64_t dbits, sse2, c;
+
+                memcpy(trial, cur, sizeof(int16_t) * t->n);
+                trial[pos] = (int16_t)newlev;
+                if (i == last && !newlev) {
+                    int j = i - 1;
+                    while (j >= 0 && !cur[t->scan[j]])
+                        j--;
+                    last2 = j;
+                }
+                dbits = trel_dbits(sh, t, cur, i, newlev, last);
+                sse2 = trel_sse(t, src, stride, pred, pred_stride, trial, qp);
+                c = sse2 + trel_price(bits + dbits, lambda);
+                if (c < cost) {
+                    cost = c;
+                    sse = sse2;
+                    bits += dbits;
+                    last = last2;
+                    cur[pos] = trial[pos];
+                    if (c < best_cost) {
+                        best_cost = c;
+                        memcpy(best, cur, sizeof(int16_t) * t->n);
+                    }
+                }
+            }
+        }
+    }
+    /* The final word is the exact price of the winner: if the local price
+     * talked the sweep into something worse than what the quantiser chose,
+     * the quantiser's levels stay. */
+    if (memcmp(best, lev, sizeof(int16_t) * t->n)) {
+        for (i = 0; i < t->n; i++)
+            scan[i] = best[t->scan[i]];
+        bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
+        sse = trel_sse(t, src, stride, pred, pred_stride, best, qp);
+        if (sse + trel_price(bits, lambda) < orig_cost)
+            memcpy(lev, best, sizeof(int16_t) * t->n);
+    }
+    return best_cost;
+}
+
+/* One macroblock's luma 4x4 blocks of an inter macroblock, whose prediction is
+ * in e->pred_l and whose levels are `lev[block][natural]`. */
+static void trellis_luma4(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                          int qp, int16_t lev[][16], double lambda)
+{
+    const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    const int s = e->stride[0];
+    int blk;
+
+    if (!e->p.cabac || e->p.trellis <= 0)
+        return;
+    /* The coded_block_flag context is a property of the neighbours, and the
+     * neighbours of a block inside this macroblock are its earlier blocks, so
+     * the counts are settled before any level moves. */
+    for (blk = 0; blk < 16; blk++) {
+        int i, n = 0;
+        for (i = 0; i < 16; i++)
+            n += lev[blk][i] != 0;
+        c->nz[blk] = (int8_t)n;
+    }
+    for (blk = 0; blk < 16; blk++) {
+        struct trel t;
+        int a, b, va, vb;
+
+        cab_nz4_luma(e, mbx, mby, c, blk, &a, &b, &va, &vb);
+        t.side = 4;
+        t.n = 16;
+        t.scan = aeg_scan4x4;
+        t.cat = 2;
+        t.cbf_ctx = cab_cbf_ctx(2, a, b, va, vb, 0);
+        trel_descent(&e->cab_shadow, &t, lev[blk],
+                     src + (blk >> 2) * 4 * s + (blk & 3) * 4, s,
+                     e->pred_l + (blk >> 2) * 4 * 16 + (blk & 3) * 4, 16,
+                     qp, lambda, 2, 1);
+    }
+}
+
+/* One 8x8 luma block of an inter macroblock.  There is no coded_block_flag
+ * here -- the coded block pattern of the macroblock says whether the group is
+ * coded -- so the price starts at the significance map. */
+static void trellis_luma8(struct aeg_encoder *e, const uint8_t *src, int stride,
+                          const uint8_t *pred, int pred_stride, int16_t *lev,
+                          int qp, double lambda)
+{
+    struct trel t;
+
+    if (!e->p.cabac || e->p.trellis <= 0)
+        return;
+    t.side = 8;
+    t.n = 64;
+    t.scan = aeg_zigzag8x8;
+    t.cat = 5;
+    t.cbf_ctx = -1;
+    trel_descent(&e->cab_shadow, &t, lev, src, stride, pred, pred_stride, qp,
+                 lambda, 1, 0);
+}
+
 static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
@@ -698,6 +969,23 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM,
                             e->d.ops.backend != AEG_BACKEND_CPU,
                             aeg_now_ns() - t0);
+        if (e->p.trellis > 0 && e->p.cabac) {
+            /* The levels of the batch are in the same layout as the scalar
+             * path's, one block after the other in natural order, so the same
+             * selection runs on them -- and the reconstruction has to be
+             * rebuilt afterwards, because it was made from the old levels. */
+            trellis_luma4(e, mbx, mby, c, qp, (int16_t (*)[16])e->coef_lev,
+                          AEG_LAMBDA(qp));
+            t0 = aeg_now_ns();
+            e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp,
+                                   e->coef_rec);
+            aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+                                e->d.ops.backend != AEG_BACKEND_CPU,
+                                aeg_now_ns() - t0);
+            luma_inter_finish(e, mbx, mby, c, e->coef_lev, NULL,
+                              e->coef_rec, pred);
+            return;
+        }
         t0 = aeg_now_ns();
         e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
         aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
@@ -712,6 +1000,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         aeg_transform_4x4(e->coef_res + 16 * blk, 4, coef);
         aeg_quant_4x4(coef, c->level[blk], qp, 0);
     }
+    trellis_luma4(e, mbx, mby, c, qp, c->level, AEG_LAMBDA(qp));
     luma_inter_finish(e, mbx, mby, c, &c->level[0][0], NULL, NULL, pred);
 }
 
@@ -745,6 +1034,9 @@ static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                                        (int)pred[y * pred_stride + x]);
     aeg_transform_8x8(res, 8, coef);
     aeg_quant_8x8(coef, c->level8[g], c->qp, intra);
+    if (!intra)
+        trellis_luma8(e, src + by * s + bx, s, pred, pred_stride, c->level8[g],
+                      c->qp, AEG_LAMBDA(c->qp));
     c->nz8[g] = 0;
     for (i = 0; i < 64; i++)
         c->nz8[g] |= c->level8[g][i] != 0;
@@ -4492,6 +4784,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * range does: the two slow presets are where the quality is wanted. */
     if (pp->refine_mv < 0)
         pp->refine_mv = pp->preset >= 4 ? 2 : (pp->preset >= 3 ? 1 : 0);
+    /* Level selection is off unless asked for: it is a large amount of work
+     * (a price and an inverse transform per candidate level) for a BD-rate
+     * change that measured inside the noise on every clip of the test set. */
+    if (pp->trellis < 0)
+        pp->trellis = 0;
     if (pp->gop_size < 0) pp->gop_size = 250;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns

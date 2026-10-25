@@ -138,6 +138,10 @@ typedef struct aeg_params {
      * candidate priced by the coder, so it is a slow-preset tool.  -1 means
      * "as the preset says" (3 -> 1, 4 -> 2, below that off). */
     int refine_mv;
+    /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
+     * off, 1 = the candidates that only remove or shrink coefficients (see
+     * trellis_luma4() in encoder.c).  -1 means "as the preset says". */
+    int trellis;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8  */
     int chroma_me;            /* include chroma in motion SAD           */
     int verbose;              /* log verbosity                          */
