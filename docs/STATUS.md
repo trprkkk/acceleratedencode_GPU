@@ -1551,6 +1551,13 @@ BD-rate on the clip whose decisions are closest (see *Quality against a
 reference CPU encoder*).  Absolute numbers move a few percent between runs; the
 `-n 60`, single-thread, same-QP comparison is the one to repeat.
 
+What the remaining time is, per stage (`-v 2`, 60 frames of 320x192 at QP 24,
+preset 2 / preset 4, milliseconds per run): transform (the forward/inverse
+transform, quantisation and reconstruction of every candidate, and the coder's
+bin walk over them) 558 / 1086, motion estimation 202 / 206, inter prediction
+18 / 18, deblocking 6 / 6.  The decision pass is now 72% of the encode at
+preset 2 and 83% at preset 4, which is where a device would be pointed first.
+
 Where the speed came from, each step measured on its own, all of them
 byte-identical (they add, average and shift the same integers, so none of them
 can move a decision):

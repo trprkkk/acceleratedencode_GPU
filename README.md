@@ -18,20 +18,20 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > `make test` asserts it over 47 clip cases, two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch.  What
-> is *not* finished is speed and the last few percent of efficiency: at
-> matched PSNR x264 baseline (three references, trellis, AQ, SIMD) spends 1–8 %
-> fewer bits on the inter test clips and is level with it on all-intra, where
-> it used to be 25–50 % ahead.  Speed is the real gap: 92 fps against x264's
-> 175 fps (`--profile baseline`, no asm) on two cores at 320x192 QP 24, so it
-> is now 1.85x behind instead of 3.4x.  What closed that: caching the
-> fractional-pel planes of the reference picture (1.6x), exact-integer SSE2
-> kernels for SAD, the 4x4 SATD, the quantiser, the inverse transform and its
-> prediction add, plus `-O3`.  What is left is the motion search and the
-> rate-distortion pass, at 40 % and 48 % of the encode time, and those are what
-> the GPU backends exist for.  The GPU backends sit behind a measured
-> dispatcher, and the kernels are checked against the CPU reference by
-> `tests/kernel_check.c`, but nothing has run on real GPU hardware in this
-> environment (there is no GPU available).  See
+> is *not* finished is speed and the last few percent of efficiency.  On the
+> test clips, at matched PSNR, a baseline-profile x264 spends 36 % more bits
+> than this encoder, while libx264's default preset (`medium`: CABAC, 8x8
+> transform, trellis quantisation, AQ, SIMD) spends 9–12 % fewer on the moving
+> clips and 18 % more on the still one — the residual of that gap is trellis
+> quantisation and a rate-distortion refined search.  Speed is the real gap:
+> 77 fps (preset 2) or 46 fps (preset 4) against x264's ~400 fps on two cores
+> at 320x192 QP 24, and 72 % of the CPU time is now the
+> transform/quantise/reconstruct work of the rate-distortion pass with 26 % in
+> the motion search (83 %/16 % at preset 4), which is exactly what the GPU
+> backends exist for.  The GPU backends sit behind a measured dispatcher, and
+> the kernels are checked against the CPU reference by `tests/kernel_check.c`,
+> but nothing has run on real GPU hardware in this environment (there is no GPU
+> available).  See
 > [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Why this design
