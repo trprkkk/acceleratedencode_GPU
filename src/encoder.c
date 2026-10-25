@@ -2433,11 +2433,13 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     int16_t cur[2][16][2];
     uint8_t avail[2][16];
+    int8_t cur_ref[2][16];
     int lists = is_b_type(c->type) ? 2 : 1;
     int p, l, n = mb_part_count(c);
 
     memset(cur, 0, sizeof(cur));
     memset(avail, 0, sizeof(avail));
+    memset(cur_ref, 0, sizeof(cur_ref));
     for (p = 0; p < n; p++) {
         int geo[4], b0;
         int masks = lists == 1 ? 1 : mb_part_lists(c, p);
@@ -2452,8 +2454,9 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                  * so its predictor is the same one the search stored and is
                  * left alone. */
                 int pmvx, pmvy;
-                predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur[l],
-                              avail[l], c->type, p, x0, y0, geo[2] / 4, l,
+                int cur_r = (l == 0 && e->cur_l0_active > 1) ? (int)c->ref[b0] : 0;
+                predict_mv_at_ref(e, mbx, mby, (const int16_t (*)[2])cur[l], cur_ref[l],
+                              avail[l], c->type, p, x0, y0, geo[2] / 4, l, cur_r,
                               &pmvx, &pmvy);
                 if (l == 0) {
                     c->pmv[b0][0] = (int16_t)pmvx;
@@ -2474,8 +2477,10 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                         cur[l][b][0] = l ? c->mv1[b0][0] : c->mv[b0][0];
                         cur[l][b][1] = l ? c->mv1[b0][1] : c->mv[b0][1];
                         avail[l][b] = AEG_MVBLK_AVAIL;
+                        cur_ref[l][b] = (l == 0) ? (int8_t)c->ref[b0] : 0;
                     } else {
                         avail[l][b] = AEG_MVBLK_NOTUSED;
+                        cur_ref[l][b] = -1;
                     }
                 }
         }
