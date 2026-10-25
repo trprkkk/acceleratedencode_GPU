@@ -78,6 +78,9 @@ typedef struct mbenc {
  * "bframes 3" and what the pyramid would need; more than that buys very little
  * and costs lookahead memory. */
 #define AEG_MAX_BFRAMES 3
+/* Picture buffers: the two anchors around a group, its reference B picture
+ * (B pyramid) and the picture being reconstructed. */
+#define AEG_NPIC 4
 typedef struct {
     int     type;
     int     nparts;
@@ -105,14 +108,27 @@ struct aeg_encoder {
      * reconstruct itself.  The roles are buffer indices rather than pointers so
      * that the rotation below is one assignment per role; bind_pictures() puts
      * the plane pointers where the rest of the encoder expects them. */
-    uint8_t *pic_mem[3];
-    uint8_t *pic_plane[3][3];
+    uint8_t *pic_mem[AEG_NPIC];
+    uint8_t *pic_plane[AEG_NPIC][3];
     int role_cur;            /* buffer being reconstructed            */
     int role_last;           /* buffer the last coded picture went to  */
-    int role_ref0;           /* oldest reference picture (list 0 of B) */
-    int role_ref1;           /* newest reference picture (list 1 of B) */
-    int pic_poc[3];          /* picture order count held by each buffer   */
-    int nrefs;               /* reference pictures alive, 0..2         */
+    int pic_poc[AEG_NPIC];   /* picture order count held by each buffer   */
+    int nrefs;               /* reference pictures alive (= ndpb)      */
+    /* The decoder's reference picture buffer, mirrored (see picture_rotate):
+     * which buffer, its POC and frame_num, and whether it is an anchor (a
+     * reference B picture of a pyramid is not). */
+    struct { int slot, poc, fn, anchor; } dpb[3];
+    int ndpb;
+    int max_refs;            /* max_num_ref_frames of the SPS            */
+    aeg_refctl refctl;       /* list modification / MMCO of this picture */
+    int cur_l1_slot;         /* buffer of list1[0] (co-located picture)  */
+    /* Per buffer: the macroblock decisions of the reference picture in it,
+     * for direct mode when it is some B picture's list1[0]. */
+    aeg_mb *slot_mbs[AEG_NPIC];
+    int slot_ref_poc[AEG_NPIC][2];
+    int slot_col_ok[AEG_NPIC];
+    int job_bref[AEG_MAX_BFRAMES + 4];
+    int cur_bref;            /* the picture being coded is a reference B */
     uint8_t *recp[3], *refp[3], *ref2p[3];
 
     aeg_mb  *mbs;
@@ -553,128 +569,168 @@ static int enc_alloc_picture(struct aeg_encoder *e, uint8_t **mem, uint8_t **pla
     return AEG_OK;
 }
 
-/* Point recp/refp/ref2p at the three buffers' current roles.  Every other
- * function in this file reads those names and never the roles, so the only
- * place that has to know which buffer is which is this one. */
+/* Point recp at the buffer being reconstructed.  The reference pointers
+ * (refp/ref2p) are set per picture by set_current_refs(). */
 static void bind_pictures(struct aeg_encoder *e)
 {
     int i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 3; i++)
         e->recp[i] = e->role_cur >= 0 ? e->pic_plane[e->role_cur][i] : NULL;
-        e->refp[i] = e->role_ref0 >= 0 ? e->pic_plane[e->role_ref0][i] : NULL;
-        e->ref2p[i] = e->role_ref1 >= 0 ? e->pic_plane[e->role_ref1][i] : NULL;
-    }
-    e->has_ref = e->nrefs > 0;
-    e->has_ref2 = e->nrefs > 1;
+    e->nrefs = e->ndpb;
+    e->has_ref = e->ndpb > 0;
+    e->has_ref2 = e->ndpb > 1;
 }
 
-/* A buffer no role holds. */
+static int dpb_holds(const struct aeg_encoder *e, int slot)
+{
+    int i;
+    for (i = 0; i < e->ndpb; i++)
+        if (e->dpb[i].slot == slot)
+            return 1;
+    return 0;
+}
+
+/* A buffer that is neither being reconstructed nor a reference picture. */
 static int pic_free(const struct aeg_encoder *e)
 {
     int i;
-    for (i = 0; i < 3; i++)
-        if (i != e->role_cur && i != e->role_ref0 && i != e->role_ref1)
+    for (i = 0; i < AEG_NPIC; i++)
+        if (i != e->role_cur && !dpb_holds(e, i))
             return i;
     return -1;
 }
 
-/* The picture just coded becomes a reference, the oldest one is dropped when
- * the buffer would otherwise overflow (the decoder's sliding window does the
- * same, which is why the SPS asks for two reference frames with B pictures),
- * and the buffer it frees is where the next picture is reconstructed.
- *
- * A B picture is not a reference picture (nal_ref_idc = 0), so this does
- * nothing for it: its buffer is simply reused by the next picture. */
+/* The decoder's reference marking (8.2.5), mirrored.  An IDR picture empties
+ * the buffer; a picture whose header carries memory_management_control
+ * operations (refctl, planned by set_current_refs) drops exactly those
+ * pictures; any other reference picture goes through the sliding window,
+ * which drops the one with the smallest frame_num once max_num_ref_frames
+ * are stored.  The picture just coded is then stored, and the buffer it
+ * frees -- or any buffer no reference holds -- is where the next picture is
+ * reconstructed.  A non-reference B picture changes nothing: its buffer is
+ * simply reused. */
 static void picture_rotate(struct aeg_encoder *e, int is_ref, int is_idr)
 {
-    int coded = e->role_cur;
+    int i, k;
 
-    e->role_last = coded;
-
-    if (!is_ref) {
-        bind_pictures(e);
-        return;
+    e->role_last = e->role_cur;
+    if (is_ref) {
+        if (is_idr) {
+            e->ndpb = 0;
+        } else if (e->refctl.n_mmco) {
+            for (k = 0; k < e->refctl.n_mmco; k++)
+                for (i = 0; i < e->ndpb; i++)
+                    if (e->dpb[i].slot == e->refctl.mmco_slot[k]) {
+                        e->dpb[i] = e->dpb[--e->ndpb];
+                        break;
+                    }
+        } else if (e->ndpb >= e->max_refs) {
+            int m = 0;
+            for (i = 1; i < e->ndpb; i++)
+                if (e->dpb[i].fn < e->dpb[m].fn)
+                    m = i;
+            e->dpb[m] = e->dpb[--e->ndpb];
+        }
+        e->dpb[e->ndpb].slot = e->role_cur;
+        e->dpb[e->ndpb].poc = e->cur_poc;
+        e->dpb[e->ndpb].fn = e->frame_num;
+        e->dpb[e->ndpb].anchor = !e->cur_is_b;
+        e->ndpb++;
+        /* frame_num counts reference pictures (7.4.3): the pictures after
+         * this one carry PrevRefFrameNum + 1 */
+        e->frame_num++;
     }
-    /* An IDR picture empties the decoder's buffer before it is stored, so it
-     * is the *only* reference afterwards.  With one reference per P picture
-     * nothing could tell the difference, but a P picture with two would take
-     * the picture before the IDR as list0[1] -- one the decoder no longer has
-     * (it conceals it with another one, silently). */
-    if (is_idr) {
-        e->role_ref0 = coded;
-        e->role_ref1 = -1;
-        e->nrefs = 1;
-        e->role_cur = -1;
-        e->role_cur = pic_free(e);
-        bind_pictures(e);
-        return;
-    }
-    if (e->nrefs == 0) {
-        e->role_ref0 = coded;
-        e->nrefs = 1;
-        e->role_cur = pic_free(e);
-    } else if (e->nrefs == 1) {
-        e->role_ref1 = coded;
-        e->nrefs = 2;
-        e->role_cur = pic_free(e);
-    } else {
-        /* both references are alive: the oldest one's buffer is reused */
-        e->role_cur = e->role_ref0;
-        e->role_ref0 = e->role_ref1;
-        e->role_ref1 = coded;
-    }
+    e->role_cur = -1;
+    e->role_cur = pic_free(e);
     bind_pictures(e);
 }
 
 /* Which reference picture each list points at for the picture about to be
- * coded.  list0[0] is the nearest reference picture in display order that comes
- * *before* this one and list1[0] the nearest that comes after it; with one
- * reference picture per anchor direction that is exactly the older and the
- * newer of the two references still alive.  A P picture only uses list 0, and
- * its nearest-past reference is always the newer of the two.  With two active
- * list0 entries (P multi-reference) the older one is list0[1] and lives in
- * ref2p for the motion compensation to find. */
+ * coded, chosen the way the decoder's default lists (8.2.4.2) order them so
+ * that index 0 is what the encoder predicted from:
+ *
+ *  - B: list0[0] is the nearest reference before it in display order and
+ *    list1[0] the nearest after it.  With a B pyramid the reference B of a
+ *    group is one of them for the other B pictures of the group.
+ *  - P: the newest anchor (the default list is in decreasing frame_num,
+ *    which puts a reference B picture of the group just coded first -- that
+ *    case gets a ref_pic_list_modification moving the anchor to the front).
+ *    With two active list0 entries (P multi-reference, no pyramid) the
+ *    older anchor is list0[1] and lives in ref2p.
+ *
+ * With a pyramid, an anchor's header also removes every reference except the
+ * previous anchor once a reference B picture is among them: the group it
+ * belonged to is finished, and the sliding window would otherwise drop the
+ * previous anchor first (it has the smaller frame_num) while the next
+ * group's B pictures still need it. */
 static int p_should_use_2refs(const struct aeg_encoder *e)
 {
     /* `refs` is resolved by aeg_encoder_open() (2 from preset 3 up on P-only
      * streams, see there); the first P picture after an IDR only has one
      * reference to offer. */
-    return e->cur_is_p && e->nrefs > 1 && e->p.refs >= 2;
+    return e->cur_is_p && e->ndpb > 1 && e->p.refs >= 2;
 }
 static void set_current_refs(struct aeg_encoder *e)
 {
-    int list0 = e->cur_is_b ? e->role_ref0 : (e->nrefs > 1 ? e->role_ref1
-                                                          : e->role_ref0);
-    int list1 = e->cur_is_b ? e->role_ref1 : -1;
-    int i;
+    int l0 = -1, l1 = -1, l0b = -1, i, bref = 0;
 
-    /* P with two list0 entries: list0[0] = newest (role_ref1), list0[1] =
-     * oldest (role_ref0).  No reordering syntax is needed: the decoder's
-     * default list0 is decreasing frame_num, which is exactly [newest, oldest]
-     * for two sliding-window references, so num_ref_idx_active_override is all
-     * that has to be sent. */
-    if (p_should_use_2refs(e) && e->nrefs > 1) {
-        int l0a = e->role_ref1, l0b = e->role_ref0;
-        for (i = 0; i < 3; i++) {
-            e->refp[i] = e->pic_plane[l0a][i];
-            e->ref2p[i] = e->pic_plane[l0b][i];
+    memset(&e->refctl, 0, sizeof(e->refctl));
+    e->refctl.l0_mod = -1;
+    for (i = 0; i < e->ndpb; i++)
+        bref |= !e->dpb[i].anchor;
+    if (e->cur_is_b) {
+        for (i = 0; i < e->ndpb; i++) {
+            int p = e->dpb[i].poc;
+            if (p < e->cur_poc && (l0 < 0 || p > e->dpb[l0].poc)) l0 = i;
+            if (p > e->cur_poc && (l1 < 0 || p < e->dpb[l1].poc)) l1 = i;
         }
-        e->ref_poc[0] = e->pic_poc[l0a];
-        e->ref_poc[1] = e->pic_poc[l0b];
+    } else {
+        for (i = 0; i < e->ndpb; i++)
+            if (e->dpb[i].anchor && (l0 < 0 || e->dpb[i].poc > e->dpb[l0].poc))
+                l0 = i;
+        for (i = 0; i < e->ndpb; i++)
+            if (i != l0 && e->dpb[i].anchor &&
+                (l0b < 0 || e->dpb[i].poc > e->dpb[l0b].poc))
+                l0b = i;
+        if (l0 >= 0 && e->cur_is_p) {
+            int top = 0;
+            for (i = 1; i < e->ndpb; i++)
+                if (e->dpb[i].fn > e->dpb[top].fn)
+                    top = i;
+            if (top != l0)
+                e->refctl.l0_mod = e->frame_num - e->dpb[l0].fn - 1;
+        }
+        if (bref && l0 >= 0)
+            for (i = 0; i < e->ndpb; i++)
+                if (i != l0) {
+                    int k = e->refctl.n_mmco++;
+                    e->refctl.mmco_diff[k] = e->frame_num - e->dpb[i].fn - 1;
+                    e->refctl.mmco_slot[k] = e->dpb[i].slot;
+                }
+    }
+    e->cur_l1_slot = l1 >= 0 ? e->dpb[l1].slot : -1;
+    if (p_should_use_2refs(e) && l0 >= 0 && l0b >= 0) {
+        int a = e->dpb[l0].slot, b = e->dpb[l0b].slot;
+        for (i = 0; i < 3; i++) {
+            e->refp[i] = e->pic_plane[a][i];
+            e->ref2p[i] = e->pic_plane[b][i];
+        }
+        e->ref_poc[0] = e->pic_poc[a];
+        e->ref_poc[1] = e->pic_poc[b];
         e->has_ref = 1;
         e->has_ref2 = 1;               /* second list0 entry lives in ref2p */
         e->cur_l0_active = 2;
         return;
     }
     for (i = 0; i < 3; i++) {
-        e->refp[i] = list0 >= 0 ? e->pic_plane[list0][i] : NULL;
-        e->ref2p[i] = list1 >= 0 ? e->pic_plane[list1][i] : NULL;
+        e->refp[i] = l0 >= 0 ? e->pic_plane[e->dpb[l0].slot][i] : NULL;
+        e->ref2p[i] = l1 >= 0 ? e->pic_plane[e->dpb[l1].slot][i] : NULL;
     }
-    e->ref_poc[0] = list0 >= 0 ? e->pic_poc[list0] : 0;
-    e->ref_poc[1] = list1 >= 0 ? e->pic_poc[list1] : 0;
-    e->has_ref = list0 >= 0;
-    e->has_ref2 = list1 >= 0;
+    e->ref_poc[0] = l0 >= 0 ? e->dpb[l0].poc : 0;
+    e->ref_poc[1] = l1 >= 0 ? e->dpb[l1].poc : 0;
+    e->has_ref = l0 >= 0;
+    e->has_ref2 = l1 >= 0;
     e->cur_l0_active = 1;
 }
 
@@ -2427,9 +2483,20 @@ static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
     lists = used[0] | (used[1] << 1);
     for (g = 0; g < 4; g++) {
         int z = 0, x8 = g & 1, y8 = g >> 1;
-        if (col && !is_intra_type(col->type) && col->ref_idx[grp4[g]] == 0) {
-            int cx = col->mv[grp4[g]][0], cy = col->mv[grp4[g]][1];
-            z = cx >= -1 && cx <= 1 && cy >= -1 && cy <= 1;
+        /* the co-located block's list 0 vector if it has one (and then only
+         * on reference 0), else its list 1 vector -- the co-located picture
+         * is a reference B picture of a pyramid for some B pictures */
+        if (col && !is_intra_type(col->type)) {
+            int lm = aeg_mb_block_lists(col, grp4[g]);
+            const int16_t *v = NULL;
+            if (lm & 1) {
+                if (col->ref_idx[grp4[g]] == 0)
+                    v = col->mv[grp4[g]];
+            } else if (lm & 2) {
+                v = col->mv1[grp4[g]];
+            }
+            if (v)
+                z = v[0] >= -1 && v[0] <= 1 && v[1] >= -1 && v[1] <= 1;
         }
         for (k = 0; k < 4; k++) {
             int b = ((y8 << 1) + (k >> 1)) * 4 + (x8 << 1) + (k & 1);
@@ -6772,7 +6839,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->cur_qp - 26, 0, 0,
                                    e->p.deblock ? 0 : 1, first_row * e->mb_w,
                                    e->cur_l0_active, e->p.direct == 1,
-                                   wp_used(e) ? &e->wp : NULL);
+                                   wp_used(e) ? &e->wp : NULL, &e->refctl);
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
@@ -7344,6 +7411,16 @@ done:
                 e->wp.chroma_denom);
 }
 
+static int bref_qp_num(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_BREFQP");   /* offset in halves */
+        v = ev ? atoi(ev) : 2;
+    }
+    return v;
+}
+
 /* Undo wp_analyse's substitution once the picture is coded. */
 static void wp_finish(struct aeg_encoder *e)
 {
@@ -7370,7 +7447,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
      * cut test, which compares the picture with its list 0 reference. */
     e->cur_poc = poc;
     e->cur_is_b = slice == AEG_SLICE_B;
-    e->cur_is_ref = !e->cur_is_b;
+    e->cur_is_ref = !e->cur_is_b || e->cur_bref;
     e->pic_poc[e->role_cur] = poc;
     /* set_current_refs() reads cur_is_p (a P picture may take two list-0
      * entries), so it has to describe *this* picture.  It used to be assigned
@@ -7399,6 +7476,18 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     if (is_p != e->cur_is_p) {
         e->cur_is_p = is_p;
         set_current_refs(e);
+    }
+    /* direct mode reads the decisions of list1[0], whichever buffer that is
+     * (the next anchor, or the group's reference B picture) */
+    if (e->cur_is_b && e->cur_l1_slot >= 0 && e->slot_mbs[e->cur_l1_slot]) {
+        int s = e->cur_l1_slot;
+        e->col_mbs = e->slot_mbs[s];
+        e->col_poc = e->pic_poc[s];
+        e->col_ref_poc[0] = e->slot_ref_poc[s][0];
+        e->col_ref_poc[1] = e->slot_ref_poc[s][1];
+        e->col_ready = e->slot_col_ok[s];
+    } else if (e->cur_is_b) {
+        e->col_ready = 0;
     }
     if (is_idr) {
         e->last_idr_frame = e->frame_count;
@@ -7447,6 +7536,12 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
          * reported anywhere in docs/STATUS.md moves. */
         int off = e->p.b_qp_offset;
 
+        /* a reference B picture is predicted from by its neighbours, so it
+         * sits half way between the anchors and the other B pictures */
+        if (e->cur_bref) {
+            const char *ev = getenv("AEG_BREFOFF");
+            off = ev ? atoi(ev) : off * bref_qp_num() / 2;
+        }
         if (e->cur_qp < B_QP_FADE)
             off = off * e->cur_qp / B_QP_FADE;
         e->cur_qp += off;
@@ -7638,7 +7733,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             /* A B picture is not used as a reference, so its nal_ref_idc is 0
              * and the decoder is free to drop it as soon as it is output. */
             out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
-                                     is_idr ? 3 : (slice == AEG_SLICE_B ? 0 : 2),
+                                     is_idr ? 3 : (e->cur_is_ref ? 2 : 0),
                                      is_idr ? 5 : 1, e->slice_bs[si], lens[si],
                                      0);
         }
@@ -7702,22 +7797,21 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     /* frame_num counts reference pictures only: a non-reference picture carries
      * PrevRefFrameNum + 1 (7.4.3), so all the B pictures of a group repeat the
      * value the anchor after them already had. */
-    if (!e->cur_is_b)
-        e->frame_num++;
-    /* The co-located picture of the following B pictures is this one if it is a
-     * reference picture, and it is the most recent reference either way. */
-    if (!e->cur_is_b && e->col_mbs) {
-        memcpy(e->col_mbs, e->mbs, (size_t)e->mb_count * sizeof(e->mbs[0]));
-        e->col_poc = e->cur_poc;
-        e->col_ref_poc[0] = e->ref_poc[0];
-        e->col_ref_poc[1] = e->ref_poc[1];
-        e->col_ready = 1;
+    /* (frame_num is advanced by picture_rotate, for reference pictures.)
+     * A reference picture may be some later B picture's list1[0], whose
+     * direct mode reads this picture's decisions: keep them with its buffer. */
+    if (e->cur_is_ref && e->slot_mbs[e->role_cur]) {
+        memcpy(e->slot_mbs[e->role_cur], e->mbs,
+               (size_t)e->mb_count * sizeof(e->mbs[0]));
+        e->slot_ref_poc[e->role_cur][0] = e->ref_poc[0];
+        e->slot_ref_poc[e->role_cur][1] = e->ref_poc[1];
+        e->slot_col_ok[e->role_cur] = 1;
     }
     /* The reconstruction becomes a reference picture and the buffer it occupied
      * is handed to the next picture (or, for a B picture, kept: a B is not a
      * reference, so its buffer is simply reused). */
     wp_finish(e);
-    picture_rotate(e, !e->cur_is_b, is_idr);
+    picture_rotate(e, e->cur_is_ref, is_idr);
     e->pic.plane[0] = e->recp[0];
     e->pic.plane[1] = e->recp[1];
     e->pic.plane[2] = e->recp[2];
@@ -7799,7 +7893,8 @@ static void push_input(struct aeg_encoder *e, const uint8_t *yuv420p,
     e->in_count++;
 }
 
-static void add_job(struct aeg_encoder *e, int display, int slice, int idr)
+static void add_job_r(struct aeg_encoder *e, int display, int slice, int idr,
+                      int bref)
 {
     int n = e->job_n;
     if (n >= (int)(sizeof(e->job_d) / sizeof(e->job_d[0])))
@@ -7807,7 +7902,12 @@ static void add_job(struct aeg_encoder *e, int display, int slice, int idr)
     e->job_d[n] = display;
     e->job_slice[n] = slice;
     e->job_idr[n] = idr;
+    e->job_bref[n] = bref;
     e->job_n = n + 1;
+}
+static void add_job(struct aeg_encoder *e, int display, int slice, int idr)
+{
+    add_job_r(e, display, slice, idr, 0);
 }
 
 /* Whether display index `poc` is due to be coded as an IDR.  With B pictures
@@ -7835,10 +7935,12 @@ static int run_job(struct aeg_encoder *e, aeg_packet *pkt)
     int64_t pts = e->in_pts[d % in_slots(e)];
     int i, rc;
 
+    e->cur_bref = e->job_bref[0];
     for (i = 1; i < e->job_n; i++) {
         e->job_d[i - 1] = e->job_d[i];
         e->job_slice[i - 1] = e->job_slice[i];
         e->job_idr[i - 1] = e->job_idr[i];
+        e->job_bref[i - 1] = e->job_bref[i];
     }
     e->job_n--;
     bind_source(e, d);
@@ -7987,8 +8089,18 @@ static void schedule(struct aeg_encoder *e)
         add_job(e, nxt, AEG_SLICE_I, 1);
     } else {
         add_job(e, nxt, AEG_SLICE_P, 0);
-        for (d = e->anchor + 1; d < nxt; d++)
-            add_job(e, d, AEG_SLICE_B, 0);
+        if (e->p.b_pyramid && nxt - e->anchor - 1 >= 2) {
+            /* the middle B picture first, as a reference for the others:
+             *   P4 B2(ref) B1 B3 */
+            int mid = e->anchor + (nxt - e->anchor) / 2;
+            add_job_r(e, mid, AEG_SLICE_B, 0, 1);
+            for (d = e->anchor + 1; d < nxt; d++)
+                if (d != mid)
+                    add_job(e, d, AEG_SLICE_B, 0);
+        } else {
+            for (d = e->anchor + 1; d < nxt; d++)
+                add_job(e, d, AEG_SLICE_B, 0);
+        }
     }
     e->anchor = nxt;
 }
@@ -8088,6 +8200,16 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->refs = 1;
     if (pp->refs > 2)
         pp->refs = 2;
+    /* The pyramid needs two B pictures to have a middle one, spatial direct
+     * (temporal direct from a reference B picture would need the co-located
+     * picture's list 1 mapped into this picture's lists, which is not
+     * implemented) and a single P reference (the anchors drop every older
+     * picture, see set_current_refs). */
+    if (pp->b_pyramid < 0)
+        pp->b_pyramid = 1;
+    if (pp->bframes < 2 || pp->direct != 1 || pp->refs != 1)
+        pp->b_pyramid = 0;
+    pp->b_pyramid = pp->b_pyramid ? 1 : 0;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns
      * ABR on, with the maximum rate as the target when no bitrate was given. */
@@ -8175,7 +8297,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     {
         int i;
-        for (i = 0; i < 3; i++)
+        for (i = 0; i < AEG_NPIC; i++)
             if (enc_alloc_picture(e, &e->pic_mem[i], e->pic_plane[i]) != AEG_OK) {
                 aeg_set_last_error("out of memory");
                 aeg_encoder_close(e);
@@ -8183,8 +8305,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             }
         e->role_cur = 0;
         e->role_last = 0;
-        e->role_ref0 = e->role_ref1 = -1;
-        e->nrefs = 0;
+        e->ndpb = 0;
+        e->max_refs = (pp->bframes > 0 && pp->b_pyramid) ? 3 :
+                      ((pp->bframes > 0 || pp->refs >= 2) ? 2 : 1);
         bind_pictures(e);
     }
     aeg_mc_ctx_init(&e->mc, e->w, e->h, e->stride[0]);
@@ -8258,8 +8381,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             }
         }
         e->in_pts = (int64_t *)aeg_alloc((size_t)slots * sizeof(int64_t));
-        e->col_mbs = (aeg_mb *)aeg_alloc((size_t)e->mb_count * sizeof(aeg_mb));
-        if (!e->in_pts || !e->col_mbs) {
+        for (i = 0; i < AEG_NPIC; i++)
+            e->slot_mbs[i] = (aeg_mb *)aeg_alloc((size_t)e->mb_count * sizeof(aeg_mb));
+        e->col_mbs = e->slot_mbs[0];
+        if (!e->in_pts || !e->slot_mbs[0] || !e->slot_mbs[1] ||
+            !e->slot_mbs[2] || !e->slot_mbs[3]) {
             aeg_set_last_error("out of memory");
             aeg_encoder_close(e);
             return NULL;
@@ -8482,7 +8608,6 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->par_cost);
     aeg_free(e->mb_dqp);
     aeg_free(e->mbs);
-    aeg_free(e->col_mbs);
     aeg_free(e->in_pts);
     {
         int i;
@@ -8491,8 +8616,10 @@ void aeg_encoder_close(aeg_encoder *enc)
         for (i = 0; i < AEG_MAX_BFRAMES + 3; i++)
             aeg_lowres_free(&e->in_low[i]);
         aeg_free(e->la_scratch);
-        for (i = 0; i < 3; i++)
+        for (i = 0; i < AEG_NPIC; i++) {
             aeg_free(e->pic_mem[i]);
+            aeg_free(e->slot_mbs[i]);
+        }
         aeg_free(e->wp_mem);
     }
     aeg_free(e->src_mem);

@@ -1563,6 +1563,53 @@ Not done yet: the weight guess is only refined by the two candidates; on the
 synthetic fading pan (3 px/frame) the half-resolution integer search misses
 the half-pel alignment and rejects the luma weight on half the pictures.
 
+**B pyramid** (`--b-pyramid`, on whenever there are two or more B pictures,
+spatial direct and one P reference).  The middle B picture of a group is
+coded right after the anchor as a reference picture (nal_ref_idc 2) and the
+other B pictures of the group predict from it: `P4 B2(ref) B1 B3`.  What it
+took:
+
+* four picture buffers and a mirror of the decoder's reference buffer
+  (`dpb[]`, picture_rotate): sliding window with max_num_ref_frames = 3,
+  or the picture's own MMCOs;
+* reference selection by the decoder's default lists (set_current_refs): a B
+  picture's list0[0]/list1[0] are the nearest references before/after it in
+  display order, so the reference B is found without any list syntax;
+* a P anchor's default list 0 starts with the reference B (largest
+  frame_num), so it sends one ref_pic_list_modification (abs_diff_pic_num)
+  that moves the previous anchor to the front, and an MMCO 1 per reference
+  other than the previous anchor -- otherwise the sliding window would drop
+  the previous anchor (smaller frame_num) while the next group still needs
+  it;
+* frame_num advances after every reference picture, including the B;
+* the macroblock decisions are kept per buffer (`slot_mbs`), because the
+  co-located picture of B1 is B2 and that of B3 is P4; colZero takes the
+  co-located block's list 1 vector when its list 0 is unused (FFmpeg's
+  `l1ref0 < 0 && l1ref1 == 0` branch).
+
+The reference B's quantiser: the same offset as the other B pictures is best
+(`AEG_BREFQP`, in halves of the offset: 0 = anchor QP +1.06%, 1 = half way
+-0.18%, 2 = same -0.65% against no pyramid; an absolute offset of 3 or 5,
+`AEG_BREFOFF`, is no better, nor is --bqp 3/5 with the pyramid).  Ours against
+ours (global PSNR, `--b-pyramid 0` -> 1 at offset 2): cock -0.55, vtest
+-1.12, mega -1.57, short 0.00 (never two B pictures), tree 0.00.
+
+| vs x264 psy=0, global PSNR | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| weightp (above) | +5.65 | -0.23 | +0.29 | -3.67 | -0.04 | +0.40 |
+| + B pyramid | +5.07 | -1.34 | -1.29 | -3.67 | -0.05 | **-0.26** |
+
+Bit-exact on every real clip at presets 1/3/4, with slices and threads,
+groups of two, mid-stream IDRs, and a 420-picture stream (POC lsb and
+frame_num wrap) in CQP and ABR+VBV.  Conformance cases `bpyr_off`,
+`bpyr_two`, `bpyr_adapt`; the fixed-structure order checks run with
+`--b-pyramid 0` (their expected order is the flat one).
+
+x264 feature values measured the same way (global PSNR, BD of ours against
+x264 with the feature off, minus the baseline +0.40): weightb 0.11,
+chroma-me 0.16, b-pyramid 0.46, ref 3 -> 1 0.70.  On cock alone: P only
+(bframes 0, ref 1 both) ours +1.24%, intra only ours -27.5%.
+
 ## Next
 
 1. The B *search*, now that the macroblock layer is complete and its vectors are

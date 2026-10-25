@@ -182,7 +182,8 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     /* pic_order_cnt_type 2 derives the picture order count from frame_num,
      * which counts *decoding* order: with B pictures the two orders differ, so
      * the count has to be sent explicitly (type 0, an 8-bit lsb per slice). */
-    const int nrefs = (p->bframes > 0 || p->refs >= 2) ? 2 : 1;
+    const int nrefs = (p->bframes > 0 && p->b_pyramid) ? 3 :
+                      ((p->bframes > 0 || p->refs >= 2) ? 2 : 1);
     if (p->bframes > 0) {
         aeg_bw_ue(&bw, 0);               /* pic_order_cnt_type = 0          */
         aeg_bw_ue(&bw, 4);               /* log2_max_pic_order_cnt_lsb_minus4 */
@@ -331,7 +332,7 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
                                 int slice_qp_delta, int deblock_alpha,
                                 int deblock_beta, int deblock_idc, int first_mb,
                                 int num_ref_idx_l0_active, int direct_spatial,
-                                const aeg_pwt *pwt)
+                                const aeg_pwt *pwt, const aeg_refctl *rc)
 {
     int nos = slice_type_in % 5;      /* 0 = P, 1 = B, 2 = I */
 
@@ -356,7 +357,14 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         } else {
             aeg_bw_put(bw, 1, 0);     /* num_ref_idx_active_override_flag   */
         }
-        aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
+        if (nos == 0 && rc && rc->l0_mod >= 0) {
+            aeg_bw_put(bw, 1, 1);     /* ref_pic_list_modification_flag_l0  */
+            aeg_bw_ue(bw, 0);         /* modification_of_pic_nums_idc: -    */
+            aeg_bw_ue(bw, (uint32_t)rc->l0_mod); /* abs_diff_pic_num_minus1 */
+            aeg_bw_ue(bw, 3);         /* end of the modifications           */
+        } else {
+            aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l0  */
+        }
         if (nos == 1)
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
     }
@@ -366,6 +374,14 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         if (idr) {
             aeg_bw_put(bw, 1, 0);     /* no_output_of_prior_pics_flag       */
             aeg_bw_put(bw, 1, 0);     /* long_term_reference_flag           */
+        } else if (rc && rc->n_mmco > 0) {
+            int k;
+            aeg_bw_put(bw, 1, 1);     /* adaptive_ref_pic_marking_mode_flag */
+            for (k = 0; k < rc->n_mmco; k++) {
+                aeg_bw_ue(bw, 1);     /* mark a short-term picture unused   */
+                aeg_bw_ue(bw, (uint32_t)rc->mmco_diff[k]);
+            }
+            aeg_bw_ue(bw, 0);         /* end of the operations              */
         } else {
             aeg_bw_put(bw, 1, 0);     /* adaptive_ref_pic_marking_mode_flag */
         }

@@ -179,6 +179,10 @@ typedef struct aeg_params {
      * motion-compensated test of the reference against the picture.  -1 = as
      * the preset says (on from preset 2 up). */
     int weightp;
+    /* B pyramid: the middle B picture of a group of two or more is a
+     * reference picture for the others (x264's b-pyramid "normal").  -1 = on
+     * whenever it can be (B pictures, spatial direct, one P reference). */
+    int b_pyramid;
     /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */

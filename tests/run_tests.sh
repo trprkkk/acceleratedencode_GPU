@@ -293,6 +293,13 @@ run_bcase bframes3     320 192 12 3 4 -q 24 --scenecut 0
 #   a still clip: every B macroblock collapses into direct-skip, which is the
 #   skip flag and direct prediction with no residual at all
 run_bcase bframes_still 320 192  8 2 3 -q 24 --scenecut 0
+# B pyramid (on by default with two or more B pictures, so the cases above
+# already run it): the middle B picture of each group is a reference, the
+# anchors re-order list 0 and drop it again with an MMCO.  Without the
+# pyramid, and with groups of two (the first B picture is the reference).
+run_bcase bpyr_off      320 192 12 3 4 -q 24 --scenecut 0 --b-pyramid 0
+run_bcase bpyr_two      320 192 13 2 1 -q 24 --scenecut 0 --b-pyramid 1
+run_bcase bpyr_adapt    320 192 24 3 4 -q 26 -p 3 --b-adapt 1 -g 10
 # Explicit weighted prediction on a fade (genyuv mode 5): the P pictures send
 # a luma and chroma weight/offset through PPS 1, the prediction is
 # interpolated first and weighted afterwards, as 8.4.2.3 has it.  P only,
@@ -312,8 +319,8 @@ run_bcase bframes_odd   320 192 11 2 1 -q 26 --scenecut 0
 run_bcase bframes_idr   320 192 12 1 1 -q 26 --scenecut 0 -g 4
 #   the fixed structure (--b-adapt 0): the reported coding order has to be the
 #   one rebuilt from the frame and B counts, with and without a mid-stream IDR
-run_bcase bframes_fix3  320 192 12 3 4 -q 24 --scenecut 0 --b-adapt 0
-run_bcase bframes_fixidr 320 192 12 2 1 -q 26 --scenecut 0 -g 5 --b-adapt 0
+run_bcase bframes_fix3  320 192 12 3 4 -q 24 --scenecut 0 --b-adapt 0 --b-pyramid 0
+run_bcase bframes_fixidr 320 192 12 2 1 -q 26 --scenecut 0 -g 5 --b-adapt 0 --b-pyramid 0
 #   the 8x8 transform and the deblocking filter both treat B macroblocks
 #   differently from P ones: the transform flag is coded for a direct
 #   macroblock, and the boundary strength compares both prediction lists

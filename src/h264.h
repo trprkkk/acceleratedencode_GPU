@@ -283,6 +283,17 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
 /* pred_weight_table() of a P slice (7.3.3.2): list 0 only, one entry per
  * active reference.  A flag of 0 means the default (unweighted) prediction. */
+/* Reference list modification and marking of one slice header (7.3.3.1,
+ * 7.3.3.3), B pyramid only.  l0_mod >= 0: one modification_of_pic_nums_idc
+ * 0 with abs_diff_pic_num_minus1 = l0_mod.  n_mmco > 0: adaptive marking
+ * with one operation 1 (difference_of_pic_nums_minus1 = mmco_diff[k]) per
+ * entry. */
+typedef struct aeg_refctl {
+    int l0_mod;
+    int n_mmco;
+    int mmco_diff[3];
+    int mmco_slot[3];   /* encoder bookkeeping, not written */
+} aeg_refctl;
 typedef struct aeg_pwt {
     int luma_denom, chroma_denom;
     int lflag[2], lw[2], lo[2];
@@ -307,7 +318,8 @@ void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
                                   int deblock_alpha, int deblock_beta,
                                   int deblock_idc, int first_mb,
                                   int num_ref_idx_l0_active,
-                                  int direct_spatial, const aeg_pwt *pwt);
+                                  int direct_spatial, const aeg_pwt *pwt,
+                                  const aeg_refctl *rc);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma

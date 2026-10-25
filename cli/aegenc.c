@@ -48,6 +48,8 @@ static void usage(void)
 "  --refine-cand <n> refine every inter candidate's vectors, not only the\n"
 "                   winner's: 0 = off (default), 1 = on (costs about a third of\n"
 "                   the encode time at preset 4 for 0.3-0.6 points of BD-rate)\n"
+"  --b-pyramid <n>  1 = the middle B picture of a group is a reference for\n"
+"                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 2)\n"
 "  --ref <n>        reference pictures for P pictures, 1 or 2 (default 2 from\n"
@@ -221,7 +223,7 @@ int main(int argc, char **argv)
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
-    int refine_mv = -1, refine_cand = -1, refs = -1, weightp = -1;
+    int refine_mv = -1, refine_cand = -1, refs = -1, weightp = -1, bpyramid = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
     int64_t *pass1_bits = NULL;
@@ -271,6 +273,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--refine-cand")) refine_cand = atoi(argv[++i]);
         else if (!strcmp(a, "--ref")) refs = atoi(argv[++i]);
         else if (!strcmp(a, "--weightp")) weightp = atoi(argv[++i]);
+        else if (!strcmp(a, "--b-pyramid")) bpyramid = atoi(argv[++i]);
         else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
         else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
         else if (!strcmp(a, "--iqp")) iqp = atoi(argv[++i]);
@@ -401,6 +404,7 @@ int main(int argc, char **argv)
     if (refine_cand >= 0) p.refine_cand = refine_cand;
     if (refs >= 0) p.refs = refs;
     if (weightp >= 0) p.weightp = weightp;
+    if (bpyramid >= 0) p.b_pyramid = bpyramid;
     if (bframes >= 0) p.bframes = bframes;
     if (bqp > -1000) p.b_qp_offset = bqp;
     if (iqp > -1000) p.i_qp_offset = iqp;
