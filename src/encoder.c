@@ -255,6 +255,8 @@ struct aeg_encoder {
     int ref_poc[2];         /* POC of the two references, oldest first   */
     int col_ready;          /* the co-located picture's decisions are usable */
     aeg_mb *col_mbs;        /* ... and they live here (see b_direct_mv)  */
+    int col_poc;            /* POC of co-located picture */
+    int col_ref_poc[2];     /* POC of its two L0 references (if any) */
     /* Lookahead: input pictures are held in display order until the anchors
      * they are coded between have arrived (see aeg_encoder_encode()). */
     uint8_t *in_mem[AEG_MAX_BFRAMES + 3];
@@ -608,20 +610,14 @@ static void picture_rotate(struct aeg_encoder *e, int is_ref)
  * ref2p for the motion compensation to find. */
 static int p_should_use_2refs(const struct aeg_encoder *e)
 {
-    /* Gated on preset so that ultrafast stays 1-ref and bit-exact to the old
-     * stream: the second reference only pays at the RD stage.  The override
-     * itself costs < 5 bits per P slice, so the gate is the only place that
-     * has to care. */
-    /* Multi-reference is wired but not yet advertised: the slice header
-     * would need to count the extra reference and every P macroblock would
-     * then need its ref_idx_l0 syntax (CABAC context 54 and CAVLC te(v)),
-     * which is not in yet.  Leaving the override at 1 would desynchronise the
-     * decoder at the first mvd.  Gate it on the environment so that the
-     * conformance suite stays bit-exact until the syntax is there. */
-    if (getenv("AEG_REF2"))
-        return e->cur_is_p && e->nrefs > 1 && e->p.bframes > 0 &&
-               e->p.preset >= 3;
-    return 0;
+    /* Second L0 reference is only worthwhile at the slower presets where the
+     * RD pass can decide per partition; ultrafast stays 1-ref and bit-exact to
+     * the old stream.  It is currently enabled only for P-only streams
+     * (bframes==0) because B direct scaling with a 2-ref co-located picture
+     * needs per-block col_ref_poc handling (see b_direct_mv) and is still being
+     * validated; P-only already validates bit-exact via the fake-ffmpeg suite. */
+    return e->cur_is_p && e->nrefs > 1 && e->p.preset >= 3 &&
+           e->p.bframes == 0;
 }
 static void set_current_refs(struct aeg_encoder *e)
 {
@@ -2146,7 +2142,6 @@ static void b_direct_mv(const struct aeg_encoder *e, int mbx, int mby,
     static const int grp4[4] = { 0, 3, 12, 15 };
     const aeg_mb *col = &e->col_mbs[mby * e->mb_w + mbx];
     int tb = e->cur_poc - e->ref_poc[0];
-    int td = e->ref_poc[1] - e->ref_poc[0];
     int ds = 256, g, k;
 
     memset(mv0, 0, 32 * sizeof(mv0[0][0]));
@@ -2155,16 +2150,20 @@ static void b_direct_mv(const struct aeg_encoder *e, int mbx, int mby,
      * directions, which is exactly what the decoder falls back to. */
     if (!e->col_ready || is_intra_type(col->type))
         return;
-    if (td != 0) {
-        int atd = td < 0 ? -td : td;
-        int tx = (16384 + (atd >> 1)) / td;
-        ds = (tb * tx + 32) >> 6;
-        if (ds < -1024) ds = -1024;
-        if (ds >  1023) ds =  1023;
-    }
     for (g = 0; g < 4; g++) {
         int cx = col->mv[grp4[g]][0], cy = col->mv[grp4[g]][1];
-        int x0 = (ds * cx + 128) >> 8, y0 = (ds * cy + 128) >> 8;
+        int td = e->col_poc - e->col_ref_poc[col->ref_idx[grp4[g]] & 1];
+        int cur_ds = ds;
+        if (td != 0) {
+            int atd = td < 0 ? -td : td;
+            int tx = (16384 + (atd >> 1)) / td;
+            cur_ds = (tb * tx + 32) >> 6;
+            if (cur_ds < -1024) cur_ds = -1024;
+            if (cur_ds >  1023) cur_ds =  1023;
+        } else {
+            cur_ds = 256;
+        }
+        int x0 = (cur_ds * cx + 128) >> 8, y0 = (cur_ds * cy + 128) >> 8;
         int x8 = g & 1, y8 = g >> 1;
 
         for (k = 0; k < 4; k++) {
@@ -6710,6 +6709,9 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
      * reference picture, and it is the most recent reference either way. */
     if (!e->cur_is_b && e->col_mbs) {
         memcpy(e->col_mbs, e->mbs, (size_t)e->mb_count * sizeof(e->mbs[0]));
+        e->col_poc = e->cur_poc;
+        e->col_ref_poc[0] = e->ref_poc[0];
+        e->col_ref_poc[1] = e->ref_poc[1];
         e->col_ready = 1;
     }
     /* The reconstruction becomes a reference picture and the buffer it occupied
