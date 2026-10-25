@@ -5,3 +5,4 @@ build/
 *.264
 *.yuv
 *.mp4
+__pycache__/

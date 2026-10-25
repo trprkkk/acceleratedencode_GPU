@@ -416,12 +416,39 @@ static inline int me_sad(const uint8_t *ref, int rstride, const uint8_t *cur,
     return aeg_sad(bw, bh, cur, cstride, ref + dy * rstride + dx, rstride);
 }
 
+/* Bits of one signed Exp-Golomb mvd component (quarter-pel units). */
+static inline int me_se_bits(int v)
+{
+    unsigned m = (unsigned)(v < 0 ? -v : v) * 2u;
+    int n = 1;
+    while (m > 1) { n += 2; m >>= 1; }
+    return n;   /* 1 for 0, 3 for +-1, 5 for +-2..3, ... = 2*floor(log2(2|v|))+1 */
+}
+
+/* What the search minimises: distortion plus lambda times the bits of the
+ * vector's difference from its predictor.  Without the rate term a search on
+ * real (noisy) content wanders to whichever vector the noise favours, and that
+ * vector then costs an mvd and breaks the skip/direct runs the predictor would
+ * have given for free. */
+typedef struct me_rate {
+    int lambda;          /* 0 = distortion only                         */
+    int px, py;          /* predictor, quarter-pel                      */
+} me_rate;
+
+static inline int me_mv_cost(const me_rate *r, int qx, int qy)
+{
+    if (!r->lambda)
+        return 0;
+    return r->lambda * (me_se_bits(qx - r->px) + me_se_bits(qy - r->py));
+}
+
 static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
                       int cstride, int bw, int bh, int range,
-                      int *mvx, int *mvy)
+                      const me_rate *rt, int *mvx, int *mvy, int *dist)
 {
     int cx = *mvx, cy = *mvy;
-    int best = me_sad(ref, rstride, cur, cstride, bw, bh, cx, cy);
+    int bd = me_sad(ref, rstride, cur, cstride, bw, bh, cx, cy);
+    int best = bd + me_mv_cost(rt, cx * 4, cy * 4);
     int step, i, improved = 1;
 
     for (step = 0; step < 2 && improved; step++) {
@@ -430,32 +457,35 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         int n = step ? 9 : 7;
         improved = 1;
         while (improved) {
-            int bx = cx, by = cy, bc = best;
+            int bx = cx, by = cy, bc = best, bdd = bd;
             improved = 0;
             for (i = 1; i < n; i++) {
-                int nx = cx + dx[i], ny = cy + dy[i], c;
+                int nx = cx + dx[i], ny = cy + dy[i], c, d;
                 if (nx < -range || nx > range || ny < -range || ny > range)
                     continue;
-                c = me_sad(ref, rstride, cur, cstride, bw, bh, nx, ny);
-                if (c < bc) { bc = c; bx = nx; by = ny; improved = 1; }
+                d = me_sad(ref, rstride, cur, cstride, bw, bh, nx, ny);
+                c = d + me_mv_cost(rt, nx * 4, ny * 4);
+                if (c < bc) { bc = c; bdd = d; bx = nx; by = ny; improved = 1; }
             }
-            cx = bx; cy = by; best = bc;
+            cx = bx; cy = by; best = bc; bd = bdd;
         }
     }
     *mvx = cx; *mvy = cy;
+    *dist = bd;
     return best;
 }
 
-/* subpel refinement: quarter-pel, SATD driven */
+/* subpel refinement: quarter-pel, SATD (+ lambda * mvd bits) driven */
 static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                          int cstride, int bw, int bh, int range,
-                         const aeg_mc_ctx *mc, int *mvx, int *mvy)
+                         const aeg_mc_ctx *mc, const me_rate *rt,
+                         int *mvx, int *mvy, int *dist)
 {
     static const int8_t offs[9][2] = {
         {0,0},{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
     };
     uint8_t buf[16 * 16];
-    int best, bx = *mvx, by = *mvy;
+    int best, bd, bx = *mvx, by = *mvy;
     int i, pass;
     int cx = *mvx, cy = *mvy;
 
@@ -464,8 +494,9 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
      * interpolation, so evaluate it once here and skip the centre from then on:
      * it can never improve on itself, and it is 1 of the 9 candidates of every
      * step of every pass. */
-    best = aeg_satd(bw, bh, cur, cstride,
-                    ref + (cy >> 2) * rstride + (cx >> 2), rstride);
+    bd = aeg_satd(bw, bh, cur, cstride,
+                  ref + (cy >> 2) * rstride + (cx >> 2), rstride);
+    best = bd + me_mv_cost(rt, cx, cy);
 
     /* Two passes: half-pel then quarter-pel steps.  Each pass walks until it
      * stops improving, but at most `iters` steps: past the second step the
@@ -479,7 +510,7 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
             improved = 0;
             for (i = 1; i < 9; i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;
-                int ix = nx >> 2, iy = ny >> 2, cost;
+                int ix = nx >> 2, iy = ny >> 2, cost, d;
                 if (ix < -range || ix > range || iy < -range || iy > range)
                     continue;
                 if (nx < -range * 4 || nx > range * 4 || ny < -range * 4 || ny > range * 4)
@@ -490,14 +521,31 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                 else
                     aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
                                 bh, nx & 3, ny & 3);
-                cost = aeg_satd(bw, bh, buf, bw, cur, cstride);
-                if (cost < best) { best = cost; bx = nx; by = ny; improved = 1; }
+                d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+                cost = d + me_mv_cost(rt, nx, ny);
+                if (cost < best) { best = cost; bd = d; bx = nx; by = ny; improved = 1; }
             }
             cx = bx; cy = by;
         }
     }
     *mvx = bx; *mvy = by;
+    *dist = bd;
     return best;
+}
+
+/* x264's lambda for motion search (SAD/SATD scale): 2^((qp-12)/6), at least 1.
+ * Exposed so that every caller prices vectors the same way. */
+int aeg_me_lambda(int qp)
+{
+    static const uint8_t tab[52] = {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9,
+        10, 11, 13, 14, 16, 18, 20, 23, 25, 29, 32, 36, 40, 45, 51, 57,
+        64, 72, 81, 91
+    };
+    if (qp < 0) qp = 0;
+    if (qp > 51) qp = 51;
+    return tab[qp];
 }
 
 int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
@@ -505,7 +553,28 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                  int pred_x, int pred_y, const int seed[2],
                  const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out)
 {
-    int best_sad = 1 << 30, bx = 0, by = 0;
+    return aeg_me_block_l(ref, rstride, cur, cstride, bw, bh, range, subme,
+                          pred_x, pred_y, seed, NULL, 0, 0, mc, mvx, mvy,
+                          sad_out);
+}
+
+/* The motion search proper.  `extra` holds `nextra` more integer-pel start
+ * candidates (neighbours' vectors and the like) besides the predictor, zero
+ * and `seed`; `lambda` > 0 adds lambda * mvd bits to every cost.  *sad_out is
+ * the distortion (SAD, or SATD after the fractional stage) of the vector
+ * returned, without the rate term. */
+int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
+                   int cstride, int bw, int bh, int range, int subme,
+                   int pred_x, int pred_y, const int seed[2],
+                   const int (*extra)[2], int nextra, int lambda,
+                   const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out)
+{
+    int best_cost = 1 << 30, best_sad = 1 << 30, bx = 0, by = 0;
+    me_rate rt;
+
+    rt.lambda = lambda;
+    rt.px = pred_x;
+    rt.py = pred_y;
 
     /* Candidate starts: predicted MV, zero, and the integer-rounded
      * predicted MV -- plus `seed`, the best vector a batched search over the
@@ -514,7 +583,7 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
      * batch).  Evaluating all of them keeps the search robust for fast
      * motion without the cost of a full search. */
     {
-        int cand[4][2];
+        int cand[4 + 16][2];
         int i, n = 3;
         cand[0][0] = pred_x >> 2; cand[0][1] = pred_y >> 2;
         cand[1][0] = 0;           cand[1][1] = 0;
@@ -524,16 +593,23 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
             cand[3][1] = seed[1];
             n = 4;
         }
+        for (i = 0; i < nextra && i < 16; i++) {
+            cand[n][0] = (extra[i][0] + 2) >> 2;
+            cand[n][1] = (extra[i][1] + 2) >> 2;
+            n++;
+        }
         for (i = 0; i < n; i++) {
             int c;
             if (cand[i][0] < -range || cand[i][0] > range ||
                 cand[i][1] < -range || cand[i][1] > range)
                 continue;
-            c = me_sad(ref, rstride, cur, cstride, bw, bh, cand[i][0], cand[i][1]);
-            if (c < best_sad) { best_sad = c; bx = cand[i][0]; by = cand[i][1]; }
+            c = me_sad(ref, rstride, cur, cstride, bw, bh, cand[i][0], cand[i][1]) +
+                me_mv_cost(&rt, cand[i][0] * 4, cand[i][1] * 4);
+            if (c < best_cost) { best_cost = c; bx = cand[i][0]; by = cand[i][1]; }
         }
     }
-    best_sad = hex_search(ref, rstride, cur, cstride, bw, bh, range, &bx, &by);
+    hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, &bx, &by,
+               &best_sad);
 
     if (subme <= 0) {
         *mvx = bx * 4; *mvy = by * 4; *sad_out = best_sad;
@@ -542,8 +618,8 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
 
     {
         int qx = bx * 4, qy = by * 4;
-        best_sad = subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc,
-                                 &qx, &qy);
+        subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc, &rt,
+                      &qx, &qy, &best_sad);
         *mvx = qx; *mvy = qy;
     }
     *sad_out = best_sad;

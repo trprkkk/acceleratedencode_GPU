@@ -174,7 +174,9 @@ static inline int aeg_mb_block_lists(const aeg_mb *m, int blk)
     int p;
 
     switch (m->type) {
-    case AEG_MB_B_DIRECT: return 3;
+    /* temporal direct always predicts from both lists; spatial direct may
+     * use one (the encoder stores the derived mask in blist[0]) */
+    case AEG_MB_B_DIRECT: return m->blist[0] ? m->blist[0] : 3;
     case AEG_MB_B_L0:     return 1;
     case AEG_MB_B_L1:     return 2;
     case AEG_MB_B_BI:     return 3;
@@ -297,7 +299,8 @@ void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
                                   int cabac_init_idc, int slice_qp_delta,
                                   int deblock_alpha, int deblock_beta,
                                   int deblock_idc, int first_mb,
-                                  int num_ref_idx_l0_active);
+                                  int num_ref_idx_l0_active,
+                                  int direct_spatial);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma
@@ -449,6 +452,12 @@ int  aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
                   int cstride, int bw, int bh, int range, int subme,
                   int pred_x, int pred_y, const int seed[2],
                   const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out);
+int  aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
+                    int cstride, int bw, int bh, int range, int subme,
+                    int pred_x, int pred_y, const int seed[2],
+                    const int (*extra)[2], int nextra, int lambda,
+                    const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out);
+int  aeg_me_lambda(int qp);
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
                     int mb_x, int mb_y, int top_row,
                     int *mvx, int *mvy);
@@ -505,6 +514,22 @@ extern int aeg_log_level;
 #define AEG_LOGW(...) aeg_log(1, __VA_ARGS__)
 #define AEG_LOGI(...) aeg_log(2, __VA_ARGS__)
 #define AEG_LOGD(...) aeg_log(3, __VA_ARGS__)
+
+/* Lookahead (lookahead.c): half-resolution source luma and the cost estimate
+ * the adaptive B-picture decision is made on. */
+typedef struct aeg_lowres {
+    int mb_w, mb_h;            /* one 8x8 lowres block per macroblock */
+    int w, h, stride;
+    uint8_t *mem, *plane;
+} aeg_lowres;
+int  aeg_lowres_alloc(aeg_lowres *l, int mb_w, int mb_h);
+void aeg_lowres_free(aeg_lowres *l);
+void aeg_lowres_build(aeg_lowres *l, const uint8_t *src, int sstride,
+                      int w, int h);
+/* Estimated cost of coding `cur` as a P picture from r0 (r1 NULL) or as a B
+ * picture between r0 and r1; `scratch` holds 4 ints per macroblock. */
+int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra_mbs, int *scratch);
 
 void *aeg_alloc(size_t size);        /* zeroed, 32-byte aligned            */
 void *aeg_alloc_aligned(size_t size, size_t align);

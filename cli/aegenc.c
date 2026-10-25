@@ -54,9 +54,17 @@ static void usage(void)
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"
 "                   after n+1 frames; needs CABAC.  0 codes P pictures only.\n"
-"  --bqp <n>        QP added to every B picture (default 12).  A B picture is\n"
+"  --b-adapt <n>    1 = --bframes is the most a group gets; the lookahead\n"
+"                   picks each group's length from the content (default);\n"
+"                   0 = always --bframes B pictures\n"
+"  --bqp <n>        QP added to every B picture (default 4).  A B picture is\n"
 "                   never a reference, so a coarser quantiser in it costs the\n"
 "                   pictures that follow nothing.\n"
+"  --iqp <n>        QP subtracted from I pictures at constant QP (default 3,\n"
+"                   x264's ipratio 1.4)\n"
+"  --direct <mode>  B direct prediction: spatial (default) or temporal\n"
+"  --dump-recon <f> write the reconstruction (coding order, I420)\n"
+"  --dump-order <f> write each packet's display index, one per line\n"
 "  --trellis <n>    rate-distortion level selection on the luma residual:\n"
 "                   0 = off, 1 = on (the default from preset 3 up: 0.15-2.4\n"
 "                   points of BD-rate for 12-14%% of the encode time)\n"
@@ -170,11 +178,17 @@ static void pass2_bias(const int64_t *bits, int n, int qcomp, int *bias_out)
  * order when the stream is reordered by B pictures, which is the order the
  * packets come out in; a decoder that outputs in display order has to be
  * re-ordered before the two files are compared. */
+/* --dump-order: the display index of every packet, one per line, in the order
+ * the packets come out (= the order of the reconstruction dump). */
+static FILE *g_order;
+
 static void write_packet(FILE *out, const char *dumppath, aeg_encoder *enc,
                          const aeg_packet *pkt, int *first,
                          int width, int height)
 {
     fwrite(pkt->data, 1, pkt->size, out);
+    if (g_order)
+        fprintf(g_order, "%lld\n", (long long)pkt->pts);
     if (dumppath) {
         const uint8_t *pl[3];
         int str[3], y;
@@ -207,11 +221,12 @@ int main(int argc, char **argv)
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, refs = -1;
     int trellis = -1;
-    int bframes = -1, bqp = -1000;
+    int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
     int64_t *pass1_bits = NULL;
     int pass1_n = 0;
     char stats_path[4096];
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
+    const char *orderpath = NULL;
     uint8_t *frame;
     size_t fsize;
     int64_t pts = 0;
@@ -255,6 +270,11 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--ref")) refs = atoi(argv[++i]);
         else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
         else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
+        else if (!strcmp(a, "--iqp")) iqp = atoi(argv[++i]);
+        else if (!strcmp(a, "--direct")) {
+            const char *v = argv[++i];
+            direct = !strcmp(v, "spatial") ? 1 : (!strcmp(v, "temporal") ? 0 : atoi(v));
+        }
         else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
@@ -269,6 +289,8 @@ int main(int argc, char **argv)
             return r == 0 ? 0 : 1;
         } else if (!strcmp(a, "--bench")) bench = 1;
         else if (!strcmp(a, "--dump-recon")) dumppath = argv[++i];
+        else if (!strcmp(a, "--dump-order")) orderpath = argv[++i];
+        else if (!strcmp(a, "--b-adapt")) badapt = atoi(argv[++i]);
         else if (!strcmp(a, "-s")) {
             char *eq;
             char *arg = argv[++i];
@@ -377,6 +399,13 @@ int main(int argc, char **argv)
     if (refs >= 0) p.refs = refs;
     if (bframes >= 0) p.bframes = bframes;
     if (bqp > -1000) p.b_qp_offset = bqp;
+    if (iqp > -1000) p.i_qp_offset = iqp;
+    if (direct >= 0) p.direct = direct;
+    if (badapt >= 0) p.b_adapt = badapt;
+    if (orderpath && !(g_order = fopen(orderpath, "w"))) {
+        fprintf(stderr, "cannot open %s\n", orderpath);
+        return 1;
+    }
     if (trellis >= 0) p.trellis = trellis;
     if (partitions >= 0) p.partitions = partitions;
     aeg_log_level = verbose;
@@ -581,5 +610,7 @@ int main(int argc, char **argv)
     free(frame);
     if (in != stdin) fclose(in);
     if (out != stdout) fclose(out);
+    if (g_order)
+        fclose(g_order);
     return ret;
 }

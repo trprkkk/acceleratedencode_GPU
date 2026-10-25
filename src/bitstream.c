@@ -300,7 +300,7 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
                                 int is_ref, int cabac_init_idc,
                                 int slice_qp_delta, int deblock_alpha,
                                 int deblock_beta, int deblock_idc, int first_mb,
-                                int num_ref_idx_l0_active)
+                                int num_ref_idx_l0_active, int direct_spatial)
 {
     int nos = slice_type_in % 5;      /* 0 = P, 1 = B, 2 = I */
 
@@ -313,14 +313,11 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
     aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);
     /* bottom_field_pic_order_in_frame_present_flag is 0 in the PPS, so there
      * is no delta_pic_order_cnt_bottom. */
-    /* Temporal direct: the co-located picture's vectors are scaled by the
-     * picture order counts (8.4.1.2.3), which is what the encoder implements
-     * (b_direct_mv).  Spatial direct would make every direct macroblock depend
-     * on its neighbours' vectors, so the encoder and the decoder would have to
-     * agree on every one of them, and a single disagreement would corrupt the
-     * picture instead of just costing bits. */
+    /* Temporal direct scales the co-located picture's vectors by the picture
+     * order counts (8.4.1.2.3, b_direct_mv in the encoder); spatial direct
+     * predicts them from the neighbours (8.4.1.2.2, b_direct_spatial). */
     if (nos == 1)
-        aeg_bw_put(bw, 1, 0);         /* direct_spatial_mv_pred_flag = 0    */
+        aeg_bw_put(bw, 1, direct_spatial ? 1u : 0u); /* direct_spatial_mv_pred_flag */
     if (nos == 0 || nos == 1) {
         if (nos == 0 && num_ref_idx_l0_active > 1) {
             aeg_bw_put(bw, 1, 1);     /* num_ref_idx_active_override_flag   */

@@ -112,10 +112,24 @@ typedef struct aeg_params {
      * encoder holds `bframes` pictures of lookahead, so aeg_encoder_encode()
      * returns AEG_EAGAIN until it has them. */
     int bframes;
+    /* Adaptive B pictures: 1 = `bframes` is the most a group can have, and the
+     * lookahead decides group by group how many it gets (none on fast,
+     * irregular motion); 0 = always `bframes`.  -1 = the default (1). */
+    int b_adapt;
     /* QP added to every B picture (it is never a reference, so the coarser
      * quantiser cannot propagate; x264 spends +2 by default for the same
      * reason).  Only meaningful with bframes > 0. */
     int b_qp_offset;
+    /* QP subtracted from every I/IDR picture at constant QP (x264's ipratio
+     * 1.4 is the same thing, -3).  Everything after a keyframe predicts from
+     * it, so its quality is inherited by every skipped or cheaply coded
+     * macroblock that follows.  -1 = the default. */
+    int i_qp_offset;
+    /* Direct-mode prediction of B pictures (B_Skip, B_Direct_16x16,
+     * B_Direct_8x8): 0 = temporal (the co-located anchor's vectors scaled by
+     * the picture distances), 1 = spatial (the neighbours' vectors, zeroed
+     * where the co-located block stands still).  -1 = the default. */
+    int direct;
     /* Scene-cut detection: insert an IDR when a picture's inter prediction is
      * worse than its intra prediction by more than `scenecut` percent (0 = off).
      * A scene change is exactly where a P picture costs more than the IDR it

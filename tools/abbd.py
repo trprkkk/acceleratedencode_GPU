@@ -4,6 +4,10 @@
     ./tools/abbd.py --clip clip.yuv 320x192 [--clip ...] -n 30 \
         [-q 22,25,28,31,34,37] [-p 3] --a "--ref 1" --b "--ref 2"
 
+Leading NAME=value words in --a/--b are set in that side's environment, so an
+AEG_* experiment switch can be compared against the build's default:
+--a "" --b "AEG_FOO=1 --bframes 3".
+
 Both configurations are encoded at the same QPs on the same source; the
 PSNR is measured from the stream *decoded by ffmpeg* (`--ffmpeg`, default
 $FFMPEG or `ffmpeg`), so B-picture streams are compared in display order and
@@ -48,10 +52,17 @@ def psnr(a, b, fs):
 def encode(args, extra, clip, w, h, q, tag):
     out = '/tmp/abbd_%s.264' % tag
     dec = '/tmp/abbd_%s.yuv' % tag
+    # leading NAME=value tokens are environment variables for this side only
+    # (the AEG_* experiment switches), the rest are aegenc options
+    env = dict(os.environ)
+    toks = extra.split()
+    while toks and '=' in toks[0] and not toks[0].startswith('-'):
+        k, v = toks.pop(0).split('=', 1)
+        env[k] = v
     t0 = time.time()
     subprocess.run([args.bin, '-w', str(w), '-h', str(h), '-i', clip, '-o', out,
                     '-q', str(q), '-n', str(args.n), '-p', str(args.preset)] +
-                   extra.split(), check=True, capture_output=True)
+                   toks, check=True, capture_output=True, env=env)
     dt = time.time() - t0
     subprocess.run([args.ffmpeg, '-v', 'error', '-y', '-i', out, '-f', 'rawvideo',
                     '-pix_fmt', 'yuv420p', dec], check=True)
@@ -100,6 +111,7 @@ def main():
     args = ap.parse_args()
     qs = [int(x) for x in args.q.split(',')]
     res = []
+    tta = ttb = 0.0
     for clip, wh in args.clip:
         w, h = (int(x) for x in wh.lower().split('x'))
         ra, pa, rb, pb = [], [], [], []
@@ -113,9 +125,12 @@ def main():
                   (os.path.basename(clip), q, r1, p1, r2, p2))
         d = bd(ra, pa, rb, pb)
         res.append(d)
+        tta += ta
+        ttb += tb
         print('%-30s BD-rate B vs A: %+6.2f %%   time A %.2fs B %.2fs (%+.0f %%)' %
               (os.path.basename(clip), d, ta, tb, (tb / ta - 1) * 100 if ta else 0))
-    print('mean BD-rate: %+.2f %%' % (sum(res) / len(res)))
+    print('mean BD-rate: %+.2f %%   total time A %.1fs B %.1fs (%+.1f %%)' %
+          (sum(res) / len(res), tta, ttb, (ttb / tta - 1) * 100 if tta else 0))
 
 
 if __name__ == '__main__':

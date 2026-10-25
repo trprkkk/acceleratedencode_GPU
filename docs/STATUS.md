@@ -22,9 +22,11 @@ The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 | two P references (`--ref 2`), P-only and under B pictures, with IDRs and scene cuts (162-case B matrix x2) | 320x192 | 20 … 36 | 0 … 4 | 12 … 60 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs seventy-six encoded clip cases
-frame by frame, all of them bit-exact, fifteen of them with B pictures compared
-through a coding-order map.  It also
+fails (non-zero exit) on any mismatch; it runs seventy-eight encoded clip cases
+frame by frame, all of them bit-exact, eighteen of them with B pictures compared
+through the coding order the encoder reports (`--dump-order`; with the adaptive
+group length it is the only way to know it, and the two `--b-adapt 0` cases
+check it against the fixed structure rebuilt from the frame and B counts).  It also
 checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -1389,6 +1391,81 @@ reference, vector and predictor, which is how all of the above were narrowed
 to a single macroblock: diff the encoder's line against the decoded picture at
 that macroblock, and the predictor or the reference that differs is the bug.
 
+## Real clips (against libx264 medium)
+
+Every earlier quality table in this file was measured on synthetic clips, and
+two of the decisions taken on them did not survive real content.  Five real
+clips (30 frames each, decoded from public sample videos: `cock` 640x352 with a
+scene change and fast irregular motion, `vtest` 384x288 grainy surveillance,
+`mega` 352x256, `short` and `tree` 320x240), QP 22..37, BD-rate of preset 3
+against `libx264 -preset medium` (positive = more bits than x264 for the same
+PSNR):
+
+| configuration | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| defaults at `adf2ab9` (3 B, `--bqp 12`) | +51.74 | +10.61 | +11.40 | +13.42 | +12.04 | +19.84 |
+| + rate term in the motion search | +24.66 | +13.44 | +3.59 | +4.26 | +11.22 | +11.43 (bqp 6) |
+| + I offset 3, `--bqp 4` | +23.95 | +4.93 | +5.75 | +6.11 | +9.32 | +10.01 |
+| + spatial direct | +22.77 | +5.11 | +6.80 | +5.30 | +8.95 | +9.79 |
+| + level selection on intra blocks | +19.62 | +4.34 | +5.39 | +5.27 | +7.10 | +8.34 |
+| **+ adaptive group length (the defaults now)** | **+5.28** | **+4.87** | **+4.25** | **-2.00** | **+9.63** | **+4.41** |
+
+What each step is:
+
+* **Rate term in the motion search** (`me_rate()` in mc.c): the integer and
+  sub-pel searches price a vector as SATD + lambda x the exp-Golomb length of
+  its difference from the predictor, the way x264 does, instead of SATD alone.
+  On synthetic clips this was inside the noise; on real ones (noise, many small
+  vectors) it is the largest single gain.  `AEG_MELAMBDA=0` turns it off.
+* **I-picture offset** (`--iqp`, default 3 = x264's ipratio 1.4) and **B offset**
+  (`--bqp`, default 4, was 12).  The 12 was the optimum of the synthetic clips;
+  on the real ones it costs 8-12 points, and the optimum is 4-6.
+* **Spatial direct** (`--direct spatial`, the default; `temporal` keeps the old
+  derivation).  Implemented after FFmpeg's `pred_spatial_direct_motion`
+  (reference = min of the neighbours' positive references per list, vector =
+  median, zeroed per 8x8 where the co-located block is still); bit-exact on the
+  synthetic B matrix and on all fifteen real-clip encodes.  Worth little on its
+  own (0.2 points) but it is what x264 uses and it raises the B skip rate from
+  about 15% to 35-39% of the B macroblocks on `cock` (x264: 52%).
+* **Level selection on intra blocks**: the coordinate-descent pass of
+  *Rate-distortion level selection* now also runs on the Intra_4x4 and
+  Intra_8x8 blocks, at half the inter lambda (an intra block's error is
+  inherited by everything that predicts from it).  At the full lambda vtest
+  lost 2.2 points; at half, -1.06 points on average and no clip loses.
+  `AEG_TINTRA=0` turns it off, `=1` uses the full lambda.
+* **Adaptive group length** (`--b-adapt 1`, the default): `--bframes` becomes
+  the most a group gets.  The lookahead (src/lookahead.c) estimates, on
+  half-resolution source pictures, the cost of each structure -- per 8x8 block
+  the minimum of an intra estimate (DC/H/V/plane SATD) and a half-pel hexagon
+  search (P) or the best of list 0 / list 1 / average (B) -- and the scheduler
+  applies x264's "fast" decision (b-adapt 1, including its 1/1.2 discount of
+  B estimates and its distance-falling threshold) group by group.  The fixed
+  3-B structure was costing `cock` +18 points against P only; the decision
+  takes that back without giving up the B pictures where they pay.  The ring
+  already held a whole group when its anchor was decided, so this needed no
+  extra latency or memory beyond the lowres planes.  Not tuned further: the
+  discount (`AEG_LABIAS`) and the threshold scale (`AEG_LATHRESH`) move single
+  clips across a decision boundary in both directions, and the x264 values are
+  as good as any tried.
+
+Per-feature value, measured the same way for both encoders (P pictures only,
+one reference; BD-rate of turning the feature *off*):
+
+| turned off | x264 (mean of 5) | this encoder (mean of 5) |
+|---|---|---|
+| sub-pel refinement (x264 subme 2 / ours `--subme 0`) | +10.2 | +8.6 |
+| partitions (x264 none / ours `--partitions 1`) | +9.0 | +4.4 |
+| 8x8 transform | +5.4 | +4.8 |
+| trellis | +5.4 | +1.1 (inter luma only at the time) |
+
+so what remains of the gap is mostly the B pictures themselves (on `cock` at
+QP 28 ours spend 40% more bits per B picture than x264's for +0.6 dB), the
+partition search, and the level selection, which still does not reach chroma
+or Intra_16x16.
+
+Tools for this: `tools/bdrate.py` (ours against x264) and `tools/abbd.py`
+(ours against ours, any two option sets, with per-side environment).
+
 ## Next
 
 1. The B *search*, now that the macroblock layer is complete and its vectors are
@@ -1401,9 +1478,9 @@ that macroblock, and the predictor or the reference that differs is the bug.
    16x16 candidates now get (2 lists x 4 neighbours x 4 groups = 32 full
    candidates) is the one remaining quality-for-time trade here, and the 8x4/
    4x8/4x4 sub-types become worth searching only after that.  Spatial direct is
-   deliberately *not* on the list: it makes every direct macroblock depend on
-   its neighbours' vectors, so an encoder/decoder disagreement corrupts the
-   picture instead of costing a few bits.
+   in now (*Real clips*) and the default; if the 8x4/4x8 sub-types are ever
+   enabled under it, note that the decoder then sees later direct groups of a
+   B_8x8 as neighbours.
 2. The motion-vector refinement is exact now (bug 43) and reaches the
    candidates as well as the winner (`--refine-cand`, see *Refining every
    candidate*), but its trials are still priced with the predictor the search

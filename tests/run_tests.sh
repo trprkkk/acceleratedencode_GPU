@@ -51,9 +51,12 @@ PY
 
 # B pictures are coded out of display order, so the reconstruction dump (coding
 # order) and the decoder's output (display order) can only be compared after
-# undoing that permutation.  It is the one the encoder schedules: the anchor
-# first, then the group's B pictures, then the leftovers of the last, incomplete
-# group -- which is what the loop below rebuilds from the frame and B counts.
+# undoing that permutation.  The encoder reports it (--dump-order: the display
+# index of every packet); with the adaptive group length (--b-adapt 1, the
+# default) that is the only way to know it.  With --b-adapt 0 the structure is
+# fixed -- the anchor first, then the group's B pictures, then the leftovers of
+# the last, incomplete group -- and the loop below rebuilds it from the frame and
+# B counts to check the reported order against it.
 cat > "$TMP/cmp_b.py" <<'PY'
 import sys, os
 rec, dec, w, h, n, b, tag = (sys.argv[1], sys.argv[2], int(sys.argv[3]),
@@ -68,6 +71,11 @@ if len(A) != len(B) or len(A) < fs * n:
     sys.exit(1)
 G = b + 1
 gop = int(sys.argv[8]) if len(sys.argv) > 8 else 0
+reported = [int(l) for l in open(sys.argv[9])]
+fixed = sys.argv[10] == "1"
+if sorted(reported) != list(range(n)):
+    print("   %-22s BAD REPORTED ORDER %s" % (tag, reported))
+    sys.exit(1)
 order = [0]
 a = 0
 last_idr = 0
@@ -84,9 +92,10 @@ while a + G < n:
         order.extend(range(a + 1, nxt))
     a = nxt
 order.extend(range(a + 1, n))
-if len(order) != n:
-    print("   %-22s BAD ORDER MAP (%d != %d)" % (tag, len(order), n))
+if fixed and order != reported:
+    print("   %-22s ORDER %s, expected %s" % (tag, reported, order))
     sys.exit(1)
+order = reported
 bad = 0
 first = None
 mx = 0
@@ -105,7 +114,9 @@ if bad:
           "(display %d, x=%d y=%d), max abs diff %d"
           % (tag, bad, fs * n, first[0], first[1], first[3], first[2], mx))
     sys.exit(1)
-print("   %-22s bit-exact (%d frames, coding order, max abs diff 0)" % (tag, n))
+nb = sum(1 for k in range(1, n) if order[k] < max(order[:k]))
+print("   %-22s bit-exact (%d frames, %d B, coding order, max abs diff 0)"
+      % (tag, n, nb))
 PY
 
 # run_bcase <name> <w> <h> <frames> <bframes> <genyuv mode> <extra aegenc args...>
@@ -113,7 +124,8 @@ run_bcase() {
     name=$1; w=$2; h=$3; n=$4; b=$5; mode=$6; shift 6
     "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
     ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
-        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" "$@" \
+        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" \
+        --dump-order "$TMP/$name.order" "$@" \
         >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
@@ -127,12 +139,14 @@ run_bcase() {
         FAIL=1
     fi
     gop=0
+    fixed=0
     for a in "$@"; do
         if [ "$prev" = "-g" ]; then gop=$a; fi
+        if [ "$prev" = "--b-adapt" ] && [ "$a" = "0" ]; then fixed=1; fi
         prev=$a
     done
     python3 "$TMP/cmp_b.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" \
-        "$n" "$b" "$name" "$gop" || FAIL=1
+        "$n" "$b" "$name" "$gop" "$TMP/$name.order" "$fixed" || FAIL=1
 }
 
 # run_case <name> <w> <h> <frames> <genyuv mode> <extra aegenc args...>
@@ -288,6 +302,10 @@ run_bcase bframes_lo    320 192  9 1 2 -q 51 --scenecut 0
 #   coded as P pictures) and one with an IDR picture in the middle
 run_bcase bframes_odd   320 192 11 2 1 -q 26 --scenecut 0
 run_bcase bframes_idr   320 192 12 1 1 -q 26 --scenecut 0 -g 4
+#   the fixed structure (--b-adapt 0): the reported coding order has to be the
+#   one rebuilt from the frame and B counts, with and without a mid-stream IDR
+run_bcase bframes_fix3  320 192 12 3 4 -q 24 --scenecut 0 --b-adapt 0
+run_bcase bframes_fixidr 320 192 12 2 1 -q 26 --scenecut 0 -g 5 --b-adapt 0
 #   the 8x8 transform and the deblocking filter both treat B macroblocks
 #   differently from P ones: the transform flag is coded for a direct
 #   macroblock, and the boundary strength compares both prediction lists

@@ -123,9 +123,16 @@ void aeg_params_default(aeg_params *p)
      * was re-run after the partitioned B types landed, and the optimum moved
      * *up*, from 8 to 12-14, not down: better prediction makes the residual
      * cheaper to throw away, not dearer.  12 is the middle of the measured flat
-     * top (g1_60 -2.1%, p2 -1.3%, p0 -3.2% against 8, q4 and p3 neutral). */
+     * top (g1_60 -2.1%, p2 -1.3%, p0 -3.2% against 8, q4 and p3 neutral).
+     * That optimum was an artefact of the synthetic clips: on five real clips
+     * (docs/STATUS.md, *Real clips*) 12 costs 8-12 points of BD-rate against
+     * x264 and the optimum is 4-6, with the I-picture offset and the adaptive
+     * group length on.  4 it is. */
     p->bframes = 3;
-    p->b_qp_offset = 12;
+    p->b_qp_offset = 4;
+    p->i_qp_offset = -1;
+    p->direct = -1;
+    p->b_adapt = -1;
     p->trellis = -1;
     p->refs = -1;
     p->deblock = 1;

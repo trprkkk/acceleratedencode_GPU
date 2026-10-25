@@ -135,6 +135,8 @@ struct aeg_encoder {
      * instead of up to eighteen. */
     int mb_frac[2];
     int mb_frac1[2];        /* the same, for list 1 of a B picture        */
+    int me_lambda;          /* motion-search lambda of the current MB
+                               (aeg_me_lambda(qp)), 0 = distortion only   */
     /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8,
      * 8x16 and P_8x8.  Each carries the per-partition MVs and their
      * predictors, which is exactly what the bitstream has to transmit. */
@@ -262,6 +264,8 @@ struct aeg_encoder {
     uint8_t *in_mem[AEG_MAX_BFRAMES + 3];
     uint8_t *in_plane[AEG_MAX_BFRAMES + 3][3];
     int64_t *in_pts;
+    aeg_lowres in_low[AEG_MAX_BFRAMES + 3];   /* b_adapt: lowres of the ring */
+    int *la_scratch;
     int in_count;           /* pictures pushed so far        */
     int enc_pos;            /* pictures coded so far         */
     int anchor;             /* display index of the last coded anchor, -1 */
@@ -1153,6 +1157,22 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
     return best_cost;
 }
 
+/* Whether the intra blocks (Intra_4x4, Intra_8x8) get the level selection
+ * too.  AEG_TINTRA=0/1 overrides, for measurements. */
+static int trellis_intra_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_TINTRA");
+        v = ev ? atoi(ev) : 3;
+    }
+    return v;
+}
+#define trellis_intra_on() (trellis_intra_mode() == 1 || \
+    (trellis_intra_mode() == 2 && (e->cur_is_p || e->cur_is_b)) || \
+    trellis_intra_mode() == 3)
+#define trellis_intra_lambda(l) (trellis_intra_mode() == 3 ? (l) * 0.5 : (l))
+
 /* One macroblock's luma 4x4 blocks of an inter macroblock, whose prediction is
  * in e->pred_l and whose levels are `lev[block][natural]`. */
 static void trellis_luma4(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
@@ -1291,9 +1311,10 @@ static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                                        (int)pred[y * pred_stride + x]);
     aeg_transform_8x8(res, 8, coef);
     aeg_quant_8x8(coef, c->level8[g], c->qp, intra);
-    if (!intra)
+    if (!intra || trellis_intra_on())
         trellis_luma8(e, src + by * s + bx, s, pred, pred_stride, c->level8[g],
-                      c->qp, AEG_LAMBDA(c->qp));
+                      c->qp, intra ? trellis_intra_lambda(AEG_LAMBDA(c->qp))
+                                   : AEG_LAMBDA(c->qp));
     c->nz8[g] = 0;
     for (i = 0; i < 64; i++)
         c->nz8[g] |= c->level8[g][i] != 0;
@@ -1720,7 +1741,24 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
                              const mbenc *c)
 {
     int g, x, y, pl;
+    const int lists = c->blist[0] ? c->blist[0] : 3;
 
+    if (lists != 3) {
+        /* spatial direct on one list: an ordinary single-list prediction
+         * per 8x8 group (the groups' vectors differ only through colZero) */
+        for (g = 0; g < 4; g++) {
+            int x0 = (g & 1) * 8, y0 = (g >> 1) * 8;
+            int b0 = (y0 >> 2) * 4 + (x0 >> 2);
+            int l = lists == 2;
+            int mx = l ? c->mv1[b0][0] : c->mv[b0][0];
+            int my = l ? c->mv1[b0][1] : c->mv[b0][1];
+            uint8_t *d0[2] = { e->pred_c[0], e->pred_c[1] };
+
+            mc_rect_luma_to(e, l, e->pred_l, mbx, mby, x0, y0, 8, 8, mx, my);
+            mc_rect_chroma_to(e, l, d0, mbx, mby, x0 / 2, y0 / 2, 4, 4, mx, my);
+        }
+        return;
+    }
     for (g = 0; g < 4; g++) {
         int x0 = (g & 1) * 8, y0 = (g >> 1) * 8;
         /* Index of the 8x8 group's first 4x4 block: the group is two blocks
@@ -2139,7 +2177,9 @@ static int direct_group_ok(const struct aeg_encoder *e, int mbx, int mby, int g)
 {
     static const int grp4[4] = { 0, 3, 12, 15 };
     const aeg_mb *col;
-    if (!e->col_ready)
+    /* spatial direct takes refIdx 0 of each list from the neighbours, never
+     * the co-located block's reference, so every group qualifies */
+    if (e->p.direct == 1 || !e->col_ready)
         return 1;
     col = &e->col_mbs[mby * e->mb_w + mbx];
     if (is_intra_type(col->type))
@@ -2214,6 +2254,92 @@ static void b_direct_mv(const struct aeg_encoder *e, int mbx, int mby,
             mv1[b][1] = y0 - cy;
         }
     }
+}
+
+/* Spatial direct (8.4.1.2.2), the derivation FFmpeg's
+ * pred_spatial_direct_motion() implements for frame pictures.
+ *
+ * Per list, the reference index is the smallest non-negative one among the
+ * macroblock's neighbours A, B and C (C falling back to D) -- with one
+ * reference per list that is simply "0 if any of them predicts from this list,
+ * else unused" -- and the vector is the ordinary 16x16 predictor of that list,
+ * which b_mv_predict() already computes from the same three neighbours.  When
+ * neither list is used by any neighbour both are used with zero vectors.
+ * Then, per 8x8 group, colZeroFlag: if the co-located anchor's block at the
+ * group's corner (direct_8x8_inference) is inter, on its reference 0, and its
+ * vector is within +-1 quarter sample in both components, the vectors of the
+ * used lists (both on reference 0) are zero for that group.
+ *
+ * Returns the list mask, the same for all four groups. */
+static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
+                            int mv0[16][2], int mv1[16][2])
+{
+    static const int grp4[4] = { 0, 3, 12, 15 };
+    const aeg_mb *col = e->col_ready ? &e->col_mbs[mby * e->mb_w + mbx] : NULL;
+    int used[2], pmv[2][2], list, g, k, lists;
+
+    memset(mv0, 0, 32 * sizeof(mv0[0][0]));
+    memset(mv1, 0, 32 * sizeof(mv1[0][0]));
+    for (list = 0; list < 2; list++) {
+        const aeg_mb *m;
+        int u = 0;
+        if (mbx > 0) {
+            m = &e->mbs[mby * e->mb_w + mbx - 1];
+            u |= !is_intra_type(m->type) &&
+                 (aeg_mb_block_lists(m, 3) & (1 << list));
+        }
+        if (mby > e->top_row) {
+            m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+            u |= !is_intra_type(m->type) &&
+                 (aeg_mb_block_lists(m, 12) & (1 << list));
+            if (mbx + 1 < e->mb_w) {
+                m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
+                u |= !is_intra_type(m->type) &&
+                     (aeg_mb_block_lists(m, 12) & (1 << list));
+            } else if (mbx > 0) {
+                m = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
+                u |= !is_intra_type(m->type) &&
+                     (aeg_mb_block_lists(m, 15) & (1 << list));
+            }
+        }
+        used[list] = u;
+        pmv[list][0] = pmv[list][1] = 0;
+        if (u)
+            b_mv_predict(e, mbx, mby, list, &pmv[list][0], &pmv[list][1]);
+    }
+    if (!used[0] && !used[1])
+        return 3;                       /* both lists, zero vectors */
+    lists = used[0] | (used[1] << 1);
+    for (g = 0; g < 4; g++) {
+        int z = 0, x8 = g & 1, y8 = g >> 1;
+        if (col && !is_intra_type(col->type) && col->ref_idx[grp4[g]] == 0) {
+            int cx = col->mv[grp4[g]][0], cy = col->mv[grp4[g]][1];
+            z = cx >= -1 && cx <= 1 && cy >= -1 && cy <= 1;
+        }
+        for (k = 0; k < 4; k++) {
+            int b = ((y8 << 1) + (k >> 1)) * 4 + (x8 << 1) + (k & 1);
+            if (used[0] && !z) {
+                mv0[b][0] = pmv[0][0];
+                mv0[b][1] = pmv[0][1];
+            }
+            if (used[1] && !z) {
+                mv1[b][0] = pmv[1][0];
+                mv1[b][1] = pmv[1][1];
+            }
+        }
+    }
+    return lists;
+}
+
+/* The direct-mode vectors of this macroblock in the mode the slice header
+ * announces, and the lists they predict from (temporal: always both). */
+static int b_direct(const struct aeg_encoder *e, int mbx, int mby,
+                    int mv0[16][2], int mv1[16][2])
+{
+    if (e->p.direct == 1)
+        return b_direct_spatial(e, mbx, mby, mv0, mv1);
+    b_direct_mv(e, mbx, mby, mv0, mv1);
+    return 3;
 }
 
 static void reset_mb_enc(mbenc *c, int qp)
@@ -2392,13 +2518,14 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
     const uint8_t *rp = (ref ? e->ref2p[0] : e->refp[0]) + (mby * 16 + geo[1]) * e->stride[0] +
                         mbx * 16 + geo[0];
     const aeg_mc_ctx *mc = ref ? &e->mc1 : &e->mc;
-    aeg_me_block(rp,
+    aeg_me_block_l(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, mc,
+                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, NULL, 0,
+                 e->me_lambda, mc,
                  mvx, mvy, sad);
     if (!refine && e->p.subme > 0) {
         int fx = e->mb_frac[0], fy = e->mb_frac[1];
@@ -2562,13 +2689,14 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                       geo[1] / 4, geo[2] / 4, l, &pmv[l][0], &pmv[l][1]);
         seed[0] = mv16[l][0] / 4;
         seed[1] = mv16[l][1] / 4;
-        aeg_me_block(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+        aeg_me_block_l(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
                          geo[0],
                      e->stride[0],
                      e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                          mbx * 16 + geo[0],
                      e->stride[0], geo[2], geo[3], range, 0,
-                     pmv[l][0], pmv[l][1], seed, mc, &mv[l][0], &mv[l][1],
+                     pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
+                     &mv[l][0], &mv[l][1],
                      &sad);
         if (e->p.subme > 0) {
             int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
@@ -2672,9 +2800,10 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
 {
     int16_t cur[2][16][2];
     uint8_t avail[2][16];
-    int direct[16][2], direct1[16][2];
+    int direct[16][2], direct1[16][2], dlists = 3;
     int g, l, slot = e->mb_ncand;
     int range = e->p.search_range ? e->p.search_range : 16;
+    int b8_sub = getenv("AEG_B8SUB") ? atoi(getenv("AEG_B8SUB")) : 0;
     mbcand *cd;
 
     if (slot >= (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0])))
@@ -2684,7 +2813,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
     memset(direct, 0, sizeof(direct));
     memset(direct1, 0, sizeof(direct1));
     if (e->col_ready)
-        b_direct_mv(e, mbx, mby, direct, direct1);
+        dlists = b_direct(e, mbx, mby, direct, direct1);
     cd = &e->mb_cand[slot];
     memset(cd, 0, sizeof(*cd));
     cd->type = AEG_MB_B_8x8;
@@ -2707,14 +2836,16 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
                           &pmv[l][0], &pmv[l][1]);
             seed[0] = mv16[l][0] / 4;
             seed[1] = mv16[l][1] / 4;
-            aeg_me_block(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+            aeg_me_block_l(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
                              geo[0],
                          e->stride[0],
                          e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                              mbx * 16 + geo[0],
-                         e->stride[0], 8, 8, range, 0, pmv[l][0], pmv[l][1],
-                         seed, mc, &mv[l][0], &mv[l][1], &sad);
-            if (e->p.subme > 0) {
+                         e->stride[0], 8, 8, range, b8_sub ? e->p.subme : 0,
+                         pmv[l][0], pmv[l][1],
+                         seed, NULL, 0, e->me_lambda, mc, &mv[l][0],
+                         &mv[l][1], &sad);
+            if (e->p.subme > 0 && !b8_sub) {
                 int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
                 int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
                 int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
@@ -2733,11 +2864,17 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
         satd[2] = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1],
                                  mv[1][0], mv[1][1]);
         /* direct: the co-located vectors, both lists, no difference to send */
-        satd[3] = e->col_ready && direct_group_ok(e, mbx, mby, g)
+        satd[3] = !(e->col_ready && direct_group_ok(e, mbx, mby, g))
+                      ? (1 << 30)
+                      : dlists == 3
                       ? b_part_satd_bi(e, mbx, mby, geo, direct[b0][0],
                                        direct[b0][1], direct1[b0][0],
                                        direct1[b0][1])
-                      : (1 << 30);
+                      : dlists == 1
+                      ? b_part_satd(e, mbx, mby, geo, direct[b0][0],
+                                    direct[b0][1], 0)
+                      : b_part_satd(e, mbx, mby, geo, direct1[b0][0],
+                                    direct1[b0][1], 1);
         cost[0] = satd[0] + 8 * bits[0];
         cost[1] = satd[1] + 8 * bits[1];
         cost[2] = satd[2] + 8 * (bits[0] + bits[1]);
@@ -2749,7 +2886,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
         /* best: 0 = list 0, 1 = list 1, 2 = both, 3 = direct */
         st = best == 0 ? 1 : (best == 1 ? 2 : (best == 2 ? 3 : 0));
         cd->sub_type[g] = (uint8_t)st;
-        cd->blist[g] = (uint8_t)b_sub_lists[st];
+        cd->blist[g] = (uint8_t)(st == 0 ? dlists : b_sub_lists[st]);
         cd->pmv[b0][0] = (int16_t)pmv[0][0];
         cd->pmv[b0][1] = (int16_t)pmv[0][1];
         cd->pmv1[b0][0] = (int16_t)pmv[1][0];
@@ -3279,8 +3416,9 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
          * is a far better starting point than zero on content that moves. */
         seed[0] = list ? mv[0][0] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2];
         seed[1] = list ? mv[0][1] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
-        aeg_me_block(ref, e->stride[0], src, e->stride[0], 16, 16, range,
-                     e->p.subme, pmv[list][0], pmv[list][1], seed, mc,
+        aeg_me_block_l(ref, e->stride[0], src, e->stride[0], 16, 16, range,
+                     e->p.subme, pmv[list][0], pmv[list][1], seed, NULL, 0,
+                     e->me_lambda, mc,
                      &mv[list][0], &mv[list][1], &sad[list]);
         if (!list) {
             /* the smaller partitions would inherit this alignment */
@@ -3347,13 +3485,23 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         direct_group_ok(e, mbx, mby, 3)) {
         mbcand *cd = &e->mb_cand[e->mb_ncand];
         memset(cd, 0, sizeof(*cd));
+        int dl;
         cd->type = AEG_MB_B_DIRECT;
         cd->nparts = 1;
-        cd->blist[0] = 3;
-        b_direct_mv(e, mbx, mby, cd->mv, cd->mv1);
+        dl = b_direct(e, mbx, mby, cd->mv, cd->mv1);
+        cd->blist[0] = cd->blist[1] = cd->blist[2] = cd->blist[3] = (uint8_t)dl;
         e->mb_ncand++;
     }
     return e->mb_ncand > 0;
+}
+
+/* Whether the motion search prices the vector's rate (lambda * mvd bits) as
+ * well as its distortion.  AEG_MELAMBDA=0/1 overrides, for measurements. */
+static int me_lambda_on(const struct aeg_encoder *e)
+{
+    const char *ev = getenv("AEG_MELAMBDA");
+    (void)e;
+    return ev ? atoi(ev) != 0 : 1;
 }
 
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
@@ -3380,6 +3528,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     c->i16_mode = e->mb_modes[0];
     c->chroma_mode = chroma_mode_by_sad(e, mbx, mby);
 
+    e->me_lambda = me_lambda_on(e) ? aeg_me_lambda(c->qp) : 0;
     e->mb_inter_ok = 0;
     e->mb_ncand = 0;
     e->mb_mv[0] = e->mb_mv[1] = 0;
@@ -3419,13 +3568,13 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             int seed[2];
             seed[0] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 0];
             seed[1] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
-            aeg_me_block(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
+            aeg_me_block_l(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0],
                          e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0], 16, 16,
                          e->p.search_range ? e->p.search_range : 16,
                          e->p.subme, e->mb_pmv[0], e->mb_pmv[1], seed,
-                         &e->mc, &mvx, &mvy, &sad);
+                         NULL, 0, e->me_lambda, &e->mc, &mvx, &mvy, &sad);
         }
         e->mb_mv[0] = mvx;
         e->mb_mv[1] = mvy;
@@ -3901,6 +4050,21 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                                                (int)pred[y * 4 + x]);
             aeg_transform_4x4(res, 4, coef);
             aeg_quant_4x4(coef, t->level[rb], t->qp, 1);
+            if (e->p.trellis > 0 && e->p.cabac && trellis_intra_on()) {
+                /* the same level selection the inter blocks get; the block's
+                 * neighbours inside the macroblock are already final */
+                struct trel tr;
+                int a, b, va, vb;
+
+                cab_nz4_luma(e, mbx, mby, t, rb, &a, &b, &va, &vb);
+                tr.side = 4;
+                tr.n = 16;
+                tr.scan = aeg_scan4x4;
+                tr.cat = 2;
+                tr.cbf_ctx = cab_cbf_ctx(2, a, b, va, vb, 1);
+                trel_descent(&e->cab_shadow, &tr, t->level[rb], sb, s, pred, 4,
+                             t->qp, trellis_intra_lambda(lambda), 2, 1);
+            }
             for (k = 0; k < 16; k++)
                 nz += t->level[rb][k] != 0;
             t->nz[rb] = (int8_t)nz;
@@ -6263,7 +6427,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->p.cabac ? e->cabac_init_idc : -1,
                                    e->cur_qp - 26, 0, 0,
                                    e->p.deblock ? 0 : 1, first_row * e->mb_w,
-                                   e->cur_l0_active);
+                                   e->cur_l0_active, e->p.direct == 1);
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
@@ -6535,7 +6699,9 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     int is_p;
     size_t out_len;
     int64_t t_all = aeg_now_ns();
+    int64_t dbg_type0[AEG_MB_TYPE_COUNT];
 
+    memcpy(dbg_type0, e->stat_type, sizeof(dbg_type0));
     /* Which lists this picture predicts from.  A B picture reads both anchors;
      * a P picture reads the newest one.  This has to happen before the scene
      * cut test, which compares the picture with its list 0 reference. */
@@ -6590,6 +6756,10 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             e->cur_qp -= 2;
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
+    }
+    else if ((is_idr || slice == AEG_SLICE_I) && e->p.i_qp_offset > 0) {
+        e->cur_qp -= e->p.i_qp_offset;
+        if (e->cur_qp < 0)  e->cur_qp = 0;
     }
     if (e->rc_qp_offset) {
         e->cur_qp += e->rc_qp_offset;
@@ -6880,6 +7050,20 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     e->pic.plane[2] = e->recp[2];
     if (is_idr)
         e->idr_pic_id = (e->idr_pic_id + 1) & 0xffff;
+    if (getenv("AEG_RCDBG")) {
+        /* one line per picture: what it is and where its macroblocks went */
+        int64_t sk = e->stat_type[AEG_MB_SKIP] - dbg_type0[AEG_MB_SKIP];
+        int64_t in = 0;
+        int k;
+        for (k = 0; k < AEG_MB_TYPE_COUNT; k++)
+            if (k == AEG_MB_I4x4 || k == AEG_MB_I8x8 || k == AEG_MB_I16x16 ||
+                k == AEG_MB_IPCM)
+                in += e->stat_type[k] - dbg_type0[k];
+        fprintf(stderr, "PIC %c poc %d qp %d bits %d skip %lld intra %lld\n",
+                is_idr ? 'I' : (e->cur_is_b ? 'B' : (e->cur_is_p ? 'P' : 'i')),
+                e->cur_poc, e->cur_qp, (int)(out_len * 8), (long long)sk,
+                (long long)in);
+    }
     if (getenv("AEG_RCDBG"))
         fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f vbv %.0f\n",
                 e->frame_count, e->cur_qp, (int)(out_len * 8),
@@ -6935,6 +7119,9 @@ static void push_input(struct aeg_encoder *e, const uint8_t *yuv420p,
 {
     int slot = e->in_count % in_slots(e);
     copy_yuv(e, e->in_plane[slot], yuv420p);
+    if (e->in_low[slot].mem)
+        aeg_lowres_build(&e->in_low[slot], e->in_plane[slot][0], e->stride[0],
+                         e->w, e->h);
     e->in_pts[slot] = pts;
     e->in_count++;
 }
@@ -6988,6 +7175,88 @@ static int run_job(struct aeg_encoder *e, aeg_packet *pkt)
     return rc;
 }
 
+/* Adaptive B pictures: how long the group after anchor `a` should be, given
+ * that pictures a+1..last are in the ring (last = a + bframes + 1).  Returns
+ * the display index of the group's anchor.  This is x264's "fast" decision
+ * (b-adapt 1) on the same kind of estimate (lookahead.c):
+ *
+ *  - if a+2 predicted from a is mostly intra, a+1 is a P picture;
+ *  - if a+1 and a+2 as two P pictures cost less than a+1 as a B picture
+ *    between a and a+2 plus a+2 as a P picture from a, a+1 is a P picture;
+ *  - otherwise a+1 is a B picture, and so is every following picture j as
+ *    long as j+1 predicted from a stays below a cost threshold (which falls
+ *    with the distance) and is not one third intra; the first picture that
+ *    fails is the anchor. */
+static int la_bias(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_LABIAS");
+        v = ev ? atoi(ev) : 120;
+    }
+    return v;
+}
+
+static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
+                       int *intra)
+{
+    int slots = in_slots(e);
+    int64_t c = aeg_lowres_cost(&e->in_low[b % slots], &e->in_low[p0 % slots],
+                                p1 != b ? &e->in_low[p1 % slots] : NULL, intra,
+                                e->la_scratch);
+
+    /* a B picture is coded at a coarser quantiser and nothing predicts from
+     * it; x264 discounts its estimate by the same 1/1.2 */
+    if (p1 != b)
+        c = c * 100 / la_bias();
+    return c;
+}
+
+static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
+{
+    int nmb = e->mb_w > 2 && e->mb_h > 2 ? (e->mb_w - 2) * (e->mb_h - 2)
+                                         : e->mb_w * e->mb_h;
+    int64_t c2p1, c1b1, c1p0, c2p0;
+    int intra, j;
+
+    if (last - a < 2)
+        return last;
+    c2p1 = la_cost(e, a, a + 2, a + 2, &intra);
+    if (intra > nmb / 2)
+        return a + 1;
+    c1b1 = la_cost(e, a, a + 2, a + 1, NULL);
+    c1p0 = la_cost(e, a, a + 1, a + 1, NULL);
+    c2p0 = la_cost(e, a + 1, a + 2, a + 2, NULL);
+    if (getenv("AEG_LADBG"))
+        fprintf(stderr, "LA a %d intra %d/%d  1p0 %lld 2p0 %lld | 1b1 %lld 2p1 %lld\n",
+                a, intra, nmb, (long long)c1p0, (long long)c2p0,
+                (long long)c1b1, (long long)c2p1);
+    if (c1p0 + c2p0 < c1b1 + c2p1)
+        return a + 1;
+    for (j = a + 2; j < last; j++) {
+        int thresh = 300 - 50 * (j - a - 1);
+        int64_t pc;
+
+        if (thresh < 30)
+            thresh = 30;
+        {
+            static int ts = -1;
+            if (ts < 0) {
+                const char *ev = getenv("AEG_LATHRESH");
+                ts = ev ? atoi(ev) : 100;
+            }
+            thresh = thresh * ts / 100;
+        }
+        pc = la_cost(e, a, j + 1, j + 1, &intra);
+        if (getenv("AEG_LADBG"))
+            fprintf(stderr, "LA   j %d pcost/mb %lld thresh %d intra %d\n", j,
+                    (long long)(pc / nmb), thresh, intra);
+        if (pc > (int64_t)thresh * nmb || intra > nmb / 3)
+            break;
+    }
+    return j;
+}
+
 /* Fill the job queue with the next coding step, if the input has arrived. */
 static void schedule(struct aeg_encoder *e)
 {
@@ -7033,6 +7302,8 @@ static void schedule(struct aeg_encoder *e)
             break;
         }
     }
+    if (!idr && e->p.b_adapt)
+        nxt = b_adapt_decide(e, e->anchor, nxt);
     if (!idr)
         idr = idr_due(e, nxt);
     if (idr) {
@@ -7132,6 +7403,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * when there are no B pictures; --ref 2 forces it either way. */
     if (pp->refs < 0)
         pp->refs = (pp->preset >= 3 && pp->bframes == 0) ? 2 : 1;
+    if (pp->i_qp_offset < 0)
+        pp->i_qp_offset = 3;
+    if (pp->direct < 0 || pp->direct > 1)
+        pp->direct = 1;
+    if (pp->b_adapt < 0 || pp->b_adapt > 1)
+        pp->b_adapt = 1;
     if (pp->refs < 1)
         pp->refs = 1;
     if (pp->refs > 2)
@@ -7314,6 +7591,18 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         }
         for (i = 0; i < slots; i++)
             e->in_pts[i] = 0;
+        if (e->p.b_adapt) {
+            e->la_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 *
+                                             sizeof(int));
+            for (i = 0; i < slots; i++)
+                if (aeg_lowres_alloc(&e->in_low[i], e->mb_w, e->mb_h))
+                    break;
+            if (i < slots || !e->la_scratch) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+        }
     }
     e->mbs = (aeg_mb *)aeg_alloc(sizeof(aeg_mb) * (size_t)e->mb_count);
     if (!e->mbs) {
@@ -7524,6 +7813,9 @@ void aeg_encoder_close(aeg_encoder *enc)
         int i;
         for (i = 0; i < (int)(sizeof(e->in_mem) / sizeof(e->in_mem[0])); i++)
             aeg_free(e->in_mem[i]);
+        for (i = 0; i < AEG_MAX_BFRAMES + 3; i++)
+            aeg_lowres_free(&e->in_low[i]);
+        aeg_free(e->la_scratch);
         for (i = 0; i < 3; i++)
             aeg_free(e->pic_mem[i]);
     }
