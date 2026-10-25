@@ -6660,15 +6660,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->refine_mv = pp->preset >= 4 ? 2 : (pp->preset >= 3 ? 1 : 0);
     /* Refining every candidate is a large amount of work (one macroblock
      * evaluation per neighbour per candidate) for a change that measured
-     * between 0.1 and 0.6 points, so it is off unless asked for -- the same
-     * rule the level selection follows. */
+     * between 0.3 and 0.6 points, a worse exchange rate than the level
+     * selection's, so it is off unless asked for. */
     if (pp->refine_cand < 0)
         pp->refine_cand = 0;
-    /* Level selection is off unless asked for: it is a large amount of work
-     * (a price and an inverse transform per candidate level) for a BD-rate
-     * change that measured inside the noise on every clip of the test set. */
+    /* Level selection is a large amount of work (a price and an inverse
+     * transform per candidate level) that measured 0.15-2.4 points of BD-rate
+     * for 12-14 % of the encode time, i.e. a better exchange rate than the
+     * candidate refinement, so it follows the preset: presets 3 and 4 run it,
+     * below them it is off (see "Rate-distortion level selection"). */
     if (pp->trellis < 0)
-        pp->trellis = 0;
+        pp->trellis = pp->preset >= 3 ? 1 : 0;
     if (pp->gop_size < 0) pp->gop_size = 250;
     /* B pictures: three between two anchors at most (AEG_MAX_BFRAMES), and none
      * at all without CABAC -- the B macroblock layer is only implemented for the

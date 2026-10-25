@@ -116,7 +116,8 @@ the target over 90 frames), `--aq <tenths>` turns on variance-based adaptive
 quantisation (off by default: it is worth its PSNR cost only perceptually, see
 `docs/STATUS.md`), `-p 0..4` is the speed/quality
 preset (it scales the search range, the subpel refinement and, from 3 up, the
-rate-distortion refinement of the winning motion vector), `--refine-mv 0|1|2`
+rate-distortion refinement of the winning motion vector and the level
+selection), `--refine-mv 0|1|2`
 controls that last one on its own (0 off, 1 the four axial quarter-pel
 neighbours, 2 all eight; 1.2-4.2 points of BD-rate against x264 medium for
 30-45 % more time, and from preset 3 up it also refines each partition of a
@@ -125,9 +126,9 @@ points there, see `docs/STATUS.md`), `--refine-cand 0|1`
 refines *every* inter candidate's vectors rather than only the winner's, so a
 candidate that lost on a quarter-pel error gets a second chance (0.3-0.6 points
 of BD-rate for about 40 % more time at preset 4; off by default, see
-*Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
-level selection on the luma residual (priced by the CABAC coder; off by default
-because it costs 19-40 % of the encode time for 0.1-2.8 points, see
+*Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1` controls rate-distortion
+level selection on the luma residual (priced by the CABAC coder; on from preset
+3 up, where it is worth 0.15-2.2 points for 12-14 % of the encode time, see
 *Rate-distortion level selection* in `docs/STATUS.md`),
 `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =

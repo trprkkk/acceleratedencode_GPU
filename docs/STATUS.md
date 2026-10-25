@@ -1934,11 +1934,27 @@ the 8x8 inter blocks; chroma and intra keep the quantiser's levels.
 
 The verdict: worth 1.5 and 1.6 points on the four-quadrant clip, 2.8 and 1.1 on
 the still one, and 0.1-2.0 on the two panning clips -- positive everywhere, and
-the largest where the residual is largest.  It is still **off by default**,
-because it costs 19% of the encode time at preset 2 and 40% at preset 4 (the 8x8
-blocks are the expensive half: 64 coefficients, two directions apiece, one
-inverse transform per candidate), which is more than the last 1-2 points are
-worth at a given preset; `--trellis 1` buys them for anyone who wants to pay.
+the largest where the residual is largest.  That table is B-pictures-off and is
+kept because it isolates the pass; the same measurement with the encoder as it
+stands now, B pictures on and their vectors refined, moves the exchange rate in
+its favour -- the rest of the encode got more expensive per picture, so the pass
+now costs 12-14% of the time instead of 19-40% for the same absolute work:
+
+| clip (BD-rate against x264 medium; - is better) | preset 3 off / on | preset 4 off / on |
+|---|---|---|
+| mode 0, 320x192, 60 frames | -24.78% / **-26.64%** | -24.38% / **-26.94%** |
+| mode 1, 320x192, 30 frames | -12.83% / **-13.03%** | -12.58% / **-13.16%** |
+| mode 4, 320x192, 10 frames | -8.02% / **-8.86%** | -7.52% / **-8.34%** |
+| mode 3 (still), 320x192, 30 frames | -22.70% / **-22.81%** | -22.36% / **-22.52%** |
+| mode 0, 320x192, 30 frames | -23.47% / **-25.50%** | -23.63% / **-25.61%** |
+
+Every clip gains (0.15-2.2 points, 1.0-1.2 on average) for 14% of the encode
+time at preset 3 (0.703 s -> 0.803 s for 60 frames of 320x192 at QP 28) and 12%
+at preset 4 (0.821 -> 0.918 s), which is a better exchange rate than the
+candidate refinement's 0.3-0.6 points for 40%.  It therefore **follows the
+preset**: presets 3 and 4 run it, presets 0-2 do not, and `--trellis 0` turns it
+off on a slow preset.  The reason it did not follow the preset before was the
+cost, and the cost is what changed -- not the gain.
 
 The earlier measurement of this pass was read in the wrong direction: it
 reported the skip-heavy still clip as a 3-3.7 point *loss*, where the same six
@@ -2254,7 +2270,9 @@ frame of the `genyuv … 3` clip costs 4148 bytes, each following frame 8 bytes.
 60 frames of 320x192 at QP 24, single thread, CPU backend (2 cores, no GPU in
 this sandbox), best of three runs.  The clip is `genyuv 320 192 60 out.yuv 1`
 (the two halves moving in opposite directions, i.e. the one where 16x8/8x16
-partitions are worth coding):
+partitions are worth coding).  The `ours` rows below predate B pictures being
+the default and the level selection following the preset; re-measured on the
+same clip with both (see the paragraph after the table):
 
 | encoder | fps | bytes | PSNR |
 |---|---|---|---|
@@ -2270,6 +2288,16 @@ All seven rows are decoded and PSNR'd the same way (mean of the per-frame YUV
 PSNR), so the numbers are comparable; absolute values move a few percent
 between runs, the `-n 60`, single-thread, same-QP comparison is the one to
 repeat.
+
+Re-measured with the encoder as it stands (B pictures on by default at
+`--bframes 3`, preset 3 and 4 running the level selection), same clip, same
+method, best of three: preset 0 243 fps / 86 933 B / 42.02 dB, preset 2 97 fps
+/ 28 645 B / 45.66 dB, preset 3 63 fps / 28 425 B / 45.72 dB, preset 4 49 fps /
+28 669 B / 45.71 dB.  B pictures made the slow presets *faster* per frame in
+spite of the work added to them, because a third of the pictures are now cheap
+ones: preset 4 went from 43 to 49 fps while gaining the level selection.  The
+cost of the pass on its own is visible in the two controls: preset 3 with
+`--trellis 0` runs at 72 fps and preset 2 with `--trellis 1` at 84 fps.
 
 The preset rows differ by more than "a wider search": the coder-priced decision
 pass is the decision pass, and the vector refinement adds another 25% / 40% on
