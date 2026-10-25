@@ -21,7 +21,7 @@ The encoder is **conformant on I *and* P pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs forty-eight encoded clip cases
+fails (non-zero exit) on any mismatch; it runs fifty-three encoded clip cases
 frame by frame, checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -857,10 +857,11 @@ has to be caught before an external decoder is the only witness.
 1. B pictures.  This is now the whole of the remaining gap on moving content,
    and it is measurable in one line: with x264's own B pictures switched off
    (`-x264-params bframes=0`, everything else at `-preset medium`), our stream
-   is 2.6% *fewer* bits on the two-quadrant clip, 14.1% fewer on the still clip,
-   7.2% more on the panning clip and 13.8% more on the mode-4 clip -- against
-   19.8%, 11.3% fewer, 21.7% and 12.8% with them on.  So 4-22 points of BD-rate
-   are B pictures alone, and P-picture coding is within a few points of x264's.
+   is 2.6% *fewer* bits on the two-quadrant clip, 2.7% fewer on the four-quadrant
+   clip, 14.1% fewer on the still clip and 7.2% more on the panning clip --
+   against 19.8%, 15.7% and 21.7% *more* and 11.3% fewer with them on.  So 2-19
+   points of BD-rate are B pictures alone, and P-picture coding is within a few
+   points of x264's on three of the four clips.
    What it needs: picture order count and reordering, a second reference list
    (L1 = a future picture, so the encoder holds two references and the decoder
    reorders), the B slice syntax (`mb_skip_flag`'s own context base,
@@ -1171,17 +1172,19 @@ PSNR):
 
 | clip | preset 2 (off) | preset 3 (4 neighbours) | preset 4 (8 neighbours) |
 |---|---|---|---|
-| mode 4, 320x240, 8 frames | 12.6% more | 9.3% more | 9.8% more |
-| mode 2, 320x192, 30 frames | 21.0% more | 20.3% more | 20.4% more |
-| mode 3 (still), 320x192, 30 frames | 11.3% fewer | 13.7% fewer | 18.3% fewer |
+| mode 4, 320x240, 8 frames | 15.7% more | 15.0% more | 14.8% more |
+| mode 2, 320x192, 30 frames | 19.8% more | 19.3% more | 19.3% more |
+| mode 3 (still), 320x192, 30 frames | 11.3% fewer | 13.7% fewer | 18.2% fewer |
+| mode 1, 320x192, 60 frames | 21.7% more | 20.4% more | 20.3% more |
 
-and the cost is one full candidate evaluation per neighbour: 320x192 preset 2
-runs at 77 fps, preset 3 at 56 and preset 4 at 45 on this machine.  The two
-MIDDLE rows are where the idea is weakest (0.6 points for 27% of the time on
-the partitioned clip) and the still clip is where it is strongest: on content
-that barely moves, the search's vector is a quarter pel off, and the price --
-which knows that a vector that is exactly the neighbour median costs no mvd at
-all -- is what finds that out.
+and the cost is one full candidate evaluation per neighbour: 320x192 QP 24, 60
+frames, preset 2 runs at 69 fps, preset 3 at 53 and preset 4 at 42 on this
+machine (the presets also widen the search range, 24 -> 32 -> 48, so part of
+that time is not the refinement).  The moving clips gain 0.7-1.4 points for
+25% / 40% more time; the still clip gains 2.4 and then 4.5 more: on content that
+barely moves the search's vector is a quarter pel off, and the price -- which
+knows that a vector that is exactly the neighbour median costs no mvd at all --
+is what finds that out.
 
 The refinement runs before the chroma decision (the chroma prediction follows
 the luma vector) and restores the luma plane afterwards, because every trial
@@ -1349,7 +1352,7 @@ the 8x8 inter blocks; chroma and intra keep the quantiser's levels.
 
 | clip | preset 2 off / on | preset 4 off / on |
 |---|---|---|
-| mode 4, 320x240, 8 frames | 12.8% more / 13.0% more | 9.5% more / 9.8% more |
+| mode 4, 320x240, 8 frames | 15.7% more / **14.3% more** | 14.8% more / **13.7% more** |
 | mode 2, 320x192, 30 frames | 19.8% more / 19.7% more | 19.3% more / 19.3% more |
 | mode 3 (still), 320x192, 30 frames | 11.3% fewer / **15.0% fewer** | 18.2% fewer / **15.0% fewer** |
 | mode 1, 320x192, 60 frames | 21.7% more / 21.5% more | 20.4% more / 20.3% more |
@@ -1357,9 +1360,9 @@ the 8x8 inter blocks; chroma and intra keep the quantiser's levels.
 (the percentages are bits at matched PSNR against `libx264 -preset medium` over
 six QPs, so "19.8% more" is *worse* than x264.)
 
-The verdict is not a wash, it is a split: on the three clips with real residuals
-the pass is worth at most 0.2 points either way, and on the skip-heavy still
-clip it **costs 3.2-3.7 points**.  That is the drift above made visible: on a
+The verdict is not a wash, it is a split: on the four-quadrant clip it is worth
+1.1-1.4 points, on the two panning/divided clips at most 0.2 either way, and on
+the skip-heavy still clip it **costs 3.2-3.7 points**.  That is the drift above made visible: on a
 picture that is almost entirely skipped, the few blocks that do carry residual
 are the ones whose reconstruction every following P picture predicts from, and a
 level that lowers `sse + lambda * bits` for its own block today can cost a
@@ -1450,26 +1453,34 @@ BD-rate over QP 22/25/28/31/34/37, our stream against `libx264 -preset medium
 
 | x264, `-preset medium`, with | ours, bits at matched PSNR |
 |---|---|
-| `-profile:v baseline -x264-params cabac=0:8x8dct=0` | 35.8% fewer |
-| `-x264-params cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 9.1% more |
-| (preset defaults: CABAC, 8x8, trellis, AQ, psy-rd) | 12.6% more |
+| `-x264-params cabac=0:8x8dct=0` (baseline profile) | 47.3% fewer |
+| `-x264-params cabac=1:8x8dct=1:trellis=0:aq-mode=0` | 13.8% more |
+| (preset defaults: B pictures, CABAC, 8x8, trellis, AQ, psy-rd) | 15.7% more |
 
 CABAC and the 8x8 transform together are what used to be the whole gap against
-x264 *baseline*, and with both in the encoder is now **35.8% ahead** of a
-baseline-profile x264 on this clip (same script, `-profile:v baseline
--x264-params cabac=0:8x8dct=0`).  Against the *default* preset what is left is
-12% on this clip, and the split is measurable: x264 with `cabac=1:8x8dct=1` but
-`trellis=0:aq-mode=0` is 9.1% ahead of us, i.e. ~3.5 points of the 12.6 is
-trellis quantisation (level selection inside each block) and the rest is the
-motion search and the rate-distortion refinement of it.  The first half of that
-inference did not hold up: this encoder has its own level selection now
-(*Rate-distortion level selection*), priced by the same coder that codes the
-macroblock, and on this clip it is worth nothing -- so the 3.5 points are not
-the trellis on its own but what the trellis does for *x264's* search, and the
-rest of the gap is the search, which is the compute the GPU port is for.  On the two-quadrant clip (mode 2, the one that exists to make
-16x8 and 8x16 partitions pay) the gap is 21%, and on the still clip the encoder
-is 11% *ahead* of x264 medium -- the spread across three clips is what the
-decision pass can and cannot see.
+x264 *baseline*, and with both in the encoder is now **47% ahead** of a
+baseline-profile x264 on this clip (same script, `cabac=0:8x8dct=0`).  Against
+the *default* preset what is left is 15.7% on this clip, and the split is
+measurable: x264 with `cabac=1:8x8dct=1` but `trellis=0:aq-mode=0` is 13.8%
+ahead of us, so ~2 points are x264's trellis and adaptive quantisation and the
+rest is B pictures (see *Next*), the motion search and the rate-distortion
+refinement of it.
+
+The four clips the numbers in this file come from, all at preset 2/3/4 against
+`libx264 -preset medium -qp N` over QP 22/25/28/31/34/37 (bits at matched PSNR;
+"more" is worse for us):
+
+| clip (`tests/genyuv W H N out MODE`) | preset 2 | preset 3 | preset 4 |
+|---|---|---|---|
+| 320x192, 60 frames, mode 1 (halves moving apart vertically) | 21.7% more | 20.4% more | 20.3% more |
+| 320x192, 30 frames, mode 2 (the same horizontally) | 19.8% more | 19.3% more | 19.3% more |
+| 320x192, 30 frames, mode 3 (still after the first frame) | 11.3% fewer | 13.7% fewer | **18.2% fewer** |
+| 320x240, 8 frames, mode 4 (four quadrants, four directions) | 15.7% more | 15.0% more | 14.8% more |
+
+The spread across the four clips is what the decision pass can and cannot see:
+on the still picture it is ahead of x264's default preset by 11-18% (the skip
+rule and the coder's price agree there), and on the clips with motion it is
+15-22% behind, of which -- see *Next* -- most is B pictures.
 
 What the decision pass prices a candidate *with* matters more than any of the
 knobs tried before it.  Until this round the rate term was CAVLC-priced (the
@@ -1479,11 +1490,14 @@ as a stand-in for the real model: it gained 0.9-0.5 points on two clips and lost
 1.6 on the third (skip-heavy), so the bias is per syntax element and a single
 factor cannot fix it.  The rate term is now the coder's own price -- see
 *Pricing the decision pass with the coder* under *CABAC* -- and the three clips
-below are the measurement of it:
+below are the measurement of it (every clip in this file is
+`tests/genyuv W H N out.yuv MODE`; the 320x240 row is the exception, generated
+by an older `genyuv` whose mode 4 moves faster, so it does not reproduce from
+the tree and the current mode-4 clip below is a few points further behind):
 
 | clip | before | coder-priced | + the skip candidate | now (preset 2) | preset 3 | preset 4 |
 |---|---|---|---|---|---|---|
-| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | 12.6% more | 12.8% more | 9.4% more | 9.5% more |
+| mode 4, 320x240, 8 frames (older `genyuv` output, see below) | 12.9% more | 12.3% more | 12.6% more | 12.8% more | 9.4% more | 9.5% more |
 | mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | 21.0% more | **19.8% more** | 19.3% more | 19.3% more |
 | mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | 11.3% fewer | 11.3% fewer | 13.7% fewer | **18.2% fewer** |
 
@@ -1645,8 +1659,9 @@ and buys 1.0-1.2 points on the partitioned clip, and `--trellis 1` costs another
 20% / 35% for nothing measurable, which is why it is off.
 
 The honest reading against the reference: a *no-asm* x264 build is within 1.8x
-of this encoder, a normal libx264 with assembly is 6x faster, and it spends 9%
-fewer bits than we do on the still clip and 10% fewer on this one -- while
+of this encoder, a normal libx264 with assembly is 6x faster, and at matched
+PSNR it spends 22% fewer bits than we do on this clip (18% fewer on the still
+clip, 15-20% fewer on the partitioned ones) -- while
 coding B pictures we do not have yet (see *Next*).
 
 What the remaining time is, per stage (`-v 2`, 60 frames of 320x192 at QP 24,

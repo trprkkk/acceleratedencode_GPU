@@ -19,17 +19,18 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch.  What
 > is *not* finished is speed and B pictures.  On the test clips, at matched
-> PSNR, a baseline-profile x264 spends 36 % more bits than this encoder, while
+> PSNR, a baseline-profile x264 spends 47 % more bits than this encoder, while
 > libx264's default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
-> quantisation, AQ, SIMD) spends 9–21 % fewer on the moving clips and 11 % more
+> quantisation, AQ, SIMD) spends 15–22 % fewer on the moving clips and 11 % more
 > on the still one.  Almost all of that is B pictures: with x264's own B
-> pictures disabled the gap on the moving clips collapses to 2.6 % *in our
-> favour* (and 7 % against us on the panning clip), so P-picture coding is
+> pictures disabled the gap on two of the three moving clips collapses to 2.6 %
+> *in our favour* (and 7 % against us on the panning clip), so P-picture coding is
 > within a few points of x264's — the last few points of it are the search
 > (partition shapes and sub-pel vectors chosen by SATD rather than by the
 > coder's price).  Level selection priced by the coder is implemented and
-> measured, and switches itself off by default because it measured as a wash
-> on residual-heavy content and a loss on skip-heavy content.  Speed is the
+> measured, and stays off by default: it is worth 1.1–1.4 % BD-rate on the
+> four-quadrant clip, nothing on two of the others and a 3-point *loss* on
+> skip-heavy content.  Speed is the
 > real gap: 69 fps (preset 2) or 43 fps (preset 4) against x264's ~400 fps on
 > two cores at 320x192 QP 24, and 68 % of the CPU time is now the
 > transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
