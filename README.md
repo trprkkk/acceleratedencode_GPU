@@ -9,8 +9,9 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 
 > **Status: conformant High-profile encoder core (I, P and B pictures,
 > Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
-> 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, P_Skip,
-> temporal direct mode and bi-prediction), quality work in progress.**
+> 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, the same
+> shapes in B pictures with a per-partition choice of list, P_Skip, temporal
+> direct mode and bi-prediction), quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
@@ -22,12 +23,12 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > documented exception: `--refine-mv` desynchronises a partitioned macroblock,
 > see *Next* in `docs/STATUS.md`).  What
 > is *not* finished is speed.  B pictures are conformant and on by default (three
-> between two anchors, quantised eight coarser): at matched PSNR against libx264's
+> between two anchors, quantised twelve coarser): at matched PSNR against libx264's
 > default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
-> quantisation, AQ, SIMD) the encoder now spends 7.8–21.5 % **fewer** bits on four
-> of the five test clips and 0.7 % more on the fifth, where P-only coding was
+> quantisation, AQ, SIMD) the encoder now spends 10.3–21.9 % **fewer** bits on four
+> of the five test clips and 4.4 % more on the fifth, where P-only coding was
 > 9.6–27.8 % *more* on four of them.  What is left of the gap is the shape of a B
-> macroblock (four 16x16 types, no partitions, no `B_8x8`) and the search
+> macroblock (`B_8x8` is the one type still missing) and the search
 > (partition shapes and sub-pel vectors chosen by SATD rather than by the
 > coder's price).  Level selection priced by the coder is implemented and
 > measured, and stays off by default: it is worth 1.5–2.8 % BD-rate on the

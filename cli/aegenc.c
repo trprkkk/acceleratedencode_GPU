@@ -66,7 +66,9 @@ static void usage(void)
 "                   --slices uses one slice per thread)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8 (8x8 with 8x4/4x8/4x4 sub-partitions)\n"
-"                   (default 15; P_8x8 is skipped by preset 0)\n"
+"                   (default 15; P_8x8 is skipped by preset 0, and so\n"
+"                   are bits 1-3 for B pictures -- 16x8 and 8x16 are\n"
+"                   the only B shapes so far)\n"
 "  -v <int>         verbosity (0 quiet, 1 normal, 2 debug)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
 "  --calibrate      measure the accelerator launch overhead and exit\n"
@@ -527,10 +529,11 @@ int main(int argc, char **argv)
             /* the stream's rate is a property of the file and the frame rate,
              * not of how fast this machine happened to encode it */
             if (st.macroblocks > 0) {
-                static const char *const names[13] = {
+                static const char *const names[15] = {
                     "skip", "P16x16", "P16x8", "P8x16", "P_8x8",
                     "I4x4", "I16x16", "I_PCM", "I8x8",
-                    "B_direct", "B_L0", "B_L1", "B_BI"
+                    "B_direct", "B_L0", "B_L1", "B_BI",
+                    "B16x8", "B8x16"
                 };
                 int k;
                 printf("macroblock types: %" PRId64 " skip of %" PRId64
@@ -539,7 +542,7 @@ int main(int argc, char **argv)
                        100.0 * (double)st.skipped / (double)st.macroblocks,
                        st.macroblocks - st.skipped);
                 printf("  breakdown:");
-                for (k = 0; k < 13; k++)
+                for (k = 0; k < 15; k++)
                     if (st.mb_types[k])
                         printf(" %s %" PRId64, names[k], st.mb_types[k]);
                 printf("\n");

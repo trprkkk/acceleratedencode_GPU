@@ -52,8 +52,16 @@ enum {
     AEG_MB_B_L0,
     AEG_MB_B_L1,
     AEG_MB_B_BI,
+    /* Partitioned B macroblocks: the two 16x8 or the two 8x16 partitions, each
+     * of which picks its own lists (blist[0] and blist[1] hold the two
+     * partitions' masks).  The mb_type the standard assigns to a given pair of
+     * masks is a table lookup, not a type of its own, so one AEG_MB_* covers
+     * every combination. */
+    AEG_MB_B16x8,
+    AEG_MB_B8x16,
     AEG_MB_TYPE_COUNT          /* number of entries above, for the statistics */
 };
+
 
 enum { AEG_MB_I_V = 0, AEG_MB_I_H = 1, AEG_MB_I_DC = 2, AEG_MB_I_P = 3 };
 
@@ -144,6 +152,36 @@ typedef struct aeg_mb {
     int16_t  coef[AEG_BLK_COUNT][AEG_DCT_SIZE]; /* quantised coefficients  */
     int32_t  cost;            /* chosen RD cost (debug/stats)             */
 } aeg_mb;
+
+/* The prediction lists that cover 4x4 luma block `blk` of macroblock `m`, as a
+ * mask (1 = list 0, 2 = list 1).  Everything that compares two blocks -- the
+ * motion-vector predictor of a following partition, the deblocking filter's
+ * reference-index test -- has to ask per block rather than per macroblock as
+ * soon as a B macroblock may predict one partition from list 0 and the next
+ * from list 1: the union of the two masks would tell every block that both
+ * lists are in use.  Every reference index of a used list is 0 (the encoder
+ * keeps one reference per list), so a mask is all a comparison needs. */
+static inline int aeg_mb_block_lists(const aeg_mb *m, int blk)
+{
+    int p;
+
+    switch (m->type) {
+    case AEG_MB_B_DIRECT: return 3;
+    case AEG_MB_B_L0:     return 1;
+    case AEG_MB_B_L1:     return 2;
+    case AEG_MB_B_BI:     return 3;
+    case AEG_MB_B16x8:    p = (blk >> 2) >= 2; break;   /* bottom half */
+    case AEG_MB_B8x16:    p = (blk & 3) >= 2;  break;   /* right half  */
+    /* Every P macroblock predicts from list 0 only, at every block. */
+    case AEG_MB_SKIP:
+    case AEG_MB_P16x16:
+    case AEG_MB_P16x8:
+    case AEG_MB_P8x16:
+    case AEG_MB_P8x8:     return 1;
+    default:              return 0;                     /* intra, no list */
+    }
+    return m->blist[p] ? m->blist[p] : 3;
+}
 
 /* ------------------------------------------------------------------ */
 /* Picture                                                             */

@@ -123,17 +123,8 @@ static inline int is_intra(const aeg_mb *m)
 static inline int is_b(const aeg_mb *m)
 {
     return m->type == AEG_MB_B_DIRECT || m->type == AEG_MB_B_L0 ||
-           m->type == AEG_MB_B_L1 || m->type == AEG_MB_B_BI;
-}
-
-/* The prediction lists a B macroblock uses, as a mask.  Every reference index
- * of a used list is 0 (the encoder keeps one reference per list), so "the two
- * blocks disagree about list x" is the disjunction of this mask, which is all
- * 8.7.2.1 needs of the reference indices. */
-static inline int b_lists(const aeg_mb *m)
-{
-    int mask = m->blist[0] | m->blist[1];
-    return mask ? mask : 3;
+           m->type == AEG_MB_B_L1 || m->type == AEG_MB_B_BI ||
+           m->type == AEG_MB_B16x8 || m->type == AEG_MB_B8x16;
 }
 
 /* Index of the 8x8 group that holds 4x4 block `blk` (raster order). */
@@ -171,7 +162,9 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
      * that only looks forward is a different prediction from its neighbour that
      * only looks back, even when both vectors are zero (8.7.2.1). */
     if (is_b(p) || is_b(q)) {
-        int lp = b_lists(p), lq = b_lists(q);
+        /* per block, not per macroblock: a partitioned B macroblock may
+         * predict one partition from list 0 and the other from list 1 */
+        int lp = aeg_mb_block_lists(p, pa), lq = aeg_mb_block_lists(q, qa);
         if ((lp & 1) != (lq & 1) || (lp & 2) != (lq & 2))
             return 1;
         if ((lp & 1) && (abs(p->mv[pa][0] - q->mv[qa][0]) >= 4 ||

@@ -65,7 +65,7 @@ typedef struct mbenc {
 /* P candidates per macroblock: the searched P16x16, the skip vector, and the
  * three partitioned types (16x8, 8x16, P_8x8).  The batched RD path stores one
  * residual per candidate, so this is also its array bound. */
-#define AEG_MB_CAND_MAX 5
+#define AEG_MB_CAND_MAX 6
 
 /* Upper bound on the slices a picture may be cut into.  Slice threads use one
  * thread per slice, so this also bounds the thread count. */
@@ -129,6 +129,7 @@ struct aeg_encoder {
      * its own full refinement -- that costs one refinement per macroblock
      * instead of up to eighteen. */
     int mb_frac[2];
+    int mb_frac1[2];        /* the same, for list 1 of a B picture        */
     /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8,
      * 8x16 and P_8x8.  Each carries the per-partition MVs and their
      * predictors, which is exactly what the bitstream has to transmit. */
@@ -362,7 +363,7 @@ enum { AEG_SLICE_I = 0, AEG_SLICE_P = 1, AEG_SLICE_B = 2 };
 static int is_b_type(int t)
 {
     return t == AEG_MB_B_DIRECT || t == AEG_MB_B_L0 || t == AEG_MB_B_L1 ||
-           t == AEG_MB_B_BI;
+           t == AEG_MB_B_BI || t == AEG_MB_B16x8 || t == AEG_MB_B8x16;
 }
 
 /* The lists macroblock `m` predicts from, as a mask (1 = list 0, 2 = list 1). */
@@ -383,7 +384,8 @@ static int part_count(int type)
 {
     if (type == AEG_MB_P8x8)
         return 4;
-    return (type == AEG_MB_P16x8 || type == AEG_MB_P8x16) ? 2 : 1;
+    return (type == AEG_MB_P16x8 || type == AEG_MB_P8x16 ||
+            type == AEG_MB_B16x8 || type == AEG_MB_B8x16) ? 2 : 1;
 }
 
 /* Luma geometry of partition `p`: x, y, w, h in pixels inside the macroblock,
@@ -392,10 +394,12 @@ static void part_geom(int type, int p, int geo[4], int *blk0)
 {
     switch (type) {
     case AEG_MB_P16x8:
+    case AEG_MB_B16x8:
         geo[0] = 0; geo[1] = p ? 8 : 0; geo[2] = 16; geo[3] = 8;
         *blk0 = p ? 8 : 0;
         break;
     case AEG_MB_P8x16:
+    case AEG_MB_B8x16:
         geo[0] = p ? 8 : 0; geo[1] = 0; geo[2] = 8; geo[3] = 16;
         *blk0 = p ? 2 : 0;
         break;
@@ -1691,7 +1695,8 @@ static void nb_from_mb(nb_mv *n, const aeg_mb *m, int blk, int list)
         nb_set(n, NB_UNAVAIL, 0, 0);
         return;
     }
-    if (is_intra_type(m->type) || !(mb_lists(m->type, m->blist) & (1 << list))) {
+    if (is_intra_type(m->type) ||
+        !(aeg_mb_block_lists(m, blk) & (1 << list))) {
         nb_set(n, NB_NOTUSED, 0, 0);
         return;
     }
@@ -1728,6 +1733,14 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
     nb_mv A, B, C;
     int match;
 #define AVAIL(x, y) (avail[(y) * 4 + (x)])
+
+    /* A B macroblock predicts each partition from one or both lists, but the
+     * shape rules are the P ones: 16x8 and 8x16 short-circuit to a single
+     * neighbour, everything else runs the three-neighbour process. */
+    if (type == AEG_MB_B16x8)
+        type = AEG_MB_P16x8;
+    else if (type == AEG_MB_B8x16)
+        type = AEG_MB_P8x16;
 
     /* A: the block left of the partition (inside this macroblock when bx > 0). */
     if (bx > 0) {
@@ -1913,7 +1926,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
     if (mbx > 0) {
         m = &e->mbs[mby * e->mb_w + mbx - 1];
         if (!is_intra_type(m->type) &&
-            (mb_lists(m->type, m->blist) & (1 << list))) {
+            (aeg_mb_block_lists(m, 3) & (1 << list))) {
             a_av = 1;
             ax = list ? m->mv1[3][0] : m->mv[3][0];
             ay = list ? m->mv1[3][1] : m->mv[3][1];
@@ -1922,7 +1935,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
     if (mby > e->top_row) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         if (!is_intra_type(m->type) &&
-            (mb_lists(m->type, m->blist) & (1 << list))) {
+            (aeg_mb_block_lists(m, 12) & (1 << list))) {
             b_av = 1;
             bx = list ? m->mv1[12][0] : m->mv[12][0];
             by = list ? m->mv1[12][1] : m->mv[12][1];
@@ -1931,7 +1944,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
     if (mby > e->top_row && mbx + 1 < e->mb_w) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
         if (!is_intra_type(m->type) &&
-            (mb_lists(m->type, m->blist) & (1 << list))) {
+            (aeg_mb_block_lists(m, 12) & (1 << list))) {
             c_av = 1;
             cx = list ? m->mv1[12][0] : m->mv[12][0];
             cy = list ? m->mv1[12][1] : m->mv[12][1];
@@ -1939,7 +1952,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
     } else if (mby > e->top_row && mbx > 0) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
         if (!is_intra_type(m->type) &&
-            (mb_lists(m->type, m->blist) & (1 << list))) {
+            (aeg_mb_block_lists(m, 15) & (1 << list))) {
             c_av = 1;
             cx = list ? m->mv1[15][0] : m->mv[15][0];
             cy = list ? m->mv1[15][1] : m->mv[15][1];
@@ -2102,6 +2115,61 @@ static void me_publish(int16_t cur[16][2], const int geo[4], int mvx, int mvy)
  * of candidates), but the *decision* between partition shapes is made on SATD:
  * SAD happily prefers a wrongly aligned block whose DC error happens to be
  * small, which is exactly the mistake a sub-partition decision cannot afford. */
+/* SATD of one partition predicted from prediction list `list`. */
+static int b_part_satd(struct aeg_encoder *e, int mbx, int mby,
+                       const int geo[4], int mvx, int mvy, int list)
+{
+    const uint8_t *ref = list ? e->ref2p[0] : e->refp[0];
+    const aeg_mc_ctx *mc = list ? &e->mc1 : &e->mc;
+    uint8_t buf[16 * 16];
+    int ix = mvx >> 2, iy = mvy >> 2;
+    const uint8_t *r = ref + (mby * 16 + geo[1] + iy) * e->stride[0] +
+                       mbx * 16 + geo[0] + ix;
+    if (mc->ready)
+        aeg_mc_luma_p(buf, geo[2], mc, r, geo[2], geo[3], mvx & 3, mvy & 3);
+    else
+        aeg_mc_luma(buf, geo[2], r, e->stride[0], geo[2], geo[3],
+                    mvx & 3, mvy & 3);
+    return aeg_satd(geo[2], geo[3], buf, geo[2],
+                    e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                        mbx * 16 + geo[0], e->stride[0]);
+}
+
+/* SATD of one partition predicted from both lists and averaged -- the
+ * bi-predictive prediction, which is what a B picture is for. */
+static int b_part_satd_bi(struct aeg_encoder *e, int mbx, int mby,
+                          const int geo[4], int mv0x, int mv0y,
+                          int mv1x, int mv1y)
+{
+    uint8_t a[16 * 16], b[16 * 16];
+    int x, y;
+    {
+        const uint8_t *rp = e->refp[0] + (mby * 16 + geo[1] + (mv0y >> 2)) *
+                                e->stride[0] + mbx * 16 + geo[0] + (mv0x >> 2);
+        const uint8_t *rq = e->ref2p[0] + (mby * 16 + geo[1] + (mv1y >> 2)) *
+                                e->stride[0] + mbx * 16 + geo[0] + (mv1x >> 2);
+        if (e->mc.ready)
+            aeg_mc_luma_p(a, geo[2], &e->mc, rp, geo[2], geo[3],
+                          mv0x & 3, mv0y & 3);
+        else
+            aeg_mc_luma(a, geo[2], rp, e->stride[0], geo[2], geo[3],
+                        mv0x & 3, mv0y & 3);
+        if (e->mc1.ready)
+            aeg_mc_luma_p(b, geo[2], &e->mc1, rq, geo[2], geo[3],
+                          mv1x & 3, mv1y & 3);
+        else
+            aeg_mc_luma(b, geo[2], rq, e->stride[0], geo[2], geo[3],
+                        mv1x & 3, mv1y & 3);
+    }
+    for (y = 0; y < geo[3]; y++)
+        for (x = 0; x < geo[2]; x++)
+            a[y * geo[2] + x] = (uint8_t)((a[y * geo[2] + x] +
+                                           b[y * geo[2] + x] + 1) >> 1);
+    return aeg_satd(geo[2], geo[3], a, geo[2],
+                    e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                        mbx * 16 + geo[0], e->stride[0]);
+}
+
 static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
                      int mvx, int mvy)
 {
@@ -2171,6 +2239,127 @@ static void avail_publish(uint8_t avail[16], const int geo[4])
     for (y = y0; y < y1; y++)
         for (x = x0; x < x1; x++)
             avail[(y << 2) + x] = 1;
+}
+
+/* One partition of a partitioned B macroblock (16x8 or 8x16).
+ *
+ * Both lists are searched independently and then list 0, list 1 and the average
+ * of the two compete.  The average is the reason B pictures exist -- it halves
+ * the noise of each predictor -- and it is the only one of the three that sends
+ * two motion vectors, which is why it is priced with both.
+ *
+ * `cur`/`avail` are per list: the decoder's cache is, and a partition that only
+ * looks forward is *not* available to a following partition that predicts from
+ * list 1 (its reference index for list 1 is LIST_NOT_USED, which matches no
+ * reference).  Getting that backwards makes the encoder predict a different
+ * vector than the decoder and reconstruct a different picture.
+ *
+ * The search itself is integer-only, with the quarter-pel offset the
+ * macroblock's 16x16 search found applied afterwards -- four full quarter-pel
+ * searches per macroblock would cost more than the B picture is worth; the
+ * macroblock-level RD pass still has the last word on the shape. */
+static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
+                          int p, int16_t cur[2][16][2],
+                          uint8_t avail[2][16], const int mv16[2][2],
+                          mbcand *cd)
+{
+    int geo[4], b0, l, x, y, lists, best;
+    int range = e->p.search_range ? e->p.search_range : 16;
+    int pmv[2][2], mv[2][2], satd[3], cost[3], bits[2];
+
+    part_geom(type, p, geo, &b0);
+    for (l = 0; l < 2; l++) {
+        const uint8_t *ref = l ? e->ref2p[0] : e->refp[0];
+        const aeg_mc_ctx *mc = l ? &e->mc1 : &e->mc;
+        int seed[2], sad;
+
+        predict_mv_at(e, mbx, mby, cur[l], avail[l], type, p, geo[0] / 4,
+                      geo[1] / 4, geo[2] / 4, l, &pmv[l][0], &pmv[l][1]);
+        seed[0] = mv16[l][0] / 4;
+        seed[1] = mv16[l][1] / 4;
+        aeg_me_block(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+                         geo[0],
+                     e->stride[0],
+                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                         mbx * 16 + geo[0],
+                     e->stride[0], geo[2], geo[3], range, 0,
+                     pmv[l][0], pmv[l][1], seed, mc, &mv[l][0], &mv[l][1],
+                     &sad);
+        if (e->p.subme > 0) {
+            int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
+            int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
+            int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
+
+            if (fx || fy) {
+                int c_int = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+                int c_frac = b_part_satd(e, mbx, mby, geo, qx, qy, l);
+
+                if (c_frac < c_int) {
+                    mv[l][0] = qx;
+                    mv[l][1] = qy;
+                }
+            }
+        }
+        satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+        bits[l] = aeg_mvd_bits(mv[l][0] - pmv[l][0], mv[l][1] - pmv[l][1]);
+    }
+    satd[2] = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1],
+                             mv[1][0], mv[1][1]);
+    cost[0] = satd[0] + 8 * bits[0];
+    cost[1] = satd[1] + 8 * bits[1];
+    cost[2] = satd[2] + 8 * (bits[0] + bits[1]);
+    best = 0;
+    if (cost[1] < cost[best]) best = 1;
+    if (cost[2] < cost[best]) best = 2;
+    lists = best == 0 ? 1 : (best == 1 ? 2 : 3);
+    cd->blist[p] = (uint8_t)lists;
+    cd->pmv[b0][0] = (int16_t)pmv[0][0];
+    cd->pmv[b0][1] = (int16_t)pmv[0][1];
+    cd->pmv1[b0][0] = (int16_t)pmv[1][0];
+    cd->pmv1[b0][1] = (int16_t)pmv[1][1];
+    for (y = 0; y < geo[3] / 4; y++)
+        for (x = 0; x < geo[2] / 4; x++) {
+            int b = (geo[1] / 4 + y) * 4 + geo[0] / 4 + x;
+
+            cd->mv[b][0] = (int16_t)mv[0][0];
+            cd->mv[b][1] = (int16_t)mv[0][1];
+            cd->mv1[b][0] = (int16_t)mv[1][0];
+            cd->mv1[b][1] = (int16_t)mv[1][1];
+            if (lists & 1) {
+                cur[0][b][0] = (int16_t)mv[0][0];
+                cur[0][b][1] = (int16_t)mv[0][1];
+                avail[0][b] = 1;
+            }
+            if (lists & 2) {
+                cur[1][b][0] = (int16_t)mv[1][0];
+                cur[1][b][1] = (int16_t)mv[1][1];
+                avail[1][b] = 1;
+            }
+        }
+}
+
+/* A partitioned B candidate (16x8 or 8x16): two partitions, each of which picks
+ * its own lists.  The RD pass decides whether the finer motion field pays for
+ * the extra mb_type bins and the second mvd pair. */
+static void b_candidate_parts(struct aeg_encoder *e, int mbx, int mby, int type,
+                              const int mv16[2][2])
+{
+    int16_t cur[2][16][2];
+    uint8_t avail[2][16];
+    int p, slot = e->mb_ncand;
+    mbcand *cd;
+
+    if (slot >= (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0])))
+        return;
+    memset(cur, 0, sizeof(cur));
+    memset(avail, 0, sizeof(avail));
+    cd = &e->mb_cand[slot];
+    memset(cd, 0, sizeof(*cd));
+    cd->type = type;
+    cd->nparts = 2;
+    for (p = 0; p < 2; p++)
+        b_part_search(e, mbx, mby, type, p, cur, avail, mv16, cd);
+    e->mb_ncand = slot + 1;
 }
 
 static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
@@ -2605,6 +2794,11 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
     e->mb_inter_sad = sad[0] < sad[1] ? sad[0] : sad[1];
     e->mb_ncand = 0;
 
+    /* list 1's fractional offset, for the partitioned searches below (the
+     * 16x16 search of each list leaves its own) */
+    e->mb_frac1[0] = mv[1][0] & 3;
+    e->mb_frac1[1] = mv[1][1] & 3;
+
     /* list 0, list 1, and both */
     for (list = 0; list < 3; list++) {
         mbcand *cd = &e->mb_cand[e->mb_ncand];
@@ -2624,6 +2818,19 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         cd->pmv1[0][0] = (int16_t)pmv[1][0];
         cd->pmv1[0][1] = (int16_t)pmv[1][1];
         e->mb_ncand++;
+    }
+    /* The partitioned shapes.  Like the P path they only pay off with the RD
+     * decision, so ultrafast stays 16x16; and the candidate list has room for
+     * both of them plus the four 16x16 ones. */
+    if (e->p.preset >= 1 && !getenv("AEG_NOPARTB")) {
+        int mv16[2][2];
+
+        mv16[0][0] = mv[0][0]; mv16[0][1] = mv[0][1];
+        mv16[1][0] = mv[1][0]; mv16[1][1] = mv[1][1];
+        if (e->p.partitions & 2)
+            b_candidate_parts(e, mbx, mby, AEG_MB_B16x8, (const int (*)[2])mv16);
+        if (e->p.partitions & 4)
+            b_candidate_parts(e, mbx, mby, AEG_MB_B8x16, (const int (*)[2])mv16);
     }
     /* direct: vectors derived, nothing sent */
     if (e->col_ready) {
@@ -2820,7 +3027,11 @@ static int mb_type_bits(const struct aeg_encoder *e, const mbenc *c, int is_p)
          * refuses the combination), so it is only ever a heuristic. */
         int list = mb_lists(c->type, c->blist);
         int bits = c->type == AEG_MB_B_DIRECT ? 1 : 4;
+        /* The partitioned types (codes 4..21) are the four-bit code plus the
+         * fifth bin; a 16x16 one is that code alone. */
         (void)e;
+        if (c->type == AEG_MB_B16x8 || c->type == AEG_MB_B8x16)
+            return bits + (list == 3 ? 2 : 1);
         return bits + (list == 3 ? 1 : 0);
     }
     /* An I_NxN macroblock carries transform_size_8x8_flag right after mb_type
@@ -2847,7 +3058,12 @@ static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
         for (i = 0; i < 4; i++)
             bits += aeg_ue_bits((uint32_t)c->sub_type[i]);
     for (p = 0; p < c->nparts; p++) {
-        int geo[4], b0, lmask = mb_lists(c->type, c->blist);
+        int geo[4], b0;
+        /* A partitioned B macroblock picks its lists per partition, so the
+         * mask has to come from the partition rather than from the
+         * macroblock's union of them. */
+        int lmask = is_b_type(c->type) ? mb_part_lists(c, p)
+                                       : mb_lists(c->type, c->blist);
         mb_part_geom(c, p, geo, &b0);
         /* A direct macroblock sends no mvd at all (8.4.1.2), the decoder
          * derives its vectors; every other inter type sends one pair per list
@@ -3595,7 +3811,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * reconstruction there.  Eight full candidate evaluations per macroblock,
      * so it belongs to the slow presets (AEG_MVREF=1 forces it on for
      * measurement). */
-    if (e->p.cabac && e->p.refine_mv > 0 && inter &&
+    if (e->p.cabac && e->p.refine_mv > 0 && inter && !e->cur_is_b &&
         mb_part_count(&best) <= 2) {
         static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
         static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
@@ -4113,6 +4329,11 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
         int lx = 0, ly = 0, tx = 0, ty = 0;
         int bx, by;
 
+        /* A partition of a B macroblock only sends a difference for the lists
+         * it predicts from: the others have no vector at all, and the decoder
+         * leaves both the vector and its difference at zero. */
+        if (is_b_type(c->type) && !(mb_part_lists(c, p) & (1 << list)))
+            continue;
         mb_part_geom(c, p, geo, &b0);
         bx = geo[0] / 4;
         by = geo[1] / 4;
@@ -4291,8 +4512,25 @@ static const uint8_t cab_i16_ctx_b[6] = { 32, 33, 34, 34, 35, 35 };
  * writer refuses rather than emitting a type that does not match the picture. */
 static int b_mb_type_code(const mbenc *c)
 {
+    /* Table 7-14 codes 4..21: the two partitioned shapes share each pair of
+     * codes, keyed by the lists the two partitions picked (partition 0 first).
+     * The even code of a pair is the 16x8 shape and the odd one the 8x16. */
+    static const uint8_t parts[3][3] = {
+        /*            part1: L0  L1  BI */
+        /* part0 L0 */ {  4,  8, 12 },
+        /* part0 L1 */ { 10,  6, 14 },
+        /* part0 BI */ { 16, 18, 20 },
+    };
+
     if (c->type == AEG_MB_B_DIRECT)
         return 0;
+    if (c->type == AEG_MB_B16x8 || c->type == AEG_MB_B8x16) {
+        int l0 = c->blist[0] ? c->blist[0] : 3;
+        int l1 = c->blist[1] ? c->blist[1] : 3;
+
+        return parts[l0 - 1][l1 - 1] +
+               (c->type == AEG_MB_B8x16 ? 1 : 0);
+    }
     if (c->nparts > 1)
         return -1;
     if (c->blist[0] == 1)
@@ -4767,6 +5005,10 @@ static void vbv_update(struct aeg_encoder *e, int bits)
 #define RC_WINDOW 6.0
 #define RC_GAIN   1.2
 #define RC_DEBT_MAX 3.0
+
+/* The QP below which the B-picture offset is faded out (see the B picture's QP
+ * in aeg_encoder_encode): at QP 12 and above it is applied in full. */
+#define B_QP_FADE 12
 
 /* How much of a frame's budget each picture is expected to take.
  *
@@ -5387,7 +5629,21 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
      * anything.  This is the cheapest half of what B pictures are for --
      * x264 spends +2 by default for exactly this reason. */
     if (e->cur_is_b && e->p.b_qp_offset) {
-        e->cur_qp += e->p.b_qp_offset;
+        /* The offset fades out towards QP 0.  A QP step is a *relative* change
+         * in quality, and it is only worth a fixed number of steps while there
+         * is room to pay for it: at QP 4 an offset of twelve puts the B picture
+         * at the quality of QP 16, where the error is plainly visible, and the
+         * bits it saves cannot be spent on anything better -- which is exactly
+         * what happened to the rate controller, whose stream fell 17% short of
+         * its target because the B pictures alone were cheap enough that the
+         * anchors were already at QP 0.  The fade starts at B_QP_FADE (below),
+         * well under the 22..37 the offset was measured in, so no measurement
+         * reported anywhere in docs/STATUS.md moves. */
+        int off = e->p.b_qp_offset;
+
+        if (e->cur_qp < B_QP_FADE)
+            off = off * e->cur_qp / B_QP_FADE;
+        e->cur_qp += off;
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }

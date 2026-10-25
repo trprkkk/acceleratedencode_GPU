@@ -683,6 +683,14 @@ index.  A B picture whose direct derivation is wrong reconstructs a different
 picture *without* breaking the syntax, so this re-ordering is the only thing in
 the suite that sees the four B bugs listed below.
 
+The ten B cases run the default partition mask, so they exercise the
+partitioned B types as well: at QP 24 on the panning clip the type breakdown
+reports ten `B16x8` macroblocks, and the two-quadrant clip selects `B8x16`.
+That is how the neighbour-mask bug in *The partitioned types* was narrowed down
+-- the first differing picture was an anchor, not a B one, so the partitioning
+in the B picture was working and the failure came from the *P* path using the
+same mask.
+
 Six cases fail today and are not a B-picture regression: `refine_thr`,
 `refine_part`, `trellis4`, `trellis8`, `trellis_thr` and `trellis_batch`
 reproduce identically at `db80149`, before B pictures existed.  They all have
@@ -891,9 +899,12 @@ never from its neighbours).  The encoder holds `bframes + 3` input pictures of
 lookahead, codes a group as *anchor, then its B pictures*, and emits each
 picture as its own packet; `aeg_encoder_flush()` drains the tail, where the
 group's remaining pictures can only be coded as P pictures because their
-anchor never arrives.  B macroblocks are 16x16 only: `B_Direct_16x16`,
-`B_L0_16x16`, `B_L1_16x16` and `B_Bi_16x16` (the bi-predictive average is
-`(a + b + 1) >> 1`, rounded once on the interpolated samples).
+anchor never arrives.  B macroblocks are `B_Direct_16x16`, `B_L0_16x16`,
+`B_L1_16x16`, `B_Bi_16x16` and the two partitioned shapes `B_16x8` and
+`B_8x16`, whose partitions pick their lists independently (codes 4-21, see
+*The partitioned types* below); the bi-predictive average is
+`(a + b + 1) >> 1`, rounded once on the interpolated samples.  `B_8x8` is the
+one shape still missing.
 
 Four bugs stood between "it writes plausible B slices" and "the decoder
 reconstructs the same picture", and all four were *syntax*-level in the sense
@@ -928,6 +939,64 @@ them and nothing else did.
    them on moving content; the encoder reconstructed a different picture than
    the decoder without desynchronising the stream.
 
+### The partitioned types
+
+`B_16x8` and `B_8x16` are not types of their own in the standard.  Table 7-14
+assigns a code to each *pair* of partition list masks, so the B `mb_type`
+codes 4-21 are the two shapes crossed with the nine ways two partitions can
+pick from {L0, L1, bi}.  The encoder keeps one `AEG_MB_*` for both shapes
+(`AEG_MB_B16x8`, `AEG_MB_B8x16`) with the two masks in `blist[0..1]`, and
+`b_mb_type_code()` turns them into the code:
+
+|              | part 1 L0 | part 1 L1 | part 1 bi |
+|--------------|-----------|-----------|-----------|
+| **part 0 L0**|  4 / 5    |  8 / 9    | 12 / 13   |
+| **part 0 L1**| 10 / 11   |  6 / 7    | 14 / 15   |
+| **part 0 bi**| 16 / 17   | 18 / 19   | 20 / 21   |
+
+(the second number of each pair is the 8x16 shape; codes 12-21 are the ones the
+CABAC binarization spends a fifth bin on).  Each partition picks its lists on
+its own -- list 0, list 1 and bi-prediction are priced per partition by the
+partition's own SATD plus eight times its own mvd bits -- and the macroblock as
+a whole still goes through the exact RD comparison, which is what decides
+whether the finer motion field pays for the extra `mb_type` and mvd bins.
+
+Two properties of the *syntax* decide whether the reconstruction matches, and
+both are per list rather than per macroblock:
+
+* the differences go out list-major: every partition's list-0 mvd first, then
+  every partition's list-1 mvd (the partition order is the bitstream's, top to
+  bottom or left to right);
+* a partition that does not predict from a list sends nothing for that list,
+  and the decoder leaves that partition's vector *and* its difference at zero --
+  so `cabac_mvd()` skips the pair but `cabac_mb_mvd()` still publishes the zeros
+  in the per-block mvd table, because the *next* macroblock's context is built
+  from it, and `nb_from_mb()` has to treat that block as LIST_NOT_USED rather
+  than as a neighbour whose vector happens to be zero.
+
+**The one bug this cost was in the neighbour mask, not in any of that.**  The
+per-block list mask `aeg_mb_block_lists()` was written for the deblocking
+filter, whose only requirement is that two macroblocks of the *same* picture be
+comparable, and its `default:` returned 0 -- "this block predicts from no
+list".  P macroblocks, `P_Skip` and the whole P path fall into that default, so
+in a *P* picture `nb_from_mb()` asked the mask about a P neighbour, got 0, and
+concluded that the neighbour used no list at all: every partitioned P
+macroblock's predictor came out as (0, 0) while the decoder's was the real
+median, and the two pictures diverged by the mvd.  In a B picture nothing
+showed, because there every neighbour is a B type.
+
+It was found the way these things are found: the first differing frame of a
+`--bframes 2 --partitions 3` encode was *not* a B picture at all but the anchor
+in front of the first B group, the differing macroblocks sat under the few
+`P16x8` macroblocks of that frame, and dumping `mv`/`pmv` per partition showed
+a partition whose predictor was (0, 0) with a top neighbour at (36, 24) and a
+left neighbour at (-36, -24).  With the P types mapped to list 0 in the mask,
+`--partitions 1 3 5 7 15` are all bit-exact with one, two and three B pictures,
+at every QP and every preset, with slices, and on the 64x64 clip.
+
+`B_8x8` (code 22, sub-types 0-12, contexts 36-39) is not implemented; it is
+next.
+
 ### Making them pay
 
 B pictures on their own were a *loss*: four 16x16 shapes with no partitions and
@@ -938,25 +1007,49 @@ new syntax element.
 **A coarser quantiser for the non-reference pictures.**  A B picture is never
 used as a reference, so its quantisation error cannot propagate: rounding it
 harder costs nothing to the pictures that follow, which is why x264 spends a
-`bframes`-dependent offset here by default.  `--bqp N` sets it (default 8 -- no
-longer the +2 the standard advice suggests, see the sweep).  The sweep, with
+`bframes`-dependent offset here by default.  `--bqp N` sets it; the default is
+**12**, not the +2 the standard advice suggests.  The first sweep, with
 `--bframes 2`, `--scenecut 0`, `tools/bdrate.py` against libx264 medium on the
 panning clip / the quadrant clip / the eight-frame one (negative = we spend fewer
-bits than x264):
+bits than x264), found 8, and predicted that the offset would have to *come
+down* once B partitions existed -- the reasoning being that the two 16x16
+shapes were what the offset was paying for.
 
-| `--bqp` | g1_60 | p2 | q4 |
-|---|---|---|---|
+| `--bqp` | g1_60 | p2 | q4 | (first sweep, `--bframes 2`) |
+|---|---|---|---|---|
 | 0 | +19.7 % | +17.2 % | +17.2 % |
 | 2 | +7.4 % | +5.6 % | +8.5 % |
 | 4 | +3.3 % | +1.9 % | +5.9 % |
 | 6 | +1.1 % | -0.0 % | +4.6 % |
 | 8 | -1.1 % | -1.6 % | +4.0 % |
 
-and the number is monotone in the offset up to 10, where three B pictures per
-group measure -9.1 / -11.0 / +0.7 %.  Eight was chosen rather than ten because
-the coarse offset is buying back exactly what the missing *shapes* cost: once B
-partitions exist the offset has to come down again, and it is easier to defend a
-bound that already sits a little below the measured optimum.
+The prediction was wrong in the interesting way: with the partitions in place
+the optimum moved *up*.  Better prediction makes the residual cheaper, so a
+still coarser quantiser costs less in bits than it did, and the second sweep
+(with `--bframes 3`, the partitioned types, six QPs, and the offsets compared
+against each other over the range the two curves actually share) has a flat top
+at 12-14:
+
+| `--bqp` vs 8 | g1_60 | p2 | p0 | p3 | q4 |
+|---|---|---|---|---|---|
+| 10 | -1.25 % | -0.85 % | -- | -- | -- |
+| **12** | **-2.07 %** | **-1.34 %** | **-3.20 %** | +0.14 % | +0.06 % |
+| 14 | -2.19 % | -1.00 % | -- | -- | -- |
+| 16 | -1.14 % | +0.30 % | -- | -- | -- |
+
+Twelve sits inside the flat top of both clips and costs nothing on the two
+static ones (a static picture has no B residual to quantise at all).
+
+**The offset fades out towards QP 0.**  A QP step is a *relative* change in
+quality, and a fixed number of steps is only worth paying while there is room to
+pay for it.  At QP 4 an offset of twelve puts the B pictures at the quality of
+QP 16 -- plainly visible -- and the bits it saves cannot be spent on anything,
+because the anchors are already at QP 0.  This is not a theory: it is what broke
+the rate controller.  At 400 kb/s on the ABR clip the B pictures became cheap
+enough that the whole stream landed 17 % *under* the target with every anchor at
+QP 0 and nothing left to spend the budget on.  The offset is now scaled by
+`min(1, qp / 12)`, which leaves every measurement above untouched (they are all
+taken at QP 22-37) and puts that stream back at 419.7 kb/s.
 
 **The rate controller, the buffer model and the scene-cut detector had to learn
 what a B picture is.**  All three were written for a stream of interchangeable
@@ -969,9 +1062,7 @@ pictures:
   they should.  Each picture's share is now a *measured* weight: the running ratio
   of B-picture bits to anchor bits (an EWMA, seeded from the QP offset's
   `2^(-bqp/6)`), so one group is worth exactly the pictures in it.  400 kb/s at
-  `--bframes 3` now lands at 371 kb/s rather than 344, and what is left is the
-  content: at QP 0 with three B pictures this clip produces 343 kb/s, so 400 kb/s
-  is not reachable on it at all;
+  `--bframes 3` now lands at 419.7 kb/s rather than 344;
 * the debt clamp and the per-picture QP step are measured in *this picture's*
   budget, and the step cap grows with the outstanding debt (up to 4 QP).  With a
   group of four, the whole group's error is repaid through the anchor alone, and
@@ -1006,34 +1097,41 @@ trail the input); it feeds a picture per iteration and drains the lookahead.
 `tools/bdrate.py` against libx264 medium, 6 QPs, negative = we spend fewer bits
 than x264 at matched PSNR:
 
-| clip | B pictures off | default (`--bframes 3 --bqp 8`) |
-|---|---|---|
-| g1_60 (60 frames, panning texture) | +27.8 % | **-7.8 %** |
-| p2 (30 frames, two quadrants apart) | +24.7 % | **-10.1 %** |
-| q4 (8 frames, four quadrants) | +18.6 % | **+0.7 %** |
-| p3 (30 frames, still after the first) | -10.2 % | **-21.5 %** |
-| p0 (30 frames, whole frame pans) | +9.6 % | **-19.0 %** |
+| clip | B pictures off | `--bframes 3 --bqp 8`, 16x16 B | **default (`--bframes 3 --bqp 12`, partitioned)** |
+|---|---|---|---|
+| g1_60 (60 frames, panning texture) | +27.8 % | -8.2 % | **-10.3 %** |
+| p2 (30 frames, two quadrants apart) | +24.7 % | -10.3 % | **-11.8 %** |
+| q4 (8 frames, four quadrants) | +18.6 % | +4.4 % | **+4.4 %** |
+| p3 (30 frames, still after the first) | -10.2 % | -21.5 % | **-21.4 %** |
+| p0 (30 frames, whole frame pans) | +9.6 % | -19.1 % | **-21.9 %** |
 
-Four of the five clips are now *ahead* of x264's default preset, where P-only
-coding was behind on three of them.  The remaining shape gap is the obvious next
-step: the partitioned types (codes 4-21) and `B_8x8` (22, 36-39) let a B picture
-spend its bits where the two references actually disagree, which is where a
-16x16-only B macroblock wastes them.
+Four of the five clips are ahead of x264's default preset, where P-only coding
+was behind on three of them.  q4 is the exception and it is the measurement
+rather than the encoder: its curve tops out at 46.9 dB where x264's reaches
+47.4, so the BD-rate is integrated over 59 % of the reference's span and the
+number moves by several points with the method.  Against the same reference
+*at the same QPs* the partitioned types are worth 0.3 points on it (4.69 % ->
+4.36 %), and the offset is worth nothing (a ten-frame clip at 400 kb/s has
+nothing to spend it on).
+
+What is left of the shape gap is `B_8x8` (code 22, sub-types 0-12, contexts
+36-39): four 8x8 sub-macroblocks that each pick direct/L0/L1/bi *and* split
+into 8x4, 4x8 and 4x4.  It is worth less than the 16x8/8x16 pair was -- the
+pair is where most of a B picture's gain from partitioning lives -- but it is
+the last type the standard has and the last thing between this encoder and a
+full B macroblock layer.
 
 ## Next
 
-1. B pictures, the rest of them.  They are conformant, they are on by default
-   and they now beat x264 medium on four of the five test clips (see *The
-   result*), but every B macroblock is still one of four 16x16 shapes.  In order
-   of expected value: the partitioned B types (codes 4-21 -- one list or both per
-   partition, which the candidate list already carries as `blist`/`mv1`), then
-   `B_8x8` with its four `B_Direct_8x8`/`B_L0_8x8`/... sub-types (codes 22 and
-   36-39).  Both are worth more than the shape itself because they let the
-   `--bqp` offset come back down: the offset is currently paying for bits a 16x16
-   B macroblock has nowhere to put.  Spatial direct is deliberately *not* on the
-   list: it makes every direct macroblock depend on its neighbours' vectors, so
-   an encoder/decoder disagreement corrupts the picture instead of costing a few
-   bits.
+1. `B_8x8`, the last B macroblock shape.  Code 22 with four sub-macroblock
+   types out of thirteen (`B_Direct_8x8`, `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8` and
+   the 8x4/4x8/4x4 splits of each), the sub-type read through contexts 36-39,
+   `direct_8x8_inference_flag` already 1 in the SPS, and a per-sub-partition
+   list mask so that the deblocking filter keeps working.  It is the last thing
+   between this encoder and a complete B macroblock layer.  Spatial direct is
+   deliberately *not* on the list: it makes every direct macroblock depend on
+   its neighbours' vectors, so an encoder/decoder disagreement corrupts the
+   picture instead of costing a few bits.
 2. The motion-vector refinement desynchronises a partitioned macroblock.  Six
    cases in the gate fail because of it (`--refine-mv` together with 8x16 or
    P_8x8: `--partitions 1` is clean, `--partitions 5` is not), which is
