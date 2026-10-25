@@ -309,6 +309,15 @@ run_bcase bframes_8x8   320 192 12 2 4 -q 24 --scenecut 0 -p 3 --partitions 1
 #   pictures between two anchors with 8x16 enabled and QP 24, which is the
 #   combination that selects it.
 run_bcase bframes_8x16  320 192 12 3 4 -q 24 --scenecut 0 -p 2 --partitions 5
+#   The B pictures refine their vectors like the P ones do from preset 3 on:
+#   each partition's list 0 vector and then its list 1 vector is re-coded with
+#   its four quarter-pel neighbours.  What that must *not* touch is a direct
+#   macroblock, whose vectors are derived from the co-located picture and are
+#   not in the bitstream -- moving one changes the encoder's reconstruction and
+#   nothing else, which is a silent desync from the first macroblock of the
+#   picture.  Mode 4 (four quadrants) with the partitioned shapes enabled picks
+#   direct, single-list and bi-predictive blocks next to each other.
+run_bcase bframes_refine 320 192 12 3 4 -q 24 --scenecut 0 -p 4 --partitions 7
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

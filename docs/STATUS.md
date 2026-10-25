@@ -21,8 +21,8 @@ The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs sixty-eight encoded clip cases
-frame by frame, all of them bit-exact, twelve of them with B pictures compared
+fails (non-zero exit) on any mismatch; it runs sixty-nine encoded clip cases
+frame by frame, all of them bit-exact, thirteen of them with B pictures compared
 through a coding-order map.  It also
 checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
@@ -591,7 +591,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 67 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 69 clip cases
 ```
 
 `make test` runs seven things:
@@ -638,7 +638,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 67 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — sixty-eight cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — sixty-nine cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -647,7 +647,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 67 clip cases
    P_Skip runs at two QPs, and level selection on both transforms, through the
    slice threads and through the batched coefficient path, the vector
    refinement of both a 16x16 and a 16x8 winner -- all of them with the 8x8
-   transform and CABAC enabled, which are the defaults; twelve of them with B
+   transform and CABAC enabled, which are the defaults; thirteen of them with B
    pictures, one, two and three between two anchors, at QP 12 and 51, on a
    still clip, with a short GOP, without deblocking, without the 8x8 transform,
    under the rate controller, one with B_8x8 at preset 3 and one with a
@@ -706,7 +706,7 @@ the same on both sides but the predictor it was added to differed by exactly the
 refinement step, and the first bad macroblock was always in column 0 -- the only
 place where a 16x8's second partition has no left neighbour and falls back to
 the first partition's vector.  With `refresh_pmvs()` in place every case is
-exact: the whole gate (sixty-eight cases) is bit-exact, plus a 216-case sweep of
+exact: the whole gate (sixty-nine cases) is bit-exact, plus a 216-case sweep of
 `--refine-mv 1/2` x `--partitions` 5/7/9/11/13/15 x preset 2/4 x QP 20/26/32 on
 three clips.
 
@@ -963,6 +963,15 @@ has to be caught before an external decoder is the only witness.
     same presets, so its cases inherited the failure).  `refresh_pmvs()`
     re-derives every partition's predictor from the vectors the macroblock
     finally carries, after the refinement has run.
+44. **A refinement must not move what the bitstream does not carry.**  The
+    same refinement applied to B pictures initially included `B_Direct_16x16`,
+    whose vectors are *derived* from the co-located picture rather than coded.
+    Moving one changed the encoder's reconstruction and nothing else, so every
+    B picture desynchronised from its first macroblock on -- and it looked like
+    a predictor bug (the decoder derived 12,8 where the encoder predicted with
+    11,7) even though the predictors were right.  The rule: a refinement may
+    only touch syntax that exists.  Direct macroblocks are excluded by type, and
+    the case that keeps them out is `bframes_refine`.
 
 `--bframes N` (0..3) codes N B pictures between two anchors; the default is
 **three**, with `--bqp 8` (see *Making them pay* below) -- this is the one place
@@ -1267,17 +1276,19 @@ full B macroblock layer.
 
 ## Next
 
-1. The B *search*, now that the macroblock layer is complete.  Every B
-   candidate is priced from SATD plus a fixed eight bits per mvd symbol: the
-   16x16 candidates, the partitioned shapes' lists and B_8x8's sub-types.  The
-   measured consequence is that B_8x8 adds nothing (see *B_8x8*) -- the shape is
-   there, the *decision* that would use it is not.  Pricing each candidate with
-   the coder's own model, the way the P_8x8 shape decision prices its
-   sub_mb_types against P_8x8's own RD pass, is the next step; and the 8x4/4x8/
-   4x4 sub-types become worth searching once the decision can see them.  Spatial
-   direct is deliberately *not* on the list: it makes every direct macroblock
-   depend on its neighbours' vectors, so an encoder/decoder disagreement
-   corrupts the picture instead of costing a few bits.
+1. The B *search*, now that the macroblock layer is complete and its vectors are
+   refined (see *The same refinement in a B picture*).  Three ways of pricing
+   the per-partition list choice and the partitioned shapes' vectors were
+   measured and are inside the noise or worse, so what is left is the
+   *candidates*, not their prices: B_8x8's groups still search integer-pel per
+   list and inherit the macroblock's fractional offset, which is why the shape
+   is selected on 2 macroblocks in 2400; giving each group the refinement the
+   16x16 candidates now get (2 lists x 4 neighbours x 4 groups = 32 full
+   candidates) is the one remaining quality-for-time trade here, and the 8x4/
+   4x8/4x4 sub-types become worth searching only after that.  Spatial direct is
+   deliberately *not* on the list: it makes every direct macroblock depend on
+   its neighbours' vectors, so an encoder/decoder disagreement corrupts the
+   picture instead of costing a few bits.
 2. The motion-vector refinement is exact now (bug 43) but still only refines
    the winning candidate, one partition at a time, and prices its trials with
    the predictor the search happened to store.  Two cheap follow-ups: re-derive
@@ -1591,7 +1602,8 @@ steps and keep whichever the coder's own price prefers -- `SSD + lambda * bits`
 with `bits` from the shadow coder, so the mvd, the residual and the
 macroblock's own syntax are all in the comparison.  Preset 3 tries the four
 axial neighbours, preset 4 all eight; `--refine-mv 0|1|2` overrides it, and
-preset 2 and below do not refine at all.
+preset 2 and below do not refine at all.  B pictures refine both lists of every
+partition the same way (*The same refinement in a B picture* below).
 
 Measured as BD-rate against libx264 medium over QP 22..37, negative = we need
 fewer bits; the middle column of each preset refines only the 16x16 winner, the
@@ -1626,6 +1638,71 @@ macroblocks, not sub-regions.  P_8x8 is the one shape left out: four partitions
 times eight neighbours is 32 full candidate evaluations, more than the rest of
 the macroblock costs, and its four vectors come from a search that already ran
 per 8x8 block.
+
+### The same refinement in a B picture
+
+A B macroblock had been the one place where the vectors were never revisited:
+they come out of the per-list SATD search and go straight into the RD
+comparison, so `--refine-mv` -- the thing that makes preset 3 and 4 what they
+are on P pictures -- did nothing there.  It does now, per list and per
+partition: each partition's list 0 vector is refined with the other vectors
+held at the value the search returned, then its list 1 vector, and every trial
+is a whole-macroblock re-code priced by the coder (`SSD + lambda * bits`).  The
+predictors have to be re-derived after every accepted move, in *both* lists,
+because a partition's vector and its list mask are both part of the state its
+neighbours predict from -- the same rule as bug 43, and the reason
+`refresh_pmvs()` now speaks both lists.
+
+BD-rate against libx264 medium, preset 3, `--bframes 3 --scenecut 0`, QP
+22..37, negative = we spend fewer bits at matched PSNR:
+
+| clip | before | with the B refinement |
+|---|---|---|
+| mode 0, 320x192, 60 frames | -23.87% | **-24.78%** |
+| mode 1, 320x192, 30 frames | -12.09% | **-12.83%** |
+| mode 4, 320x192, 10 frames | -7.35% | **-8.02%** |
+| mode 3 (still), 320x192, 30 frames | -22.70% | -22.70% |
+| mode 0, 320x192, 30 frames | -22.64% | **-23.47%** |
+
+That is 0.4-0.9 points on four of five clips for 9 % of the encode time at
+preset 3 and 2 % at preset 4 (where the rest of the preset already costs more).
+The still clip is unchanged, which is what it should be: nothing moves there,
+so nothing has a quarter-pel neighbour worth trying.
+
+What the refinement must *not* touch is a direct macroblock.  Its vectors are
+derived from the co-located picture and are not in the bitstream at all, so
+moving one changes the encoder's reconstruction and nothing else: the first
+version refined direct blocks too and every B picture desynchronised from its
+first macroblock (the decoder derives 12,8 where the encoder then predicted
+with 11,7).  The gate is `best.type != AEG_MB_B_DIRECT`; B_8x8's *groups* are
+left out separately, because four groups times two lists times four neighbours
+is 32 full candidates per macroblock.
+
+Three other ways to spend effort on the B side were measured and dropped,
+which is worth recording because they were the obvious ones:
+
+* **Pricing the per-partition list choice with lambda instead of a fixed eight
+  bits per mvd bit.**  The search picks a partition's lists (and a B_8x8
+  group's) by `SATD + 8 * bits`, a weight that is the same at QP 12 and QP 40.
+  Replacing it with `lambda * bits` -- the same SSD-calibrated lambda the RD
+  pass uses, on the argument that SATD and SSD differ by a constant factor --
+  changed the BD-rate by 0.01 points on every clip.  The list choices are
+  simply not near that boundary.
+* **Refining the list choice exactly.**  Every partition was re-coded with
+  each of the other two list masks and kept if the coder preferred it.  That
+  is *worse* (-12.09% → -10.77% on the mode-1 clip), because the choice is
+  made on luma SSD while the measurement is over Y+U+V and the chroma follows
+  the luma decision: a bi-predictive partition averages its chroma too, and the
+  trial cannot see that.
+* **A per-partition subpel search.**  The partitioned B shapes search
+  integer-pel and then inherit the macroblock's own quarter-pel offset; giving
+  them the ordinary `subme` refinement instead is neutral (-23.81% vs -23.87%)
+  and 3 % slower.
+
+B_8x8 remains nearly unused (2 of 2400 macroblocks on the quadrant clip) even
+with the refinement in place, so its problem is not the pricing of its groups
+either: its vectors are searched per 8x8 with the macroblock's fractional
+offset and, unlike the 16x16 candidates, they are not refined.
 
 ## P_8x8 sub-macroblock partitions
 

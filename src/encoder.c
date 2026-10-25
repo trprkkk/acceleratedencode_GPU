@@ -2322,26 +2322,54 @@ static void avail_publish(uint8_t avail[16], const int geo[4])
  * exactly that, so it has to call this afterwards. */
 static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
-    int16_t cur[16][2];
-    uint8_t avail[16];
-    int p, n = mb_part_count(c);
+    int16_t cur[2][16][2];
+    uint8_t avail[2][16];
+    int lists = is_b_type(c->type) ? 2 : 1;
+    int p, l, n = mb_part_count(c);
 
     memset(cur, 0, sizeof(cur));
     memset(avail, 0, sizeof(avail));
     for (p = 0; p < n; p++) {
-        int geo[4], b0, pmvx, pmvy;
+        int geo[4], b0;
+        int masks = lists == 1 ? 1 : mb_part_lists(c, p);
+        int x, y, x0, y0, x1, y1;
+
         mb_part_geom(c, p, geo, &b0);
-        /* The first partition has no neighbour inside the macroblock, so its
-         * predictor is the same one the search stored and is left alone. */
-        if (p > 0) {
-            predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, c->type,
-                          p, geo[0] / 4, geo[1] / 4, geo[2] / 4, 0,
-                          &pmvx, &pmvy);
-            c->pmv[b0][0] = (int16_t)pmvx;
-            c->pmv[b0][1] = (int16_t)pmvy;
+        x0 = geo[0] / 4; y0 = geo[1] / 4;
+        x1 = x0 + geo[2] / 4; y1 = y0 + geo[3] / 4;
+        for (l = 0; l < lists; l++) {
+            if (p > 0) {
+                /* The first partition has no neighbour inside the macroblock,
+                 * so its predictor is the same one the search stored and is
+                 * left alone. */
+                int pmvx, pmvy;
+                predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur[l],
+                              avail[l], c->type, p, x0, y0, geo[2] / 4, l,
+                              &pmvx, &pmvy);
+                if (l == 0) {
+                    c->pmv[b0][0] = (int16_t)pmvx;
+                    c->pmv[b0][1] = (int16_t)pmvy;
+                } else {
+                    c->pmv1[b0][0] = (int16_t)pmvx;
+                    c->pmv1[b0][1] = (int16_t)pmvy;
+                }
+            }
+            /* Publish the partition for the ones that follow: a block that does
+             * not predict from this list is LIST_NOT_USED to them, not
+             * PART_NOT_AVAILABLE. */
+            for (y = y0; y < y1; y++)
+                for (x = x0; x < x1; x++) {
+                    int b = (y << 2) + x;
+
+                    if (masks & (1 << l)) {
+                        cur[l][b][0] = l ? c->mv1[b0][0] : c->mv[b0][0];
+                        cur[l][b][1] = l ? c->mv1[b0][1] : c->mv[b0][1];
+                        avail[l][b] = AEG_MVBLK_AVAIL;
+                    } else {
+                        avail[l][b] = AEG_MVBLK_NOTUSED;
+                    }
+                }
         }
-        me_publish(cur, geo, c->mv[b0][0], c->mv[b0][1]);
-        avail_publish(avail, geo);
     }
 }
 
@@ -3973,7 +4001,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * returns above), but initialising them keeps the compiler from warning
      * about every memcpy in the snapshot helpers. */
     uint8_t snap_l[16 * 16] = { 0 }, snap_c[2 * 8 * 8] = { 0 };
-    mbenc best, t;
+    mbenc best, t, retry;
     int64_t best_cost = INT64_MAX;
     double lambda = AEG_LAMBDA(c->qp);
     int i, inter;
@@ -4126,6 +4154,102 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
          * second partition's predictor was derived from the vector the search
          * returned.  Re-derive it from what the macroblock now carries. */
         refresh_pmvs(e, mbx, mby, &best);
+    }
+
+    /* The same rate-distortion refinement for a B macroblock's vectors.
+     *
+     * A B picture's vectors are searched per list by SATD and are never looked
+     * at again, which is the one thing the P path does differently: there the
+     * winner of the candidate comparison is re-coded with each quarter-pel
+     * neighbour of its vector and kept if the coder's price prefers it, and
+     * that is worth 0.2-0.5 points of BD-rate.  A B macroblock has up to two
+     * vectors per partition, so each list of each partition is refined with
+     * the others held where the search left them -- the same one-at-a-time
+     * rule the P path uses for its two partitions.  Only the shapes the P path
+     * refines are refined (16x16, 16x8, 8x16): four groups times two lists is
+     * sixteen more full candidates per macroblock for a shape that the RD
+     * comparison rejects almost everywhere.
+     *
+     * A *direct* macroblock is excluded, and not because of the cost: its
+     * vectors are derived from the co-located picture and are not in the
+     * bitstream at all, so moving one changes the encoder's reconstruction and
+     * nothing else -- a silent desync from the first macroblock of the picture
+     * on (the decoder derives 12,8 where the encoder then predicts with 11,7).
+     */
+    if (e->p.cabac && e->cur_is_b && inter && e->p.refine_mv > 0 &&
+        best.type != AEG_MB_B_DIRECT && mb_part_count(&best) <= 2) {
+        static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+        static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+        static const int cross[4] = { 1, 3, 4, 6 };
+        const int cheap = e->p.refine_mv < 2;
+        const int nn = cheap ? 4 : 8;
+        const int npart = mb_part_count(&best);
+        mbcand save = e->mb_cand[0];
+        const int mb_qp = c->qp;
+        int p, l, j, b;
+
+        for (p = 0; p < npart; p++) {
+            int geo[4], b0;
+            mb_part_geom(&best, p, geo, &b0);
+            for (l = 0; l < 2; l++) {
+                if (!(mb_part_lists(&best, p) & (1 << l)))
+                    continue;
+                for (j = 0; j < nn; j++) {
+                    int k = cheap ? cross[j] : j;
+                    int64_t cost;
+                    e->mb_cand[0] = save;
+                    e->mb_cand[0].type = best.type;
+                    e->mb_cand[0].nparts = best.nparts;
+                    memcpy(e->mb_cand[0].sub_type, best.sub_type,
+                           sizeof(e->mb_cand[0].sub_type));
+                    memcpy(e->mb_cand[0].blist, best.blist,
+                           sizeof(e->mb_cand[0].blist));
+                    for (b = 0; b < 16; b++) {
+                        e->mb_cand[0].mv[b][0] = best.mv[b][0];
+                        e->mb_cand[0].mv[b][1] = best.mv[b][1];
+                        e->mb_cand[0].mv1[b][0] = best.mv1[b][0];
+                        e->mb_cand[0].mv1[b][1] = best.mv1[b][1];
+                        e->mb_cand[0].pmv[b][0] = best.pmv[b][0];
+                        e->mb_cand[0].pmv[b][1] = best.pmv[b][1];
+                        e->mb_cand[0].pmv1[b][0] = best.pmv1[b][0];
+                        e->mb_cand[0].pmv1[b][1] = best.pmv1[b][1];
+                    }
+                    for (b = 0; b < 16; b++) {
+                        int bx = (b & 3) * 4, by = (b >> 2) * 4;
+                        if (bx < geo[0] || bx >= geo[0] + geo[2] ||
+                            by < geo[1] || by >= geo[1] + geo[3])
+                            continue;
+                        if (l == 0) {
+                            e->mb_cand[0].mv[b][0] = best.mv[b][0] + dx[k];
+                            e->mb_cand[0].mv[b][1] = best.mv[b][1] + dy[k];
+                        } else {
+                            e->mb_cand[0].mv1[b][0] = best.mv1[b][0] + dx[k];
+                            e->mb_cand[0].mv1[b][1] = best.mv1[b][1] + dy[k];
+                        }
+                    }
+                    cand_enc(e, 0, c->qp, &retry);
+                    refresh_pmvs(e, mbx, mby, &retry);
+                    for (b = 0; b < 16; b++) {
+                        e->mb_cand[0].pmv[b][0] = retry.pmv[b][0];
+                        e->mb_cand[0].pmv[b][1] = retry.pmv[b][1];
+                        e->mb_cand[0].pmv1[b][0] = retry.pmv1[b][0];
+                        e->mb_cand[0].pmv1[b][1] = retry.pmv1[b][1];
+                    }
+                    cost = rd_luma(e, mbx, mby, &t, mb_qp, best.type, 0, lambda, 0);
+                    cost = rd_price(e, mbx, mby, &t, cost, lambda);
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        best = t;
+                        snap_luma(e, mbx, mby, snap_l);
+                    }
+                    c->qp = mb_qp;
+                }
+            }
+        }
+        e->mb_cand[0] = save;
+        restore_luma(e, mbx, mby, snap_l);
+        refresh_pmvs(e, mbx, mby, &best);
+        c->qp = mb_qp;
     }
 
     /* chroma: every legal intra mode, or the motion-compensated prediction */
