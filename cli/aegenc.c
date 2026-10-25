@@ -45,6 +45,10 @@ static void usage(void)
 "  --refine-mv <n>  0 = off, 1 = four quarter-pel neighbours of the winning\n"
 "                   vector, 2 = all eight (rate-distortion refined, slower;\n"
 "                   default 0, preset 3 uses 1 and preset 4 uses 2)\n"
+"  --bframes <n>    B pictures between two anchors, 0..3 (default 0).  The\n"
+"                   stream is then coded out of display order and the encoder\n"
+"                   holds n pictures of lookahead, so the first packets appear\n"
+"                   after n+1 frames; needs CABAC.\n"
 "  --trellis <n>    rate-distortion level selection on the luma residual:\n"
 "                   0 = off (default), 1 = on (costs 15-35%% of the encode time\n"
 "                   for a BD-rate change inside the noise on the test clips)\n"
@@ -151,6 +155,37 @@ static void pass2_bias(const int64_t *bits, int n, int qcomp, int *bias_out)
     }
 }
 
+/* Write one packet to the stream and, if a reconstruction dump was asked for,
+ * append this picture's reconstruction to it.  The dump follows the *coding*
+ * order when the stream is reordered by B pictures, which is the order the
+ * packets come out in; a decoder that outputs in display order has to be
+ * re-ordered before the two files are compared. */
+static void write_packet(FILE *out, const char *dumppath, aeg_encoder *enc,
+                         const aeg_packet *pkt, int *first,
+                         int width, int height)
+{
+    fwrite(pkt->data, 1, pkt->size, out);
+    if (dumppath) {
+        const uint8_t *pl[3];
+        int str[3], y;
+        FILE *df = fopen(dumppath, *first ? "wb" : "ab");
+
+        *first = 0;
+        if (!df)
+            return;
+        aeg_encoder_recon(enc, pl, str, NULL);
+        for (y = 0; y < height; y++)
+            fwrite(pl[0] + (size_t)y * str[0], 1, (size_t)width, df);
+        /* planar I420, same layout as the decoder dumps so the two can be
+         * compared byte for byte */
+        for (y = 0; y < height / 2; y++)
+            fwrite(pl[1] + (size_t)y * str[1], 1, (size_t)width / 2, df);
+        for (y = 0; y < height / 2; y++)
+            fwrite(pl[2] + (size_t)y * str[2], 1, (size_t)width / 2, df);
+        fclose(df);
+    }
+}
+
 int main(int argc, char **argv)
 {
     aeg_params p;
@@ -162,6 +197,7 @@ int main(int argc, char **argv)
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1;
     int trellis = -1;
+    int bframes = -1;
     int64_t *pass1_bits = NULL;
     int pass1_n = 0;
     char stats_path[4096];
@@ -169,6 +205,7 @@ int main(int argc, char **argv)
     uint8_t *frame;
     size_t fsize;
     int64_t pts = 0;
+    int dump_first = 1;
     aeg_stats st;
     int i, ret = 0;
 
@@ -204,6 +241,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-mv")) refine_mv = atoi(argv[++i]);
+        else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
         else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
         else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
         else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
@@ -249,6 +287,14 @@ int main(int argc, char **argv)
         if (!out) { perror(outpath); return 1; }
     }
 
+    /* Two-pass looks at one packet per picture, in display order.  With B
+     * pictures the packets come out in coding order, so the measurement of
+     * picture i would be applied to picture i of the bitstream, not of the
+     * source. */
+    if (pass && p.bframes > 0) {
+        fprintf(stderr, "error: --pass and --bframes cannot be combined yet\n");
+        return 1;
+    }
     if (pass) {
         if (!stats_path[0]) {
             if (!outpath) {
@@ -310,6 +356,7 @@ int main(int argc, char **argv)
     if (range) p.search_range = range;
     if (subme >= 0) p.subme = subme;
     if (refine_mv >= 0) p.refine_mv = refine_mv;
+    if (bframes >= 0) p.bframes = bframes;
     if (trellis >= 0) p.trellis = trellis;
     if (partitions >= 0) p.partitions = partitions;
     aeg_log_level = verbose;
@@ -381,29 +428,21 @@ int main(int argc, char **argv)
             if (pass == 2)
                 aeg_encoder_set_qp_offset(enc, n < pass1_n ? bias_of_frame[n] : 0);
             r = aeg_encoder_encode(enc, frame, fsize, pts++, &pkt);
+            if (r == AEG_EAGAIN) {
+                /* The picture went into the lookahead (B pictures): it will come
+                 * out when the group it belongs to is complete. */
+                n++;
+                if (max_frames && n >= max_frames)
+                    break;
+                continue;
+            }
             if (r != 0) {
                 fprintf(stderr, "encode failed: %s\n", aeg_last_error());
                 ret = 1;
                 break;
             }
-            fwrite(pkt.data, 1, pkt.size, out);
-            if (dumppath) {
-                const uint8_t *pl[3];
-                int str[3], y;
-                FILE *df = fopen(dumppath, n ? "ab" : "wb");
-                if (df) {
-                    aeg_encoder_recon(enc, pl, str, NULL);
-                    for (y = 0; y < height; y++)
-                        fwrite(pl[0] + (size_t)y * str[0], 1, (size_t)width, df);
-                    /* planar I420, same layout as the decoder dumps so the two
-                     * can be compared byte for byte */
-                    for (y = 0; y < height / 2; y++)
-                        fwrite(pl[1] + (size_t)y * str[1], 1, (size_t)width / 2, df);
-                    for (y = 0; y < height / 2; y++)
-                        fwrite(pl[2] + (size_t)y * str[2], 1, (size_t)width / 2, df);
-                    fclose(df);
-                }
-            }
+            write_packet(out, dumppath, enc, &pkt, &dump_first,
+                         width, height);
             if (pass == 1) {
                 static int cap = 0;
 
@@ -424,6 +463,17 @@ int main(int argc, char **argv)
             n++;
             if (max_frames && n >= max_frames)
                 break;
+        }
+        /* Drain the lookahead: the pictures still held back have no more input
+         * coming, so the encoder codes them and they come out here. */
+        for (;;) {
+            aeg_packet pkt;
+            int r = aeg_encoder_flush(enc, &pkt);
+
+            if (r == AEG_EOF || r != AEG_OK)
+                break;
+            write_packet(out, dumppath, enc, &pkt, &dump_first,
+                         width, height);
         }
         if (pass == 1) {
             FILE *sf = fopen(stats_path, "w");
@@ -450,9 +500,10 @@ int main(int argc, char **argv)
             /* the stream's rate is a property of the file and the frame rate,
              * not of how fast this machine happened to encode it */
             if (st.macroblocks > 0) {
-                static const char *const names[9] = {
+                static const char *const names[13] = {
                     "skip", "P16x16", "P16x8", "P8x16", "P_8x8",
-                    "I4x4", "I16x16", "I_PCM", "I8x8"
+                    "I4x4", "I16x16", "I_PCM", "I8x8",
+                    "B_direct", "B_L0", "B_L1", "B_BI"
                 };
                 int k;
                 printf("macroblock types: %" PRId64 " skip of %" PRId64
@@ -461,7 +512,7 @@ int main(int argc, char **argv)
                        100.0 * (double)st.skipped / (double)st.macroblocks,
                        st.macroblocks - st.skipped);
                 printf("  breakdown:");
-                for (k = 0; k < 9; k++)
+                for (k = 0; k < 13; k++)
                     if (st.mb_types[k])
                         printf(" %s %" PRId64, names[k], st.mb_types[k]);
                 printf("\n");

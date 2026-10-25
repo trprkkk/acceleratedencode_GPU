@@ -114,7 +114,7 @@ static int pick_level(int mb_w, int mb_h, int fps_num, int fps_den,
     return 51;
 }
 
-static void write_vui(aeg_bitwriter *bw, const aeg_params *p)
+static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
 {
     uint32_t units = (uint32_t)(p->fps_den > 0 ? p->fps_den : 1);
     uint32_t scale = (uint32_t)(p->fps_num > 0 ? p->fps_num * 2 : 60);
@@ -139,8 +139,12 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p)
     aeg_bw_ue(bw, 0);                /* max_bits_per_mb_denom               */
     aeg_bw_ue(bw, 16);               /* log2_max_mv_length_horizontal       */
     aeg_bw_ue(bw, 16);               /* log2_max_mv_length_vertical         */
-    aeg_bw_ue(bw, 0);                /* max_num_reorder_frames              */
-    aeg_bw_ue(bw, 1);                /* max_dec_frame_buffering             */
+    /* With B pictures the decoder has to hold pictures back before it can
+     * output them, and it must be told how many.  Without B pictures both
+     * numbers are 0 and 1 as before, so the SPS of a stream without them is
+     * byte for byte what it was. */
+    aeg_bw_ue(bw, (uint32_t)(p->bframes > 0 ? p->bframes : 0));
+    aeg_bw_ue(bw, (uint32_t)(p->bframes > 0 ? max_refs + p->bframes : 1));
 }
 
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
@@ -175,8 +179,19 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
         aeg_bw_put(&bw, 1, 0);           /* seq_scaling_matrix_present_flag */
     }
     aeg_bw_ue(&bw, (uint32_t)(frame_num_bits - 4));
-    aeg_bw_ue(&bw, 2);                   /* pic_order_cnt_type = 2          */
-    aeg_bw_ue(&bw, 1);                   /* max_num_ref_frames              */
+    /* pic_order_cnt_type 2 derives the picture order count from frame_num,
+     * which counts *decoding* order: with B pictures the two orders differ, so
+     * the count has to be sent explicitly (type 0, an 8-bit lsb per slice). */
+    if (p->bframes > 0) {
+        aeg_bw_ue(&bw, 0);               /* pic_order_cnt_type = 0          */
+        aeg_bw_ue(&bw, 4);               /* log2_max_pic_order_cnt_lsb_minus4 */
+    } else {
+        aeg_bw_ue(&bw, 2);               /* pic_order_cnt_type = 2          */
+    }
+    /* Two reference pictures are alive at once with B pictures: the anchor the
+     * B pictures predict backwards from and the one they predict forwards
+     * from.  Without them one is enough (and was, until now). */
+    aeg_bw_ue(&bw, (uint32_t)(p->bframes > 0 ? 2 : 1));
     aeg_bw_put(&bw, 1, 0);               /* gaps_in_frame_num_value_allowed */
     aeg_bw_ue(&bw, (uint32_t)(mb_w - 1));
     aeg_bw_ue(&bw, (uint32_t)(mb_h - 1));
@@ -192,7 +207,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
         aeg_bw_put(&bw, 1, 0);
     }
     aeg_bw_put(&bw, 1, 1);               /* vui_parameters_present_flag     */
-    write_vui(&bw, p);
+    write_vui(&bw, p, p->bframes > 0 ? 2 : 1);
     return aeg_bw_finish(&bw);
 }
 
@@ -261,5 +276,61 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
     if (deblock_idc != 1) {
         aeg_bw_se(bw, deblock_alpha); /* slice_alpha_c0_offset_div2         */
         aeg_bw_se(bw, deblock_beta);  /* slice_beta_offset_div2             */
+    }
+}
+
+/* The same header for a picture that carries a picture order count, i.e. every
+ * picture of a stream with B pictures.  The extra syntax is inserted exactly
+ * where 7.3.3 puts it: pic_order_cnt_lsb after idr_pic_id, the direct-mode flag
+ * for B slices, then the reference list bookkeeping (one modification flag per
+ * list), and finally the reference marking, which a B picture does not have at
+ * all because it is not a reference picture (nal_ref_idc = 0). */
+void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
+                                int frame_num, int frame_num_bits, int idr,
+                                int idr_pic_id, int poc_lsb, int poc_lsb_bits,
+                                int is_ref, int cabac_init_idc,
+                                int slice_qp_delta, int deblock_alpha,
+                                int deblock_beta, int deblock_idc, int first_mb)
+{
+    int nos = slice_type_in % 5;      /* 0 = P, 1 = B, 2 = I */
+
+    aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
+    aeg_bw_ue(bw, (uint32_t)slice_type_in);
+    aeg_bw_ue(bw, 0);                 /* pic_parameter_set_id               */
+    aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
+    if (idr)
+        aeg_bw_ue(bw, (uint32_t)idr_pic_id);
+    aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);
+    /* bottom_field_pic_order_in_frame_present_flag is 0 in the PPS, so there
+     * is no delta_pic_order_cnt_bottom. */
+    /* Temporal direct: the co-located picture's vectors are scaled by the
+     * picture order counts (8.4.1.2.3), which is what the encoder implements
+     * (b_direct_mv).  Spatial direct would make every direct macroblock depend
+     * on its neighbours' vectors, so the encoder and the decoder would have to
+     * agree on every one of them, and a single disagreement would corrupt the
+     * picture instead of just costing bits. */
+    if (nos == 1)
+        aeg_bw_put(bw, 1, 0);         /* direct_spatial_mv_pred_flag = 0    */
+    if (nos == 0 || nos == 1) {
+        aeg_bw_put(bw, 1, 0);         /* num_ref_idx_active_override_flag   */
+        aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
+        if (nos == 1)
+            aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
+    }
+    if (is_ref) {
+        if (idr) {
+            aeg_bw_put(bw, 1, 0);     /* no_output_of_prior_pics_flag       */
+            aeg_bw_put(bw, 1, 0);     /* long_term_reference_flag           */
+        } else {
+            aeg_bw_put(bw, 1, 0);     /* adaptive_ref_pic_marking_mode_flag */
+        }
+    }
+    if (cabac_init_idc >= 0 && nos != 2)
+        aeg_bw_ue(bw, (uint32_t)cabac_init_idc);
+    aeg_bw_se(bw, slice_qp_delta);    /* slice_qp_delta                     */
+    aeg_bw_ue(bw, (uint32_t)deblock_idc);
+    if (deblock_idc != 1) {
+        aeg_bw_se(bw, deblock_alpha);
+        aeg_bw_se(bw, deblock_beta);
     }
 }

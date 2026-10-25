@@ -589,7 +589,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 57 clip cases
 ```
 
 `make test` runs seven things:
@@ -853,27 +853,79 @@ has to be caught before an external decoder is the only witness.
     what pointed at the writer rather than at the rate model.  `aeg_cabac_open()`
     now clears both price fields.
 
+## B pictures
+
+`--bframes N` (0..3, off by default) codes N B pictures between two anchors.
+The stream has `pic_order_cnt_type 0` with an 8-bit `pic_order_cnt_lsb` per
+slice, `max_num_ref_frames 2`, and `direct_spatial_mv_pred_flag = 0` (temporal
+direct, so a direct macroblock's vectors come from the co-located picture and
+never from its neighbours).  The encoder holds `bframes + 3` input pictures of
+lookahead, codes a group as *anchor, then its B pictures*, and emits each
+picture as its own packet; `aeg_encoder_flush()` drains the tail, where the
+group's remaining pictures can only be coded as P pictures because their
+anchor never arrives.  B macroblocks are 16x16 only: `B_Direct_16x16`,
+`B_L0_16x16`, `B_L1_16x16` and `B_Bi_16x16` (the bi-predictive average is
+`(a + b + 1) >> 1`, rounded once on the interpolated samples).
+
+Four bugs stood between "it writes plausible B slices" and "the decoder
+reconstructs the same picture", and all four were *syntax*-level in the sense
+that the stream decoded without an error report while the picture was wrong --
+which is why the two-pass md5 comparison in `tests/run_tests.sh` is what found
+them and nothing else did.
+
+1. **The B `mb_type` context counted unavailable neighbours as non-direct.**
+   The context is `!IS_DIRECT(left - 1) + !IS_DIRECT(top - 1)`, in which the
+   reference decoder's *unavailable* neighbour (stored as 0) satisfies
+   `IS_DIRECT(-1)`: only a neighbour that is there and is not direct increments
+   the context.  The encoder counted both missing neighbours, so every
+   macroblock of the first row/column used the wrong context and from the first
+   bin onwards the two sides read different symbols.
+2. **The B `mb_skip_flag` context was derived from the wrong state.**  It is
+   the *same* rule as in a P slice (`+13` for the B slice's own block of
+   contexts, then `!skipped` of the left and top neighbours), not a comparison
+   of the neighbours' types against direct mode.  With the wrong context the
+   skip flag decoded as the wrong symbol, which inverts everything that
+   follows.
+3. **The deblocking filter ignored the second prediction list.**  For an edge
+   between two B macroblocks, 8.7.2.1 compares the reference indices of *both*
+   lists and the motion vectors of the lists that are used; the filter is on as
+   soon as one macroblock predicts only backwards and the other only forwards,
+   even with both vectors at zero.  The filter was derived from list 0 alone.
+4. **Direct mode read the wrong co-located vector.**  `B_Direct_16x16`'s own
+   type entry carries no 16x16 shape bit, and the reference decoder's
+   partitioned path takes one vector per 8x8 group from the co-located
+   picture's 4x4 blocks 0, 3, 12 and 15 -- not from the macroblock's first
+   block, and not from each group's bottom-right corner.  The two readings only
+   disagree when the co-located macroblock was partitioned, which is most of
+   them on moving content; the encoder reconstructed a different picture than
+   the decoder without desynchronising the stream.
+
+B pictures are **not yet a rate-distortion win**, so they stay off by default.
+`tools/bdrate.py` against libx264 medium (6 QPs, the four test clips, negative =
+fewer bits than x264) measures +27.8 / +24.7 / -10.2 / +18.6 % for the four
+clips without B pictures and +39.7 / +40.0 / -5.0 / +17.2 % with
+`--bframes 2`: quality rises (on the panning clip, 48.25 dB at 228.6 kb/s
+becomes 48.98 dB at 261.8 kb/s at QP 22), but it rises more slowly than the bits
+do.  The anchors are three times further apart and the B pictures themselves
+have only four shapes to choose from -- no partitions, no `B_8x8` -- so what
+they save in prediction they lose in syntax.  B partitions (`B_L0_16x8` and
+friends, type codes 4-21), `B_8x8` (code 22) and a QP offset for non-reference
+pictures are the three obvious ways to close that; see *Next*.
+
 ## Next
 
-1. B pictures.  This is now the whole of the remaining gap on moving content,
-   and it is measurable in one line: with x264's own B pictures switched off
-   (`-x264-params bframes=0`, everything else at `-preset medium`), our stream
-   needs 2.4% *fewer* bits on the four-quadrant clip, 2.0% fewer on the
-   two-quadrant clip, 6.2% fewer on the still clip and 6.5% *more* on the
-   panning clip -- against +18.6%, +24.7%, -10.2% and +27.8% with them on.  So
-   21-27 points of BD-rate on the three clips that move are B pictures alone,
-   and without them the encoder is within 2.4% of x264 medium on two of the
-   four clips and within 6.5% on all four.
-   What it needs: picture order count and reordering, a second reference list
-   (L1 = a future picture, so the encoder holds two references and the decoder
-   reorders), the B slice syntax (`mb_skip_flag`'s own context base,
-   `B_Direct_16x16`, and `B_L0/L1/Bi` with both the 8x8 and the 16x16 type
-   codes), the bi-predictive average (the two predictors rounded once, not
-   twice), direct mode's vector derivation from the co-located picture, and the
-   RD pass over the three prediction modes per partition.  The pieces that are
-   already in place are the ones that usually make this expensive: the rate term
-   (the shadow coder and `aeg_cabac_coef_price()`), the reference picture
-   bookkeeping for one list, and the whole macroblock RD loop.
+1. B pictures, the rest of them.  They are conformant (see *B pictures*) but
+   they are not yet a BD-rate win: +39.7 / +40.0 / -5.0 / +17.2 % on the four
+   test clips with `--bframes 2` against +27.8 / +24.7 / -10.2 / +18.6 % with
+   them off, because every B macroblock is one of four 16x16 shapes.  In order
+   of expected value: the partitioned B types (codes 4-21 -- one list or both
+   per partition, which the candidate list already carries as
+   `blist`/`mv1`), `B_8x8` with its four `B_Direct_8x8`/`B_L0_8x8`...
+   sub-types (codes 22 and 36-39), and a QP offset for the non-reference
+   pictures so a B picture spends its cheaper prediction on fewer bits.
+   Spatial direct is deliberately *not* on the list: it makes every direct
+   macroblock depend on its neighbours' vectors, so an encoder/decoder
+   disagreement corrupts the picture instead of costing a few bits.
 2. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and

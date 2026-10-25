@@ -106,6 +106,12 @@ typedef struct aeg_params {
     int vbv_maxrate_kbps;     /* R: channel rate, 0 = off               */
     int vbv_bufsize_kbits;    /* B: buffer size, 0 = off                */
     int gop_size;             /* keyframe interval, 0 = only first      */
+    /* B pictures between two anchors: 0 = every picture predicts from the one
+     * before it (P only), 1..3 = that many B pictures are inserted between an
+     * anchor and the next, and the stream is coded out of display order.  The
+     * encoder holds `bframes` pictures of lookahead, so aeg_encoder_encode()
+     * returns AEG_EAGAIN until it has them. */
+    int bframes;
     /* Scene-cut detection: insert an IDR when a picture's inter prediction is
      * worse than its intra prediction by more than `scenecut` percent (0 = off).
      * A scene change is exactly where a P picture costs more than the IDR it
@@ -183,8 +189,8 @@ typedef struct aeg_stats {
     int64_t macroblocks;
     int64_t skipped;
     /* How many macroblocks were coded with each type, indexed by the internal
-     * AEG_MB_* enumeration (0 = skip ... 8 = Intra_8x8). */
-    int64_t mb_types[9];
+     * AEG_MB_* enumeration (0 = skip ... 12 = B_Bi_16x16). */
+    int64_t mb_types[16];
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

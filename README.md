@@ -15,10 +15,12 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 54 clip cases, two CABAC round-trips, a
+> `make test` asserts it over 57 clip cases (ten of them B pictures, compared
+> after undoing the coding-order permutation), two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch.  What
-> is *not* finished is speed and B pictures.  On the test clips, at matched
+> is *not* finished is speed, and B pictures are conformant but not yet a
+> rate-distortion win, so they stay off by default.  On the test clips, at matched
 > PSNR, a baseline-profile x264 spends 47 % more bits than this encoder, while
 > libx264's default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
 > quantisation, AQ, SIMD) spends 16–22 % fewer on the moving clips and 11 % more

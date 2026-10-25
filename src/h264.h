@@ -43,6 +43,15 @@ enum {
     /* Intra_8x8 (High profile): I_NxN with transform_size_8x8_flag = 1 and one
      * prediction mode per 8x8 luma block. */
     AEG_MB_I8x8,
+    /* B pictures.  A B macroblock partitions its 16x16 the same way a P one
+     * does, but every partition also chooses *which* reference list predicts
+     * it.  Only the 16x16 shapes exist so far: direct (vectors derived from
+     * the neighbours of the co-located picture, no mvd at all), list 0, list 1
+     * and bi-predictive (the two predictors averaged). */
+    AEG_MB_B_DIRECT,
+    AEG_MB_B_L0,
+    AEG_MB_B_L1,
+    AEG_MB_B_BI,
     AEG_MB_TYPE_COUNT          /* number of entries above, for the statistics */
 };
 
@@ -117,11 +126,21 @@ typedef struct aeg_mb {
     int8_t   qp;              /* luma QP actually used by this MB         */
     int8_t   qp_delta;        /* mb_qp_delta                              */
     int8_t   sub_type[4];     /* P_8x8 sub partitions: 0=8x8,1=8x4,2=4x8,3=4x4 */
-    int16_t  mv[16][2];       /* per 4x4 MV in 1/4 pel (luma)             */
+    int16_t  mv[16][2];       /* per 4x4 MV in 1/4 pel (luma), list 0     */
+    /* B pictures: the list 1 vector of every 4x4 block (unused by P pictures),
+     * and one bit mask per partition saying which lists predict it (1 = list 0,
+     * 2 = list 1, 3 = both).  A direct macroblock has no vectors to send: the
+     * decoder derives them, so its mv/mv1 hold what *it* derives (that is what
+     * the encoder has to reconstruct with) and its mask is 3. */
+    int16_t  mv1[16][2];
+    uint8_t  blist[2];
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     uint8_t  skip;            /* P slice: coded as a skip run / flag      */
-    int16_t  mvd[16][2];      /* motion vector difference actually sent   */
+    /* The motion vector difference actually sent, per 4x4 block and per
+     * prediction list: the CABAC context of a difference is derived from the
+     * neighbouring differences *of the same list*, so a B picture needs both. */
+    int16_t  mvd[2][16][2];
     int16_t  coef[AEG_BLK_COUNT][AEG_DCT_SIZE]; /* quantised coefficients  */
     int32_t  cost;            /* chosen RD cost (debug/stats)             */
 } aeg_mb;
@@ -138,7 +157,7 @@ typedef struct aeg_picture {
     int      frame_num;
     int      qp;
     int      is_idr;
-    int      type;            /* 0=I, 1=P                                 */
+    int      type;            /* 0=I, 1=P, 2=B                            */
     int64_t  pts;
     int      ref_count;       /* 0 free, >0 in use                        */
     void    *priv;
@@ -218,6 +237,15 @@ void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int cabac_init_idc, int slice_qp_delta,
                               int deblock_alpha, int deblock_beta,
                               int deblock_idc, int first_mb);
+/* The same, plus the picture order count, for a stream with B pictures (see
+ * bitstream.c). */
+void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
+                                  int frame_num, int frame_num_bits, int idr,
+                                  int idr_pic_id, int poc_lsb,
+                                  int poc_lsb_bits, int is_ref,
+                                  int cabac_init_idc, int slice_qp_delta,
+                                  int deblock_alpha, int deblock_beta,
+                                  int deblock_idc, int first_mb);
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma

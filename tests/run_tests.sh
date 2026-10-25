@@ -49,6 +49,92 @@ if bad:
 print("   %-22s bit-exact (%d frames, max abs diff 0)" % (tag, n))
 PY
 
+# B pictures are coded out of display order, so the reconstruction dump (coding
+# order) and the decoder's output (display order) can only be compared after
+# undoing that permutation.  It is the one the encoder schedules: the anchor
+# first, then the group's B pictures, then the leftovers of the last, incomplete
+# group -- which is what the loop below rebuilds from the frame and B counts.
+cat > "$TMP/cmp_b.py" <<'PY'
+import sys, os
+rec, dec, w, h, n, b, tag = (sys.argv[1], sys.argv[2], int(sys.argv[3]),
+                             int(sys.argv[4]), int(sys.argv[5]),
+                             int(sys.argv[6]), sys.argv[7])
+fs = w * h * 3 // 2
+A = open(rec, 'rb').read() if os.path.exists(rec) else b''
+B = open(dec, 'rb').read() if os.path.exists(dec) else b''
+if len(A) != len(B) or len(A) < fs * n:
+    print("   %-22s SIZE MISMATCH recon=%d dec=%d (expected %d)"
+          % (tag, len(A), len(B), fs * n))
+    sys.exit(1)
+G = b + 1
+gop = int(sys.argv[8]) if len(sys.argv) > 8 else 0
+order = [0]
+a = 0
+last_idr = 0
+while a + G < n:
+    nxt = a + G
+    if gop > 0 and nxt - last_idr >= gop:
+        # no B picture may precede an IDR: the group's B pictures go out as P
+        # pictures in display order and the IDR comes last
+        order.extend(range(a + 1, nxt))
+        order.append(nxt)
+        last_idr = nxt
+    else:
+        order.append(nxt)
+        order.extend(range(a + 1, nxt))
+    a = nxt
+order.extend(range(a + 1, n))
+if len(order) != n:
+    print("   %-22s BAD ORDER MAP (%d != %d)" % (tag, len(order), n))
+    sys.exit(1)
+bad = 0
+first = None
+mx = 0
+for k in range(n):
+    x = A[k * fs:(k + 1) * fs]
+    y = B[order[k] * fs:(order[k] + 1) * fs]
+    for i in range(fs):
+        d = abs(x[i] - y[i])
+        if d:
+            bad += 1
+            mx = max(mx, d)
+            if first is None:
+                first = (k, order[k], i // w, i % w)
+if bad:
+    print("   %-22s FAIL %d/%d samples differ, first at coding frame %d "
+          "(display %d, x=%d y=%d), max abs diff %d"
+          % (tag, bad, fs * n, first[0], first[1], first[3], first[2], mx))
+    sys.exit(1)
+print("   %-22s bit-exact (%d frames, coding order, max abs diff 0)" % (tag, n))
+PY
+
+# run_bcase <name> <w> <h> <frames> <bframes> <genyuv mode> <extra aegenc args...>
+run_bcase() {
+    name=$1; w=$2; h=$3; n=$4; b=$5; mode=$6; shift 6
+    "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
+    ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
+        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" "$@" \
+        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
+    if ! command -v "$FF" >/dev/null 2>&1; then
+        echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
+        return
+    fi
+    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
+        "$TMP/$name.dec" 2>"$TMP/$name.decerr"
+    if [ -s "$TMP/$name.decerr" ]; then
+        echo "   $name: decoder reported problems:"
+        sed 's/^/     /' "$TMP/$name.decerr" | head -3
+        FAIL=1
+    fi
+    gop=0
+    for a in "$@"; do
+        if [ "$prev" = "-g" ]; then gop=$a; fi
+        prev=$a
+    done
+    python3 "$TMP/cmp_b.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" \
+        "$n" "$b" "$name" "$gop" || FAIL=1
+}
+
 # run_case <name> <w> <h> <frames> <genyuv mode> <extra aegenc args...>
 run_case() {
     name=$1; w=$2; h=$3; n=$4; mode=$5; shift 5
@@ -171,6 +257,32 @@ run_case aq_skip_lo   320 192 10 3 -q 16 --aq 16 -g 4
 # which is where the mode prediction and the reference handling meet.
 run_case all_intra    320 192  6 1 -q 26 -g 1
 run_case gop3         320 192 10 1 -q 26 -g 3
+# B pictures.  Their macroblocks are direct (vectors derived from the co-located
+# picture, no mvd at all), list 0, list 1 or bi-predictive, and the direct ones
+# are where a wrong derivation shows up: it reconstructs a different picture
+# without breaking the syntax, so only this comparison sees it.
+#   one and three B pictures between anchors (different group sizes, and with
+#   three a B picture that is not adjacent to the anchor it predicts from)
+run_bcase bframes1     320 192 12 1 1 -q 24 --scenecut 0
+run_bcase bframes3     320 192 12 3 4 -q 24 --scenecut 0
+#   a still clip: every B macroblock collapses into direct-skip, which is the
+#   skip flag and direct prediction with no residual at all
+run_bcase bframes_still 320 192  8 2 3 -q 24 --scenecut 0
+#   the lowest and highest rate: at q 51 every macroblock is a skip, at q 12
+#   all of them carry residuals and the bi-predictive average is at its most
+#   visible
+run_bcase bframes_hi    320 192  9 1 2 -q 12 --scenecut 0
+run_bcase bframes_lo    320 192  9 1 2 -q 51 --scenecut 0
+#   a stream whose length is not a multiple of the group size (the tail is
+#   coded as P pictures) and one with an IDR picture in the middle
+run_bcase bframes_odd   320 192 11 2 1 -q 26 --scenecut 0
+run_bcase bframes_idr   320 192 12 1 1 -q 26 --scenecut 0 -g 4
+#   the 8x8 transform and the deblocking filter both treat B macroblocks
+#   differently from P ones: the transform flag is coded for a direct
+#   macroblock, and the boundary strength compares both prediction lists
+run_bcase bframes_t8    320 192 10 2 4 -q 22 --scenecut 0
+run_bcase bframes_nodeb 320 192 10 2 1 -q 24 --scenecut 0 --no-deblock
+run_bcase bframes_q8x8  320 192 10 1 1 -q 24 --scenecut 0 --no-8x8dct
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

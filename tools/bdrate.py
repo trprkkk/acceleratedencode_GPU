@@ -95,6 +95,17 @@ def ref_point(args, clip, q, w, h, n, cache):
     return rb, rp
 
 
+def has_bframes(args):
+    """True when --extra asks for B pictures."""
+    toks = args.extra.split()
+    for i, t in enumerate(toks):
+        if t == '--bframes' and i + 1 < len(toks):
+            return int(toks[i + 1]) > 0
+        if t.startswith('--bframes='):
+            return int(t.split('=', 1)[1]) > 0
+    return False
+
+
 def ours(args, clip, q, w, h, n):
     dst = '/tmp/bd_ours.264'
     subprocess.run([args.bin, '-w', str(w), '-h', str(h), '-i', clip, '-o', dst,
@@ -102,6 +113,23 @@ def ours(args, clip, q, w, h, n):
                     '--dump-recon', '/tmp/bd_ours.rec'] + args.extra.split(),
                    check=True, capture_output=True)
     return os.path.getsize(dst) * 8 / 1000.0
+
+
+def ours_recon(args, w, h):
+    """The reconstruction to measure PSNR on.
+
+    With B pictures the encoder hands its pictures out, and dumps them, in
+    *coding* order while the source clip is in display order, so the dump can
+    only be compared frame for frame after undoing that permutation -- which
+    this script does not know (it depends on the GOP and on scene cuts).  The
+    decoded stream is the same reconstruction in display order, and it *is* the
+    reconstruction bit for bit (that is what tests/run_tests.sh checks), so the
+    B path measures the decoded stream instead.  Without B pictures both are in
+    display order and the dump is used, which keeps the numbers of every
+    recorded measurement unchanged."""
+    if has_bframes(args):
+        return decode(args.ffmpeg, '/tmp/bd_ours.264', w, h, '/tmp/bd_ours.yuv')
+    return open('/tmp/bd_ours.rec', 'rb').read()
 
 
 def x264(args, clip, q, w, h):
@@ -186,7 +214,7 @@ def main():
               (path, w, h, n, a.preset, a.extra))
         for q in qs:
             ob = ours(a, path, q, w, h, n)
-            orec = open('/tmp/bd_ours.rec', 'rb').read()
+            orec = ours_recon(a, w, h)
             rb, rp = ref_point(a, path, q, w, h, n, cache) if cache is not None \
                 else (x264(a, path, q, w, h), float('nan'))
             op = psnr(src, orec, fs)
