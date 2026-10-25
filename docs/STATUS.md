@@ -1,6 +1,6 @@
 # Status and engineering notes
 
-Date: 2026-10-25.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
+Date: 2026-10-26.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
 
 ## Where the project stands
 
@@ -19,10 +19,11 @@ The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 | IDR pictures after P pictures (`-g 3`, `-g 1`) | 320x192 | 20, 26, 34 | 2 | 6 … 10 |
 | slices (`--slices 2 … 12`, including uneven row counts) | 320x192, 320x208, 64x64 | 22 … 26 | 0, 1, 4 | 4 … 8 |
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
+| two P references (`--ref 2`), P-only and under B pictures, with IDRs and scene cuts (162-case B matrix x2) | 320x192 | 20 … 36 | 0 … 4 | 12 … 60 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs seventy-one encoded clip cases
-frame by frame, all of them bit-exact, fourteen of them with B pictures compared
+fails (non-zero exit) on any mismatch; it runs seventy-six encoded clip cases
+frame by frame, all of them bit-exact, fifteen of them with B pictures compared
 through a coding-order map.  It also
 checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
@@ -591,7 +592,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 71 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 76 clip cases
 ```
 
 `make test` runs seven things:
@@ -1278,6 +1279,116 @@ pair is where most of a B picture's gain from partitioning lives -- but it is
 the last type the standard has and the last thing between this encoder and a
 full B macroblock layer.
 
+## Two P references
+
+`--ref 2` gives a P picture a second list-0 entry: list0[1] is the reference
+picture before the previous one (the anchor before the previous anchor when
+there are B pictures).  The slice header overrides `num_ref_idx_l0_active` to
+two, the SPS keeps two reference frames, and no reordering syntax is needed --
+the decoder's default list 0 is descending `frame_num`, which is exactly
+[newest, older] for a two-entry sliding window.
+
+What the encoder does with it is deliberately narrow: a **16x16 candidate on
+the second reference**, with its own predictor and its own full quarter-pel
+search, competes in the ordinary rate-distortion comparison.  The partitioned
+shapes stay on reference 0.  They can do otherwise (the search, the predictors
+and the syntax all handle a reference per partition, `part_ref_search()`), but
+that pick is a SATD + 8 * bits decision that *replaces* the ref-0 vector rather
+than adding a candidate, and it measured worse than not doing it (-0.5 %
+against -1.2 % mean BD-rate, for more time).  When no macroblock of a slice
+ends up on the second reference, the slice is written with one active
+reference after all -- the header is now written after the decision pass, every
+decision stays valid, and the ref_idx syntax disappears from every partition
+(that alone moved the panning clip from +1.2 % to +0.6 %).
+
+`tools/abbd.py` (ours against ours, no reference encoder needed), preset 3,
+QP 22..37, 30 frames, negative = the second reference saves bits:
+
+| clip | P-only (`--bframes 0`) | default (`--bframes 3`) |
+|---|---|---|
+| mode 0, whole frame pans | +0.57 % | -0.50 % |
+| mode 1, halves apart vertically | **-2.87 %** | -0.44 % |
+| mode 2, halves apart horizontally | +0.13 % | -0.81 % |
+| mode 4, four quadrants | **-3.52 %** | +0.96 % |
+| mean / encode time | **-1.42 %** / +13-18 % | -0.20 % / +5-9 % |
+
+So it follows the preset (2 from preset 3 up) **only when there are no B
+pictures**.  With three B pictures the anchors are four pictures apart and the
+older reference eight, which is rarely the better prediction on any content,
+and a B macroblock cannot use direct mode where the co-located block sat on
+the older reference (see below), so the two effects cancel.  `--ref 2` forces
+it either way and is conformant either way.  The synthetic clips are pure
+translations, where an older picture has nothing a newer one lacks except a
+different noise sample; real content with occlusion and repetitive motion is
+where multiple references are known to pay, and this environment cannot show
+that.
+
+The feature had been "in" since the wiring commits, and the gate was green --
+because the second reference was never actually coded.  Getting it to the point
+where a macroblock on reference 1 reaches the bitstream and the decoder agrees
+took six fixes, five of them silent (the stream parses, the picture differs):
+
+45. **The candidate copy dropped the reference.**  `rd_luma()` copies a
+    candidate's vectors and predictors into the macroblock it prices, but not
+    its `ref[]`, so every candidate the search had put on reference 1 was
+    priced -- and coded -- on reference 0, with the vector and the *predictor*
+    derived for reference 1.  The predictor is what broke the reconstruction:
+    a 16x8's top half predicts from the block above only when that block is
+    on the same reference, so the decoder derived (20,0) where the encoder had
+    stored the median (9,0).  The winner refinement had the same hole (it
+    rebuilt its trial candidate from candidate 0 and overwrote the vectors
+    only).
+46. **`max_num_ref_frames` was 1 without B pictures.**  The SPS asked for two
+    reference frames only when B pictures were on, so in a P-only stream the
+    decoder's sliding window dropped the older picture as soon as the next one
+    arrived, and ref_idx 1 pointed at a picture it no longer had.  FFmpeg
+    conceals that with the picture it does have -- the decoded block was the
+    newer reference at exactly the coded vector -- and logs nothing at
+    `-v error`.
+47. **ref_idx is not ue(v) and not truncated.**  With two active references,
+    CAVLC codes ref_idx as te(v) with cMax 1, which is a single *inverted* bit
+    (`!read_bits(1)`), and CABAC binarises it as plain unary whatever the
+    number of references, so 1 is the two bins 1, 0 (the second at
+    ctxIdxInc 4).  Both writers agreed with the decoder for 0 -- which is all a
+    stream that never picked reference 1 contains.
+48. **A macroblock on reference 1 was coded as P_Skip.**  The skip test was
+    "16x16, no residual, vector equal to the skip vector", and P_Skip always
+    predicts from reference 0.  The skip vector derivation itself (8.4.1.1)
+    also has to look at the neighbours' references: only a neighbour on
+    reference 0 *with a zero vector* forces (0,0), and the median follows the
+    reference-matching rule.
+49. **`cur_is_p` was one picture late.**  `encode_frame()` assigned it after
+    `set_current_refs()`, which reads it, so every picture was set up with the
+    previous picture's value: a B picture after a P anchor became a
+    two-reference P picture with its two lists swapped, and the P anchor after
+    a B picture got one reference.  P-only streams hid it -- the stale value
+    was the right one -- and it is what made every preset-3 B case fail the
+    moment two references were enabled with B pictures.
+50. **Reference state survived an IDR.**  `picture_rotate()` kept both
+    references across an IDR picture, so the P picture after a mid-stream IDR
+    (`-g`, or a scene cut) took the picture before the IDR as list0[1] -- one
+    an IDR has removed from the decoder.  An IDR now leaves itself as the only
+    reference.
+
+Two more were not about the second reference itself but only became visible
+through it.  **Direct mode cannot follow a co-located block on the older
+reference**: temporal direct takes the co-located block's reference picture as
+its own list-0 reference, and the anchor's list0[1] is two anchors back, in
+neither list of the B picture and no longer in the decoder's buffer;
+`direct_group_ok()` keeps B_Skip, B_Direct_16x16 and B_Direct_8x8 away from
+those 8x8 groups.  And **the picture padding was too small for the search
+range**: the search bounds a vector by +-range around zero and knows nothing
+about the picture edge, so preset 4's range of 48 read past the 32-sample
+padding -- into the neighbouring row's padding instead of the clamped edge --
+whenever a block at the border searched far enough out.  With one reference it
+never happened on these clips; with an older reference the vectors double.
+`AEG_PAD` is 64 and the search range is clamped to `AEG_PAD - 8`.
+
+`AEG_MBDBG=2` prints one line per P macroblock with its type, each partition's
+reference, vector and predictor, which is how all of the above were narrowed
+to a single macroblock: diff the encoder's line against the decoded picture at
+that macroblock, and the predictor or the reference that differs is the bug.
+
 ## Next
 
 1. The B *search*, now that the macroblock layer is complete and its vectors are
@@ -1340,9 +1451,10 @@ full B macroblock layer.
 4. Encoder features that need the profile to change: none left -- CABAC and the
    8x8 transform are both in (main profile and High profile respectively), and
    the encoder emits Main, High or Baseline depending on which tools a stream
-   uses.  Of x264's *default* preset, only multiple reference pictures is still
-   missing (an RD decision over several references, ~2 points on moving
-   content, and it multiplies the memory search); B pictures are in, and only
+   uses.  Of x264's *default* preset, multiple reference pictures are now in
+   as far as two (*Two P references*); more than two would need a larger
+   buffer and reference list reordering, and on these clips the second one is
+   already worth little once B pictures are on.  B pictures are in, and only
    their partitioned shapes are left (item 1).  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and

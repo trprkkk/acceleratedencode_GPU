@@ -182,16 +182,20 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     /* pic_order_cnt_type 2 derives the picture order count from frame_num,
      * which counts *decoding* order: with B pictures the two orders differ, so
      * the count has to be sent explicitly (type 0, an 8-bit lsb per slice). */
+    const int nrefs = (p->bframes > 0 || p->refs >= 2) ? 2 : 1;
     if (p->bframes > 0) {
         aeg_bw_ue(&bw, 0);               /* pic_order_cnt_type = 0          */
         aeg_bw_ue(&bw, 4);               /* log2_max_pic_order_cnt_lsb_minus4 */
     } else {
         aeg_bw_ue(&bw, 2);               /* pic_order_cnt_type = 2          */
     }
-    /* Two reference pictures are alive at once with B pictures: the anchor the
+    /* Two reference pictures are alive at once with B pictures (the anchor the
      * B pictures predict backwards from and the one they predict forwards
-     * from.  Without them one is enough (and was, until now). */
-    aeg_bw_ue(&bw, (uint32_t)(p->bframes > 0 ? 2 : 1));
+     * from) and with two P references (list0[1] is the anchor before the
+     * previous one).  With max_num_ref_frames = 1 the sliding window drops
+     * that picture before the next P picture is decoded, and a decoder then
+     * conceals ref_idx 1 with whatever it still has -- a silent mismatch. */
+    aeg_bw_ue(&bw, (uint32_t)nrefs);
     aeg_bw_put(&bw, 1, 0);               /* gaps_in_frame_num_value_allowed */
     aeg_bw_ue(&bw, (uint32_t)(mb_w - 1));
     aeg_bw_ue(&bw, (uint32_t)(mb_h - 1));
@@ -207,7 +211,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
         aeg_bw_put(&bw, 1, 0);
     }
     aeg_bw_put(&bw, 1, 1);               /* vui_parameters_present_flag     */
-    write_vui(&bw, p, p->bframes > 0 ? 2 : 1);
+    write_vui(&bw, p, nrefs);
     return aeg_bw_finish(&bw);
 }
 

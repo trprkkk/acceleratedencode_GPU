@@ -155,6 +155,11 @@ typedef struct aeg_params {
      * Costs about a third of the encode time at preset 4 for 0.1-0.6 points of
      * BD-rate (see docs/STATUS.md, "Refining every candidate"). */
     int refine_cand;
+    /* P-picture reference pictures: 1 or 2.  -1 = as the preset says (2 from
+     * preset 3 up on streams without B pictures, 1 otherwise).  The second
+     * reference is the anchor before the previous one; a whole-macroblock
+     * 16x16 candidate on it competes in the rate-distortion decision. */
+    int refs;
     /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */

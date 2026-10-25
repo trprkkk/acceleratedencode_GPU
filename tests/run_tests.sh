@@ -326,6 +326,24 @@ run_bcase bframes_refine 320 192 12 3 4 -q 24 --scenecut 0 -p 4 --partitions 7
 run_case refine_cand   320 192 10 4 -q 24 -p 4 --partitions 15 --refine-cand 1
 run_bcase bframes_rcand 320 192 10 3 4 -q 24 --scenecut 0 -p 4 --partitions 15 \
     --refine-cand 1
+# Two P references (--ref 2): list0[1] is the anchor before the previous one,
+# chosen per macroblock by rate-distortion.  Each of these selects it on a few
+# hundred macroblocks.  What they guard, in the order it went wrong: the SPS has
+# to keep two reference frames alive (with max_num_ref_frames = 1 the decoder
+# drops the picture and conceals ref_idx 1 silently), ref_idx is one *inverted*
+# bit in CAVLC and plain unary (two bins for 1) in CABAC, a macroblock on the
+# second reference is never a P_Skip, the skip vector and the predictors follow
+# the reference-matching rule, and the slice header drops to one reference when
+# no macroblock of the slice used the second.  The B case adds the anchors' two
+# references under B pictures: a direct block must not follow a co-located
+# block on the older reference, and at preset 4 (search range 48, eight
+# pictures between an anchor and its older reference) the vectors reach past a
+# 32-sample picture padding -- which is why the padding is 64 now.
+run_case ref2_p        320 192 16 4 -q 34 -p 3 --ref 2
+run_case ref2_cavlc    320 192 16 4 -q 34 -p 3 --ref 2 --no-cabac
+run_case ref2_slices   320 192 16 4 -q 34 -p 3 --ref 2 --slices 3 -t 2
+run_case ref2_gop      320 192 12 1 -q 28 -p 3 --ref 2 -g 5
+run_bcase bframes_ref2 320 192 13 3 1 -q 20 --scenecut 0 -p 4 --ref 2
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

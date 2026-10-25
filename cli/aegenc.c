@@ -48,6 +48,8 @@ static void usage(void)
 "  --refine-cand <n> refine every inter candidate's vectors, not only the\n"
 "                   winner's: 0 = off (default), 1 = on (costs about a third of\n"
 "                   the encode time at preset 4 for 0.3-0.6 points of BD-rate)\n"
+"  --ref <n>        reference pictures for P pictures, 1 or 2 (default 2 from\n"
+"                   preset 3 up when --bframes is 0, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"
@@ -203,7 +205,7 @@ int main(int argc, char **argv)
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
-    int refine_mv = -1, refine_cand = -1;
+    int refine_mv = -1, refine_cand = -1, refs = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000;
     int64_t *pass1_bits = NULL;
@@ -250,6 +252,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-mv")) refine_mv = atoi(argv[++i]);
         else if (!strcmp(a, "--refine-cand")) refine_cand = atoi(argv[++i]);
+        else if (!strcmp(a, "--ref")) refs = atoi(argv[++i]);
         else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
         else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
         else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
@@ -371,6 +374,7 @@ int main(int argc, char **argv)
     if (subme >= 0) p.subme = subme;
     if (refine_mv >= 0) p.refine_mv = refine_mv;
     if (refine_cand >= 0) p.refine_cand = refine_cand;
+    if (refs >= 0) p.refs = refs;
     if (bframes >= 0) p.bframes = bframes;
     if (bqp > -1000) p.b_qp_offset = bqp;
     if (trellis >= 0) p.trellis = trellis;

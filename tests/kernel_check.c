@@ -100,7 +100,7 @@ static int g_pdstride;
 static void call_intp(int i)
 {
     (void)i;
-    interp_plane(g_pref, g_rstride, g_pw, g_ph, 32, g_pwhich,
+    interp_plane(g_pref, g_rstride, g_pw, g_ph, AEG_PAD, g_pwhich,
                  g_pdst, g_pdstride);
 }
 
@@ -324,7 +324,7 @@ int main(void)
 
     /* ---- fractional-pel planes of a reference picture ---------------- */
     {
-        int w = 96, h = 64, pad = 32, which, x, y;
+        int w = 96, h = 64, pad = AEG_PAD, which, x, y;
         size_t stride = (size_t)w + 2 * pad, rows = (size_t)h + 2 * pad;
         uchar *padded = (uchar *)calloc(stride * rows, 1);
         uchar *dst = (uchar *)calloc(stride * rows, 1);
@@ -377,7 +377,7 @@ int main(void)
 
     /* ---- SATD of fractional-pel candidates --------------------------- */
     {
-        int w = 96, h = 64, pad = 32, t, bad = 0;
+        int w = 96, h = 64, pad = AEG_PAD, t, bad = 0;
         size_t stride = (size_t)w + 2 * pad, rows = (size_t)h + 2 * pad;
         uchar *padded = (uchar *)calloc(stride * rows, 1);
         uchar *plane[3];

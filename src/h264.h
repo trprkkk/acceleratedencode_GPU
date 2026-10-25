@@ -16,7 +16,7 @@
 /* ------------------------------------------------------------------ */
 /* Geometry                                                            */
 /* ------------------------------------------------------------------ */
-#define AEG_PAD 32              /* border padding around each picture      */
+#define AEG_PAD 64              /* border padding around each picture      */
 /* Steps per subpel pass of the motion search.  Swept over 2..6 on four
  * clip/QP combinations: 2 is consistently worst, 3..5 are within 0.1% of each
  * other in rate and 0.03 dB in PSNR, and 6 starts to be worse again (an extra
