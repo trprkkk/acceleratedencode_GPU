@@ -21,10 +21,9 @@ The encoder is **conformant on I, P *and* B pictures**: an independent decoder
 | 8x8 transform + Intra_8x8 (every clip above re-run with it on; 30-case I-picture matrix over four ramp/noise clips) | 32x16 … 320x192 | 12 … 40 | 0 … 4 | 1 … 16 |
 
 with and without the in-loop deblocking filter.  `make test` asserts this and
-fails (non-zero exit) on any mismatch; it runs sixty-five encoded clip cases
-frame by frame (fifty-nine bit-exact, ten of them with B pictures compared
-through a coding-order map; the six preset-4/trellis cases are the open failure
-described at the end of *Verification*).  It also
+fails (non-zero exit) on any mismatch; it runs sixty-eight encoded clip cases
+frame by frame, all of them bit-exact, twelve of them with B pictures compared
+through a coding-order map.  It also
 checks that the ABR controller hits its target, plus a sweep of
 the partition, QP and GOP options (`tools/sweep.sh`) and a 240-case matrix over
 `--partitions 1|3|7|15`.
@@ -639,7 +638,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 67 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — sixty-seven cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — sixty-eight cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -694,21 +693,27 @@ That is how the neighbour-mask bug in *The partitioned types* was narrowed down
 in the B picture was working and the failure came from the *P* path using the
 same mask.
 
-Six cases fail today and are not a B-picture regression: `refine_thr`,
-`refine_part`, `trellis4`, `trellis8`, `trellis_thr` and `trellis_batch`
-reproduce identically at `db80149`, before B pictures existed.  They all have
-`--refine-mv` on, and the drift starts at a 16x8/8x16/P_8x8 macroblock's second
-partition: the refinement moves one partition's vector, which changes the
-*predictor* of the next one, and the mvd sent then no longer matches what the
-decoder derives.  That is a real bug in the P path, not in the comparison --
-`--partitions 1` with the refinement is bit-exact, `--partitions 5` (which adds
-8x16) is not -- and it is the next thing to fix in the quality work.
+Six cases failed from `db80149` on and were not a B-picture regression:
+`refine_thr`, `refine_part`, `trellis4`, `trellis8`, `trellis_thr` and
+`trellis_batch`.  They all have `--refine-mv` on, and the drift started at a
+16x8/8x16 macroblock: the refinement moved one partition's vector, which changes
+the *predictor* of the next one, so the mvd sent no longer matched what the
+decoder derived (bug 43).  `--partitions 1` with the refinement was bit-exact
+and `--partitions 5` was not, which is what pointed at the second partition
+rather than at the coder.  Found by comparing the encoder's own block table with
+the decoder's exported vectors: at the first bad macroblock the coded mvd was
+the same on both sides but the predictor it was added to differed by exactly the
+refinement step, and the first bad macroblock was always in column 0 -- the only
+place where a 16x8's second partition has no left neighbour and falls back to
+the first partition's vector.  With `refresh_pmvs()` in place every case is
+exact: the whole gate (sixty-eight cases) is bit-exact, plus a 216-case sweep of
+`--refine-mv 1/2` x `--partitions` 5/7/9/11/13/15 x preset 2/4 x QP 20/26/32 on
+three clips.
 
-The same refinement is also why preset 3 fails at `--partitions 3/5/15` with B
-pictures: `-p 3` sets `--refine-mv 1`, so a B case at that preset has to be run
-with `--refine-mv 0` before its failure means anything about the B layer.  With
-the refinement off, preset 3 decodes bit-exactly for `--bframes` 1/2/3, QP
-12/24/37 and every `--partitions` value, which is how B_8x8 was verified.
+The same refinement is also why preset 3 used to fail at `--partitions 3/5/15`
+with B pictures: `-p 3` sets `--refine-mv 1`.  Preset 3 decodes bit-exactly now
+for `--bframes` 1/2/3, QP 12/24/37 and every `--partitions` value, with the
+refinement left on -- that is how B_8x8 was verified.
 
 One more failure was found and fixed while isolating the refinement bug, and it
 was a *syntax* bug of the nastiest kind: **mb_type 13 is B_L0_Bi_8x16, and the
@@ -939,6 +944,25 @@ has to be caught before an external decoder is the only witness.
     -- a "the filter is wrong" signature over a syntax bug.  Intra now has the
     sentinel `CAB_B_TYPE_INTRA = 23`, and the gate runs a case that selects the
     type (`bframes_8x16`).
+43. **A predictor derived from a vector that later changes has to be
+    re-derived.**  The motion-vector refinement re-codes the winning inter
+    macroblock with each of the quarter-pel neighbours of the winner's vector,
+    one partition at a time.  A 16x8 or 8x16 macroblock's *second* partition
+    predicts from the first one (8.4.1.3.1: the decoder has just written those
+    vectors into its block cache), and that predictor had been derived when the
+    search found the first vector -- so as soon as the refinement moved it, the
+    stored predictor was off by exactly the refinement step while the decoder
+    derived the new one, and the two reconstructions diverged from that
+    macroblock on.  Two properties kept this hidden: it needs a partitioned
+    macroblock (16x16 has no neighbour inside itself, so `--partitions 1` is
+    clean and `--partitions 5` is not), and it needs the refinement to *accept*
+    a move, which is why `--no-8x8dct` and `--no-deblock` made it vanish -- they
+    changed the residual enough that no move paid.  Six gate cases had failed
+    from `db80149` on because of it (`refine_thr`, `refine_part`, `trellis4`,
+    `trellis8`, `trellis_thr`, `trellis_batch` -- trellis is reached through the
+    same presets, so its cases inherited the failure).  `refresh_pmvs()`
+    re-derives every partition's predictor from the vectors the macroblock
+    finally carries, after the refinement has run.
 
 `--bframes N` (0..3) codes N B pictures between two anchors; the default is
 **three**, with `--bqp 8` (see *Making them pay* below) -- this is the one place
@@ -1078,7 +1102,7 @@ macroblock) and only eight of 14 400 macroblocks select it.  It is therefore
 enabled from *preset 3*, where the encoder is already spending its time on
 refinement, and the gate has a case of its own (`bframes_8x8`, preset 3 with
 the P partitions held at 16x16 so that the case is about the B macroblock layer
-rather than about the pre-existing `--refine-mv` bug).
+rather than about the motion search).
 
 **The two bugs it cost were both in what the encoder publishes, not in the
 syntax.**  The first was the copy the decision pass makes into the `aeg_mb` grid
@@ -1113,10 +1137,9 @@ not a boolean, and "coded but not from this list" is the one that gets lost.
 
 Verification: 630/630 decode cases bit-exact (three clips x `--bframes` 1/2/3 x
 QP 12/20/24/28/37 x `--partitions` 1/3/5/7/9/13/15 x preset 2/3), all with
-`--refine-mv 0` so that the matrix isolates the B layer from the pre-existing
-refinement bug of *Next* item 2 -- preset 3 turns that refinement on, so a
-preset-3 case at `--partitions 3/5/15` fails for B_8x8-unrelated reasons at
-`ed0801f` too.  That matrix is also what found bug 42.
+`--refine-mv 0` so that the matrix isolates the B layer from the P-side
+refinement; the refinement itself is exact (bug 43) and was swept separately at
+`--refine-mv 1/2`.  That matrix is also what found bug 42.
 
 ### Making them pay
 
@@ -1255,23 +1278,13 @@ full B macroblock layer.
    direct is deliberately *not* on the list: it makes every direct macroblock
    depend on its neighbours' vectors, so an encoder/decoder disagreement
    corrupts the picture instead of costing a few bits.
-2. The motion-vector refinement desynchronises a partitioned macroblock.  Six
-   cases in the gate fail because of it (`--refine-mv` together with 8x16 or
-   P_8x8: `--partitions 1` is clean, `--partitions 5` is not), which is
-   documented at the end of *Verification*.  The refinement moves a partition's
-   vector after its neighbour's predictor was derived from the old one, so the
-   mvd sent no longer matches the mvd the decoder derives, and the two
-   reconstructions differ from that macroblock on.  Recomputing the predictors
-   after each refinement step was tried and made it *worse* (frame 1 went from
-   bit-exact to 23 000 wrong samples), so the derivation in
-   `predict_mv_at()` is not the whole story -- the decoder's own rules for which
-   neighbour is available at a sub-partition boundary are what to compare
-   against, with the `AEG_MBDBG` listing and an instrumented decoder as in bug
-   27.  Until then the refinement stays where it was: on presets 3 and 4, which
-   is where it already was, and the six failures are pre-existing, not a
-   regression.  (The failure that looked like a third bug in that area --
-   `--bframes 3 --partitions 5` decoding into garbage -- was bug 42, the
-   B_L0_Bi_8x16 / intra code collision, and is fixed.)
+2. The motion-vector refinement is exact now (bug 43) but still only refines
+   the winning candidate, one partition at a time, and prices its trials with
+   the predictor the search happened to store.  Two cheap follow-ups: re-derive
+   the predictors *inside* the trial loop so the mvd priced is the mvd coded
+   (the difference is one or two bits per trial), and refine the chroma vector
+   with the luma one instead of copying it.  Both are pure quality-for-time
+   trades and belong behind the same preset gate.
 3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and

@@ -2308,6 +2308,43 @@ static void avail_publish(uint8_t avail[16], const int geo[4])
             avail[(y << 2) + x] = AEG_MVBLK_AVAIL;
 }
 
+/* Re-derive the predictor of every partition of an inter macroblock from the
+ * vectors the macroblock finally carries.
+ *
+ * The neighbours inside the same macroblock are part of the predictor: the
+ * second half of a 16x8 or 8x16 predicts from the first half (9.3.3.1 rules in
+ * 8.4.1.3.1 -- the decoder has just stored those vectors in its block cache),
+ * and every 8x8 sub-partition predicts from the ones before it.  The search
+ * derives a partition's predictor before the *later* partitions exist, so if a
+ * later step changes an earlier vector the stored predictor goes stale by
+ * exactly that change, and the decoder -- which derives it from the coded
+ * vector -- reconstructs a different vector.  The motion-vector refinement does
+ * exactly that, so it has to call this afterwards. */
+static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    int16_t cur[16][2];
+    uint8_t avail[16];
+    int p, n = mb_part_count(c);
+
+    memset(cur, 0, sizeof(cur));
+    memset(avail, 0, sizeof(avail));
+    for (p = 0; p < n; p++) {
+        int geo[4], b0, pmvx, pmvy;
+        mb_part_geom(c, p, geo, &b0);
+        /* The first partition has no neighbour inside the macroblock, so its
+         * predictor is the same one the search stored and is left alone. */
+        if (p > 0) {
+            predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, c->type,
+                          p, geo[0] / 4, geo[1] / 4, geo[2] / 4, 0,
+                          &pmvx, &pmvy);
+            c->pmv[b0][0] = (int16_t)pmvx;
+            c->pmv[b0][1] = (int16_t)pmvy;
+        }
+        me_publish(cur, geo, c->mv[b0][0], c->mv[b0][1]);
+        avail_publish(avail, geo);
+    }
+}
+
 /* One partition of a partitioned B macroblock (16x8 or 8x16).
  *
  * Both lists are searched independently and then list 0, list 1 and the average
@@ -4085,6 +4122,10 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         e->mb_cand[0] = save;
         restore_luma(e, mbx, mby, snap_l);
+        /* The refinement may have moved the first partition's vector, and the
+         * second partition's predictor was derived from the vector the search
+         * returned.  Re-derive it from what the macroblock now carries. */
+        refresh_pmvs(e, mbx, mby, &best);
     }
 
     /* chroma: every legal intra mode, or the motion-compensated prediction */

@@ -178,6 +178,13 @@ run_case refine_thr    320 192  6 1 -q 26 -p 4 --slices 2 -t 2
 # macroblock; mode 1 moves the halves of the picture in opposite
 # directions, which is what makes the encoder pick those shapes.
 run_case refine_part   320 192  6 1 -q 26 -p 4 --slices 2 -t 2
+# The second half of a 16x8 or 8x16 predicts from the first half (8.4.1.3.1),
+# so moving the first vector in the refinement invalidates the second
+# partition's predictor and it has to be re-derived (bug 43).  Column 0 is the
+# only place where that partition has no left neighbour to fall back on, so
+# this case is single-threaded, at the preset that reaches the refinement
+# without the slice machinery, on the clip that pans in both directions.
+run_case refine_pred   320 192  6 1 -q 26 -p 2 --refine-mv 1 --partitions 11
 # Level selection (--trellis) changes the coefficients *after* the quantiser,
 # so everything the macroblock layer derives from them -- the coded block
 # pattern, the counts the neighbours' contexts are built from, the
