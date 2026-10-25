@@ -636,14 +636,15 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — forty-eight cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — fifty-three cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
    forced whole-frame fractional refinement, all-intra and 3-frame GOPs, the RD
-   Intra_4x4 decision of the slow presets, P_Skip, ABR, AQ, and AQ over
-   P_Skip runs at two QPs -- all of them with the 8x8 transform and CABAC
-   enabled, which are the defaults)
+   Intra_4x4 decision of the slow presets, P_Skip, ABR, AQ, AQ over
+   P_Skip runs at two QPs, and level selection on both transforms, through the
+   slice threads and through the batched coefficient path -- all of them with
+   the 8x8 transform and CABAC enabled, which are the defaults)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -656,11 +657,12 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 47 clip cases
    no bit-exactness check can see that.  The encoder reports the full type
    breakdown (`skip`, `P16x16`, `P16x8`, `P8x16`, `P_8x8`, the three intra
    types), which is what the gap analysis below is read from: on the
-   two-quadrant clip at QP 28 it codes 65% P16x16, 24% skip, 5.6% Intra_16x16
-   and 3.8% 8x16 -- i.e. the content is genuinely mostly 16x16 (the picture
-   translates as two halves of 160 px each, so only the two columns at the
-   boundary need a split), and the 21% of rate the clip still costs against
-   x264 is in the residual, not in the partition decision.
+   two-quadrant clip at QP 28 it codes 64% P16x16, 24% skip, 5.5% Intra_16x16,
+   3.5% 8x16 and 2.0% P_8x8 -- i.e. the content is genuinely mostly 16x16 (the
+   picture translates as two halves of 160 px each, so only the two columns at
+   the boundary need a split), and the 20% of rate the clip still costs against
+   x264 is in the residual and in the B pictures x264 codes and this encoder
+   does not, not in the partition decision.
 
 `reconstruction vs decode` must be `max abs diff 0`.
 
@@ -852,22 +854,37 @@ has to be caught before an external decoder is the only witness.
 
 ## Next
 
-1. Quality/RD: per-block rate-distortion level selection (trellis, or at least
-   the last non-zero coefficient).  The rate term is now the coder's own price,
-   so the level decision has the model it needs.  The same machinery would let
-   the *partition* shapes (16x8/8x16/P_8x8 and the sub_mb_type inside P_8x8) be
-   decided by the coder's price instead of by SAD: today the whole macroblock is
-   priced exactly, but which shape to price at all is still a SAD decision, and
-   on the partitioned clip that is where the remaining 20% sits.  Measured against x264 (which has trellis=1
-   by default) on the panning clip at QP 24: trellis off 60 047 B / 45.95 dB,
-   trellis 1 61 495 B / 46.26 dB, trellis 2 61 106 B / 46.24 dB -- i.e. it buys
-   quality with bits at a fixed QP and is a wash in PSNR-per-bit here, which is
-   why it has not been a priority.  The bigger item behind it is the 8x8 DCT
-   (see 3).  The sub-partition *shape* choice
-   is currently a SAD + 8-bit approximation; re-deciding it inside the RD pass
-   would recover a little more (it picks a slightly too fine shape on some
-   macroblocks).
-2. GPU: every stage that can be batched is now wired to its kernel.  The plane
+1. B pictures.  This is now the whole of the remaining gap on moving content,
+   and it is measurable in one line: with x264's own B pictures switched off
+   (`-x264-params bframes=0`, everything else at `-preset medium`), our stream
+   is 2.6% *fewer* bits on the two-quadrant clip, 14.1% fewer on the still clip,
+   7.2% more on the panning clip and 13.8% more on the mode-4 clip -- against
+   19.8%, 11.3% fewer, 21.7% and 12.8% with them on.  So 4-22 points of BD-rate
+   are B pictures alone, and P-picture coding is within a few points of x264's.
+   What it needs: picture order count and reordering, a second reference list
+   (L1 = a future picture, so the encoder holds two references and the decoder
+   reorders), the B slice syntax (`mb_skip_flag`'s own context base,
+   `B_Direct_16x16`, and `B_L0/L1/Bi` with both the 8x8 and the 16x16 type
+   codes), the bi-predictive average (the two predictors rounded once, not
+   twice), direct mode's vector derivation from the co-located picture, and the
+   RD pass over the three prediction modes per partition.  The pieces that are
+   already in place are the ones that usually make this expensive: the rate term
+   (the shadow coder and `aeg_cabac_coef_price()`), the reference picture
+   bookkeeping for one list, and the whole macroblock RD loop.
+2. Quality/RD, the parts that are left.  Level selection is now implemented and
+   measured (*Rate-distortion level selection*): priced by the coder, exact
+   distortion, off by default, worth 0.2 points either way on residual-heavy
+   content and 3-4 points *negative* on skip-heavy content.  What is left of the
+   quality gap on P pictures is the search, not the coefficients:
+   * the *partition shapes* (which of 16x16/16x8/8x16/P_8x8 to price, and the
+     `sub_mb_type` inside P_8x8) are still chosen by SAD plus an 8-bit rate
+     guess; the shapes that make it into the list are therefore a SATD decision
+     even though the comparison between them is exact;
+   * the sub-pel vector is chosen by SATD, then only the *winning* macroblock's
+     vector is refined by the coder's price (`--refine-mv`, presets 3-4).
+     Refining inside the candidate loop with `aeg_cabac_coef_price()` is the
+     natural next step and is a pure quality-for-time trade.
+3. GPU: every stage that can be batched is now wired to its kernel.  The plane
    build is `interp_plane`, both halves of the search are rounds through
    `sad_batch` and `satd_batch`, and the coefficient stages of an inter
    macroblock are one `tq_batch` + one `iq_idct_batch` per candidate (see the
@@ -887,21 +904,19 @@ has to be caught before an external decoder is the only witness.
    dispatcher also only ever measures the path it chose, so a stage is switched
    by its forced override (`-s stage=backend`) or, on hardware, after both
    paths have been probed.
-3. Encoder features that need the profile to change: none left -- CABAC and the
+4. Encoder features that need the profile to change: none left -- CABAC and the
    8x8 transform are both in (main profile and High profile respectively), and
    the encoder emits Main, High or Baseline depending on which tools a stream
-   uses.  The decision pass now prices a candidate with the coder that emits the
-   stream (see *Pricing the decision pass with the coder*), which was the
-   prerequisite for trellis-style level optimisation: with a real per-bin price
-   the level choice can be a run over the coefficients of a block, and the 3.6
-   points the trellis row of the table above is worth are the largest single
-   item left on the quality side.  MB-tree was
+   uses.  Two tools of x264's *default* preset are still missing and both are
+   deliberate: B pictures (item 1, which needs a reordered stream) and multiple
+   reference pictures (an RD decision over several references, ~2 points on
+   moving content, and it multiplies the memory search).  MB-tree was
    evaluated for the rate controller and is *not* in: at a fixed rate on the
    two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
    this environment has no real content to show the gain it is known for, so
    two-pass allocation (which is measurable here, +3.8 dB) is the mechanism that
    was kept.
-4. Threads beyond slices: a per-thread device context (so that slice threads
+5. Threads beyond slices: a per-thread device context (so that slice threads
    and GPU stages can run at the same time -- today a picture with any stage on
    a device is coded by one thread), and frame-level threading (code picture
    N+1's decision pass while picture N is being written), which needs the
@@ -1295,7 +1310,81 @@ rarely "free" enough: dropping it removes real detail, and the bits it saves are
 already recovered by the macroblock-level RD pass choosing a coarser partition.
 A full trellis (every coefficient, every level, with the cbp and neighbour
 context costs carried through the whole 4x4 block) is the version that pays in
-x264, and that is a bigger piece of work than this shortcut.
+x264; it is implemented now, and *Rate-distortion level selection* below is the
+measurement of it -- which lands in the same place as this shortcut did.
+
+## Rate-distortion level selection (`--trellis`)
+
+The quantiser rounds into a deadzone widened on purpose (`aeg_quant_bias()`,
+1.5x the rounding point) and never asks whether the bits a level costs are worth
+the distortion it removes.  `--trellis 1` asks, block by block, with both terms
+measured rather than modelled:
+
+* the *price* is `aeg_cabac_residual()` run in price-only mode against the
+  slice's shadow coder, i.e. the coder that decides the macroblock also decides
+  the levels;
+* the *distortion* is the inverse transform of the candidate levels, clipped and
+  added to the prediction, SSE against the source -- not a coefficient-domain
+  estimate of it.
+
+The search is a coordinate descent over the levels of one block: start from what
+the quantiser chose, consider emptying the block, then sweep the coefficients in
+the order the coder sends them (last to first) trying each level one step towards
+zero and one step away from it, keeping a move whenever it lowers
+`sse + lambda * bits`.  A second sweep lets moves combine, which is the part a
+per-coefficient rule cannot see: a level dropped here only pays for itself
+together with a level raised there.  Two details make it affordable:
+
+* a changed coefficient only changes its own significance bin, the last-coefficient
+  flag (when it is the block's last), its level prefix and its sign, so the rate
+  term of a candidate is `aeg_cabac_coef_price()`, O(1) instead of a walk over the
+  whole list (the level-prefix context is taken as the block's first node, an
+  approximation that only affects which candidates win);
+* the block that comes out of the sweep is priced *exactly* and compared with the
+  quantiser's own levels, so the approximation can cost choices but never make the
+  result worse than not running the pass at all.
+
+It covers the 4x4 inter blocks (both the per-block path and the batched one) and
+the 8x8 inter blocks; chroma and intra keep the quantiser's levels.
+
+| clip | preset 2 off / on | preset 4 off / on |
+|---|---|---|
+| mode 4, 320x240, 8 frames | 12.8% more / 13.0% more | 9.5% more / 9.8% more |
+| mode 2, 320x192, 30 frames | 19.8% more / 19.7% more | 19.3% more / 19.3% more |
+| mode 3 (still), 320x192, 30 frames | 11.3% fewer / **15.0% fewer** | 18.2% fewer / **15.0% fewer** |
+| mode 1, 320x192, 60 frames | 21.7% more / 21.5% more | 20.4% more / 20.3% more |
+
+(the percentages are bits at matched PSNR against `libx264 -preset medium` over
+six QPs, so "19.8% more" is *worse* than x264.)
+
+The verdict is not a wash, it is a split: on the three clips with real residuals
+the pass is worth at most 0.2 points either way, and on the skip-heavy still
+clip it **costs 3.2-3.7 points**.  That is the drift above made visible: on a
+picture that is almost entirely skipped, the few blocks that do carry residual
+are the ones whose reconstruction every following P picture predicts from, and a
+level that lowers `sse + lambda * bits` for its own block today can cost a
+skip tomorrow.  It is therefore **off by default** and lives behind
+`--trellis 1`; it costs 13% of the encode time at preset 2 and 35% at preset 4
+(the 8x8 blocks make the sweep expensive: 64 coefficients, two directions
+apiece).
+
+Why the full search does not pay here, when it is worth several percent in x264:
+this encoder's deadzone and lambda already sit near the RD optimum for these
+decisions -- the same conclusion the "drop the last coefficient" shortcut below
+reached from the other direction -- and, more fundamentally, the pass optimises
+each block against a *fixed* reference picture while the levels it picks *change*
+the reconstruction that later pictures predict from.  On a P-only stream that
+drift is a real cost the block-local model never sees, and it is the whole of the
+negative result on the still clip.  A version that pays would have to carry the
+path across the whole picture's decisions -- the cbp, the neighbour contexts and
+the effect on the next reference -- not just across one block.
+
+The pieces of this pass that *are* reusable are the two pricing entry points it
+needed: `aeg_cabac_residual()` in price-only mode (the whole block, exact) and
+`aeg_cabac_coef_price()` (one coefficient, O(1)), both against a shadow coder.
+Anything else that wants a rate term the coder would actually charge -- a
+sub-pel vector refinement, a sub-partition shape, a B-picture's bi-prediction --
+starts from those.
 
 ## The 8x8 transform and Intra_8x8
 
@@ -1372,9 +1461,12 @@ baseline-profile x264 on this clip (same script, `-profile:v baseline
 12% on this clip, and the split is measurable: x264 with `cabac=1:8x8dct=1` but
 `trellis=0:aq-mode=0` is 9.1% ahead of us, i.e. ~3.5 points of the 12.6 is
 trellis quantisation (level selection inside each block) and the rest is the
-motion search and the rate-distortion refinement of it -- both of which this
-encoder does with cheaper heuristics, and both of which are the compute the
-GPU port is for.  On the two-quadrant clip (mode 2, the one that exists to make
+motion search and the rate-distortion refinement of it.  The first half of that
+inference did not hold up: this encoder has its own level selection now
+(*Rate-distortion level selection*), priced by the same coder that codes the
+macroblock, and on this clip it is worth nothing -- so the 3.5 points are not
+the trellis on its own but what the trellis does for *x264's* search, and the
+rest of the gap is the search, which is the compute the GPU port is for.  On the two-quadrant clip (mode 2, the one that exists to make
 16x8 and 8x16 partitions pay) the gap is 21%, and on the still clip the encoder
 is 11% *ahead* of x264 medium -- the spread across three clips is what the
 decision pass can and cannot see.
@@ -1389,16 +1481,21 @@ factor cannot fix it.  The rate term is now the coder's own price -- see
 *Pricing the decision pass with the coder* under *CABAC* -- and the three clips
 below are the measurement of it:
 
-| clip | before | coder-priced | + the skip candidate | preset 3 | preset 4 |
-|---|---|---|---|---|---|
-| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | 12.6% more | 9.3% more | 9.8% more |
-| mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | 21.0% more | 20.3% more | 20.4% more |
-| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | 11.3% fewer | 13.7% fewer | **18.3% fewer** |
+| clip | before | coder-priced | + the skip candidate | now (preset 2) | preset 3 | preset 4 |
+|---|---|---|---|---|---|---|
+| mode 4, 320x240, 8 frames | 12.9% more | 12.3% more | 12.6% more | 12.8% more | 9.4% more | 9.5% more |
+| mode 2, 320x192, 30 frames | 28.6% more | 24.5% more | 21.0% more | **19.8% more** | 19.3% more | 19.3% more |
+| mode 3 (still, skip-heavy), 320x192, 30 frames | 21.7% more | 6.2% more | 11.3% fewer | 11.3% fewer | 13.7% fewer | **18.2% fewer** |
 
 The last two columns are the slow presets, which since this round also refine
 the winning motion vector by rate-distortion (*Rate-distortion refinement of the
 motion vector*): 2.2-2.8 points on two of the three clips and 7 points on the
-still one, for 27% / 40% more time than preset 2.
+still one, for 27% / 40% more time than preset 2.  The "now" column is preset 2
+with one more thing fixed: the candidate array was still sized four while the
+macroblock generates five candidates, so P_8x8 was being dropped by the bound
+whenever the skip vector was present (*P_8x8 sub-macroblock partitions*).  With
+all five priced, the two-quadrant clip -- the one that exists to make partitions
+pay -- gains 1.0-1.2 points at every preset.
 
 The clip that gains most is the one whose decisions are dominated by skip and
 by near-zero residuals, which is exactly where the CAVLC estimate is furthest
@@ -1526,36 +1623,37 @@ partitions are worth coding):
 
 | encoder | fps | bytes | PSNR |
 |---|---|---|---|
-| ours, preset 0, before / after the coder-priced decision pass | 584 / 527 | 118 680 / 118 680 | 43.74 / 43.74 (YUV) |
-| ours, preset 2 | 86 / 76 | 49 335 / 47 928 | 46.33 / 46.59 (YUV) |
-| ours, preset 3 (four-neighbour vector refinement) | 82 / 58 | 49 537 / 47 512 | 46.29 / 46.62 (YUV) |
-| ours, preset 4 (eight-neighbour vector refinement) | 82 / 46 | 49 537 / 47 390 | 46.29 / 46.64 (YUV) |
-| x264 baseline (no asm), earlier round | 175 | 78 664 | 45.16 (Y) |
-| libx264 baseline, this machine, asm | 385 | 78 692 | 46.30 (YUV) |
-| libx264 medium, this machine, asm | 395 | 34 612 | 46.39 (YUV) |
+| ours, preset 0 | 528 | 118 680 | 43.74 |
+| ours, preset 2 | 69 | 47 309 | 46.51 |
+| ours, preset 3 (four-neighbour vector refinement) | 53 | 46 871 | 46.50 |
+| ours, preset 4 (eight-neighbour vector refinement) | 43 | 46 846 | 46.50 |
+| ours, preset 2, `--trellis 1` | 52 | 46 556 | 46.31 |
+| libx264, baseline profile (CABAC and 8x8 off), asm | 405 | 79 935 | 46.32 |
+| libx264, medium, asm | 408 | 34 537 | 46.37 |
 
-The preset rows now differ by more than "a wider search": the coder-priced
-decision pass costs 12% (preset 0 is unaffected -- it takes the SAD path and
-codes each macroblock once) and the vector refinement another 27% / 40% on top
-of that at presets 3 and 4, which is why the slow presets are 1.6x and 2x
-slower than preset 2 for 2-7 points of BD-rate.
+All seven rows are decoded and PSNR'd the same way (mean of the per-frame YUV
+PSNR), so the numbers are comparable; absolute values move a few percent
+between runs, the `-n 60`, single-thread, same-QP comparison is the one to
+repeat.
 
-The three x264 rows are on the same clip and QP but from different builds and
-PSNR conventions (the first row predates this table's rewrite and averages Y
-only), so the honest reading is: against a *no-asm* x264 this encoder is within
-1.8x, against a normal libx264 with assembly it is 4-5x slower, and it now
-spends 13-18% more time than it did before the decision pass priced candidates
-with the coder (preset 0 is unaffected -- it takes the SAD path and codes each
-macroblock once).  The bits it buys with that time are 3-5%, and 15 points of
-BD-rate on the clip whose decisions are closest (see *Quality against a
-reference CPU encoder*).  Absolute numbers move a few percent between runs; the
-`-n 60`, single-thread, same-QP comparison is the one to repeat.
+The preset rows differ by more than "a wider search": the coder-priced decision
+pass is the decision pass, and the vector refinement adds another 25% / 40% on
+top of it at presets 3 and 4, which is why the slow presets are 1.3x and 1.6x
+slower than preset 2 for 1-7 points of BD-rate.  Since the previous round the
+fifth candidate (P_8x8, which an array bound was silently dropping) costs ~10%
+and buys 1.0-1.2 points on the partitioned clip, and `--trellis 1` costs another
+20% / 35% for nothing measurable, which is why it is off.
+
+The honest reading against the reference: a *no-asm* x264 build is within 1.8x
+of this encoder, a normal libx264 with assembly is 6x faster, and it spends 9%
+fewer bits than we do on the still clip and 10% fewer on this one -- while
+coding B pictures we do not have yet (see *Next*).
 
 What the remaining time is, per stage (`-v 2`, 60 frames of 320x192 at QP 24,
 preset 2 / preset 4, milliseconds per run): transform (the forward/inverse
 transform, quantisation and reconstruction of every candidate, and the coder's
-bin walk over them) 558 / 1086, motion estimation 202 / 206, inter prediction
-18 / 18, deblocking 6 / 6.  The decision pass is now 72% of the encode at
+bin walk over them) 573 / 1100, motion estimation 266 / 268, inter prediction
+17 / 17, deblocking 6 / 6.  The decision pass is now 68% of the encode at
 preset 2 and 83% at preset 4, which is where a device would be pointed first.
 
 Where the speed came from, each step measured on its own, all of them

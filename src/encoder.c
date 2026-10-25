@@ -105,7 +105,7 @@ struct aeg_encoder {
     /* Inter partitioning candidates gathered by analyse_mb(): 16x16, 16x8,
      * 8x16 and P_8x8.  Each carries the per-partition MVs and their
      * predictors, which is exactly what the bitstream has to transmit. */
-    mbcand mb_cand[4];
+    mbcand mb_cand[AEG_MB_CAND_MAX];
     int mb_ncand;
 
     aeg_dispatcher d;

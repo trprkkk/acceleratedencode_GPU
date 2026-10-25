@@ -15,19 +15,25 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 47 clip cases, two CABAC round-trips, a
+> `make test` asserts it over 53 clip cases, two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch.  What
-> is *not* finished is speed and the last few percent of efficiency.  On the
-> test clips, at matched PSNR, a baseline-profile x264 spends 36 % more bits
-> than this encoder, while libx264's default preset (`medium`: CABAC, 8x8
-> transform, trellis quantisation, AQ, SIMD) spends 9–12 % fewer on the moving
-> clips and 18 % more on the still one — the residual of that gap is trellis
-> quantisation and a rate-distortion refined search.  Speed is the real gap:
-> 77 fps (preset 2) or 46 fps (preset 4) against x264's ~400 fps on two cores
-> at 320x192 QP 24, and 72 % of the CPU time is now the
-> transform/quantise/reconstruct work of the rate-distortion pass with 26 % in
-> the motion search (83 %/16 % at preset 4), which is exactly what the GPU
+> is *not* finished is speed and B pictures.  On the test clips, at matched
+> PSNR, a baseline-profile x264 spends 36 % more bits than this encoder, while
+> libx264's default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
+> quantisation, AQ, SIMD) spends 9–21 % fewer on the moving clips and 11 % more
+> on the still one.  Almost all of that is B pictures: with x264's own B
+> pictures disabled the gap on the moving clips collapses to 2.6 % *in our
+> favour* (and 7 % against us on the panning clip), so P-picture coding is
+> within a few points of x264's — the last few points of it are the search
+> (partition shapes and sub-pel vectors chosen by SATD rather than by the
+> coder's price).  Level selection priced by the coder is implemented and
+> measured, and switches itself off by default because it measured as a wash
+> on residual-heavy content and a loss on skip-heavy content.  Speed is the
+> real gap: 69 fps (preset 2) or 43 fps (preset 4) against x264's ~400 fps on
+> two cores at 320x192 QP 24, and 68 % of the CPU time is now the
+> transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
+> the motion search (80 %/19 % at preset 4), which is exactly what the GPU
 > backends exist for.  The GPU backends sit behind a measured dispatcher, and
 > the kernels are checked against the CPU reference by `tests/kernel_check.c`,
 > but nothing has run on real GPU hardware in this environment (there is no GPU
@@ -109,7 +115,11 @@ preset (it scales the search range, the subpel refinement and, from 3 up, the
 rate-distortion refinement of the winning motion vector), `--refine-mv 0|1|2`
 controls that last one on its own (0 off, 1 the four axial quarter-pel
 neighbours, 2 all eight; 2-7 points of BD-rate against x264 medium for 27-40 %
-more time, see `docs/STATUS.md`), `--partitions`
+more time, see `docs/STATUS.md`), `--trellis 0|1` turns on rate-distortion
+level selection on the luma residual (priced by the CABAC coder; off by default
+because it measured as a wash on residual-heavy content and a 3-point loss on
+skip-heavy content, see *Rate-distortion level selection* in `docs/STATUS.md`),
+`--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the
 default), `--dump-recon` writes what the encoder itself
