@@ -3666,10 +3666,63 @@ static void me_seed_frame(struct aeg_encoder *e)
  * over a reference that may be a whole anchor interval away, and the average of
  * the two is what the residual is computed against.
  */
+static int bidir_on(const struct aeg_encoder *e)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_BIDIR");
+        v = ev ? atoi(ev) : -1;
+    }
+    return v >= 0 ? v : e->p.preset >= 3;
+}
+
+static void bidir_refine(struct aeg_encoder *e, int mbx, int mby,
+                         const int pmv[2][2], int mv[2][2])
+{
+    static const int8_t offs[8][2] = {
+        {-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
+    };
+    static const int geo[4] = { 0, 0, 16, 16 };
+    const int range4 = (e->p.search_range ? e->p.search_range : 16) * 4;
+    const int lam = e->me_lambda;
+    int best, it, moved = 1;
+
+    best = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1], mv[1][0],
+                          mv[1][1]) +
+           lam * (aeg_mvd_bits(mv[0][0] - pmv[0][0], mv[0][1] - pmv[0][1]) +
+                  aeg_mvd_bits(mv[1][0] - pmv[1][0], mv[1][1] - pmv[1][1]));
+    for (it = 0; it < 4 && moved; it++) {
+        int l;
+        moved = 0;
+        for (l = 1; l >= 0; l--) {
+            int k, bx = mv[l][0], by = mv[l][1];
+            for (k = 0; k < 8; k++) {
+                int t[2][2] = { { mv[0][0], mv[0][1] }, { mv[1][0], mv[1][1] } };
+                int c;
+                t[l][0] = bx + offs[k][0];
+                t[l][1] = by + offs[k][1];
+                if (t[l][0] < -range4 || t[l][0] > range4 ||
+                    t[l][1] < -range4 || t[l][1] > range4)
+                    continue;
+                c = b_part_satd_bi(e, mbx, mby, geo, t[0][0], t[0][1],
+                                   t[1][0], t[1][1]) +
+                    lam * (aeg_mvd_bits(t[0][0] - pmv[0][0], t[0][1] - pmv[0][1]) +
+                           aeg_mvd_bits(t[1][0] - pmv[1][0], t[1][1] - pmv[1][1]));
+                if (c < best) {
+                    best = c;
+                    mv[l][0] = t[l][0];
+                    mv[l][1] = t[l][1];
+                    moved = 1;
+                }
+            }
+        }
+    }
+}
+
 static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
-    int pmv[2][2], mv[2][2], sad[2], list, b;
+    int pmv[2][2], mv[2][2], mvbi[2][2], sad[2], list, b;
     int range = e->p.search_range ? e->p.search_range : 16;
 
     b_mv_predict(e, mbx, mby, 0, &pmv[0][0], &pmv[0][1]);
@@ -3719,19 +3772,33 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
     e->mb_frac1[0] = mv[1][0] & 3;
     e->mb_frac1[1] = mv[1][1] & 3;
 
+    /* The bi-predictive vectors: each list's own winner is the best
+     * predictor *alone*, not the best half of an average.  Refine them
+     * jointly (x264's bidir refinement): one list's vector held, the other
+     * walks its quarter-pel neighbours on the SATD of the average plus the
+     * rate of the vector that moves, alternating until neither moves. */
+    {
+        int bi[2][2] = { { mv[0][0], mv[0][1] }, { mv[1][0], mv[1][1] } };
+        if (bidir_on(e))
+            bidir_refine(e, mbx, mby, pmv, bi);
+        mvbi[0][0] = bi[0][0]; mvbi[0][1] = bi[0][1];
+        mvbi[1][0] = bi[1][0]; mvbi[1][1] = bi[1][1];
+    }
     /* list 0, list 1, and both */
     for (list = 0; list < 3; list++) {
         mbcand *cd = &e->mb_cand[e->mb_ncand];
+        const int (*vv)[2] = list == 2 ? (const int (*)[2])mvbi
+                                       : (const int (*)[2])mv;
         memset(cd, 0, sizeof(*cd));
         cd->type = list == 0 ? AEG_MB_B_L0 : (list == 1 ? AEG_MB_B_L1
                                                         : AEG_MB_B_BI);
         cd->nparts = 1;
         cd->blist[0] = (uint8_t)(list == 0 ? 1 : (list == 1 ? 2 : 3));
         for (b = 0; b < 16; b++) {
-            cd->mv[b][0] = (int16_t)mv[0][0];
-            cd->mv[b][1] = (int16_t)mv[0][1];
-            cd->mv1[b][0] = (int16_t)mv[1][0];
-            cd->mv1[b][1] = (int16_t)mv[1][1];
+            cd->mv[b][0] = (int16_t)vv[0][0];
+            cd->mv[b][1] = (int16_t)vv[0][1];
+            cd->mv1[b][0] = (int16_t)vv[1][0];
+            cd->mv1[b][1] = (int16_t)vv[1][1];
         }
         cd->pmv[0][0] = (int16_t)pmv[0][0];
         cd->pmv[0][1] = (int16_t)pmv[0][1];
@@ -7411,6 +7478,18 @@ done:
                 e->wp.chroma_denom);
 }
 
+static int chroma_me_on(const struct aeg_encoder *e)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_CHROMAME");
+        v = ev ? atoi(ev) : -1;
+    }
+    /* measured -0.02 % for +18 % time (docs/STATUS.md): off by default */
+    (void)e;
+    return v > 0;
+}
+
 static int bref_qp_num(void)
 {
     static int v = -1;
@@ -7584,6 +7663,21 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
             if (e->cur_is_b || e->cur_l0_active > 1)
                 aeg_mc_ctx_refresh(&e->mc1, e->ref2p[0], e->w, e->h);
+        }
+        {
+            /* chroma in the quarter-pel cost (x264's chroma-me) */
+            int on = chroma_me_on(e), l;
+            for (l = 0; l < 2; l++) {
+                aeg_mc_ctx *ctx = l ? &e->mc1 : &e->mc;
+                uint8_t **rp = l ? e->ref2p : e->refp;
+                ctx->chroma = on && rp[1] != NULL;
+                ctx->cref[0] = rp[1];
+                ctx->cref[1] = rp[2];
+                ctx->cur_y = e->srcp[0];
+                ctx->cur_c[0] = e->srcp[1];
+                ctx->cur_c[1] = e->srcp[2];
+                ctx->cstride = e->stride[1];
+            }
         }
         aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,
                             e->d.use_gpu[AEG_STAGE_INTER_PRED] &&

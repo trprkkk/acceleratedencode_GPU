@@ -123,6 +123,7 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     mc->buf = aeg_alloc(3 * (size_t)stride * rows);
     mc->base[0] = NULL;
     mc->ready = 0;
+    mc->chroma = 0;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
                                 (size_t)AEG_PAD * stride + AEG_PAD
@@ -486,6 +487,28 @@ static int me_try_pmv(void)
     return v;
 }
 
+/* SATD of both chroma planes of the block at `cur` (luma) predicted with the
+ * quarter-pel luma vector (nx, ny), i.e. an eighth-pel chroma vector. */
+static int me_chroma_satd(const aeg_mc_ctx *mc, const uint8_t *cur,
+                          int rstride, int bw, int bh, int nx, int ny)
+{
+    ptrdiff_t off = cur - mc->cur_y;
+    int y = (int)(off / rstride), x = (int)(off - (ptrdiff_t)y * rstride);
+    int cw = bw >> 1, ch = bh >> 1, pl, d = 0;
+    uint8_t buf[8 * 8];
+
+    for (pl = 0; pl < 2; pl++) {
+        const uint8_t *src = mc->cref[pl] +
+                             ((y >> 1) + (ny >> 3)) * mc->cstride +
+                             (x >> 1) + (nx >> 3);
+        aeg_mc_chroma(buf, 8, src, mc->cstride, cw, ch, nx & 7, ny & 7);
+        d += aeg_satd(cw, ch, buf, 8,
+                      mc->cur_c[pl] + (y >> 1) * mc->cstride + (x >> 1),
+                      mc->cstride);
+    }
+    return d;
+}
+
 /* subpel refinement: quarter-pel, SATD (+ lambda * mvd bits) driven */
 static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                          int cstride, int bw, int bh, int range,
@@ -505,8 +528,12 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
      * interpolation, so evaluate it once here and skip the centre from then on:
      * it can never improve on itself, and it is 1 of the 9 candidates of every
      * step of every pass. */
+    const int cme = mc && mc->chroma && bw >= 8 && bh >= 8 && cstride == rstride;
+
     bd = aeg_satd(bw, bh, cur, cstride,
                   ref + (cy >> 2) * rstride + (cx >> 2), rstride);
+    if (cme)
+        bd += me_chroma_satd(mc, cur, rstride, bw, bh, cx, cy);
     best = bd + me_mv_cost(rt, cx, cy);
     /* The predictor itself, at its own fractional position: it costs no mvd
      * bits at all, and the integer search can only reach its rounded
@@ -524,6 +551,8 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                 aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
                             bh, nx & 3, ny & 3);
             d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+            if (cme)
+                d += me_chroma_satd(mc, cur, rstride, bw, bh, nx, ny);
             cost = d + me_mv_cost(rt, nx, ny);
             if (cost < best) {
                 best = cost; bd = d; bx = cx = nx; by = cy = ny;
@@ -555,6 +584,8 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                     aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
                                 bh, nx & 3, ny & 3);
                 d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+                if (cme)
+                    d += me_chroma_satd(mc, cur, rstride, bw, bh, nx, ny);
                 cost = d + me_mv_cost(rt, nx, ny);
                 if (cost < best) { best = cost; bd = d; bx = nx; by = ny; improved = 1; }
             }

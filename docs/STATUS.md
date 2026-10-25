@@ -1605,6 +1605,21 @@ frame_num wrap) in CQP and ABR+VBV.  Conformance cases `bpyr_off`,
 `bpyr_two`, `bpyr_adapt`; the fixed-structure order checks run with
 `--b-pyramid 0` (their expected order is the flat one).
 
+**Joint refinement of the bi-predictive vectors** (`AEG_BIDIR`, preset 3
+up): the B_Bi_16x16 candidate used each list's own winner, which is the best
+predictor alone, not the best half of an average.  bidir_refine() holds one
+list's vector and walks the other's eight quarter-pel neighbours on the SATD
+of the average plus the rate of both vectors, alternating (at most four
+rounds) until neither moves (x264 does the same).  Ours against ours: cock
+-0.30, vtest -0.02, mega -0.25, short -0.14, tree +0.02, mean -0.14% for
++1.8% time.
+
+**Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
+the SATD of both chroma planes added to the luma SATD at every quarter-pel
+candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
+(x264 values it at 0.16 points, but our RD refinement of the vectors
+already prices the chroma residual).
+
 x264 feature values measured the same way (global PSNR, BD of ours against
 x264 with the feature off, minus the baseline +0.40): weightb 0.11,
 chroma-me 0.16, b-pyramid 0.46, ref 3 -> 1 0.70.  On cock alone: P only

@@ -443,6 +443,14 @@ typedef struct aeg_mc_ctx {
     uint8_t       *buf;
     int            stride;
     int            ready;
+    /* Chroma in the sub-pel cost (x264's chroma-me): when `chroma` is set,
+     * the quarter-pel refinement adds the SATD of both chroma planes,
+     * predicted from cref[] against cur_c[], to the luma SATD.  cur_y is the
+     * current picture's luma origin, from which a block's position is read
+     * back (same stride as the reference). */
+    int            chroma;
+    const uint8_t *cref[2], *cur_y, *cur_c[2];
+    int            cstride;
 } aeg_mc_ctx;
 
 void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride);
