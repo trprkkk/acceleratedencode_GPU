@@ -592,7 +592,7 @@ hardware.
 
 ```sh
 make -j2
-FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 65 clip cases
+FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 66 clip cases
 ```
 
 `make test` runs seven things:
@@ -639,7 +639,7 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 65 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — sixty-five cases (QP 12/23/26/40, presets 0-4,
+7. `tests/run_tests.sh` — sixty-six cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -648,10 +648,10 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 65 clip cases
    P_Skip runs at two QPs, and level selection on both transforms, through the
    slice threads and through the batched coefficient path, the vector
    refinement of both a 16x16 and a 16x8 winner -- all of them with the 8x8
-   transform and CABAC enabled, which are the defaults; ten of them with B
+   transform and CABAC enabled, which are the defaults; eleven of them with B
    pictures, one, two and three between two anchors, at QP 12 and 51, on a
-   still clip, with a short GOP, without deblocking, without the 8x8 transform
-   and under the rate controller)
+   still clip, with a short GOP, without deblocking, without the 8x8 transform,
+   under the rate controller, and the last one with B_8x8 at preset 3)
    encoded, decoded with ffmpeg and compared **frame by frame**, then an ABR
    accuracy check: the encoder's `--dump-recon` must be bit-identical to the decoder's
    output.  Any mismatch fails the script; a decoder that logs an error also
@@ -683,9 +683,10 @@ index.  A B picture whose direct derivation is wrong reconstructs a different
 picture *without* breaking the syntax, so this re-ordering is the only thing in
 the suite that sees the four B bugs listed below.
 
-The ten B cases run the default partition mask, so they exercise the
-partitioned B types as well: at QP 24 on the panning clip the type breakdown
-reports ten `B16x8` macroblocks, and the two-quadrant clip selects `B8x16`.
+The B cases run the default partition mask, so they exercise the partitioned
+B types as well: at QP 24 on the panning clip the type breakdown reports
+`B16x8`, `B8x16` and `B_8x8` macroblocks, and the two-quadrant clip selects
+`B8x16`.
 That is how the neighbour-mask bug in *The partitioned types* was narrowed down
 -- the first differing picture was an anchor, not a B one, so the partitioning
 in the B picture was working and the failure came from the *P* path using the
@@ -700,6 +701,25 @@ partition: the refinement moves one partition's vector, which changes the
 decoder derives.  That is a real bug in the P path, not in the comparison --
 `--partitions 1` with the refinement is bit-exact, `--partitions 5` (which adds
 8x16) is not -- and it is the next thing to fix in the quality work.
+
+The same refinement is also why preset 3 fails at `--partitions 3/5/15` with B
+pictures: `-p 3` sets `--refine-mv 1`, so a B case at that preset has to be run
+with `--refine-mv 0` before its failure means anything about the B layer.  With
+the refinement off, preset 3 decodes bit-exactly for `--bframes` 1/2/3, QP
+12/24/37 and every `--partitions` value, which is how B_8x8 was verified.
+
+One more pre-existing failure is *not* in the gate because it takes a
+combination the suite does not use: `--bframes 3 -q 24 -p 2 --partitions 5` (or
+`13`) on the panning clip desynchronises 66 666 samples, and `ed0801f`
+reproduces it exactly -- it is not a B_8x8 regression either.  `--no-deblock`
+*or* `--no-8x8dct` makes it bit-exact, so the syntax and the reconstruction are
+right and only the *deblocking model* disagrees with the decoder about a B 8x16
+macroblock inside a three-B group: either the per-block list mask the decision
+pass publishes or the per-block vector the filter reads is not what the decoder
+has cached.  It wants the same treatment as the two B_8x8 publish bugs above --
+compare `aeg_mb_block_lists()` and `mv[]`/`mv1[]` block by block against a
+decoder's cache -- and the new `bframes_8x8` case stays at `--partitions 1` so
+that it is a test of the B_8x8 layer and not of this.
 
 With a GPU present, `tools/gpu_validate.sh clip.yuv W H FRAMES QP` runs the same
 comparison over every device code path at once (CPU stream against dispatcher
@@ -902,9 +922,9 @@ group's remaining pictures can only be coded as P pictures because their
 anchor never arrives.  B macroblocks are `B_Direct_16x16`, `B_L0_16x16`,
 `B_L1_16x16`, `B_Bi_16x16` and the two partitioned shapes `B_16x8` and
 `B_8x16`, whose partitions pick their lists independently (codes 4-21, see
-*The partitioned types* below); the bi-predictive average is
-`(a + b + 1) >> 1`, rounded once on the interpolated samples.  `B_8x8` is the
-one shape still missing.
+*The partitioned types* below), and `B_8x8` (code 22, see *B_8x8* below); the
+bi-predictive average is `(a + b + 1) >> 1`, rounded once on the interpolated
+samples.  That is the whole B macroblock layer.
 
 Four bugs stood between "it writes plausible B slices" and "the decoder
 reconstructs the same picture", and all four were *syntax*-level in the sense
@@ -994,8 +1014,77 @@ left neighbour at (-36, -24).  With the P types mapped to list 0 in the mask,
 `--partitions 1 3 5 7 15` are all bit-exact with one, two and three B pictures,
 at every QP and every preset, with slices, and on the 64x64 clip.
 
-`B_8x8` (code 22, sub-types 0-12, contexts 36-39) is not implemented; it is
-next.
+### B_8x8
+
+The last B macroblock shape is code 22 plus one `sub_mb_type` per 8x8 group,
+read through contexts 36-39.  Thirteen sub-types, and the tree is not shaped
+the way the numbering suggests: after "is it direct" (36) and "is it one of the
+two 8x8 list predictions" (37) the third bin (38) separates the 4x4 values
+(11, 12) from everything else, and the fourth (39) then splits *the bi 8x8 and
+the 8x4 values* (3-6) from the 4x8 ones (7-10) -- so `code_b_sub_mb_type()`
+carries a comment about each branch, because the numbering that comes out is
+0, 1/2, 3, 4-10, 11/12 rather than anything monotone.
+
+Only the four 8x8 sub-types (direct, L0, L1, both) are *searched*.  The 8x4,
+4x8 and 4x4 splits would triple the work for a shape whose value a B picture
+has already spent: the two lists absorb most of the freedom an extra split
+would buy, and the splits only matter where the two references disagree inside
+8x8, which the 16x8/8x16 shapes already cover.  The writer emits all thirteen
+values, so adding them later is a search change and not a syntax change.
+
+Each group picks its own prediction out of direct, list 0, list 1 and both, and
+the groups are searched in raster order so that a following group's predictor
+sees the vectors already decided (the same per-list cache the partitioned
+shapes use).  A group coded as `B_Direct_8x8` sends no mvd at all, which is why
+`mb_part_sends_mvd()` exists and why `cabac_mb_mvd()` still publishes the zeros
+in the per-block table: the *next* macroblock builds its contexts from it.
+
+**It measured neutral, and that is why it is behind the preset.**  With
+`--bframes 3 --bqp 12` on five clips at six QPs, enabling B_8x8 moves the
+BD-rate by -0.01, -0.10, -0.01, -0.00 and -0.07 points -- i.e. nothing -- while
+costing about a tenth of the encode time (eight extra integer searches per B
+macroblock) and only eight of 14 400 macroblocks select it.  It is therefore
+enabled from *preset 3*, where the encoder is already spending its time on
+refinement, and the gate has a case of its own (`bframes_8x8`, preset 3 with
+the P partitions held at 16x16 so that the case is about the B macroblock layer
+rather than about the pre-existing `--refine-mv` bug).
+
+**The two bugs it cost were both in what the encoder publishes, not in the
+syntax.**  The first was the copy the decision pass makes into the `aeg_mb` grid
+that the deblocking filter and the following macroblocks read: it had been
+written for the partitioned shapes and moved `blist[0..1]` only, so the bottom
+half of every B_8x8 was published with "no list", which
+`aeg_mb_block_lists()`'s fallback then read as *both* lists.  Ten samples of one
+frame differed and `--no-deblock` was bit-exact: the filter alone disagreed
+about the boundary strength of two 8x8 groups.  A ten-sample mismatch with a
+maximum difference of 2 is what a boundary-strength disagreement looks like; a
+motion vector or residual error moves whole blocks by much more.
+
+The second was the per-list motion-vector cache a B_8x8 builds across its own
+four groups, and it is the more interesting one because the *state* it was
+missing is a third state.  `predict_mv_at()` takes the vectors of the groups
+already coded in this macroblock from `cur[]`, with an `avail[]` flag saying
+which of them the decoder has filled in yet.  That flag was a bit per list,
+and `avail = 0` meant "not decoded yet" -- but a group that is coded and simply
+does not predict from this list (an 8x8 group coded list 0 only, asked about
+list 1) is *also* zero in that table, and the two are not the same thing to the
+decoder: the first is `PART_NOT_AVAILABLE` and is skipped by both the fallback
+rule of 8.4.1.3.1 and the median, while the second is `LIST_NOT_USED`, which
+counts as available and contributes its zero vector.  So as soon as a group was
+coded from one list and the next group was searched for the other, our predictor
+came from a different neighbour set than the decoder's and the mvd no longer
+matched -- 528 wrong samples, maximum 48, on the first B_8x8 that mixed its
+lists.  `avail[]` is now a three-state field (`AEG_MVBLK_AVAIL` /
+`AEG_MVBLK_NOTUSED` / `AEG_MVBLK_UNAVAIL`) and `nb_from_cur()` maps it to the
+predictor's `NB_OK` / `NB_NOTUSED` / `NB_UNAVAIL`.  The lesson generalises: any
+per-block table shared with the decoder needs the decoder's *three* cache states,
+not a boolean, and "coded but not from this list" is the one that gets lost.
+
+Verification: 135/135 decode cases bit-exact at preset 3 with `--refine-mv 0`
+(three clips x `--bframes` 1/2/3 x QP 12/24/37 x `--partitions` 1/3/5/9/15),
+which is the matrix that isolates B_8x8 from the pre-existing refinement bug of
+*Next* item 2 -- preset 3 turns that refinement on, so a preset-3 case at
+`--partitions 3/5/15` fails for B_8x8-unrelated reasons at `ed0801f` too.
 
 ### Making them pay
 
@@ -1123,15 +1212,17 @@ full B macroblock layer.
 
 ## Next
 
-1. `B_8x8`, the last B macroblock shape.  Code 22 with four sub-macroblock
-   types out of thirteen (`B_Direct_8x8`, `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8` and
-   the 8x4/4x8/4x4 splits of each), the sub-type read through contexts 36-39,
-   `direct_8x8_inference_flag` already 1 in the SPS, and a per-sub-partition
-   list mask so that the deblocking filter keeps working.  It is the last thing
-   between this encoder and a complete B macroblock layer.  Spatial direct is
-   deliberately *not* on the list: it makes every direct macroblock depend on
-   its neighbours' vectors, so an encoder/decoder disagreement corrupts the
-   picture instead of costing a few bits.
+1. The B *search*, now that the macroblock layer is complete.  Every B
+   candidate is priced from SATD plus a fixed eight bits per mvd symbol: the
+   16x16 candidates, the partitioned shapes' lists and B_8x8's sub-types.  The
+   measured consequence is that B_8x8 adds nothing (see *B_8x8*) -- the shape is
+   there, the *decision* that would use it is not.  Pricing each candidate with
+   the coder's own model, the way the P_8x8 shape decision prices its
+   sub_mb_types against P_8x8's own RD pass, is the next step; and the 8x4/4x8/
+   4x4 sub-types become worth searching once the decision can see them.  Spatial
+   direct is deliberately *not* on the list: it makes every direct macroblock
+   depend on its neighbours' vectors, so an encoder/decoder disagreement
+   corrupts the picture instead of costing a few bits.
 2. The motion-vector refinement desynchronises a partitioned macroblock.  Six
    cases in the gate fail because of it (`--refine-mv` together with 8x16 or
    P_8x8: `--partitions 1` is clean, `--partitions 5` is not), which is
@@ -1146,7 +1237,11 @@ full B macroblock layer.
    against, with the `AEG_MBDBG` listing and an instrumented decoder as in bug
    27.  Until then the refinement stays where it was: on presets 3 and 4, which
    is where it already was, and the six failures are pre-existing, not a
-   regression.
+   regression.  A separate, smaller correctness debt sits next to it: the
+   *deblocking model* is wrong for one B 8x16 combination
+   (`--bframes 3 --partitions 5`, end of *Verification*), which is a publish/
+   read mismatch rather than a search problem and should be fixed with the same
+   per-block comparison the B_8x8 bugs used.
 3. Quality/RD, the parts that are left.  Level selection is implemented and
    measured (*Rate-distortion level selection*): priced by the coder, exact
    distortion, worth 1.5-2.8 points on the clips with the most residual and

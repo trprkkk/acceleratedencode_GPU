@@ -124,7 +124,8 @@ static inline int is_b(const aeg_mb *m)
 {
     return m->type == AEG_MB_B_DIRECT || m->type == AEG_MB_B_L0 ||
            m->type == AEG_MB_B_L1 || m->type == AEG_MB_B_BI ||
-           m->type == AEG_MB_B16x8 || m->type == AEG_MB_B8x16;
+           m->type == AEG_MB_B16x8 || m->type == AEG_MB_B8x16 ||
+           m->type == AEG_MB_B_8x8;
 }
 
 /* Index of the 8x8 group that holds 4x4 block `blk` (raster order). */

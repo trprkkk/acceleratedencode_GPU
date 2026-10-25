@@ -59,6 +59,10 @@ enum {
      * every combination. */
     AEG_MB_B16x8,
     AEG_MB_B8x16,
+    /* B_8x8: four 8x8 sub-macroblock partitions, each with its own lists and
+     * (in the standard) its own split into 8x4/4x8/4x4.  Only the four 8x8
+     * sub-types are coded so far. */
+    AEG_MB_B_8x8,
     AEG_MB_TYPE_COUNT          /* number of entries above, for the statistics */
 };
 
@@ -141,7 +145,7 @@ typedef struct aeg_mb {
      * decoder derives them, so its mv/mv1 hold what *it* derives (that is what
      * the encoder has to reconstruct with) and its mask is 3. */
     int16_t  mv1[16][2];
-    uint8_t  blist[2];
+    uint8_t  blist[4];
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     uint8_t  skip;            /* P slice: coded as a skip run / flag      */
@@ -172,6 +176,10 @@ static inline int aeg_mb_block_lists(const aeg_mb *m, int blk)
     case AEG_MB_B_BI:     return 3;
     case AEG_MB_B16x8:    p = (blk >> 2) >= 2; break;   /* bottom half */
     case AEG_MB_B8x16:    p = (blk & 3) >= 2;  break;   /* right half  */
+    /* B_8x8: one mask per 8x8 group, and every sub-partition of a group uses
+     * the group's lists, so the group index is all a block needs. */
+    case AEG_MB_B_8x8:    p = (((blk >> 2) >= 2) << 1) + ((blk & 3) >= 2);
+                          break;
     /* Every P macroblock predicts from list 0 only, at every block. */
     case AEG_MB_SKIP:
     case AEG_MB_P16x16:

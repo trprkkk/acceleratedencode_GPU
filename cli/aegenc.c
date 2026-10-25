@@ -529,11 +529,11 @@ int main(int argc, char **argv)
             /* the stream's rate is a property of the file and the frame rate,
              * not of how fast this machine happened to encode it */
             if (st.macroblocks > 0) {
-                static const char *const names[15] = {
+                static const char *const names[16] = {
                     "skip", "P16x16", "P16x8", "P8x16", "P_8x8",
                     "I4x4", "I16x16", "I_PCM", "I8x8",
                     "B_direct", "B_L0", "B_L1", "B_BI",
-                    "B16x8", "B8x16"
+                    "B16x8", "B8x16", "B_8x8"
                 };
                 int k;
                 printf("macroblock types: %" PRId64 " skip of %" PRId64
@@ -542,7 +542,7 @@ int main(int argc, char **argv)
                        100.0 * (double)st.skipped / (double)st.macroblocks,
                        st.macroblocks - st.skipped);
                 printf("  breakdown:");
-                for (k = 0; k < 15; k++)
+                for (k = 0; k < 16; k++)
                     if (st.mb_types[k])
                         printf(" %s %" PRId64, names[k], st.mb_types[k]);
                 printf("\n");

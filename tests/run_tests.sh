@@ -291,6 +291,11 @@ run_bcase bframes_q8x8  320 192 10 1 1 -q 24 --scenecut 0 --no-8x8dct
 #   B picture is coded coarser than the anchors around it: the mb_qp_delta that
 #   follows has to survive both, which is what this case is for
 run_bcase bframes_abr   320 192 12 2 1 -q 24 --scenecut 0 --bitrate 300
+#   B_8x8: four 8x8 groups, each picking direct / list 0 / list 1 / both.  It
+#   follows the preset (3 and up), not the partition mask, so the mask here
+#   keeps the P pictures at 16x16 -- the point of the case is the B macroblock
+#   layer, including the sub_mb_type tree and the per-group mvd suppression
+run_bcase bframes_8x8   320 192 12 2 4 -q 24 --scenecut 0 -p 3 --partitions 1
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in

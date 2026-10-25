@@ -10,13 +10,14 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > **Status: conformant High-profile encoder core (I, P and B pictures,
 > Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
 > 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, the same
-> shapes in B pictures with a per-partition choice of list, P_Skip, temporal
-> direct mode and bi-prediction), quality work in progress.**
+> shapes in B pictures with a per-partition choice of list, `B_8x8`, P_Skip,
+> temporal direct mode and bi-prediction -- the complete B macroblock layer),
+> quality work in progress.**
 > The bitstream decodes correctly: an independent decoder (FFmpeg 7.0.2)
 > reproduces the encoder's reconstruction **exactly** (max abs diff 0, on every
 > frame, not just the IDR) on 16x16 – 320x208 content, QP 10–51, presets 0–4,
 > every partition mask, `-g 1` and `-g 3`, with and without deblocking.
-> `make test` asserts it over 65 clip cases (ten of them B pictures, compared
+> `make test` asserts it over 66 clip cases (eleven of them B pictures, compared
 > after undoing the coding-order permutation), two CABAC round-trips, a
 > 200 000-block coefficient cross-check and the device kernels, and *fails* on
 > any mismatch (six preset-4 cases with the motion-vector refinement are the one
@@ -27,10 +28,10 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > default preset (`medium`: B pictures, CABAC, 8x8 transform, trellis
 > quantisation, AQ, SIMD) the encoder now spends 10.3–21.9 % **fewer** bits on four
 > of the five test clips and 4.4 % more on the fifth, where P-only coding was
-> 9.6–27.8 % *more* on four of them.  What is left of the gap is the shape of a B
-> macroblock (`B_8x8` is the one type still missing) and the search
-> (partition shapes and sub-pel vectors chosen by SATD rather than by the
-> coder's price).  Level selection priced by the coder is implemented and
+> 9.6–27.8 % *more* on four of them.  What is left of the gap is the *search*
+> rather than the syntax (partition shapes, per-partition lists and sub-pel
+> vectors are chosen by SATD rather than by the coder's price; `B_8x8` measured
+> neutral for exactly that reason and is enabled from preset 3).  Level selection priced by the coder is implemented and
 > measured, and stays off by default: it is worth 1.5–2.8 % BD-rate on the
 > clips with the most residual and 0.1–2 % on the others, for 19–40 % more
 > time.  Speed is the

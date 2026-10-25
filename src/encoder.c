@@ -37,7 +37,7 @@ typedef struct mbenc {
      * lists predict it (1 = list 0, 2 = list 1, 3 = both). */
     int16_t  mv1[16][2];
     int16_t  pmv1[16][2];
-    uint8_t  blist[2];
+    uint8_t  blist[4];              /* lists per partition (B_8x8: per 8x8) */
     int      type;                  /* AEG_MB_*                             */
     int      i16_mode;              /* 0=V 1=H 2=DC 3=Plane                 */
     uint8_t  intra4[16];            /* Intra_4x4 modes, Figure 6-8 order    */
@@ -62,10 +62,12 @@ typedef struct mbenc {
 /* One inter partitioning candidate gathered by analyse_mb(): the shape, its
  * sub_macroblock types and, per 4x4 block, the motion vector, plus the
  * predictor of every partition (indexed by its first 4x4 block). */
-/* P candidates per macroblock: the searched P16x16, the skip vector, and the
- * three partitioned types (16x8, 8x16, P_8x8).  The batched RD path stores one
- * residual per candidate, so this is also its array bound. */
-#define AEG_MB_CAND_MAX 6
+/* Candidates per macroblock: a P picture has the searched P16x16, the skip
+ * vector and the three partitioned types (16x8, 8x16, P_8x8); a B picture has
+ * the three 16x16 list choices, the two partitioned shapes, B_8x8 and direct.
+ * The batched RD path stores one residual per candidate, so this is also its
+ * array bound -- seven for the B list. */
+#define AEG_MB_CAND_MAX 7
 
 /* Upper bound on the slices a picture may be cut into.  Slice threads use one
  * thread per slice, so this also bounds the thread count. */
@@ -83,7 +85,7 @@ typedef struct {
     int     mv1[16][2];
     int     pmv[16][2];
     int     pmv1[16][2];
-    uint8_t blist[2];
+    uint8_t blist[4];
 } mbcand;
 
 struct aeg_encoder {
@@ -363,18 +365,20 @@ enum { AEG_SLICE_I = 0, AEG_SLICE_P = 1, AEG_SLICE_B = 2 };
 static int is_b_type(int t)
 {
     return t == AEG_MB_B_DIRECT || t == AEG_MB_B_L0 || t == AEG_MB_B_L1 ||
-           t == AEG_MB_B_BI || t == AEG_MB_B16x8 || t == AEG_MB_B8x16;
+           t == AEG_MB_B_BI || t == AEG_MB_B16x8 || t == AEG_MB_B8x16 ||
+           t == AEG_MB_B_8x8;
 }
 
 /* The lists macroblock `m` predicts from, as a mask (1 = list 0, 2 = list 1). */
-static int mb_lists(int type, const uint8_t blist[2])
+static int mb_lists(int type, const uint8_t blist[4])
 {
     if (is_intra_type(type))
         return 0;
     if (!is_b_type(type))
         return 1;                      /* a P macroblock only has list 0 */
     {
-        int m = blist[0] | blist[1];
+        int m = blist[0] | blist[1] |
+                ((type == AEG_MB_B_8x8) ? (blist[2] | blist[3]) : 0);
         return m ? m : 3;
     }
 }
@@ -382,7 +386,7 @@ static int mb_lists(int type, const uint8_t blist[2])
 /* Number of partitions of an inter macroblock type. */
 static int part_count(int type)
 {
-    if (type == AEG_MB_P8x8)
+    if (type == AEG_MB_P8x8 || type == AEG_MB_B_8x8)
         return 4;
     return (type == AEG_MB_P16x8 || type == AEG_MB_P8x16 ||
             type == AEG_MB_B16x8 || type == AEG_MB_B8x16) ? 2 : 1;
@@ -404,6 +408,7 @@ static void part_geom(int type, int p, int geo[4], int *blk0)
         *blk0 = p ? 2 : 0;
         break;
     case AEG_MB_P8x8:
+    case AEG_MB_B_8x8:
         /* Four 8x8 sub-macroblock partitions, coded in raster order; their
          * first 4x4 blocks are 0, 2, 8 and 10. */
         geo[0] = (p & 1) ? 8 : 0; geo[1] = (p & 2) ? 8 : 0;
@@ -420,6 +425,23 @@ static void part_geom(int type, int p, int geo[4], int *blk0)
 /* Sub-partitions of an 8x8 sub-macroblock partition type: 8x8 has one, 8x4 and
  * 4x8 have two, 4x4 has four (H.264 table 7-17). */
 static const uint8_t sub_cnt[4] = { 1, 2, 2, 4 };
+
+/* B_8x8 sub_mb_type (table 7-14): one entry per value of the CABAC tree, in
+ * the order the tree numbers them.  0 is B_Direct_8x8, which derives both
+ * vectors from the co-located picture and sends no mvd; 1/2 are the 8x8 list 0
+ * and list 1 predictions, 3 the bi-predictive one; 4..12 are the same three
+ * lists crossed with the 8x4, 4x8 and 4x4 splits.  The partition geometry is
+ * `sub_geom()` of the shape each entry names. */
+static const uint8_t b_sub_shape[13]  = { 0, 0, 0, 0, 1, 2, 1, 2, 1, 2, 3, 3, 3 };
+static const uint8_t b_sub_lists[13]  = { 3, 1, 2, 3, 1, 1, 2, 2, 3, 3, 1, 2, 3 };
+static const uint8_t b_sub_cnt[13]    = { 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 4, 4 };
+static const uint8_t b_sub_direct[13] = { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+/* The 8x8 group that holds 4x4 block `b0` (raster order). */
+static int b8_group(int b0)
+{
+    return (((b0 >> 2) >= 2) << 1) + ((b0 & 3) >= 2);
+}
 
 /* Geometry of sub-partition `k` of an 8x8 sub-macroblock partition of type `st`
  * whose top-left 4x4 block is (bx, by): x, y, w, h in pixels inside the
@@ -444,24 +466,28 @@ static void sub_geom(int st, int bx, int by, int k, int geo[4], int *b0)
 static int mb_part_count(const mbenc *c)
 {
     int i, n = 0;
-    if (c->type != AEG_MB_P8x8)
+    if (c->type != AEG_MB_P8x8 && c->type != AEG_MB_B_8x8)
         return part_count(c->type);
     for (i = 0; i < 4; i++)
-        n += sub_cnt[c->sub_type[i]];
+        n += (c->type == AEG_MB_B_8x8) ? b_sub_cnt[c->sub_type[i]]
+                                       : sub_cnt[c->sub_type[i]];
     return n;
 }
 
 static void mb_part_geom(const mbenc *c, int p, int geo[4], int *b0)
 {
+    const int b8 = c->type == AEG_MB_B_8x8;
     int i;
-    if (c->type != AEG_MB_P8x8) {
+    if (c->type != AEG_MB_P8x8 && !b8) {
         part_geom(c->type, p, geo, b0);
         return;
     }
     for (i = 0; i < 4 && p >= 0; i++) {
-        int n = sub_cnt[c->sub_type[i]];
+        int st = c->sub_type[i];
+        int n = b8 ? b_sub_cnt[st] : sub_cnt[st];
         if (p < n) {
-            sub_geom(c->sub_type[i], (i & 1) * 2, (i >> 1) * 2, p, geo, b0);
+            sub_geom(b8 ? b_sub_shape[st] : st, (i & 1) * 2, (i >> 1) * 2, p,
+                     geo, b0);
             return;
         }
         p -= n;
@@ -1546,11 +1572,38 @@ static void p_predict_typed(struct aeg_encoder *e, int mbx, int mby,
     }
 }
 
-/* Which lists predict each partition of a B macroblock. */
+/* Which lists predict each partition of a B macroblock.  The partitioned
+ * 16x8/8x16 shapes carry one mask per partition; B_8x8 carries one per 8x8
+ * group, and every sub-partition of a group uses the group's lists. */
 static int mb_part_lists(const mbenc *c, int p)
 {
-    int m = c->blist[p < 2 ? p : 1];
+    int m;
+
+    if (c->type == AEG_MB_B_8x8) {
+        int geo[4], b0;
+
+        mb_part_geom(c, p, geo, &b0);
+        m = c->blist[b8_group(b0)];
+    } else {
+        m = c->blist[p < 2 ? p : 1];
+    }
     return m ? m : 3;
+}
+
+/* Does partition `p` carry an mvd?  A B_8x8 group coded as B_Direct_8x8 does
+ * not -- the decoder derives its vectors from the co-located picture -- and
+ * neither does a whole B_Direct_16x16 macroblock. */
+static int mb_part_sends_mvd(const mbenc *c, int p)
+{
+    if (c->type == AEG_MB_B_DIRECT)
+        return 0;
+    if (c->type == AEG_MB_B_8x8) {
+        int geo[4], b0;
+
+        mb_part_geom(c, p, geo, &b0);
+        return !b_sub_direct[c->sub_type[b8_group(b0)]];
+    }
+    return 1;
 }
 
 /* Prediction of a B macroblock: per partition, the lists in `blist` are
@@ -1725,6 +1778,27 @@ static int mv_median3(int a, int b, int c)
  * the reference decoder (16x8 and 8x16 short-circuit to a single neighbour;
  * every other partition, including all the 8x8 sub-partitions, uses the plain
  * three-neighbour process). */
+/* Three states, because the decoder's motion-vector cache has three and they
+ * are not interchangeable: `AEG_MVBLK_AVAIL` is a decided vector,
+ * `AEG_MVBLK_NOTUSED` is a block that was coded but does not predict from this
+ * list (the decoder stores LIST_NOT_USED and a zero vector there), and
+ * anything else is PART_NOT_AVAILABLE -- a block the decoder has not reached
+ * yet.  The difference matters twice: a LIST_NOT_USED neighbour counts as
+ * "available" for the fallback branch of 8.4.1.3.1 and contributes its zero
+ * vector to the median, while PART_NOT_AVAILABLE does not; and the match count
+ * compares the reference index, so neither matches the current one. */
+enum { AEG_MVBLK_UNAVAIL = 0, AEG_MVBLK_AVAIL = 1, AEG_MVBLK_NOTUSED = 2 };
+
+static void nb_from_cur(nb_mv *n, const int16_t cur[16][2], int state, int b)
+{
+    if (state == AEG_MVBLK_NOTUSED)
+        nb_set(n, NB_NOTUSED, 0, 0);
+    else if (state == AEG_MVBLK_AVAIL)
+        nb_set(n, NB_OK, cur[b][0], cur[b][1]);
+    else
+        nb_set(n, NB_UNAVAIL, 0, 0);
+}
+
 static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
                           const int16_t cur[16][2], const uint8_t *avail,
                           int type, int p, int bx, int by, int pw, int list,
@@ -1733,6 +1807,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
     nb_mv A, B, C;
     int match;
 #define AVAIL(x, y) (avail[(y) * 4 + (x)])
+#define NB_CUR(n, x, y) nb_from_cur(&(n), cur, AVAIL(x, y), ((y) << 2) + (x))
 
     /* A B macroblock predicts each partition from one or both lists, but the
      * shape rules are the P ones: 16x8 and 8x16 short-circuit to a single
@@ -1741,14 +1816,12 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
         type = AEG_MB_P16x8;
     else if (type == AEG_MB_B8x16)
         type = AEG_MB_P8x16;
+    else if (type == AEG_MB_B_8x8)
+        type = AEG_MB_P8x8;
 
     /* A: the block left of the partition (inside this macroblock when bx > 0). */
     if (bx > 0) {
-        if (AVAIL(bx - 1, by))
-            nb_set(&A, NB_OK, cur[(by << 2) + bx - 1][0],
-                   cur[(by << 2) + bx - 1][1]);
-        else
-            nb_from_mb(&A, NULL, 0, list);
+        NB_CUR(A, bx - 1, by);
     } else if (mbx > 0) {
         nb_from_mb(&A, &e->mbs[mby * e->mb_w + mbx - 1], (by << 2) + 3, list);
     } else {
@@ -1757,11 +1830,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
 
     /* B: the block above the partition (inside this macroblock when by > 0). */
     if (by > 0) {
-        if (AVAIL(bx, by - 1))
-            nb_set(&B, NB_OK, cur[((by - 1) << 2) + bx][0],
-                   cur[((by - 1) << 2) + bx][1]);
-        else
-            nb_from_mb(&B, NULL, 0, list);
+        NB_CUR(B, bx, by - 1);
     } else if (mby > e->top_row) {
         nb_from_mb(&B, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx, list);
     } else {
@@ -1779,7 +1848,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
     {
         int cx = bx + pw, cy = by - 1;
         if (cy >= 0 && cx <= 3 && AVAIL(cx, cy)) {
-            nb_set(&C, NB_OK, cur[(cy << 2) + cx][0], cur[(cy << 2) + cx][1]);
+            NB_CUR(C, cx, cy);
         } else if (cy >= 0) {
             nb_set(&C, NB_UNAVAIL, 0, 0);
         } else if (cx <= 3) {
@@ -1798,11 +1867,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
              * directly above the partition, i.e. the block above-left of the
              * partition's top-left corner. */
             if (by > 0 && bx > 0) {
-                if (AVAIL(bx - 1, by - 1))
-                    nb_set(&C, NB_OK, cur[((by - 1) << 2) + bx - 1][0],
-                           cur[((by - 1) << 2) + bx - 1][1]);
-                else
-                    nb_from_mb(&C, NULL, 0, list);
+                NB_CUR(C, bx - 1, by - 1);
             } else if (by > 0) {
                 if (mbx > 0)
                     nb_from_mb(&C, &e->mbs[mby * e->mb_w + mbx - 1],
@@ -1856,6 +1921,7 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
         *pmvy = mv_median3(A.mvy, B.mvy, C.mvy);
     }
 #undef AVAIL
+#undef NB_CUR
 }
 
 /* Motion vector of a P_Skip macroblock (H.264 8.4.1.1).  It is *not* the
@@ -2230,15 +2296,16 @@ static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
 /* Motion search for one partitioned candidate (16x8 or 8x16): every partition
  * gets its own search centred on its own MV predictor, and the MVs decided so
  * far are visible to the following partitions of the same macroblock. */
-/* Mark the 4x4 blocks a partition covers as decoded, so that the following
- * partitions can predict from them (and only from them). */
+/* Mark the 4x4 blocks a partition covers as decoded from list 0, so that the
+ * following partitions can predict from them (and only from them).  This is
+ * the P path, where list 0 is the only list there is. */
 static void avail_publish(uint8_t avail[16], const int geo[4])
 {
     int x, y, x0 = geo[0] / 4, y0 = geo[1] / 4;
     int x1 = x0 + geo[2] / 4, y1 = y0 + geo[3] / 4;
     for (y = y0; y < y1; y++)
         for (x = x0; x < x1; x++)
-            avail[(y << 2) + x] = 1;
+            avail[(y << 2) + x] = AEG_MVBLK_AVAIL;
 }
 
 /* One partition of a partitioned B macroblock (16x8 or 8x16).
@@ -2328,12 +2395,16 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
             if (lists & 1) {
                 cur[0][b][0] = (int16_t)mv[0][0];
                 cur[0][b][1] = (int16_t)mv[0][1];
-                avail[0][b] = 1;
+                avail[0][b] = AEG_MVBLK_AVAIL;
+            } else {
+                avail[0][b] = AEG_MVBLK_NOTUSED;
             }
             if (lists & 2) {
                 cur[1][b][0] = (int16_t)mv[1][0];
                 cur[1][b][1] = (int16_t)mv[1][1];
-                avail[1][b] = 1;
+                avail[1][b] = AEG_MVBLK_AVAIL;
+            } else {
+                avail[1][b] = AEG_MVBLK_NOTUSED;
             }
         }
 }
@@ -2359,6 +2430,140 @@ static void b_candidate_parts(struct aeg_encoder *e, int mbx, int mby, int type,
     cd->nparts = 2;
     for (p = 0; p < 2; p++)
         b_part_search(e, mbx, mby, type, p, cur, avail, mv16, cd);
+    e->mb_ncand = slot + 1;
+}
+
+/* A B_8x8 candidate: four 8x8 sub-macroblock partitions, each of which picks
+ * its own prediction out of direct, list 0, list 1 and both.
+ *
+ * The vectors come from one integer search per list per group -- seeded with
+ * the macroblock's own 16x16 vector of that list, with the macroblock's
+ * quarter-pel offset applied afterwards, exactly like the partitioned shapes
+ * above -- and direct mode is priced against the vectors the co-located
+ * picture hands out.  Direct sends no mvd at all, so it carries no rate term;
+ * the other three are priced with their own differences, which is what makes
+ * the choice per group rather than per macroblock.
+ *
+ * Only the four 8x8 sub-types are searched.  The 8x4/4x8/4x4 splits are eight
+ * more sub-types and would triple the searches; the shape decision that pays
+ * for them in a P picture (SATD against the sub_mb_type's own rate) has no B
+ * counterpart yet, and the B value of a split is much smaller than the P one
+ * because the two lists already absorb most of the extra freedom. */
+static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
+                            const int mv16[2][2])
+{
+    int16_t cur[2][16][2];
+    uint8_t avail[2][16];
+    int direct[16][2], direct1[16][2];
+    int g, l, slot = e->mb_ncand;
+    int range = e->p.search_range ? e->p.search_range : 16;
+    mbcand *cd;
+
+    if (slot >= (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0])))
+        return;
+    memset(cur, 0, sizeof(cur));
+    memset(avail, 0, sizeof(avail));
+    memset(direct, 0, sizeof(direct));
+    memset(direct1, 0, sizeof(direct1));
+    if (e->col_ready)
+        b_direct_mv(e, mbx, mby, direct, direct1);
+    cd = &e->mb_cand[slot];
+    memset(cd, 0, sizeof(*cd));
+    cd->type = AEG_MB_B_8x8;
+    cd->nparts = 4;
+
+    for (g = 0; g < 4; g++) {
+        int geo[4], b0, pmv[2][2], mv[2][2], satd[4], cost[4], bits[2];
+        int best, st;
+        int x, y;
+
+        geo[0] = (g & 1) * 8; geo[1] = (g >> 1) * 8; geo[2] = geo[3] = 8;
+        b0 = (g >> 1) * 8 + (g & 1) * 2;
+        for (l = 0; l < 2; l++) {
+            const uint8_t *ref = l ? e->ref2p[0] : e->refp[0];
+            const aeg_mc_ctx *mc = l ? &e->mc1 : &e->mc;
+            int seed[2], sad;
+
+            predict_mv_at(e, mbx, mby, cur[l], avail[l], AEG_MB_B_8x8, 0,
+                          geo[0] / 4, geo[1] / 4, geo[2] / 4, l,
+                          &pmv[l][0], &pmv[l][1]);
+            seed[0] = mv16[l][0] / 4;
+            seed[1] = mv16[l][1] / 4;
+            aeg_me_block(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+                             geo[0],
+                         e->stride[0],
+                         e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                             mbx * 16 + geo[0],
+                         e->stride[0], 8, 8, range, 0, pmv[l][0], pmv[l][1],
+                         seed, mc, &mv[l][0], &mv[l][1], &sad);
+            if (e->p.subme > 0) {
+                int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
+                int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
+                int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
+
+                if ((fx || fy) &&
+                    b_part_satd(e, mbx, mby, geo, qx, qy, l) <
+                        b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l)) {
+                    mv[l][0] = qx;
+                    mv[l][1] = qy;
+                }
+            }
+            satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+            bits[l] = aeg_mvd_bits(mv[l][0] - pmv[l][0],
+                                   mv[l][1] - pmv[l][1]);
+        }
+        satd[2] = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1],
+                                 mv[1][0], mv[1][1]);
+        /* direct: the co-located vectors, both lists, no difference to send */
+        satd[3] = e->col_ready
+                      ? b_part_satd_bi(e, mbx, mby, geo, direct[b0][0],
+                                       direct[b0][1], direct1[b0][0],
+                                       direct1[b0][1])
+                      : (1 << 30);
+        cost[0] = satd[0] + 8 * bits[0];
+        cost[1] = satd[1] + 8 * bits[1];
+        cost[2] = satd[2] + 8 * (bits[0] + bits[1]);
+        cost[3] = satd[3];
+        best = 0;
+        for (l = 1; l < 4; l++)
+            if (cost[l] < cost[best])
+                best = l;
+        /* best: 0 = list 0, 1 = list 1, 2 = both, 3 = direct */
+        st = best == 0 ? 1 : (best == 1 ? 2 : (best == 2 ? 3 : 0));
+        cd->sub_type[g] = (uint8_t)st;
+        cd->blist[g] = (uint8_t)b_sub_lists[st];
+        cd->pmv[b0][0] = (int16_t)pmv[0][0];
+        cd->pmv[b0][1] = (int16_t)pmv[0][1];
+        cd->pmv1[b0][0] = (int16_t)pmv[1][0];
+        cd->pmv1[b0][1] = (int16_t)pmv[1][1];
+        if (best == 3) {
+            mv[0][0] = direct[b0][0];  mv[0][1] = direct[b0][1];
+            mv[1][0] = direct1[b0][0]; mv[1][1] = direct1[b0][1];
+        }
+        for (y = 0; y < 2; y++)
+            for (x = 0; x < 2; x++) {
+                int b = (geo[1] / 4 + y) * 4 + geo[0] / 4 + x;
+
+                cd->mv[b][0] = (int16_t)mv[0][0];
+                cd->mv[b][1] = (int16_t)mv[0][1];
+                cd->mv1[b][0] = (int16_t)mv[1][0];
+                cd->mv1[b][1] = (int16_t)mv[1][1];
+                if (cd->blist[g] & 1) {
+                    cur[0][b][0] = (int16_t)mv[0][0];
+                    cur[0][b][1] = (int16_t)mv[0][1];
+                    avail[0][b] = AEG_MVBLK_AVAIL;
+                } else {
+                    avail[0][b] = AEG_MVBLK_NOTUSED;
+                }
+                if (cd->blist[g] & 2) {
+                    cur[1][b][0] = (int16_t)mv[1][0];
+                    cur[1][b][1] = (int16_t)mv[1][1];
+                    avail[1][b] = AEG_MVBLK_AVAIL;
+                } else {
+                    avail[1][b] = AEG_MVBLK_NOTUSED;
+                }
+            }
+    }
     e->mb_ncand = slot + 1;
 }
 
@@ -2822,7 +3027,7 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
     /* The partitioned shapes.  Like the P path they only pay off with the RD
      * decision, so ultrafast stays 16x16; and the candidate list has room for
      * both of them plus the four 16x16 ones. */
-    if (e->p.preset >= 1 && !getenv("AEG_NOPARTB")) {
+    if (e->p.preset >= 1) {
         int mv16[2][2];
 
         mv16[0][0] = mv[0][0]; mv16[0][1] = mv[0][1];
@@ -2831,6 +3036,15 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
             b_candidate_parts(e, mbx, mby, AEG_MB_B16x8, (const int (*)[2])mv16);
         if (e->p.partitions & 4)
             b_candidate_parts(e, mbx, mby, AEG_MB_B8x16, (const int (*)[2])mv16);
+        /* B_8x8 follows the preset rather than the partition mask: the mask's
+         * bit 3 is documented as P_8x8, and this shape measured *neutral*
+         * (BD-rate within +-0.1 % on five clips at six QPs) for about a tenth
+         * of the encode time, so it sits with the slow presets.  Prepending it
+         * to the candidate list costs two integer searches per 8x8 group --
+         * eight per macroblock -- and the exact RD comparison then rejects it
+         * on all but a handful of macroblocks. */
+        if (e->p.preset >= 3)
+            b_candidate_8x8(e, mbx, mby, (const int (*)[2])mv16);
     }
     /* direct: vectors derived, nothing sent */
     if (e->col_ready) {
@@ -3032,6 +3246,8 @@ static int mb_type_bits(const struct aeg_encoder *e, const mbenc *c, int is_p)
         (void)e;
         if (c->type == AEG_MB_B16x8 || c->type == AEG_MB_B8x16)
             return bits + (list == 3 ? 2 : 1);
+        if (c->type == AEG_MB_B_8x8)
+            return bits;                /* code 22: four bins, no fifth */
         return bits + (list == 3 ? 1 : 0);
     }
     /* An I_NxN macroblock carries transform_size_8x8_flag right after mb_type
@@ -3053,10 +3269,17 @@ static int mb_type_bits(const struct aeg_encoder *e, const mbenc *c, int is_p)
 static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
 {
     int p, i, bits = mb_type_bits(e, c, 1);
-    /* P_8x8 carries a sub_mb_type per 8x8 partition, before any mvd. */
+    /* P_8x8 carries a sub_mb_type per 8x8 partition, before any mvd; B_8x8's
+     * is a CABAC tree of one to four bins, priced here by its depth. */
     if (c->type == AEG_MB_P8x8)
         for (i = 0; i < 4; i++)
             bits += aeg_ue_bits((uint32_t)c->sub_type[i]);
+    if (c->type == AEG_MB_B_8x8)
+        for (i = 0; i < 4; i++) {
+            int st = c->sub_type[i];
+
+            bits += (st == 0) ? 1 : (st <= 2 ? 2 : (st >= 11 ? 4 : 3));
+        }
     for (p = 0; p < c->nparts; p++) {
         int geo[4], b0;
         /* A partitioned B macroblock picks its lists per partition, so the
@@ -3068,7 +3291,7 @@ static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
         /* A direct macroblock sends no mvd at all (8.4.1.2), the decoder
          * derives its vectors; every other inter type sends one pair per list
          * it predicts from. */
-        if (c->type == AEG_MB_B_DIRECT)
+        if (!mb_part_sends_mvd(c, p))
             continue;
         if (lmask & 1)
             bits += aeg_mvd_bits(c->mv[b0][0] - c->pmv[b0][0],
@@ -4114,6 +4337,10 @@ enum {
     CAB_P_16X8      = 17,   /* P: 16x8 vs 8x16                         */
     CAB_P_I16       = 17,   /* P: Intra_16x16 fields, offset by 14     */
     CAB_SUB_TYPE    = 21,   /* P: sub_mb_type                          */
+    CAB_BSUB_DIRECT = 36,   /* B: sub_mb_type, "direct"                */
+    CAB_BSUB_L0L1   = 37,   /* B: sub_mb_type, L0/L1 8x8 vs the rest   */
+    CAB_BSUB_SHAPE  = 38,   /* B: sub_mb_type, 8x4/4x8/4x4 family      */
+    CAB_BSUB_TAIL   = 39,   /* B: sub_mb_type, the shared tail bin     */
     CAB_MVD_X       = 40,   /* P: |mvd| horizontal                     */
     CAB_MVD_Y       = 47,   /* P: |mvd| vertical                       */
     CAB_QP_DELTA    = 60,   /* mb_qp_delta                             */
@@ -4331,8 +4558,10 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
 
         /* A partition of a B macroblock only sends a difference for the lists
          * it predicts from: the others have no vector at all, and the decoder
-         * leaves both the vector and its difference at zero. */
-        if (is_b_type(c->type) && !(mb_part_lists(c, p) & (1 << list)))
+         * leaves both the vector and its difference at zero.  A B_8x8 group
+         * coded as direct sends none at all, for either list. */
+        if (!mb_part_sends_mvd(c, p) ||
+            (is_b_type(c->type) && !(mb_part_lists(c, p) & (1 << list))))
             continue;
         mb_part_geom(c, p, geo, &b0);
         bx = geo[0] / 4;
@@ -4524,6 +4753,8 @@ static int b_mb_type_code(const mbenc *c)
 
     if (c->type == AEG_MB_B_DIRECT)
         return 0;
+    if (c->type == AEG_MB_B_8x8)
+        return 22;
     if (c->type == AEG_MB_B16x8 || c->type == AEG_MB_B8x16) {
         int l0 = c->blist[0] ? c->blist[0] : 3;
         int l1 = c->blist[1] ? c->blist[1] : 3;
@@ -4547,6 +4778,45 @@ static int b_mb_type_code(const mbenc *c)
  * 27+5, with two more bins after the codes 12..14 (of which only 13 is intra,
  * which is why an intra macroblock in a B slice is reached through the mb_type
  * tree and not through a flag of its own). */
+/* sub_mb_type of a B_8x8 macroblock (9.3.3.1.1.6).  The tree is: "direct?";
+ * "L0/L1 8x8 or something else?"; then either the shape family (8x4/4x8/4x4,
+ * with L0_4x4 and the two 4x4 list 1/bi values hanging off the far end) or,
+ * for the 8x8 values, which list.  The four 8x8 values (0..3) are the ones the
+ * search produces today; the rest of the tree is written out so that adding
+ * the splits is a search change, not a syntax change. */
+static void code_b_sub_mb_type(aeg_cabac *cb, int st)
+{
+    if (st == 0) {
+        aeg_cabac_decision(cb, CAB_BSUB_DIRECT, 0);
+        return;
+    }
+    aeg_cabac_decision(cb, CAB_BSUB_DIRECT, 1);
+    if (st <= 2) {                              /* B_L0_8x8, B_L1_8x8 */
+        aeg_cabac_decision(cb, CAB_BSUB_L0L1, 0);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, st - 1);
+        return;
+    }
+    aeg_cabac_decision(cb, CAB_BSUB_L0L1, 1);
+    if (st >= 11) {                             /* L1_4x4, Bi_4x4       */
+        aeg_cabac_decision(cb, CAB_BSUB_SHAPE, 1);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, 1);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, st - 11);
+        return;
+    }
+    if (st >= 7) {                              /* 4x8 splits, L0_4x4    */
+        aeg_cabac_decision(cb, CAB_BSUB_SHAPE, 1);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, 0);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, ((st - 7) >> 1) & 1);
+        aeg_cabac_decision(cb, CAB_BSUB_TAIL, (st - 7) & 1);
+        return;
+    }
+    /* 3..6: B_Bi_8x8 followed by the three 8x4 values -- the tree puts the
+     * bi 8x8 shape in front of the shape question, not behind it. */
+    aeg_cabac_decision(cb, CAB_BSUB_SHAPE, 0);
+    aeg_cabac_decision(cb, CAB_BSUB_TAIL, ((st - 3) >> 1) & 1);
+    aeg_cabac_decision(cb, CAB_BSUB_TAIL, (st - 3) & 1);
+}
+
 static void code_b_mb_type(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                            int mby, int code)
 {
@@ -4653,6 +4923,14 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
             }
             code_b_mb_type(e, cb, mbx, mby, code);
             lmask = mb_lists(c->type, c->blist);
+            /* B_8x8 carries one sub_mb_type per 8x8 group, after mb_type and
+             * before any mvd (7.3.5). */
+            if (c->type == AEG_MB_B_8x8) {
+                int g;
+
+                for (g = 0; g < 4; g++)
+                    code_b_sub_mb_type(cb, c->sub_type[g]);
+            }
             /* A direct macroblock sends no mvd (8.4.1.2); every other one sends
              * a pair per list it predicts from, list 0 first (Table 7-16). */
             if (c->type != AEG_MB_B_DIRECT) {
@@ -5296,8 +5574,16 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             m->chroma_mode = (uint8_t)tmp->chroma_mode;
             m->cbp = (uint8_t)tmp->cbp;
             m->qp = (int8_t)tmp->qp;
-            for (i = 0; i < 2; i++)
+            /* All four masks, not the two the partitioned shapes need: B_8x8
+             * carries one per 8x8 group, and the deblocking filter reads them
+             * per 4x4 block.  Publishing only the first two left the bottom
+             * half of every B_8x8 at "no list" (which the mask fallback then
+             * read as *both*), so the filter disagreed with the decoder about
+             * the two bottom 8x8 groups of every such macroblock. */
+            for (i = 0; i < 4; i++)
                 m->blist[i] = tmp->blist[i];
+            for (i = 0; i < 4; i++)
+                m->sub_type[i] = (int8_t)tmp->sub_type[i];
             for (i = 0; i < 16; i++)
                 m->intra4[i] = tmp->intra4[i];
             for (i = 0; i < 4; i++)
