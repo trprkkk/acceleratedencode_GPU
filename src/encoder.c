@@ -1776,13 +1776,20 @@ static void inter_predict_typed(struct aeg_encoder *e, int mbx, int mby,
 #define NB_OK        0
 
 typedef struct {
-    int ref;
+    int ref; /* NB_OK/NOTUSED/UNAVAIL */
     int mvx, mvy;
+    int ref_idx; /* -1 for unavailable/notused, 0..1 for available */
 } nb_mv;
 
 static void nb_set(nb_mv *n, int ref, int mvx, int mvy)
 {
     n->ref = ref; n->mvx = mvx; n->mvy = mvy;
+    n->ref_idx = -1;
+}
+static void nb_set_r(nb_mv *n, int ref, int mvx, int mvy, int ref_idx)
+{
+    n->ref = ref; n->mvx = mvx; n->mvy = mvy;
+    n->ref_idx = ref_idx;
 }
 
 /* Fill `n` from macroblock `m` (NULL when the neighbour does not exist) for
@@ -1801,8 +1808,9 @@ static void nb_from_mb(nb_mv *n, const aeg_mb *m, int blk, int list)
         nb_set(n, NB_NOTUSED, 0, 0);
         return;
     }
-    nb_set(n, NB_OK, list ? m->mv1[blk][0] : m->mv[blk][0],
-           list ? m->mv1[blk][1] : m->mv[blk][1]);
+    nb_set_r(n, NB_OK, list ? m->mv1[blk][0] : m->mv[blk][0],
+             list ? m->mv1[blk][1] : m->mv[blk][1],
+             (int)m->ref_idx[blk]);
 }
 
 /* Median of three motion vector components (H.264 8.4.1.3.1). */
@@ -1842,20 +1850,32 @@ static void nb_from_cur(nb_mv *n, const int16_t cur[16][2], int state, int b)
     if (state == AEG_MVBLK_NOTUSED)
         nb_set(n, NB_NOTUSED, 0, 0);
     else if (state == AEG_MVBLK_AVAIL)
-        nb_set(n, NB_OK, cur[b][0], cur[b][1]);
+        nb_set_r(n, NB_OK, cur[b][0], cur[b][1], 0); /* caller will override ref_idx via cur_ref array */
+    else
+        nb_set(n, NB_UNAVAIL, 0, 0);
+}
+static void nb_from_cur_r(nb_mv *n, const int16_t cur[16][2], const int8_t *cur_ref,
+                          int state, int b)
+{
+    if (state == AEG_MVBLK_NOTUSED)
+        nb_set(n, NB_NOTUSED, 0, 0);
+    else if (state == AEG_MVBLK_AVAIL)
+        nb_set_r(n, NB_OK, cur[b][0], cur[b][1], cur_ref ? (int)cur_ref[b] : 0);
     else
         nb_set(n, NB_UNAVAIL, 0, 0);
 }
 
-static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
-                          const int16_t cur[16][2], const uint8_t *avail,
+static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
+                          const int16_t cur[16][2], const int8_t *cur_ref,
+                          const uint8_t *avail,
                           int type, int p, int bx, int by, int pw, int list,
+                          int cur_ref_idx,
                           int *pmvx, int *pmvy)
 {
     nb_mv A, B, C;
     int match;
 #define AVAIL(x, y) (avail[(y) * 4 + (x)])
-#define NB_CUR(n, x, y) nb_from_cur(&(n), cur, AVAIL(x, y), ((y) << 2) + (x))
+#define NB_CUR(n, x, y) nb_from_cur_r(&(n), cur, cur_ref, AVAIL(x, y), ((y) << 2) + (x))
 
     /* A B macroblock predicts each partition from one or both lists, but the
      * shape rules are the P ones: 16x8 and 8x16 short-circuit to a single
@@ -1934,11 +1954,11 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
 
     /* The decoder prefers a single neighbour that shares the reference. */
     if (type == AEG_MB_P16x8) {
-        if (p == 0 && B.ref == NB_OK) {
+        if (p == 0 && B.ref_idx == cur_ref_idx) {
             *pmvx = B.mvx; *pmvy = B.mvy;
             return;
         }
-        if (p == 1 && A.ref == NB_OK) {
+        if (p == 1 && A.ref_idx == cur_ref_idx) {
             *pmvx = A.mvx; *pmvy = A.mvy;
             return;
         }
@@ -1946,20 +1966,20 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
         /* Sub-macroblock partitions have no short-circuit of their own: the
          * reference decoder runs the ordinary three-neighbour process. */
     } else {
-        if (p == 0 && A.ref == NB_OK) {
+        if (p == 0 && A.ref_idx == cur_ref_idx) {
             *pmvx = A.mvx; *pmvy = A.mvy;
             return;
         }
-        if (p == 1 && C.ref == NB_OK) {
+        if (p == 1 && C.ref_idx == cur_ref_idx) {
             *pmvx = C.mvx; *pmvy = C.mvy;
             return;
         }
     }
 
-    match = (C.ref == NB_OK) + (B.ref == NB_OK) + (A.ref == NB_OK);
+    match = (C.ref_idx == cur_ref_idx) + (B.ref_idx == cur_ref_idx) + (A.ref_idx == cur_ref_idx);
     if (match == 1) {
-        if (A.ref == NB_OK)      { *pmvx = A.mvx; *pmvy = A.mvy; }
-        else if (B.ref == NB_OK) { *pmvx = B.mvx; *pmvy = B.mvy; }
+        if (A.ref_idx == cur_ref_idx)      { *pmvx = A.mvx; *pmvy = A.mvy; }
+        else if (B.ref_idx == cur_ref_idx) { *pmvx = B.mvx; *pmvy = B.mvy; }
         else                     { *pmvx = C.mvx; *pmvy = C.mvy; }
     } else if (match == 0 && B.ref == NB_UNAVAIL && C.ref == NB_UNAVAIL &&
                A.ref != NB_UNAVAIL) {
@@ -1970,6 +1990,13 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
     }
 #undef AVAIL
 #undef NB_CUR
+}
+static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
+                          const int16_t cur[16][2], const uint8_t *avail,
+                          int type, int p, int bx, int by, int pw, int list,
+                          int *pmvx, int *pmvy)
+{
+    predict_mv_at_ref(e, mbx, mby, cur, NULL, avail, type, p, bx, by, pw, list, 0, pmvx, pmvy);
 }
 
 /* Motion vector of a P_Skip macroblock (H.264 8.4.1.1).  It is *not* the
@@ -3407,6 +3434,16 @@ static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
 
             bits += (st == 0) ? 1 : (st <= 2 ? 2 : (st >= 11 ? 4 : 3));
         }
+    /* ref_idx_l0 for P when two references are active. */
+    if (e->cur_l0_active > 1 && is_inter_type(c->type) && !is_b_type(c->type)) {
+        if (c->type == AEG_MB_P8x8) {
+            for (i = 0; i < 4; i++)
+                bits += 1; /* te(v) with cMax=1: 1 bit */
+        } else {
+            for (p = 0; p < c->nparts; p++)
+                bits += 1;
+        }
+    }
     for (p = 0; p < c->nparts; p++) {
         int geo[4], b0;
         /* A partitioned B macroblock picks its lists per partition, so the
@@ -3934,6 +3971,7 @@ static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
         t->pmv[b][1] = (int16_t)e->mb_cand[cand].pmv[b][1];
         t->pmv1[b][0] = (int16_t)e->mb_cand[cand].pmv1[b][0];
         t->pmv1[b][1] = (int16_t)e->mb_cand[cand].pmv1[b][1];
+        t->ref[b] = e->mb_cand[cand].ref[b];
     }
 }
 
@@ -4464,15 +4502,28 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
             aeg_bw_ue(bw, (uint32_t)(1 + c->i16_mode + 4 * chroma_cbp(c) +
                                      12 * (luma_cbp_on(c) ? 1 : 0)));
     } else if (is_inter_type(c->type)) {
-        /* P_L0_16x16 / P_L0_16x8 / P_L0_8x16: one mvd pair per partition, all
-         * of them before the coded block pattern.  There is a single reference
-         * picture, so ref_idx_l0 is omitted. */
         int p;
         aeg_bw_ue(bw, (uint32_t)inter_mb_type_code(c->type));
         if (c->type == AEG_MB_P8x8)
             /* sub_mb_type: four ue(v) symbols, before any mvd (7.3.5.2). */
             for (p = 0; p < 4; p++)
                 aeg_bw_ue(bw, (uint32_t)c->sub_type[p]);
+        /* ref_idx_l0: one per partition (P_8x8: one per sub-macroblock) when
+         * NumRefIdxL0Active>1, te(v) with cMax= NumRefIdxL0Active-1 =1 so 1 bit. */
+        if (e->cur_l0_active > 1) {
+            if (c->type == AEG_MB_P8x8) {
+                for (p = 0; p < 4; p++) {
+                    int b0 = (p & 1) * 2 + (p >> 1) * 8;
+                    aeg_bw_ue(bw, (uint32_t)c->ref[b0]);
+                }
+            } else {
+                for (p = 0; p < c->nparts; p++) {
+                    int geo[4], b0;
+                    mb_part_geom(c, p, geo, &b0);
+                    aeg_bw_ue(bw, (uint32_t)c->ref[b0]);
+                }
+            }
+        }
         for (p = 0; p < c->nparts; p++) {
             int geo[4], b0;
             mb_part_geom(c, p, geo, &b0);
@@ -4909,6 +4960,68 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
     memcpy(e->mbs[idx].mvd[list], mvd, sizeof(mvd));
 }
 
+/* ref_idx_l0 for P with two active references (CABAC 9.3.2, ctx 54).
+ * One bin when NumRefIdxActive==2: 0 or 1 with ctx (refA>0)+(refB>0)*2.
+ * The neighbour refs are the 4x4 blocks at (x0-1,y0) and (x0,y0-1): inside the
+ * same macroblock they are the previous partitions' refs, otherwise the left/
+ * top macroblock's ref at the edge.  Unavailable/intra is 0. */
+static void cabac_mb_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                             int mby, const mbenc *c)
+{
+    if (e->cur_l0_active <= 1 || is_intra_type(c->type))
+        return;
+    /* P_8x8 has 4 sub-macroblocks (one ref each), otherwise partitions. */
+    int idx = mby * e->mb_w + mbx;
+    int n = (c->type == AEG_MB_P8x8) ? 4 : mb_part_count(c);
+    uint8_t cur_ref[16] = {0};
+    /* Seed with already coded parts of this MB for intra-MB neighbour lookup. */
+    for (int i = 0; i < 16; i++)
+        cur_ref[i] = 0;
+    for (int p = 0; p < n; p++) {
+        int geo[4], b0, x0, y0, ctx = 0;
+        int refa = 0, refb = 0;
+        if (c->type == AEG_MB_P8x8) {
+            int bx = (p & 1) * 2, by = (p >> 1) * 2;
+            geo[0] = bx * 4; geo[1] = by * 4; geo[2] = 8; geo[3] = 8;
+            b0 = by * 4 + bx;
+        } else {
+            mb_part_geom(c, p, geo, &b0);
+        }
+        x0 = geo[0] / 4; y0 = geo[1] / 4;
+        int ref = c->ref[b0] & 1;
+        /* left: inside MB or left MB */
+        if (x0 > 0) {
+            refa = cur_ref[y0 * 4 + x0 - 1];
+        } else if (mbx > 0) {
+            const aeg_mb *lm = &e->mbs[idx - 1];
+            if (!is_intra_type(lm->type))
+                refa = lm->ref_idx[y0 * 4 + 3];
+        }
+        /* top: inside MB or top MB */
+        if (y0 > 0) {
+            refb = cur_ref[(y0 - 1) * 4 + x0];
+        } else if (mby > e->top_row) {
+            const aeg_mb *tm = &e->mbs[idx - e->mb_w];
+            if (!is_intra_type(tm->type))
+                refb = tm->ref_idx[12 + x0];
+        }
+        if (refa > 0) ctx++;
+        if (refb > 0) ctx += 2;
+        /* Truncated unary for cMax=1: single bin 0->0, 1->1. */
+        aeg_cabac_decision(cb, 54 + ctx, ref);
+        /* Publish this partition's ref for following partitions' context. */
+        if (c->type == AEG_MB_P8x8) {
+            for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++)
+                    cur_ref[(y0 + dy) * 4 + x0 + dx] = (uint8_t)ref;
+        } else {
+            for (int dy = 0; dy < geo[3] / 4; dy++)
+                for (int dx = 0; dx < geo[2] / 4; dx++)
+                    cur_ref[(y0 + dy) * 4 + x0 + dx] = (uint8_t)ref;
+        }
+    }
+}
+
 /* coded_block_pattern, luma half: four 8x8 groups, each conditioned on the
  * neighbours' patterns (Table 9-39). */
 static void cabac_cbp_luma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
@@ -5296,6 +5409,8 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                     }
                 }
             }
+            if (e->cur_l0_active > 1)
+                cabac_mb_ref_idx(e, cb, mbx, mby, c);
             cabac_mb_mvd(e, cb, mbx, mby, c, 0);
         }
     } else {
@@ -5921,6 +6036,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 m->mv[i][1] = tmp->mv[i][1];
                 m->mv1[i][0] = tmp->mv1[i][0];
                 m->mv1[i][1] = tmp->mv1[i][1];
+                m->ref_idx[i] = tmp->ref[i];
             }
             m->cost = (int32_t)tmp->sse;
         }

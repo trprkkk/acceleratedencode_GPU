@@ -176,6 +176,10 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
             return 1;
         return 0;
     }
+    /* P multi-reference: different reference indices also cause filtering,
+     * even when vectors are equal (8.7.2.1). */
+    if (p->ref_idx[pa] != q->ref_idx[qa])
+        return 1;
     dx = abs(p->mv[pa][0] - q->mv[qa][0]);
     dy = abs(p->mv[pa][1] - q->mv[qa][1]);
     if (dx >= 4 || dy >= 4)
