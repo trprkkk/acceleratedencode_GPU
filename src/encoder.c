@@ -2319,42 +2319,68 @@ static int b_part_satd_bi(struct aeg_encoder *e, int mbx, int mby,
                         mbx * 16 + geo[0], e->stride[0]);
 }
 
-static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
-                     int mvx, int mvy)
+static int part_satd_ref(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
+                     int mvx, int mvy, int ref)
 {
     uint8_t buf[16 * 16];
     int ix = mvx >> 2, iy = mvy >> 2;
-    {
-        const uint8_t *r = e->refp[0] + (mby * 16 + geo[1] + iy) * e->stride[0] +
-                           mbx * 16 + geo[0] + ix;
-        if (e->mc.ready)
-            aeg_mc_luma_p(buf, geo[2], &e->mc, r, geo[2], geo[3], mvx & 3, mvy & 3);
-        else
-            aeg_mc_luma(buf, geo[2], r, e->stride[0], geo[2], geo[3],
-                        mvx & 3, mvy & 3);
-    }
+    const uint8_t *rp = (ref ? e->ref2p[0] : e->refp[0]) + (mby * 16 + geo[1] + iy) * e->stride[0] +
+                        mbx * 16 + geo[0] + ix;
+    const aeg_mc_ctx *mc = ref ? &e->mc1 : &e->mc;
+    if (mc->ready)
+        aeg_mc_luma_p(buf, geo[2], mc, rp, geo[2], geo[3], mvx & 3, mvy & 3);
+    else
+        aeg_mc_luma(buf, geo[2], rp, e->stride[0], geo[2], geo[3],
+                    mvx & 3, mvy & 3);
     return aeg_satd(geo[2], geo[3], buf, geo[2],
                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
                     geo[0], e->stride[0]);
+}
+static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
+                     int mvx, int mvy)
+{
+    return part_satd_ref(e, mbx, mby, geo, mvx, mvy, 0);
 }
 
 /* Motion search for one partition: its own search window, centred on its own
  * MV predictor.  `refine` selects the quarter-pel stage: the P_8x8 shape trials
  * run integer only (they compare shapes, not vectors) and the winning shape is
  * searched again with the refinement, which is where the quality comes from. */
-static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
-                         int p, const int geo[4], int pmvx, int pmvy,
+static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
+                         int p, const int geo[4], int pmvx, int pmvy, int ref,
                          int *mvx, int *mvy, int *sad, int refine)
 {
-    aeg_me_block(e->refp[0] + (mby * 16 + geo[1]) * e->stride[0] +
-                     mbx * 16 + geo[0],
+    const uint8_t *rp = (ref ? e->ref2p[0] : e->refp[0]) + (mby * 16 + geo[1]) * e->stride[0] +
+                        mbx * 16 + geo[0];
+    const aeg_mc_ctx *mc = ref ? &e->mc1 : &e->mc;
+    aeg_me_block(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, &e->mc,
+                 refine ? e->p.subme : 0, pmvx, pmvy, NULL, mc,
                  mvx, mvy, sad);
+    if (!refine && e->p.subme > 0) {
+        int fx = e->mb_frac[0], fy = e->mb_frac[1];
+        int qx = (*mvx & ~3) + fx, qy = (*mvy & ~3) + fy;
+        if (fx || fy) {
+            int c_int = part_satd_ref(e, mbx, mby, geo, *mvx, *mvy, ref);
+            int c_frac = part_satd_ref(e, mbx, mby, geo, qx, qy, ref);
+            if (c_frac < c_int) {
+                *mvx = qx;
+                *mvy = qy;
+                *sad = c_frac;
+            }
+        }
+    }
+    (void)type; (void)p;
+}
+static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
+                         int p, const int geo[4], int pmvx, int pmvy,
+                         int *mvx, int *mvy, int *sad, int refine)
+{
+    me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, 0, mvx, mvy, sad, refine);
     /* Sub-pixel alignment: the integer search leaves the vector on an integer
      * pel.  Rather than repeating the whole quarter-pel search for a 4x4
      * partition, apply the fractional offset the macroblock's 16x16 search
@@ -2719,6 +2745,7 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
 {
     int16_t cur[16][2];
     uint8_t avail[16];
+    int8_t cur_ref[16];
     int p, n = part_count(type);
     int slot = e->mb_ncand;
 
@@ -2726,22 +2753,54 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
         return;
     memset(cur, 0, sizeof(cur));
     memset(avail, 0, sizeof(avail));
+    memset(cur_ref, 0, sizeof(cur_ref));
     memset(e->mb_cand[slot].sub_type, 0, sizeof(e->mb_cand[slot].sub_type));
     memset(e->mb_cand[slot].ref, 0, sizeof(e->mb_cand[slot].ref));
     e->mb_cand[slot].type = type;
     e->mb_cand[slot].nparts = n;
     for (p = 0; p < n; p++) {
-        int geo[4], b0, pmvx, pmvy, mvx, mvy, sad;
+        int geo[4], b0;
         part_geom(type, p, geo, &b0);
-        predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, type, p,
-                      geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, &pmvx, &pmvy);
-        me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad,
-                     0);
-        cand_publish(&e->mb_cand[slot], geo, mvx, mvy);
-        e->mb_cand[slot].pmv[b0][0] = pmvx;
-        e->mb_cand[slot].pmv[b0][1] = pmvy;
-        me_publish(cur, geo, mvx, mvy);
-        avail_publish(avail, geo);
+        if (e->cur_l0_active > 1) {
+            int best_ref = 0, best_cost = 1 << 30;
+            int best_mvx = 0, best_mvy = 0, best_pmvx = 0, best_pmvy = 0, best_sad = 0;
+            int ref;
+            for (ref = 0; ref < e->cur_l0_active; ref++) {
+                int pmvx, pmvy, mvx, mvy, sad, satd, bits, cost;
+                predict_mv_at_ref(e, mbx, mby, (const int16_t (*)[2])cur, cur_ref, avail, type, p,
+                                  geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, ref, &pmvx, &pmvy);
+                me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, ref, &mvx, &mvy, &sad, 0);
+                satd = part_satd_ref(e, mbx, mby, geo, mvx, mvy, ref);
+                bits = aeg_mvd_bits(mvx - pmvx, mvy - pmvy) + 1; /* ref_idx bit */
+                cost = satd + 8 * bits;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best_ref = ref;
+                    best_mvx = mvx; best_mvy = mvy;
+                    best_pmvx = pmvx; best_pmvy = pmvy;
+                    best_sad = sad;
+                }
+            }
+            cand_publish(&e->mb_cand[slot], geo, best_mvx, best_mvy);
+            cand_publish_ref(&e->mb_cand[slot], geo, best_ref);
+            e->mb_cand[slot].pmv[b0][0] = best_pmvx;
+            e->mb_cand[slot].pmv[b0][1] = best_pmvy;
+            me_publish(cur, geo, best_mvx, best_mvy);
+            avail_publish(avail, geo);
+            { int x,y,x0=geo[0]/4,y0=geo[1]/4,x1=x0+geo[2]/4,y1=y0+geo[3]/4; for(y=y0;y<y1;y++) for(x=x0;x<x1;x++) cur_ref[(y<<2)+x]=(int8_t)best_ref; }
+            (void)best_sad;
+        } else {
+            int pmvx, pmvy, mvx, mvy, sad;
+            predict_mv_at(e, mbx, mby, (const int16_t (*)[2])cur, avail, type, p,
+                          geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, &pmvx, &pmvy);
+            me_partition(e, mbx, mby, type, p, geo, pmvx, pmvy, &mvx, &mvy, &sad, 0);
+            cand_publish(&e->mb_cand[slot], geo, mvx, mvy);
+            cand_publish_ref(&e->mb_cand[slot], geo, 0);
+            e->mb_cand[slot].pmv[b0][0] = pmvx;
+            e->mb_cand[slot].pmv[b0][1] = pmvy;
+            me_publish(cur, geo, mvx, mvy);
+            avail_publish(avail, geo);
+        }
     }
     e->mb_ncand = slot + 1;
 }
@@ -2786,18 +2845,45 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
             bits = aeg_ue_bits((uint32_t)s);
             for (k = 0; k < n; k++) {
                 int sad;
+                int ref = 0;
+                int cand_ref = 0;
+                int best_c = 1<<30;
+                int cand_mv[2][2] = {{0}}, cand_pmv[2][2] = {{0}}, cand_satd = 0;
                 sub_geom(s, bx, by, k, geo[k], &b0);
-                predict_mv_at(e, mbx, mby, (const int16_t (*)[2])trial,
-                              tavail, AEG_MB_P8x8, 0, geo[k][0] / 4,
-                              geo[k][1] / 4, geo[k][2] / 4, 0, &pmv[k][0],
-                              &pmv[k][1]);
-                me_partition(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmv[k][0],
-                             pmv[k][1], &mv[k][0], &mv[k][1], &sad, 0);
-                satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
-                me_publish(trial, geo[k], mv[k][0], mv[k][1]);
-                avail_publish(tavail, geo[k]);
-                bits += aeg_mvd_bits(mv[k][0] - pmv[k][0],
-                                     mv[k][1] - pmv[k][1]);
+                if (e->cur_l0_active > 1) {
+                    for (ref = 0; ref < e->cur_l0_active; ref++) {
+                        int pmvx, pmvy, mvx, mvy, sd, sd_satd, bts, cst;
+                        predict_mv_at(e, mbx, mby, (const int16_t (*)[2])trial,
+                                      tavail, AEG_MB_P8x8, 0, geo[k][0] / 4,
+                                      geo[k][1] / 4, geo[k][2] / 4, 0, &pmvx, &pmvy);
+                        /* Note: predictor ref-unaware here keeps 1-ref behaviour for p8x8 trial;
+                         * full ref-aware would need cur_ref plumbing. */
+                        me_partition_ref(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmvx, pmvy, ref, &mvx, &mvy, &sd, 0);
+                        sd_satd = part_satd_ref(e, mbx, mby, geo[k], mvx, mvy, ref);
+                        bts = aeg_mvd_bits(mvx - pmvx, mvy - pmvy) + 1;
+                        cst = sd_satd + 8 * bts;
+                        if (cst < best_c) { best_c = cst; cand_ref = ref; cand_mv[0][0]=mvx; cand_mv[0][1]=mvy; cand_pmv[0][0]=pmvx; cand_pmv[0][1]=pmvy; cand_satd = sd_satd; (void)sd; }
+                    }
+                    pmv[k][0]=cand_pmv[0][0]; pmv[k][1]=cand_pmv[0][1];
+                    mv[k][0]=cand_mv[0][0]; mv[k][1]=cand_mv[0][1];
+                    satd_sum += cand_satd;
+                    me_publish(trial, geo[k], mv[k][0], mv[k][1]);
+                    avail_publish(tavail, geo[k]);
+                    bits += aeg_mvd_bits(mv[k][0] - pmv[k][0], mv[k][1] - pmv[k][1]) + 1;
+                    (void)cand_ref;
+                } else {
+                    predict_mv_at(e, mbx, mby, (const int16_t (*)[2])trial,
+                                  tavail, AEG_MB_P8x8, 0, geo[k][0] / 4,
+                                  geo[k][1] / 4, geo[k][2] / 4, 0, &pmv[k][0],
+                                  &pmv[k][1]);
+                    me_partition(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmv[k][0],
+                                 pmv[k][1], &mv[k][0], &mv[k][1], &sad, 0);
+                    satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
+                    me_publish(trial, geo[k], mv[k][0], mv[k][1]);
+                    avail_publish(tavail, geo[k]);
+                    bits += aeg_mvd_bits(mv[k][0] - pmv[k][0],
+                                         mv[k][1] - pmv[k][1]);
+                }
                 /* Exact early exit: SATD and bits are both non-negative, so the
                  * cost of the complete shape is at least what the partitions
                  * decided so far cost.  Once that reaches the best shape, no
