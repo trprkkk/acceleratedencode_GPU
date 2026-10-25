@@ -2921,6 +2921,20 @@ static int part_subpel(const struct aeg_encoder *e)
     return e->p.preset >= 2 ? 2 : 0;
 }
 
+static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
+                             const int geo[4], const int pmv[2][2],
+                             int mv[2][2]);
+
+static int bidir_part_on(const struct aeg_encoder *e)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_BIDIRP");
+        v = ev ? atoi(ev) : -1;
+    }
+    return v >= 0 ? v : e->p.preset >= 3;
+}
+
 /* One partition of a partitioned B macroblock (16x8 or 8x16).
  *
  * Both lists are searched independently and then list 0, list 1 and the average
@@ -2985,14 +2999,25 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
         satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
         bits[l] = aeg_mvd_bits(mv[l][0] - pmv[l][0], mv[l][1] - pmv[l][1]);
     }
-    satd[2] = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1],
-                             mv[1][0], mv[1][1]);
-    cost[0] = satd[0] + 8 * bits[0];
-    cost[1] = satd[1] + 8 * bits[1];
-    cost[2] = satd[2] + 8 * (bits[0] + bits[1]);
-    best = 0;
-    if (cost[1] < cost[best]) best = 1;
-    if (cost[2] < cost[best]) best = 2;
+    {
+        /* the bi-predictive pair, refined jointly (see bidir_refine) */
+        int bi[2][2] = { { mv[0][0], mv[0][1] }, { mv[1][0], mv[1][1] } };
+        if (bidir_part_on(e))
+            bidir_refine_geo(e, mbx, mby, geo, (const int (*)[2])pmv, bi);
+        satd[2] = b_part_satd_bi(e, mbx, mby, geo, bi[0][0], bi[0][1],
+                                 bi[1][0], bi[1][1]);
+        cost[0] = satd[0] + 8 * bits[0];
+        cost[1] = satd[1] + 8 * bits[1];
+        cost[2] = satd[2] + 8 * (aeg_mvd_bits(bi[0][0] - pmv[0][0], bi[0][1] - pmv[0][1]) +
+                                 aeg_mvd_bits(bi[1][0] - pmv[1][0], bi[1][1] - pmv[1][1]));
+        best = 0;
+        if (cost[1] < cost[best]) best = 1;
+        if (cost[2] < cost[best]) best = 2;
+        if (best == 2) {
+            mv[0][0] = bi[0][0]; mv[0][1] = bi[0][1];
+            mv[1][0] = bi[1][0]; mv[1][1] = bi[1][1];
+        }
+    }
     lists = best == 0 ? 1 : (best == 1 ? 2 : 3);
     cd->blist[p] = (uint8_t)lists;
     cd->pmv[b0][0] = (int16_t)pmv[0][0];
@@ -3676,13 +3701,13 @@ static int bidir_on(const struct aeg_encoder *e)
     return v >= 0 ? v : e->p.preset >= 3;
 }
 
-static void bidir_refine(struct aeg_encoder *e, int mbx, int mby,
-                         const int pmv[2][2], int mv[2][2])
+static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
+                             const int geo[4], const int pmv[2][2],
+                             int mv[2][2])
 {
     static const int8_t offs[8][2] = {
         {-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
     };
-    static const int geo[4] = { 0, 0, 16, 16 };
     const int range4 = (e->p.search_range ? e->p.search_range : 16) * 4;
     const int lam = e->me_lambda;
     int best, it, moved = 1;
@@ -3717,6 +3742,13 @@ static void bidir_refine(struct aeg_encoder *e, int mbx, int mby,
             }
         }
     }
+}
+
+static void bidir_refine(struct aeg_encoder *e, int mbx, int mby,
+                         const int pmv[2][2], int mv[2][2])
+{
+    static const int geo[4] = { 0, 0, 16, 16 };
+    bidir_refine_geo(e, mbx, mby, geo, pmv, mv);
 }
 
 static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)

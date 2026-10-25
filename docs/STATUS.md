@@ -1612,7 +1612,9 @@ list's vector and walks the other's eight quarter-pel neighbours on the SATD
 of the average plus the rate of both vectors, alternating (at most four
 rounds) until neither moves (x264 does the same).  Ours against ours: cock
 -0.30, vtest -0.02, mega -0.25, short -0.14, tree +0.02, mean -0.14% for
-+1.8% time.
++1.8% time.  The same for the bi-predictive half of each 16x8/8x16 partition
+(`AEG_BIDIRP`, b_part_search): cock -0.16, vtest -0.11, mega -0.13, short
+-0.02, tree -0.01, mean -0.09% for +5% time.
 
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
