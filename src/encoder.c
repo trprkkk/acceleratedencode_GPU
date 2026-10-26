@@ -7584,6 +7584,26 @@ done:
                 e->wp.chroma_denom);
 }
 
+/* The multi-hexagon stage of the motion search (umh_search, mc.c), per
+ * block class: 16x16 / 16x8 and 8x16 / 8x8 and smaller.  Measured (ours
+ * against ours, global PSNR): 16x16 only -0.14% for +1.6% time; with the
+ * 16x8/8x16 searches -0.47% for +8%; every block -0.53% for +26%.
+ * AEG_UMH / AEG_UMHP / AEG_UMH8 override the three radii. */
+static void umh_radii(const struct aeg_encoder *e, int r[3])
+{
+    static const char *const names[3] = { "AEG_UMH", "AEG_UMHP", "AEG_UMH8" };
+    int pr = e->p.preset, k;
+
+    r[0] = pr >= 1 ? 16 : 0;
+    r[1] = pr >= 3 ? 16 : 0;
+    r[2] = pr >= 4 ? 16 : 0;
+    for (k = 0; k < 3; k++) {
+        const char *ev = getenv(names[k]);
+        if (ev)
+            r[k] = atoi(ev);
+    }
+}
+
 static int chroma_me_on(const struct aeg_encoder *e)
 {
     static int v = -2;
@@ -7783,6 +7803,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 ctx->cur_c[0] = e->srcp[1];
                 ctx->cur_c[1] = e->srcp[2];
                 ctx->cstride = e->stride[1];
+                umh_radii(e, ctx->umh);
             }
         }
         aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,

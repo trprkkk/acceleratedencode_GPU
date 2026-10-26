@@ -451,6 +451,10 @@ typedef struct aeg_mc_ctx {
     int            chroma;
     const uint8_t *cref[2], *cur_y, *cur_c[2];
     int            cstride;
+    /* Radius of the multi-hexagon stage (umh_search in mc.c) for 16x16
+     * blocks, for the other blocks with a 16-sample side, and for the
+     * smaller ones; 0 = hexagon walk only. */
+    int            umh[3];
 } aeg_mc_ctx;
 
 void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride);

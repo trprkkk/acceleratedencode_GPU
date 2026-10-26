@@ -1633,13 +1633,25 @@ not among the spatial candidates) join the neighbour candidates.  Ours
 against ours: seed cock -1.74, vtest +0.03, mega -0.40, short +0.12, tree
 -0.01 (mean -0.40%); the extra candidates cock -0.47, vtest -0.41, mega
 -0.21, short -0.14, tree 0.00 (mean -0.25%); about +1% time together.
-Exhaustive search still has -1.4% on cock (a further search pattern, e.g.
-x264's UMH, is the next step).
+Exhaustive search still had -1.4% on cock after that.
+
+**Multi-hexagon stage** (umh_search in mc.c, x264's UMH simplified): from
+the best start, a cross of every other sample out to +-16 horizontally and
++-8 vertically, a 5x5 square, and 16-point hexagons at radii 4/8/12/16, then
+the usual hexagon walk.  Per block class (`aeg_mc_ctx.umh[]`, umh_radii();
+`AEG_UMH` / `AEG_UMHP` / `AEG_UMH8`), ours against ours:
+
+| UMH on | cock | vtest | mega | short | tree | mean | time |
+|---|---|---|---|---|---|---|---|
+| 16x16 (preset 1 up) | -0.55 | -0.27 | -0.12 | +0.26 | 0.00 | -0.14 | +1.6% |
+| + 16x8/8x16 (preset 3 up) | -0.74 | -0.50 | -0.72 | -0.41 | 0.00 | **-0.47** | +8% |
+| + 8x8 and smaller (preset 4) | -0.89 | -0.81 | -0.64 | -0.31 | +0.02 | -0.53 | +26% |
 
 | vs x264 psy=0, global PSNR | cock | vtest | mega | short | tree | mean |
 |---|---|---|---|---|---|---|
 | B pyramid | +5.07 | -1.34 | -1.29 | -3.67 | -0.05 | -0.26 |
-| + bidir, lowres seeds | +2.31 | -1.83 | -2.24 | -3.84 | -0.05 | **-1.13** |
+| + bidir, lowres seeds | +2.31 | -1.83 | -2.24 | -3.84 | -0.05 | -1.13 |
+| + multi-hexagon | +1.56 | -2.33 | -2.94 | -4.25 | -0.05 | **-1.60** |
 
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel

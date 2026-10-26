@@ -124,6 +124,7 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     mc->base[0] = NULL;
     mc->ready = 0;
     mc->chroma = 0;
+    mc->umh[0] = mc->umh[1] = mc->umh[2] = 0;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
                                 (size_t)AEG_PAD * stride + AEG_PAD
@@ -477,6 +478,59 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
     return best;
 }
 
+/* x264's uneven multi-hexagon search, simplified: from the best start, a
+ * cross of every other sample out to +-r horizontally and +-r/2 vertically,
+ * a 5x5 square, and 16-point hexagons at radii 4, 8, .. r; each stage keeps
+ * the best position.  The caller's hexagon walk refines the result. */
+static void umh_search(const uint8_t *ref, int rstride, const uint8_t *cur,
+                       int cstride, int bw, int bh, int range, int r,
+                       const me_rate *rt, int *mvx, int *mvy, int *best_cost)
+{
+    static const int8_t hex16[16][2] = {
+        {-4, 2}, {-4, 1}, {-4, 0}, {-4, -1}, {-4, -2},
+        { 4, 2}, { 4, 1}, { 4, 0}, { 4, -1}, { 4, -2},
+        { 2, 3}, { 0, 4}, {-2, 3}, { 2, -3}, { 0, -4}, {-2, -3}
+    };
+    int cx = *mvx, cy = *mvy, best = *best_cost, bx = cx, by = cy, i, j;
+
+#define UMH_TRY(X, Y) do {                                                  \
+        int x_ = (X), y_ = (Y), c_;                                          \
+        if (x_ >= -range && x_ <= range && y_ >= -range && y_ <= range) {    \
+            c_ = me_sad(ref, rstride, cur, cstride, bw, bh, x_, y_) +        \
+                 me_mv_cost(rt, x_ * 4, y_ * 4);                             \
+            if (c_ < best) { best = c_; bx = x_; by = y_; }                  \
+        }                                                                    \
+    } while (0)
+    for (i = 1; i <= r; i += 2) {
+        UMH_TRY(cx + i, cy);
+        UMH_TRY(cx - i, cy);
+    }
+    for (i = 1; i <= r / 2; i += 2) {
+        UMH_TRY(cx, cy + i);
+        UMH_TRY(cx, cy - i);
+    }
+    cx = bx; cy = by;
+    for (j = -2; j <= 2; j++)
+        for (i = -2; i <= 2; i++)
+            if (i || j)
+                UMH_TRY(cx + i, cy + j);
+    cx = bx; cy = by;
+    for (j = 1; j <= r / 4; j++)
+        for (i = 0; i < 16; i++)
+            UMH_TRY(cx + hex16[i][0] * j, cy + hex16[i][1] * j);
+#undef UMH_TRY
+    *mvx = bx; *mvy = by; *best_cost = best;
+}
+
+static int me_umh_radius(const aeg_mc_ctx *mc, int bw, int bh)
+{
+    if (!mc)
+        return 0;
+    if (bw == 16 && bh == 16)
+        return mc->umh[0];
+    return bw >= 16 || bh >= 16 ? mc->umh[1] : mc->umh[2];
+}
+
 static int me_try_pmv(void)
 {
     static int v = -1;
@@ -688,6 +742,12 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
                 }
             (void)cx; (void)cy;
         }
+    }
+    {
+        int ur = me_umh_radius(mc, bw, bh);
+        if (ur > 0)
+            umh_search(ref, rstride, cur, cstride, bw, bh, range, ur, &rt,
+                       &bx, &by, &best_cost);
     }
     hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, &bx, &by,
                &best_sad);
