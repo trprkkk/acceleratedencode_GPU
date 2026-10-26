@@ -43,6 +43,16 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > available).  See
 > [`docs/STATUS.md`](docs/STATUS.md).
 
+**Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
+22-37, five real clips, PSNR of the whole sequence's MSE): **-1.60 %** BD-rate
+on average (cock +1.56, vtest -2.33, mega -2.94, short -4.25, tree -0.05).
+Since the text above was written the encoder gained B pyramid
+(`--b-pyramid`), explicit weighted P prediction (`--weightp`), two P
+references, joint refinement of the bi-predictive vectors, a motion search
+seeded by a half-resolution pre-search with a multi-hexagon stage, coder-priced
+partition/sub-pel/skip decisions and trellis quantisation of luma, chroma and
+intra blocks; the per-feature measurements are in `docs/STATUS.md`.
+
 ## Why this design
 
 Porting x264/x265 to the GPU is attractive because the expensive stages
