@@ -300,6 +300,7 @@ run_bcase bframes_still 320 192  8 2 3 -q 24 --scenecut 0
 run_bcase bpyr_off      320 192 12 3 4 -q 24 --scenecut 0 --b-pyramid 0
 run_bcase bpyr_two      320 192 13 2 1 -q 24 --scenecut 0 --b-pyramid 1
 run_bcase bpyr_adapt    320 192 24 3 4 -q 26 -p 3 --b-adapt 1 -g 10
+run_bcase bpyr_trellis  320 192 24 3 4 -q 26 -p 3 --b-adapt 2
 # Explicit weighted prediction on a fade (genyuv mode 5): the P pictures send
 # a luma and chroma weight/offset through PPS 1, the prediction is
 # interpolated first and weighted afterwards, as 8.4.2.3 has it.  P only,

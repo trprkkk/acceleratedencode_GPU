@@ -1653,6 +1653,33 @@ the usual hexagon walk.  Per block class (`aeg_mc_ctx.umh[]`, umh_radii();
 | + bidir, lowres seeds | +2.31 | -1.83 | -2.24 | -3.84 | -0.05 | -1.13 |
 | + multi-hexagon | +1.56 | -2.33 | -2.94 | -4.25 | -0.05 | **-1.60** |
 
+**B-picture decision, measured again with the pyramid.**  Fixed structures
+against the adaptive default (ours against ours, global PSNR):
+
+| structure | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| --bframes 1 --b-adapt 0 | -0.80 | +2.05 | +2.91 | -0.11 | -0.03 | +0.81 |
+| --bframes 2 --b-adapt 0 | +0.10 | -0.85 | +1.31 | +0.52 | +0.12 | +0.24 |
+| --bframes 3 --b-adapt 0 | +1.55 | -3.40 | -3.35 | +1.95 | +0.12 | -0.63 |
+| `AEG_LATHRESH=140` | +0.71 | -1.24 | -1.27 | +0.64 | +0.02 | -0.23 |
+| --b-adapt 2 (trellis, bias 120) | +0.57 | -1.18 | -3.35 | +1.95 | +0.12 | -0.38 |
+| --b-adapt 2, `AEG_LABIAS=112` | +0.83 | -0.69 | -1.41 | +1.95 | +0.12 | +0.16 |
+| --b-adapt 2, `AEG_LABIAS=100` | -3.20 | +5.79 | +0.70 | -0.29 | -0.43 | +0.51 |
+
+The best fixed structure per clip would be -1.5% on average, but every
+adjustment of the estimate trades cock/short (which want short groups)
+against vtest/mega (which want long ones): the half-resolution SATD estimate
+does not tell them apart, and the trellis (`--b-adapt 2`, la_group_cost /
+b_adapt_trellis: every split of the window priced with the B pictures
+against their real references, pyramid included) flips between all-P and
+all-3B within a few percent of the B discount.  It stays an option; the fast
+rule stays the default.  For comparison x264 (b-adapt 1) puts three B
+pictures in almost every group on all five clips; with three B pictures our
+cock is +0.4% against x264's, with one -3.2%, so part of cock's remaining
+gap is the coding of long groups (x264 gives the reference B picture QP+1
+and the others +2, we +4 for both; lowering ours was measured worse on the
+average).
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default

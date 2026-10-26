@@ -299,6 +299,10 @@ struct aeg_encoder {
     int64_t *in_pts;
     aeg_lowres in_low[AEG_MAX_BFRAMES + 3];   /* b_adapt: lowres of the ring */
     int *la_scratch;
+    /* b-adapt 2: lookahead costs already computed, keyed by display
+     * indices (the window slides by a group, so most are reused) */
+    struct { int p0, p1, b; int64_t c; } la_cache[64];
+    int la_cache_n;
     int in_count;           /* pictures pushed so far        */
     int enc_pos;            /* pictures coded so far         */
     int anchor;             /* display index of the last coded anchor, -1 */
@@ -8254,6 +8258,77 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
     return j;
 }
 
+/* b-adapt 2, x264's "trellis" decision on the same window: every way of
+ * splitting a+1..last into groups (k B pictures and their anchor, k <=
+ * bframes) is priced as the sum of its pictures' lookahead costs -- the B
+ * pictures against their actual references, the pyramid's middle one
+ * included (x264's slicetype_path_cost) -- and the first group of the
+ * cheapest split is the one coded.  Unlike the fast rule it sees what each
+ * B picture would cost, not only how far the anchor can reach. */
+static int64_t la_cost_cached(struct aeg_encoder *e, int p0, int p1, int b)
+{
+    int i, n = e->la_cache_n < 64 ? e->la_cache_n : 64;
+    int64_t c;
+
+    for (i = 0; i < n; i++)
+        if (e->la_cache[i].p0 == p0 && e->la_cache[i].p1 == p1 &&
+            e->la_cache[i].b == b)
+            return e->la_cache[i].c;
+    c = la_cost(e, p0, p1, b, NULL);
+    i = e->la_cache_n++ % 64;
+    e->la_cache[i].p0 = p0;
+    e->la_cache[i].p1 = p1;
+    e->la_cache[i].b = b;
+    e->la_cache[i].c = c;
+    return c;
+}
+
+static int64_t la_group_cost(struct aeg_encoder *e, int s, int t)
+{
+    int64_t c = la_cost_cached(e, s, t, t);
+    int b;
+
+    if (e->p.b_pyramid && t - s > 2) {
+        int mid = s + (t - s) / 2;
+        c += la_cost_cached(e, s, t, mid);
+        for (b = s + 1; b < t; b++)
+            if (b != mid)
+                c += la_cost_cached(e, b < mid ? s : mid, b < mid ? mid : t, b);
+    } else {
+        for (b = s + 1; b < t; b++)
+            c += la_cost_cached(e, s, t, b);
+    }
+    return c;
+}
+
+static int b_adapt_trellis(struct aeg_encoder *e, int a, int last)
+{
+    int64_t best[AEG_MAX_BFRAMES + 3];
+    int from[AEG_MAX_BFRAMES + 3];
+    int n = last - a, i, k;
+
+    if (n < 2)
+        return last;
+    best[0] = 0;
+    for (i = 1; i <= n; i++) {
+        best[i] = INT64_MAX;
+        from[i] = i - 1;
+        for (k = 0; k <= e->p.bframes && k <= i - 1; k++) {
+            int s = i - k - 1;
+            int64_t c = best[s] + la_group_cost(e, a + s, a + i);
+            if (c < best[i]) {
+                best[i] = c;
+                from[i] = s;
+            }
+        }
+    }
+    for (i = n; from[i] > 0; i = from[i])
+        ;
+    if (getenv("AEG_LADBG"))
+        fprintf(stderr, "LA2 a %d -> group to %d\n", a, a + i);
+    return a + i;
+}
+
 /* Fill the job queue with the next coding step, if the input has arrived. */
 static void schedule(struct aeg_encoder *e)
 {
@@ -8299,7 +8374,9 @@ static void schedule(struct aeg_encoder *e)
             break;
         }
     }
-    if (!idr && e->p.b_adapt)
+    if (!idr && e->p.b_adapt == 2)
+        nxt = b_adapt_trellis(e, e->anchor, nxt);
+    else if (!idr && e->p.b_adapt)
         nxt = b_adapt_decide(e, e->anchor, nxt);
     if (!idr)
         idr = idr_due(e, nxt);
@@ -8414,7 +8491,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->i_qp_offset = 3;
     if (pp->direct < 0 || pp->direct > 1)
         pp->direct = 1;
-    if (pp->b_adapt < 0 || pp->b_adapt > 1)
+    if (pp->b_adapt < 0 || pp->b_adapt > 2)
         pp->b_adapt = 1;
     if (pp->weightp < 0)
         pp->weightp = pp->preset >= 2;
