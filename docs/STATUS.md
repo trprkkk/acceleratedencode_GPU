@@ -1616,6 +1616,31 @@ rounds) until neither moves (x264 does the same).  Ours against ours: cock
 (`AEG_BIDIRP`, b_part_search): cock -0.16, vtest -0.11, mega -0.13, short
 -0.02, tree -0.01, mean -0.09% for +5% time.
 
+**Half-resolution motion seeds** (lr_seed_frame, `AEG_LRSEED`, preset 1
+up; `AEG_LRNB`).  Where cock lost to x264 was the P pictures at distance
+3-4 (8 of them carry half the bits with three B pictures): our P pictures
+went intra on 580 macroblocks where x264 found 404 inter ones.  An
+exhaustive +-32 search (`AEG_MEFULL=32`, diagnostic only: +1000% time) was
+-4.55% on cock's every third frame coded P only, i.e. the hexagon walk from
+the predictor / zero / neighbours stalled in local minima.  x264 starts its
+search from its lookahead's half-resolution vectors; now so do we: the
+lookahead's block search (lookahead.c) over half-resolution copies of the
+current source and of each list's reference reconstruction, one 8x8 block
+per macroblock, +-16 half-resolution samples; its half-sample vectors are
+whole samples at full resolution and become the search's seed (P and both B
+lists), and the seeds of the right and lower macroblocks (not coded yet, so
+not among the spatial candidates) join the neighbour candidates.  Ours
+against ours: seed cock -1.74, vtest +0.03, mega -0.40, short +0.12, tree
+-0.01 (mean -0.40%); the extra candidates cock -0.47, vtest -0.41, mega
+-0.21, short -0.14, tree 0.00 (mean -0.25%); about +1% time together.
+Exhaustive search still has -1.4% on cock (a further search pattern, e.g.
+x264's UMH, is the next step).
+
+| vs x264 psy=0, global PSNR | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| B pyramid | +5.07 | -1.34 | -1.29 | -3.67 | -0.05 | -0.26 |
+| + bidir, lowres seeds | +2.31 | -1.83 | -2.24 | -3.84 | -0.05 | **-1.13** |
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default

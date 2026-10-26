@@ -672,6 +672,23 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
             if (c < best_cost) { best_cost = c; bx = cand[i][0]; by = cand[i][1]; }
         }
     }
+    {
+        static int fr = -1;
+        if (fr < 0) { const char *ev = getenv("AEG_MEFULL"); fr = ev ? atoi(ev) : 0; }
+        if (fr > 0) {
+            int x, y, cx = 0, cy = 0;
+            for (y = -fr; y <= fr; y++)
+                for (x = -fr; x <= fr; x++) {
+                    int c;
+                    if (x < -range || x > range || y < -range || y > range)
+                        continue;
+                    c = me_sad(ref, rstride, cur, cstride, bw, bh, x, y) +
+                        me_mv_cost(&rt, x * 4, y * 4);
+                    if (c < best_cost) { best_cost = c; cx = x; cy = y; bx = x; by = y; }
+                }
+            (void)cx; (void)cy;
+        }
+    }
     hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, &bx, &by,
                &best_sad);
 

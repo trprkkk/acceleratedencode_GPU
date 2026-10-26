@@ -242,6 +242,14 @@ struct aeg_encoder {
      * batch through the backend (this is the stage the GPU actually runs). */
     aeg_mc_ctx mc;         /* precomputed fractional-pel planes of refp[0] */
     int16_t *seed_mv;      /* integer vectors of the parallel rounds      */
+    /* Half-resolution pre-search (lr_seed_frame): the current source and the
+     * reference reconstructions box-filtered by two, one 8x8 block per
+     * macroblock searched over twice the full-resolution reach; the vectors
+     * (whole samples, per list) start the full search. */
+    aeg_lowres lr_pic[3];
+    int     *lr_scratch;
+    int16_t *lr_mv[2];
+    int      lr_valid;
     int16_t *par_pos;      /* 4 int16 per candidate for satd_batch       */
     int16_t *par_mv;       /* quarter-pel result per macroblock          */
     int32_t *par_cost;
@@ -2694,9 +2702,9 @@ static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
  * is already a start point, but on a motion boundary the median is none of
  * them).  AEG_MENB=0 turns them off. */
 static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
-                              int list, int nb[3][2])
+                              int list, int nb[8][2])
 {
-    static int on = -1;
+    static int on = -1, lrnb = -1;
     const aeg_mb *m;
     int n = 0;
 
@@ -2725,6 +2733,24 @@ static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
         }
     }
 #undef NB_ADD
+    /* the half-resolution pre-search's vectors of the macroblocks not coded
+     * yet (right, below): the spatial neighbours cannot offer those */
+    if (lrnb < 0) {
+        const char *ev = getenv("AEG_LRNB");
+        lrnb = ev ? atoi(ev) : 1;
+    }
+    if (lrnb && e->lr_valid) {
+        static const int8_t d[3][2] = { { 1, 0 }, { 0, 1 }, { -1, 1 } };
+        int k;
+        for (k = 0; k < (lrnb > 1 ? 3 : 2); k++) {
+            int x = mbx + d[k][0], y = mby + d[k][1];
+            if (x < 0 || x >= e->mb_w || y >= e->mb_h)
+                continue;
+            nb[n][0] = (int16_t)(e->lr_mv[list][(y * e->mb_w + x) * 2] * 4);
+            nb[n][1] = (int16_t)(e->lr_mv[list][(y * e->mb_w + x) * 2 + 1] * 4);
+            n++;
+        }
+    }
     return n;
 }
 
@@ -3585,6 +3611,46 @@ static void me_par_subpel(struct aeg_encoder *e, int range4)
     }
 }
 
+static int lr_seed_on(const struct aeg_encoder *e)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_LRSEED");
+        v = ev ? atoi(ev) : -1;
+    }
+    return v >= 0 ? v : e->p.preset >= 1;
+}
+
+/* The motion search walks a hexagon from the best of a few starting points
+ * (the predictor, zero, the neighbours' vectors).  Motion larger than the
+ * neighbourhood suggests -- an object that starts moving, a P picture four
+ * frames from its reference -- leaves it in a local minimum, and the
+ * macroblock goes intra (measured on cock at P distance 3: an exhaustive
+ * +-32 search is -4.6% BD-rate).  x264 seeds its search with the vectors of
+ * its half-resolution lookahead; this is the same: the lookahead's block
+ * search (lookahead.c) on half-resolution copies of the current source and
+ * of each list's reference reconstruction, whose half-sample vectors are
+ * whole samples at full resolution. */
+static void lr_seed_frame(struct aeg_encoder *e)
+{
+    int l, i, n = e->mb_count;
+
+    e->lr_valid = 0;
+    if (e->par_valid || !lr_seed_on(e) || e->p.subme <= 0 || !e->has_ref ||
+        !(e->cur_is_p || e->cur_is_b) || (e->cur_is_b && !e->has_ref2))
+        return;
+    aeg_lowres_build(&e->lr_pic[0], e->srcp[0], e->stride[0], e->w, e->h);
+    for (l = 0; l < (e->cur_is_b ? 2 : 1); l++) {
+        aeg_lowres_build(&e->lr_pic[1 + l], l ? e->ref2p[0] : e->refp[0],
+                         e->stride[0], e->w, e->h);
+        aeg_lowres_cost(&e->lr_pic[0], &e->lr_pic[1 + l], NULL, NULL,
+                        e->lr_scratch);
+        for (i = 0; i < 2 * n; i++)
+            e->lr_mv[l][i] = (int16_t)e->lr_scratch[i];
+    }
+    e->lr_valid = 1;
+}
+
 /* Search every macroblock of the current P picture in parallel and remember the
  * resulting integer vectors in e->seed_mv[].  Runs on the GPU when the
  * dispatcher puts motion estimation there and on the CPU otherwise -- the same
@@ -3763,7 +3829,7 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         const uint8_t *ref = (list ? e->ref2p[0] : e->refp[0]) +
                              mby * 16 * e->stride[0] + mbx * 16;
         const aeg_mc_ctx *mc = list ? &e->mc1 : &e->mc;
-        int seed[2], nb[4][2], nnb = 0;
+        int seed[2], nb[9][2], nnb = 0;
 
         if (me_bnb_on())
             nnb = me_neighbour_cands(e, mbx, mby, list, nb);
@@ -3783,6 +3849,10 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
          * is a far better starting point than zero on content that moves. */
         seed[0] = list ? mv[0][0] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2];
         seed[1] = list ? mv[0][1] / 4 : (int)e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
+        if (e->lr_valid) {
+            seed[0] = e->lr_mv[list][(mby * e->mb_w + mbx) * 2];
+            seed[1] = e->lr_mv[list][(mby * e->mb_w + mbx) * 2 + 1];
+        }
         aeg_me_block_l(ref, e->stride[0], src, e->stride[0], 16, 16, range,
                      e->p.subme, pmv[list][0], pmv[list][1], seed,
                      (const int (*)[2])nb, nnb, e->me_lambda, mc,
@@ -3946,9 +4016,13 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             mvy = e->par_mv[idx * 2 + 1];
             sad = e->par_cost[idx];
         } else {
-            int seed[2], nb[3][2], nnb;
+            int seed[2], nb[8][2], nnb;
             seed[0] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 0];
             seed[1] = e->seed_mv[(mby * e->mb_w + mbx) * 2 + 1];
+            if (e->lr_valid) {
+                seed[0] = e->lr_mv[0][(mby * e->mb_w + mbx) * 2 + 0];
+                seed[1] = e->lr_mv[0][(mby * e->mb_w + mbx) * 2 + 1];
+            }
             nnb = me_neighbour_cands(e, mbx, mby, 0, nb);
             aeg_me_block_l(e->refp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0],
@@ -7718,6 +7792,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
         e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
     }
     me_seed_frame(e);
+    lr_seed_frame(e);
 
     /* frame_num counts the pictures since the last IDR (H.264 8.2.1): an IDR
      * always carries 0, otherwise the decoder invents "non-existing" frames to
@@ -8481,8 +8556,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         memset(e->prev_seed, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     if (e->par_mv)
         memset(e->par_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    {
+        int k;
+        e->lr_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 * sizeof(int));
+        e->lr_mv[0] = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
+        e->lr_mv[1] = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
+        for (k = 0; k < 3; k++)
+            if (aeg_lowres_alloc(&e->lr_pic[k], e->mb_w, e->mb_h))
+                e->lr_pic[k].mem = NULL;
+    }
     if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
-        !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost) {
+        !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost ||
+        !e->lr_scratch || !e->lr_mv[0] || !e->lr_mv[1] ||
+        !e->lr_pic[0].mem || !e->lr_pic[1].mem || !e->lr_pic[2].mem) {
         aeg_set_last_error("out of memory");
         aeg_encoder_close(e);
         return NULL;
@@ -8725,6 +8811,15 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_mc_ctx_free(&e->mc1);
     aeg_free(e->mb_encs);
     aeg_free(e->seed_mv);
+    aeg_free(e->lr_scratch);
+    aeg_free(e->lr_mv[0]);
+    aeg_free(e->lr_mv[1]);
+    {
+        int k;
+        for (k = 0; k < 3; k++)
+            if (e->lr_pic[k].mem)
+                aeg_lowres_free(&e->lr_pic[k]);
+    }
     aeg_free(e->seed_cand);
     aeg_free(e->prev_seed);
     aeg_free(e->seed_sad);
