@@ -1809,6 +1809,54 @@ Conformance cases `mbtree_wrap` (40 pictures, window 3, -g 13) and
 `mbtree_aq`; bit-exact on all real clips at presets 1-4, b-adapt 2, --ref 2
 -g 7, slices/threads, ABR and VBV with --mbtree 1, and the 420-picture stream.
 
+**Why 3-B groups lose on short, and the B mode lambda.**  With the tree on,
+fixed 3-B groups are 4.57% worse than b-adapt 1 on short, while for x264 they
+are 0.5% *better* than 1-B.  Taken apart:
+
+* It is not the structure as such.  At constant QP x264's 3-B groups are just
+  as bad on short (`b-adapt=0:bframes=3` vs `bframes=1`, QP mode: cock -0.83,
+  vtest -1.87, mega -2.78, **short +4.19**, tree +0.17); ours at the same
+  per-type offsets (I -3, Bref +1, B +2, no tree): +1.89 / -2.47 / -3.97 /
+  +4.61 / +0.54.  x264's CQP pb-ratio offsets are not tuned for PSNR, which
+  also inflates "what x264's tree is worth" (CQP -> CRF+tree at fixed 3-B:
+  -3.09 / -10.54 / -6.77 / -4.36 / -0.31).
+* It is not the tree's QP allocation.  x264's own per-macroblock QP maps
+  (decoded with `ffmpeg -debug qp`, crf = q - 5, injected as our offsets with
+  `--bqp 0 --mbtree 0`) give our encoder -0.03% against our own tree on short.
+* It is not the motion search: a full search of radius 24 changes fixed 3-B
+  short by -0.26% and the 3-B penalty by -0.4.
+* Per picture type at *identical* per-macroblock QPs (the injected maps, crf 27
+  / q 32): x264 32039 B at 37.83 dB, ours 35414 B at 38.10 dB, which on x264's
+  own slope (crf 26: 36840 B, 38.44 dB) is 3.6% worse.  The I picture is
+  better (-5.7% bits, +0.57 dB); P costs +12.5% bits for +0.24 dB and B
+  +20.6% for +0.27 dB.  At constant QP and 0, 1 or 3 B pictures the pattern is
+  the same (ours always spends ~11% more for +0.3-0.45 dB), so the weakness is
+  in coding B (and less so P) pictures generally, not in 3-B groups.
+
+Scaling the lambda of B pictures (`AEG_*LAM` experiment, fixed 3-B, cock +
+short): 2x +6.7%, 1.4x +2.6%, 0.75x -1.2%, 0.5x -1.2%; P pictures 0.75x -0.1.
+Only the *mode decision* lambda matters (0.6x on the trellis alone -0.08, on
+the mode decision alone -1.38); both the non-reference B pictures (-0.54) and
+the B references (-0.64) contribute.  The gain is the B *offset*: at
+`--bqp 0` it is gone (+0.17), with `--bqp 4` (no tree) 0.6x is -1.00.  So a B
+picture now chooses its modes with the lambda of the QP it would have without
+its offset (`mode_lambda_off`, 0.63x at the default +2); the quantiser stays
+coarser, but the decisions are priced at the slope the anchors are coded at.
+Full compensation against half (0.79x): -0.34 against -0.27 on all clips;
+the same shift of the motion-search lambda: +0.21.  With `--bqp 4` full
+compensation (0.40x) is worse than 0.6x on short (+1.01), so the rule is only
+measured near the default offset.
+
+| default b-adapt 1, ab | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| B mode lambda at QP - offset | -0.93 | +0.41 | -0.31 | -0.85 | -0.01 | **-0.34** |
+
+Against x264 (`bdx.sh`): CQP **-2.96%** (+1.71, -10.09, -4.67, -5.11, +3.37),
+CRF with its tree **+1.57%** (+2.37, +0.49, +2.57, -0.72, +3.16).  B pictures
+still spend more bits than x264's for their PSNR at the same QP; where that
+goes (fewer skips: 135-170 per picture against x264's 150-186) is the open
+question for the B search.
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
