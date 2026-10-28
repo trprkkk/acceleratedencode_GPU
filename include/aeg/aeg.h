@@ -118,7 +118,8 @@ typedef struct aeg_params {
     int b_adapt;
     /* QP added to every B picture (it is never a reference, so the coarser
      * quantiser cannot propagate; x264 spends +2 by default for the same
-     * reason).  Only meaningful with bframes > 0. */
+     * reason).  Only meaningful with bframes > 0.  -1 (the default) = 4, or
+     * 2 with the macroblock tree. */
     int b_qp_offset;
     /* QP subtracted from every I/IDR picture at constant QP (x264's ipratio
      * 1.4 is the same thing, -3).  Everything after a keyframe predicts from
@@ -183,6 +184,13 @@ typedef struct aeg_params {
      * reference picture for the others (x264's b-pyramid "normal").  -1 = on
      * whenever it can be (B pictures, spatial direct, one P reference). */
     int b_pyramid;
+    /* Macroblock tree (x264's mbtree): per-macroblock QP offsets from how
+     * much of each block later pictures predict from, estimated on the
+     * lookahead's half-resolution pictures over `rc_lookahead` pictures past
+     * the group being coded.  Needs B pictures (the lookahead ring).
+     * -1 = as the preset says. */
+    int mbtree;
+    int rc_lookahead;
     /* Rate-distortion level selection ("trellis") for the luma residual: 0 =
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */

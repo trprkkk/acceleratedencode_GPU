@@ -312,7 +312,11 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
             int cpos = pos >> 1;
             int plane;
             for (plane = 1; plane <= 2; plane++) {
-                int cqp = mb_edge ? aeg_qp_chroma(qp, 0)
+                /* 8.7.2.2: each side's chroma QP from its own luma QP,
+                 * then the average (not the chroma QP of the average luma
+                 * QP, which differs once neighbouring QPs differ) */
+                int cqp = mb_edge ? (aeg_qp_chroma(q->qp, 0) +
+                                     aeg_qp_chroma(p_mb->qp, 0) + 1) >> 1
                                   : aeg_qp_chroma(q->qp, 0);
                 int calpha, cbeta;
                 const int8_t *ctc0;

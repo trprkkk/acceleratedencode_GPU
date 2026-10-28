@@ -129,7 +129,9 @@ void aeg_params_default(aeg_params *p)
      * x264 and the optimum is 4-6, with the I-picture offset and the adaptive
      * group length on.  4 it is. */
     p->bframes = 3;
-    p->b_qp_offset = 4;
+    /* -1: 4, or 2 with the macroblock tree, which already moves the anchors'
+     * quantiser down by what the B pictures inherit from them */
+    p->b_qp_offset = -1;
     p->i_qp_offset = -1;
     p->direct = -1;
     p->b_adapt = -1;
@@ -137,6 +139,8 @@ void aeg_params_default(aeg_params *p)
     p->refs = -1;
     p->weightp = -1;
     p->b_pyramid = -1;
+    p->mbtree = -1;
+    p->rc_lookahead = -1;
     p->deblock = 1;
     p->deblock_alpha = 0;
     p->deblock_beta = 0;

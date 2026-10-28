@@ -303,6 +303,12 @@ run_bcase bpyr_adapt    320 192 24 3 4 -q 26 -p 3 --b-adapt 1 -g 10
 run_bcase bpyr_trellis  320 192 24 3 4 -q 26 -p 3 --b-adapt 2
 run_bcase bpyr_ref2     320 192 24 3 4 -q 26 -p 3 --ref 2 --scenecut 0
 run_bcase bpyr_ref2s    320 192 20 2 1 -q 30 -p 4 --ref 2 --slices 2 -g 9
+# macroblock tree: per-macroblock QP offsets on the reference pictures (the
+# Intra_16x16 delta, chroma deblocking across macroblocks of different QP),
+# and a short window over a long clip so the lookahead ring wraps and the
+# plan crosses keyframes and the flushed tail
+run_bcase mbtree_wrap   320 192 40 3 4 -q 30 -p 2 --mbtree 1 --rc-lookahead 3 -g 13
+run_bcase mbtree_aq     320 192 24 2 1 -q 34 -p 3 --mbtree 1 --aq 10 --scenecut 0
 # Explicit weighted prediction on a fade (genyuv mode 5): the P pictures send
 # a luma and chroma weight/offset through PPS 1, the prediction is
 # interpolated first and weighted afterwards, as 8.4.2.3 has it.  P only,

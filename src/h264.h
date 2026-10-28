@@ -565,6 +565,10 @@ void aeg_lowres_build(aeg_lowres *l, const uint8_t *src, int sstride,
  * picture between r0 and r1; `scratch` holds 4 ints per macroblock. */
 int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
                         const aeg_lowres *r1, int *intra_mbs, int *scratch);
+/* Per-macroblock costs for the macroblock tree (see lookahead.c). */
+void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra, int *inter,
+                        uint8_t *kind, int *mv, int *scratch);
 
 void *aeg_alloc(size_t size);        /* zeroed, 32-byte aligned            */
 void *aeg_alloc_aligned(size_t size, size_t align);

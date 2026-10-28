@@ -1718,6 +1718,97 @@ directions.  The per-macroblock RD choice does not see what a reference
 mismatch does to the neighbours' vector predictors (8.4.1.3.1) or to the
 pictures that predict from this one.  Left as an option.
 
+**Macroblock tree** (x264's mbtree; `--mbtree`, `--rc-lookahead`; on by
+default at constant QP from preset 1, window 10/20/30/40 pictures at presets
+1-4).  Measured first on x264 itself: on these clips x264 at CRF with its
+mbtree is 4.4% cheaper than x264 at constant QP (the reference every number
+above uses), and mbtree alone is worth 8.3% inside CRF -- by far the largest
+x264 feature not yet in.
+
+How it works here (src/encoder.c, `mbt_run()`; lookahead.c,
+`aeg_lowres_mbcosts()`):
+
+* every time schedule() queues a coding step it waits until `rc_lookahead`
+  more pictures are in the input ring, then *plans* the rest of the window
+  the way it will code it: the same b-adapt decisions on the same cached
+  lowres costs (`la_cost_ci()`, so the plan and the real decision agree), the
+  keyframe interval, the pyramid's reference B, the flushed tail as a P
+  chain; scene cuts are not anticipated;
+* per planned picture, per macroblock: lowres intra cost, best inter cost
+  against the planned references (list 0, list 1 or both) and the vectors;
+* from the newest picture back, each block passes (intra + propagate_in) x
+  (1 - inter/intra) to the up to four macroblocks its vector lands on in its
+  reference(s), split evenly between two references;
+* the queued reference pictures (I, P, reference B) get
+  `-1.3 * log2((intra + propagate_in) / intra)` added to the macroblock QP;
+  non-reference B pictures get nothing, and the B offset drops from 4 to 2.
+
+x264 uses strength 2.0 (5 x (1 - qcomp)), base QP + 5.4 and pb_factor 1;
+measured here (fixed 3-B groups, offline whole-clip prototype first):
+
+| variant (ours against ours) | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| P-chain prototype, --bqp 4 | +4.07 | -9.62 | -1.34 | +3.33 | +5.10 | +0.31 |
+| P-chain, --bqp 1 | +2.06 | -9.10 | +0.28 | +0.69 | +5.12 | -0.19 |
+| real group structure, bf3, strength 2.0, --bqp 1 | +1.07 | -9.03 | -4.12 | +1.26 | +3.44 | -1.48 |
+| same, strength 1.3, --bqp 1 | +0.45 | -7.05 | -2.78 | -0.33 | +1.94 | -1.55 |
+| same, strength 1.6, --bqp 0 | +0.88 | -7.50 | -2.34 | +0.91 | +3.66 | -0.88 |
+| same, strength 1.3, --bqp 2 | +0.64 | -7.97 | -3.70 | -0.19 | +1.93 | **-1.86** |
+| same, strength 1.3, --bqp 3 | +1.62 | -8.39 | -3.86 | +0.74 | +1.95 | -1.59 |
+| **in-encoder, default b-adapt 1, vs --mbtree 0** | +0.87 | -9.13 | -2.55 | +0.20 | +1.93 | **-1.74** |
+| strength 1.7 instead of 1.3 | +0.83 | -1.64 | -0.42 | +0.84 | +0.66 | +0.06 |
+| strength 1.0 instead of 1.3 | -0.37 | +2.27 | +0.19 | -0.29 | -0.66 | +0.23 |
+| --iqp 1 instead of 3 | -1.01 | +3.14 | -0.01 | -0.68 | -1.86 | -0.08 |
+| no offsets on I pictures | -1.00 | +10.38 | +0.09 | -1.26 | -0.06 | +1.63 |
+
+On the 420-picture tree/short stream (a scene cut every 30 pictures):
+-3.55%, for +10% time (mostly from the lower QPs, i.e. more coefficients);
+a 10-picture window instead of 30 is the same (-0.05).  Against x264:
+
+| | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| vs x264 CQP psy=0 (the usual reference), mbtree off | +1.56 | -2.33 | -2.94 | -4.25 | -0.05 | -1.60 |
+| vs x264 CQP psy=0, mbtree on | +2.64 | -10.47 | -4.48 | -4.33 | +3.38 | **-2.65** |
+| vs x264 CRF psy=0 aq-mode=0 (its mbtree on), ours mbtree off | +2.23 | +9.47 | +3.47 | 0.00 | -0.01 | +3.03 |
+| vs x264 CRF psy=0 aq-mode=0, ours mbtree on | +3.33 | +0.08 | +2.65 | +0.02 | +3.17 | **+1.85** |
+
+(`XRC=crf tools/real/bdx.sh "" "psy=0:aq-mode=0"`; CRF at the same values as
+the QPs.)  So against x264 as it is normally run, our tree recovers about
+1.2 of the 3 points its tree is worth.  The clips that lose (cock, short,
+tree) lose in every variant; vtest (a static surveillance camera) wants the
+strongest offsets, including on the I picture.  Note that x264 never gives
+its *first* IDR any tree offset (`slicetype_analyse()` returns before the
+tree when there is no previous non-B picture): on tree x264's I picture sits
+at exactly CRF - 3 while ours gets -5.6 on top of the I offset; taking the
+offsets off our I pictures helps cock and short by 1 point and costs vtest
+10, so they stay.  tree is a slide show (new picture at 10, 16 and 23, exact
+repeats in between).
+
+Off by default with a rate target or a buffer model: they predict a picture's
+size from its QP; with `--mbtree 1` they use QP + the picture's mean offset
+(`mbt_qoff`).  The ring holds bframes + 3 + rc_lookahead + bframes + 1
+pictures: with the window the scheduler can run a group behind the input
+(the first picture alone, a long group then a short one), and the first
+version overwrote B pictures that were still waiting.
+
+Per-macroblock QPs had never been exercised against a decoder before (AQ is
+off by default and untested with FFmpeg), and they found two bugs that also
+affected `--aq`:
+
+51. **Chroma deblocking across macroblocks of different QP.**  8.7.2.2 takes
+    each side's chroma QP from its own luma QP and averages the two; we took
+    the chroma QP of the averaged luma QP, which differs once the table
+    bends.  6 samples on an I picture at QP 38.
+52. **An Intra_16x16 macroblock with no AC keeps its own QP.**  With
+    cbp = 0 the bitstream passes replaced the QP by the previous one (no
+    mb_qp_delta), but Intra_16x16 always sends the delta and its DC levels
+    were quantised with its own QP.
+53. **The lookahead ring was a group short** (above).
+
+Conformance cases `mbtree_wrap` (40 pictures, window 3, -g 13) and
+`mbtree_aq`; bit-exact on all real clips at presets 1-4, b-adapt 2, --ref 2
+-g 7, slices/threads, ABR and VBV with --mbtree 1, and the 420-picture stream.
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
@@ -1795,19 +1886,17 @@ chroma-me 0.16, b-pyramid 0.46, ref 3 -> 1 0.70.  On cock alone: P only
    as far as two (*Two P references*); more than two would need a larger
    buffer and reference list reordering, and on these clips the second one is
    already worth little once B pictures are on.  B pictures are in, and only
-   their partitioned shapes are left (item 1).  MB-tree was
-   evaluated for the rate controller and is *not* in: at a fixed rate on the
-   two-complexity clip it undershot the target by 17% and gave back 0.7 dB, and
-   this environment has no real content to show the gain it is known for, so
-   two-pass allocation (which is measurable here, +3.8 dB) is the mechanism that
-   was kept.
+   their partitioned shapes are left (item 1).  The macroblock
+   tree is in at constant QP (*Macroblock tree*); making the rate controller
+   and the buffer model aware of it beyond the mean offset is what is left
+   for ABR/VBV.
 5. Threads beyond slices: a per-thread device context (so that slice threads
    and GPU stages can run at the same time -- today a picture with any stage on
    a device is coded by one thread), and frame-level threading (code picture
    N+1's decision pass while picture N is being written), which needs the
    reconstruct-then-write split that the loop already has, plus one reference
-   picture per thread.  Rate control is picture-level only (no macroblock-tree
-   lookahead), and the VBV model tracks the buffer level between pictures
+   picture per thread.  Rate control is picture-level only (the macroblock
+   tree is on at constant QP only), and the VBV model tracks the buffer level between pictures
    rather than the coded-picture removal times a full HRD also signals
    (`cpb_removal_delay` in the SPS VUI).
 

@@ -81,6 +81,11 @@ typedef struct mbenc {
 /* Picture buffers: the two anchors around a group, its reference B picture
  * (B pyramid) and the picture being reconstructed. */
 #define AEG_NPIC 4
+/* The macroblock tree looks this many pictures past the group being coded at
+ * most; the input ring holds them on top of a group and its next anchor. */
+#define AEG_MAX_LOOKAHEAD 60
+#define AEG_RING (2 * AEG_MAX_BFRAMES + 4 + AEG_MAX_LOOKAHEAD)
+#define LA_CACHE 512
 typedef struct {
     int     type;
     int     nparts;
@@ -294,15 +299,27 @@ struct aeg_encoder {
     int col_ref_poc[2];     /* POC of its two L0 references (if any) */
     /* Lookahead: input pictures are held in display order until the anchors
      * they are coded between have arrived (see aeg_encoder_encode()). */
-    uint8_t *in_mem[AEG_MAX_BFRAMES + 3];
-    uint8_t *in_plane[AEG_MAX_BFRAMES + 3][3];
+    uint8_t *in_mem[AEG_RING];
+    uint8_t *in_plane[AEG_RING][3];
     int64_t *in_pts;
-    aeg_lowres in_low[AEG_MAX_BFRAMES + 3];   /* b_adapt: lowres of the ring */
+    aeg_lowres in_low[AEG_RING];   /* b_adapt / mbtree: lowres of the ring */
     int *la_scratch;
-    /* b-adapt 2: lookahead costs already computed, keyed by display
-     * indices (the window slides by a group, so most are reused) */
-    struct { int p0, p1, b; int64_t c; } la_cache[64];
+    /* lookahead costs already computed, keyed by display indices (the
+     * window slides by a group, so most are reused) */
+    struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
     int la_cache_n;
+    int la_depth;           /* pictures the mbtree looks past the group      */
+    int flushing;           /* the input has ended (aeg_encoder_flush)       */
+    /* Macroblock tree, per ring slot: the lowres costs of the picture
+     * against the references it was last planned with (key d/p0/p1), its
+     * propagate_in, and the QP offsets once it is queued (valid for qd). */
+    struct mbt_slot {
+        int d, p0, p1;
+        int *intra, *inter, *mv;
+        uint8_t *kind;
+        float *prop, *qp;
+        int qd;
+    } mbt[AEG_RING];
     int in_count;           /* pictures pushed so far        */
     int enc_pos;            /* pictures coded so far         */
     int anchor;             /* display index of the last coded anchor, -1 */
@@ -366,6 +383,7 @@ struct aeg_encoder {
      * would then fire on a buffer that is nowhere near empty. */
     int    last_anchor_bits;
     int    last_anchor_qp;
+    int    mbt_qoff;        /* mean macroblock-tree offset of this picture */
 };
 
 /* Which of the two batched coefficient code paths to use for this picture.
@@ -6546,7 +6564,7 @@ static int rd_cabac_bits(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     int16_t save_mvd[2][16][2];
 
     memcpy(save_mvd, e->mbs[idx].mvd, sizeof(save_mvd));
-    if (c->cbp == 0)
+    if (c->cbp == 0 && c->type != AEG_MB_I16x16)
         c->qp = e->rd_last_qp;
     if (slice == AEG_SLICE_P && c->type == AEG_MB_P16x16 && c->cbp == 0 &&
         c->ref[0] == 0) {
@@ -6654,6 +6672,96 @@ static void aq_compute(struct aeg_encoder *e)
     (void)x; (void)y;
 }
 
+/* Macroblock tree (x264's mbtree): how much of each macroblock's information
+ * is inherited by the pictures that predict from it.  A block that later
+ * pictures copy from (static background) deserves a finer quantiser than one
+ * that is overwritten next frame, because its error is paid again in every
+ * picture that references it.
+ *
+ * Per picture the lookahead gives intra(i) and inter(i) (lowres SATD).  The
+ * fraction of block i that is predicted rather than coded anew is
+ * 1 - inter/intra; that share of (intra + propagate_in) flows to the blocks
+ * of the reference it was predicted from, split over the up to four
+ * macroblocks the vector lands on.  Processed from the newest picture back,
+ * propagate_in of a picture is complete when its turn comes, and the offset
+ * is -strength * log2((intra + propagate_in) / intra). */
+static void mbt_propagate(int mb_w, int mb_h, const int *intra,
+                          const int *inter, const uint8_t *kind, const int *mv,
+                          const float *prop_in, float *in0, float *in1, int w0)
+{
+    int x, y;
+    for (y = 0; y < mb_h; y++)
+        for (x = 0; x < mb_w; x++) {
+            int i = y * mb_w + x, l;
+            int ic = intra[i], pc = inter[i] < ic ? inter[i] : ic;
+            float amount;
+            if (ic <= 0 || pc >= ic)
+                continue;
+            amount = (float)((prop_in[i] + ic) * (double)(ic - pc) / ic);
+            for (l = 0; l < 2; l++) {
+                float *dst = l ? in1 : in0, a;
+                int px, py, mx, my, fx, fy;
+                if (kind[i] != 2 && kind[i] != l)
+                    continue;
+                if (!dst)
+                    continue;
+                a = kind[i] == 2 ? amount * (l ? 64 - w0 : w0) / 64.0f : amount;
+                /* lowres half-sample units: 16 per macroblock */
+                px = 16 * x + mv[4 * i + 2 * l];
+                py = 16 * y + mv[4 * i + 2 * l + 1];
+                mx = px >> 4; my = py >> 4; fx = px & 15; fy = py & 15;
+#define MBT_ADD(X, Y, W) do {                                              \
+                if ((X) >= 0 && (X) < mb_w && (Y) >= 0 && (Y) < mb_h && ((W) != 0)) \
+                    dst[(Y) * mb_w + (X)] += a * (W) / 256.0f;             \
+            } while (0)
+                MBT_ADD(mx, my, (16 - fx) * (16 - fy));
+                MBT_ADD(mx + 1, my, fx * (16 - fy));
+                MBT_ADD(mx, my + 1, (16 - fx) * fy);
+                MBT_ADD(mx + 1, my + 1, fx * fy);
+#undef MBT_ADD
+            }
+        }
+}
+
+static int in_slots(const struct aeg_encoder *e);
+
+/* Mean offset (rounded) the macroblock tree gives the current picture. */
+static int mbt_mean(const struct aeg_encoder *e)
+{
+    const struct mbt_slot *m;
+    double t = 0.0;
+    int n = e->mb_count, i;
+
+    if (!e->la_depth || !e->cur_is_ref)
+        return 0;
+    m = &e->mbt[e->cur_poc % in_slots(e)];
+    if (!m->qp || m->qd != e->cur_poc)
+        return 0;
+    for (i = 0; i < n; i++)
+        t += floorf(m->qp[i] + 0.5f);
+    return (int)floor(t / n + 0.5);
+}
+
+/* The offsets the macroblock tree gave this picture when it was queued (a
+ * B picture nothing predicts from has none: nothing inherits its error). */
+static void mbt_apply(struct aeg_encoder *e)
+{
+    const struct mbt_slot *m;
+    int n = e->mb_count, i;
+
+    if (!e->la_depth || !e->cur_is_ref)
+        return;
+    m = &e->mbt[e->cur_poc % in_slots(e)];
+    if (!m->qp || m->qd != e->cur_poc)
+        return;
+    for (i = 0; i < n; i++) {
+        int d = e->mb_dqp[i] + (int)floorf(m->qp[i] + 0.5f);
+        if (d < -AQ_MAX_DQP) d = -AQ_MAX_DQP;
+        if (d > AQ_MAX_DQP) d = AQ_MAX_DQP;
+        e->mb_dqp[i] = (int8_t)d;
+    }
+}
+
 /* QP of one macroblock of the current picture. */
 static int mb_qp_of(const struct aeg_encoder *e, int mbx, int mby)
 {
@@ -6703,12 +6811,15 @@ static void vbv_clamp_qp(struct aeg_encoder *e)
     avail = vbv_available(e);
     if (avail < 1.0)
         avail = 1.0;
-    pred = (double)ref_bits * pow(2.0, (double)(ref_qp - e->cur_qp) / 6.0);
+    /* the macroblock tree moves the picture's QP by its mean offset, and the
+     * pictures the prediction starts from carry theirs (vbv_update) */
+    pred = (double)ref_bits *
+           pow(2.0, (double)(ref_qp - e->cur_qp - e->mbt_qoff) / 6.0);
     if (pred <= avail)
         return;
     q_min = (double)ref_qp - 6.0 * log2(avail / (double)ref_bits);
-    if ((double)e->cur_qp < q_min) {
-        int q = (int)ceil(q_min);
+    if ((double)(e->cur_qp + e->mbt_qoff) < q_min) {
+        int q = (int)ceil(q_min) - e->mbt_qoff;
 
         if (q > 51) q = 51;
         if (q > e->cur_qp) {
@@ -6724,10 +6835,10 @@ static void vbv_update(struct aeg_encoder *e, int bits)
     double level;
 
     e->last_pic_bits = bits;
-    e->last_pic_qp = e->cur_qp;
+    e->last_pic_qp = e->cur_qp + e->mbt_qoff;
     if (!e->cur_is_b) {
         e->last_anchor_bits = bits;
-        e->last_anchor_qp = e->cur_qp;
+        e->last_anchor_qp = e->cur_qp + e->mbt_qoff;
     }
     if (!e->vbv_active)
         return;
@@ -7140,9 +7251,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 int64_t t0 = aeg_now_ns();
 
                 /* A macroblock without a coded block pattern carries no
-                 * mb_qp_delta, so the decoder keeps the QP it has; the
-                 * Intra_16x16 one always carries the delta, and it is zero. */
-                if (tmp->cbp == 0)
+                 * mb_qp_delta, so the decoder keeps the QP it has.  The
+                 * Intra_16x16 one always carries the delta: its DC levels
+                 * were quantised with its own QP, which is the one it has
+                 * to send (with per-macroblock offsets it is not the
+                 * previous one). */
+                if (tmp->cbp == 0 && tmp->type != AEG_MB_I16x16)
                     tmp->qp = e->last_qp;
                 m->qp = (int8_t)tmp->qp;
 
@@ -7835,11 +7949,13 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
+    e->mbt_qoff = mbt_mean(e);
     if (e->vbv_active)
         vbv_clamp_qp(e);
 
     resolve_coef_stages(e);
     aq_compute(e);
+    mbt_apply(e);
     wp_analyse(e);
     if ((is_p || e->cur_is_b) && e->p.subme > 0) {
         /* Build the fractional-pel planes of the reference picture once for the
@@ -8164,7 +8280,11 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
 
 static int in_slots(const struct aeg_encoder *e)
 {
-    return e->p.bframes + 3;
+    /* With the tree's window a group is queued la_depth pictures later than
+     * it could be, and the scheduler can run up to a group behind the input
+     * (the first picture alone, or a long group followed by a short one), so
+     * the B pictures still waiting must survive another group of input. */
+    return e->p.bframes + 3 + (e->la_depth ? e->la_depth + e->p.bframes + 1 : 0);
 }
 
 static void copy_yuv(const struct aeg_encoder *e, uint8_t *p[3],
@@ -8291,6 +8411,9 @@ static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
     return c;
 }
 
+static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
+                          int *intra);
+
 static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
 {
     int nmb = e->mb_w > 2 && e->mb_h > 2 ? (e->mb_w - 2) * (e->mb_h - 2)
@@ -8300,12 +8423,12 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
 
     if (last - a < 2)
         return last;
-    c2p1 = la_cost(e, a, a + 2, a + 2, &intra);
+    c2p1 = la_cost_ci(e, a, a + 2, a + 2, &intra);
     if (intra > nmb / 2)
         return a + 1;
-    c1b1 = la_cost(e, a, a + 2, a + 1, NULL);
-    c1p0 = la_cost(e, a, a + 1, a + 1, NULL);
-    c2p0 = la_cost(e, a + 1, a + 2, a + 2, NULL);
+    c1b1 = la_cost_ci(e, a, a + 2, a + 1, NULL);
+    c1p0 = la_cost_ci(e, a, a + 1, a + 1, NULL);
+    c2p0 = la_cost_ci(e, a + 1, a + 2, a + 2, NULL);
     if (getenv("AEG_LADBG"))
         fprintf(stderr, "LA a %d intra %d/%d  1p0 %lld 2p0 %lld | 1b1 %lld 2p1 %lld\n",
                 a, intra, nmb, (long long)c1p0, (long long)c2p0,
@@ -8326,7 +8449,7 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
             }
             thresh = thresh * ts / 100;
         }
-        pc = la_cost(e, a, j + 1, j + 1, &intra);
+        pc = la_cost_ci(e, a, j + 1, j + 1, &intra);
         if (getenv("AEG_LADBG"))
             fprintf(stderr, "LA   j %d pcost/mb %lld thresh %d intra %d\n", j,
                     (long long)(pc / nmb), thresh, intra);
@@ -8343,22 +8466,34 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
  * included (x264's slicetype_path_cost) -- and the first group of the
  * cheapest split is the one coded.  Unlike the fast rule it sees what each
  * B picture would cost, not only how far the anchor can reach. */
-static int64_t la_cost_cached(struct aeg_encoder *e, int p0, int p1, int b)
+static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
+                          int *intra)
 {
-    int i, n = e->la_cache_n < 64 ? e->la_cache_n : 64;
+    int i, n = e->la_cache_n < LA_CACHE ? e->la_cache_n : LA_CACHE, in = 0;
     int64_t c;
 
     for (i = 0; i < n; i++)
         if (e->la_cache[i].p0 == p0 && e->la_cache[i].p1 == p1 &&
-            e->la_cache[i].b == b)
+            e->la_cache[i].b == b) {
+            if (intra)
+                *intra = e->la_cache[i].intra;
             return e->la_cache[i].c;
-    c = la_cost(e, p0, p1, b, NULL);
-    i = e->la_cache_n++ % 64;
+        }
+    c = la_cost(e, p0, p1, b, &in);
+    i = e->la_cache_n++ % LA_CACHE;
     e->la_cache[i].p0 = p0;
     e->la_cache[i].p1 = p1;
     e->la_cache[i].b = b;
     e->la_cache[i].c = c;
+    e->la_cache[i].intra = in;
+    if (intra)
+        *intra = in;
     return c;
+}
+
+static int64_t la_cost_cached(struct aeg_encoder *e, int p0, int p1, int b)
+{
+    return la_cost_ci(e, p0, p1, b, NULL);
 }
 
 static int64_t la_group_cost(struct aeg_encoder *e, int s, int t)
@@ -8407,9 +8542,135 @@ static int b_adapt_trellis(struct aeg_encoder *e, int a, int last)
     return a + i;
 }
 
+/* Macroblock tree over the lookahead window.
+ *
+ * Every time a coding step is queued, the pictures in the ring past it are
+ * planned the way schedule() will code them -- the same group decisions on
+ * the same (cached) lowres costs, the keyframe interval honoured, scene cuts
+ * not anticipated -- and the tree is propagated from the newest picture of
+ * the plan back to the anchor the step predicts from.  Only the offsets of
+ * the pictures just queued are kept; the next step plans again with one
+ * more group of input in the window.  This is x264's macroblock_tree() on
+ * our group structure. */
+struct mbt_ent { int d, r0, r1, ref; };
+
+static int mbt_add(struct mbt_ent *pl, int n, int d, int r0, int r1, int ref)
+{
+    if (n >= AEG_RING)
+        return n;
+    pl[n].d = d;
+    pl[n].r0 = r0;
+    pl[n].r1 = r1;
+    pl[n].ref = ref;
+    return n + 1;
+}
+
+/* the pictures of the group a -> nxt in the order schedule() queues them */
+static int mbt_group(const struct aeg_encoder *e, struct mbt_ent *pl, int n,
+                     int a, int nxt, int idr)
+{
+    int d;
+
+    if (idr) {
+        for (d = a + 1; d < nxt; d++)
+            n = mbt_add(pl, n, d, d - 1, -1, 1);
+        return mbt_add(pl, n, nxt, -1, -1, 1);
+    }
+    n = mbt_add(pl, n, nxt, a, -1, 1);
+    if (e->p.b_pyramid && nxt - a - 1 >= 2) {
+        int mid = a + (nxt - a) / 2;
+        n = mbt_add(pl, n, mid, a, nxt, 1);
+        for (d = a + 1; d < nxt; d++)
+            if (d != mid)
+                n = mbt_add(pl, n, d, d < mid ? a : mid, d < mid ? mid : nxt, 0);
+    } else {
+        for (d = a + 1; d < nxt; d++)
+            n = mbt_add(pl, n, d, a, nxt, 0);
+    }
+    return n;
+}
+
+static double mbt_strength(void)
+{
+    static double v = -1.0;
+    if (v < 0.0) {
+        const char *ev = getenv("AEG_MBTS");
+        v = ev ? atoi(ev) / 10.0 : 1.3;
+    }
+    return v;
+}
+
+/* pl[0..nq-1] are the pictures just queued; the plan of the rest of the
+ * window is appended here.  `root` is the anchor they predict from (-1 for
+ * the first picture of the stream). */
+static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
+                    int root, int a, int lidr)
+{
+    int slots = in_slots(e), n = nq, nmb = e->mb_count, k, i;
+    int G = e->p.bframes + 1, end = e->in_count - 1;
+    double strength = mbt_strength();
+
+    /* the rest of the window, as schedule() will see it */
+    while (a < end) {
+        int last = a + G, nx, idr;
+
+        if (last > end) {
+            if (e->flushing)
+                for (i = a + 1; i <= end; i++)
+                    n = mbt_add(pl, n, i, i - 1, -1, 1);
+            break;
+        }
+        nx = e->p.b_adapt == 2 ? b_adapt_trellis(e, a, last)
+           : e->p.b_adapt ? b_adapt_decide(e, a, last) : last;
+        idr = e->p.gop_size > 0 && nx - lidr >= e->p.gop_size;
+        n = mbt_group(e, pl, n, a, nx, idr);
+        if (idr)
+            lidr = nx;
+        a = nx;
+    }
+    if (root >= 0)
+        memset(e->mbt[root % slots].prop, 0, sizeof(float) * (size_t)nmb);
+    for (k = 0; k < n; k++) {
+        struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+
+        memset(m->prop, 0, sizeof(float) * (size_t)nmb);
+        if (m->d != pl[k].d || m->p0 != pl[k].r0 || m->p1 != pl[k].r1) {
+            aeg_lowres_mbcosts(&e->in_low[pl[k].d % slots],
+                               pl[k].r0 >= 0 ? &e->in_low[pl[k].r0 % slots] : NULL,
+                               pl[k].r1 >= 0 ? &e->in_low[pl[k].r1 % slots] : NULL,
+                               m->intra, m->inter, m->kind, m->mv,
+                               e->la_scratch);
+            m->d = pl[k].d;
+            m->p0 = pl[k].r0;
+            m->p1 = pl[k].r1;
+        }
+    }
+    for (k = n - 1; k >= 0; k--) {
+        const struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+
+        if (pl[k].r0 < 0)
+            continue;
+        mbt_propagate(e->mb_w, e->mb_h, m->intra, m->inter, m->kind, m->mv,
+                      m->prop, e->mbt[pl[k].r0 % slots].prop,
+                      pl[k].r1 >= 0 ? e->mbt[pl[k].r1 % slots].prop : NULL, 32);
+    }
+    for (k = 0; k < nq; k++) {
+        struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+
+        if (!pl[k].ref)
+            continue;
+        for (i = 0; i < nmb; i++)
+            m->qp[i] = (float)(-strength *
+                log2((m->intra[i] + m->prop[i]) / (double)m->intra[i]));
+        m->qd = pl[k].d;
+    }
+}
+
 /* Fill the job queue with the next coding step, if the input has arrived. */
 static void schedule(struct aeg_encoder *e)
 {
+    struct mbt_ent pl[AEG_RING];
+
     int G, nxt, idr, d;
 
     if (e->job_n)
@@ -8419,14 +8680,41 @@ static void schedule(struct aeg_encoder *e)
          * be coded as soon as it is in the ring. */
         if (e->in_count < 1)
             return;
+        if (e->la_depth && !e->flushing &&
+            e->in_count <= e->p.bframes + 1 + e->la_depth)
+            return;                   /* the tree's window is not full yet */
         add_job(e, 0, AEG_SLICE_I, 1);
         e->anchor = 0;
+        if (e->la_depth) {
+            mbt_add(pl, 0, 0, -1, -1, 1);
+            mbt_run(e, pl, 1, -1, 0, 0);
+        }
         return;
     }
     G = e->p.bframes + 1;
     nxt = e->anchor + G;
-    if (e->in_count <= nxt)
-        return;                       /* the next anchor has not arrived yet */
+    if (e->in_count <= nxt) {
+        /* the next anchor has not arrived yet -- or never will: at the end of
+         * the input the B pictures still waiting have no anchor after them,
+         * and a B picture without a list 1 reference cannot be coded at all.
+         * They go out as P pictures in display order instead: same pictures,
+         * each predicting from the one before it.  This is what x264 does
+         * with the B pictures of the last, incomplete group. */
+        if (e->flushing && e->in_count > e->anchor + 1) {
+            int last = e->in_count - 1, nq = 0;
+            for (d = e->anchor + 1; d <= last; d++) {
+                add_job(e, d, AEG_SLICE_P, 0);
+                nq = mbt_add(pl, nq, d, d - 1, -1, 1);
+            }
+            if (e->la_depth)
+                mbt_run(e, pl, nq, e->anchor, last, e->last_idr_poc);
+            /* the tail becomes the chain of anchors from here on */
+            e->anchor = last;
+        }
+        return;
+    }
+    if (e->la_depth && !e->flushing && e->in_count <= nxt + e->la_depth)
+        return;                       /* the tree's window is not full yet */
     /* The scene cut test has to run before anything is queued: an IDR drops
      * every reference before it, so the B pictures of its group could no longer
      * be coded once it is in the queue.  It also decides *where* the group ends:
@@ -8478,6 +8766,10 @@ static void schedule(struct aeg_encoder *e)
             for (d = e->anchor + 1; d < nxt; d++)
                 add_job(e, d, AEG_SLICE_B, 0);
         }
+    }
+    if (e->la_depth) {
+        int nq = mbt_group(e, pl, 0, e->anchor, nxt, idr);
+        mbt_run(e, pl, nq, e->anchor, nxt, idr ? nxt : e->last_idr_poc);
     }
     e->anchor = nxt;
 }
@@ -8587,6 +8879,28 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->bframes < 2 || pp->direct != 1)
         pp->b_pyramid = 0;
     pp->b_pyramid = pp->b_pyramid ? 1 : 0;
+    /* The macroblock tree needs the lookahead ring, which only exists with B
+     * pictures (without them every picture is coded as it arrives). */
+    /* On by default at constant QP only: the rate controller and the buffer
+     * model predict a picture's size from its QP and know nothing of the
+     * offsets beyond their mean (asked for explicitly, they get that). */
+    if (pp->mbtree < 0)
+        pp->mbtree = pp->preset >= 1 && pp->bitrate_kbps <= 0 &&
+                     pp->vbv_maxrate_kbps <= 0;
+    if (pp->bframes <= 0)
+        pp->mbtree = 0;
+    pp->mbtree = pp->mbtree ? 1 : 0;
+    if (pp->rc_lookahead < 0) {
+        static const int la[5] = { 0, 10, 20, 30, 40 };
+        pp->rc_lookahead = la[pp->preset];
+    }
+    if (pp->rc_lookahead > AEG_MAX_LOOKAHEAD)
+        pp->rc_lookahead = AEG_MAX_LOOKAHEAD;
+    if (pp->rc_lookahead <= 0)
+        pp->mbtree = 0;
+    e->la_depth = pp->mbtree ? pp->rc_lookahead : 0;
+    if (pp->b_qp_offset < 0)
+        pp->b_qp_offset = pp->mbtree ? 2 : 4;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns
      * ABR on, with the maximum rate as the target when no bitrate was given. */
@@ -8759,7 +9073,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * macroblock grid (the co-located picture's decisions, which direct mode
      * derives its vectors from). */
     if (e->p.bframes > 0) {
-        int i, slots = e->p.bframes + 3;
+        int i, slots = in_slots(e);
 
         for (i = 0; i < slots; i++) {
             if (enc_alloc_picture(e, &e->in_mem[i], e->in_plane[i]) != AEG_OK) {
@@ -8780,13 +9094,30 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         }
         for (i = 0; i < slots; i++)
             e->in_pts[i] = 0;
-        if (e->p.b_adapt) {
+        if (e->p.b_adapt || e->la_depth) {
             e->la_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 *
                                              sizeof(int));
             for (i = 0; i < slots; i++)
                 if (aeg_lowres_alloc(&e->in_low[i], e->mb_w, e->mb_h))
                     break;
             if (i < slots || !e->la_scratch) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+        }
+        for (i = 0; e->la_depth && i < slots; i++) {
+            struct mbt_slot *m = &e->mbt[i];
+            size_t nm = (size_t)e->mb_count;
+            m->intra = (int *)aeg_alloc(nm * sizeof(int));
+            m->inter = (int *)aeg_alloc(nm * sizeof(int));
+            m->mv = (int *)aeg_alloc(nm * 4 * sizeof(int));
+            m->kind = (uint8_t *)aeg_alloc(nm);
+            m->prop = (float *)aeg_alloc(nm * sizeof(float));
+            m->qp = (float *)aeg_alloc(nm * sizeof(float));
+            m->d = m->qd = -1;
+            if (!m->intra || !m->inter || !m->mv || !m->kind || !m->prop ||
+                !m->qp) {
                 aeg_set_last_error("out of memory");
                 aeg_encoder_close(e);
                 return NULL;
@@ -8887,20 +9218,12 @@ int aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt)
         return AEG_EOF;
     if (e->job_n)
         return run_job(e, pkt);
-    /* The B pictures still waiting have no anchor after them any more (the
-     * stream ended), and a B picture without a list 1 reference cannot be
-     * coded at all.  They go out as P pictures in display order instead: same
-     * pictures, each predicting from the one before it.  This is what x264
-     * does with the B pictures of the last, incomplete group. */
-    if (e->in_count > e->anchor + 1) {
-        int d, last = e->in_count - 1;
-        for (d = e->anchor + 1; d <= last; d++)
-            add_job(e, d, AEG_SLICE_P, 0);
-        /* the tail becomes the chain of anchors from here on, so that the next
-         * call does not queue it again */
-        e->anchor = last;
+    /* No more input: the groups the lookahead was waiting on can go now, and
+     * the incomplete one at the end goes out as P pictures (schedule()). */
+    e->flushing = 1;
+    schedule(e);
+    if (e->job_n)
         return run_job(e, pkt);
-    }
     return AEG_EOF;
 }
 
@@ -9004,13 +9327,24 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->par_mv);
     aeg_free(e->par_cost);
     aeg_free(e->mb_dqp);
+    {
+        int i;
+        for (i = 0; i < AEG_RING; i++) {
+            aeg_free(e->mbt[i].intra);
+            aeg_free(e->mbt[i].inter);
+            aeg_free(e->mbt[i].mv);
+            aeg_free(e->mbt[i].kind);
+            aeg_free(e->mbt[i].prop);
+            aeg_free(e->mbt[i].qp);
+        }
+    }
     aeg_free(e->mbs);
     aeg_free(e->in_pts);
     {
         int i;
         for (i = 0; i < (int)(sizeof(e->in_mem) / sizeof(e->in_mem[0])); i++)
             aeg_free(e->in_mem[i]);
-        for (i = 0; i < AEG_MAX_BFRAMES + 3; i++)
+        for (i = 0; i < AEG_RING; i++)
             aeg_lowres_free(&e->in_low[i]);
         aeg_free(e->la_scratch);
         for (i = 0; i < AEG_NPIC; i++) {

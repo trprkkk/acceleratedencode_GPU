@@ -63,8 +63,14 @@ static void usage(void)
 "                   0 = always --bframes B pictures; 2 = every split of the\n"
 "                   window priced picture by picture (x264's trellis;\n"
 "                   experimental, not better on the test clips)\n"
-"  --bqp <n>        QP added to every B picture (default 4; the pyramid's\n"
-"                   reference B picture gets the same offset)\n"
+"  --bqp <n>        QP added to every B picture (default 4, 2 with the\n"
+"                   macroblock tree; the pyramid's reference B picture gets\n"
+"                   the same offset)\n"
+"  --mbtree <0|1>   macroblock tree: lower the QP of the blocks later\n"
+"                   pictures predict from (default on from preset 1; needs\n"
+"                   B pictures)\n"
+"  --rc-lookahead <n> pictures the macroblock tree looks past the group\n"
+"                   being coded (default 10/20/30/40 at presets 1-4, max 60)\n"
 "  --iqp <n>        QP subtracted from I pictures at constant QP (default 3,\n"
 "                   x264's ipratio 1.4)\n"
 "  --direct <mode>  B direct prediction: spatial (default) or temporal\n"
@@ -225,6 +231,7 @@ int main(int argc, char **argv)
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, refs = -1, weightp = -1, bpyramid = -1;
+    int mbtree = -1, rclookahead = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
     int64_t *pass1_bits = NULL;
@@ -275,6 +282,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--ref")) refs = atoi(argv[++i]);
         else if (!strcmp(a, "--weightp")) weightp = atoi(argv[++i]);
         else if (!strcmp(a, "--b-pyramid")) bpyramid = atoi(argv[++i]);
+        else if (!strcmp(a, "--mbtree")) mbtree = atoi(argv[++i]);
+        else if (!strcmp(a, "--rc-lookahead")) rclookahead = atoi(argv[++i]);
         else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
         else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
         else if (!strcmp(a, "--iqp")) iqp = atoi(argv[++i]);
@@ -406,6 +415,8 @@ int main(int argc, char **argv)
     if (refs >= 0) p.refs = refs;
     if (weightp >= 0) p.weightp = weightp;
     if (bpyramid >= 0) p.b_pyramid = bpyramid;
+    if (mbtree >= 0) p.mbtree = mbtree;
+    if (rclookahead >= 0) p.rc_lookahead = rclookahead;
     if (bframes >= 0) p.bframes = bframes;
     if (bqp > -1000) p.b_qp_offset = bqp;
     if (iqp > -1000) p.i_qp_offset = iqp;

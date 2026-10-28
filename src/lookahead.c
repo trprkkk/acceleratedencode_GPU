@@ -356,3 +356,69 @@ int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
         *intra_mbs = intra;
     return total;
 }
+
+/* Per-macroblock version of aeg_lowres_cost() for the macroblock tree: the
+ * intra cost, the best inter cost, which prediction won (0 list 0, 1 list 1,
+ * 2 both) and the two vectors of every block, border blocks included.  `mv`
+ * holds 4 ints per macroblock (list 0 x/y, list 1 x/y, lowres half-sample
+ * units). */
+void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra, int *inter,
+                        uint8_t *kind, int *mv, int *scratch)
+{
+    int mb_w = cur->mb_w, mb_h = cur->mb_h, n = mb_w * mb_h;
+    int *mv0 = scratch, *mv1 = scratch + 2 * n;
+    int x, y;
+
+    for (y = 0; y < mb_h; y++)
+        for (x = 0; x < mb_w; x++) {
+            int i = y * mb_w + x, bx = 8 * x, by = 8 * y;
+            int cand[3][2], nc, px, py, cost = 0x7fffffff, k = 0, l;
+
+            for (l = 0; r0 && l < (r1 ? 2 : 1); l++) {
+                int *m = l ? mv1 : mv0;
+                const aeg_lowres *ref = l ? r1 : r0;
+                int a[2] = {0, 0}, b[2] = {0, 0}, cc[2] = {0, 0}, c;
+
+                nc = 0;
+                if (x > 0) {
+                    a[0] = m[2 * (i - 1)]; a[1] = m[2 * (i - 1) + 1];
+                    cand[nc][0] = a[0]; cand[nc][1] = a[1]; nc++;
+                }
+                if (y > 0) {
+                    b[0] = m[2 * (i - mb_w)]; b[1] = m[2 * (i - mb_w) + 1];
+                    cand[nc][0] = b[0]; cand[nc][1] = b[1]; nc++;
+                    if (x < mb_w - 1) {
+                        cc[0] = m[2 * (i - mb_w + 1)];
+                        cc[1] = m[2 * (i - mb_w + 1) + 1];
+                        cand[nc][0] = cc[0]; cand[nc][1] = cc[1]; nc++;
+                    }
+                }
+                px = median3(a[0], b[0], cc[0]);
+                py = median3(a[1], b[1], cc[1]);
+                c = block_search(cur, ref, bx, by, (const int (*)[2])cand, nc,
+                                 px, py, m + 2 * i);
+                if (c < cost) {
+                    cost = c;
+                    k = l;
+                }
+            }
+            if (r1) {
+                int c = bidir_cost(cur, r0, r1, bx, by, mv0 + 2 * i,
+                                   mv1 + 2 * i) +
+                        mv_cost(mv0[2 * i], mv0[2 * i + 1], 0, 0) +
+                        mv_cost(mv1[2 * i], mv1[2 * i + 1], 0, 0);
+                if (c < cost) {
+                    cost = c;
+                    k = 2;
+                }
+            }
+            intra[i] = intra_cost(cur, bx, by);
+            inter[i] = cost;
+            kind[i] = (uint8_t)k;
+            mv[4 * i] = r0 ? mv0[2 * i] : 0;
+            mv[4 * i + 1] = r0 ? mv0[2 * i + 1] : 0;
+            mv[4 * i + 2] = r1 ? mv1[2 * i] : 0;
+            mv[4 * i + 3] = r1 ? mv1[2 * i + 1] : 0;
+        }
+}

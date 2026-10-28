@@ -91,7 +91,8 @@ def ref_point(args, clip, q, w, h, n, cache):
     st = os.stat(clip)
     key = '%s:%d:%d:%dx%d:%d:%s:%s:%s' % (os.path.abspath(clip), st.st_size,
                                           int(st.st_mtime), w, h, q,
-                                          args.xpreset, args.xopts,
+                                          args.xpreset,
+                                          args.xopts + ('/crf' if args.xrc == 'crf' else ''),
                                           'x264' if args.x264 else 'ffmpeg')
     if key in cache:
         return tuple(cache[key])
@@ -151,7 +152,8 @@ def x264(args, clip, q, w, h):
     dst = '/tmp/bd_ref.264'
     if args.x264:
         subprocess.run([args.x264, '--input-res', '%dx%d' % (w, h), '--fps', '30',
-                        '-q', str(q), '-o', dst, '--quiet'] +
+                        '--crf' if args.xrc == 'crf' else '-q', str(q),
+                        '-o', dst, '--quiet'] +
                        args.xopts.split() + [clip], check=True)
     else:
         subprocess.run([args.ffmpeg, '-hide_banner', '-loglevel', 'error',
@@ -159,7 +161,8 @@ def x264(args, clip, q, w, h):
                         '-s', '%dx%d' % (w, h), '-r', '30', '-i', clip,
                         '-c:v', 'libx264', '-preset', args.xpreset] +
                        (['-x264-params', args.xopts] if args.xopts else []) +
-                       ['-qp', str(q), '-f', 'h264', '-y', dst], check=True)
+                       ['-crf' if args.xrc == 'crf' else '-qp', str(q),
+                        '-f', 'h264', '-y', dst], check=True)
     return os.path.getsize(dst) * 8 / 1000.0
 
 
@@ -204,6 +207,9 @@ def main():
     ap.add_argument('--preset', type=int, default=2)
     ap.add_argument('--extra', default='', help='extra aegenc arguments')
     ap.add_argument('--xopts', default='', help='x264 parameters (or -x264-params)')
+    ap.add_argument('--xrc', default='qp', choices=['qp', 'crf'],
+                    help='reference rate control: constant QP (default) or '
+                         'CRF at the same values (x264 with its mbtree)')
     ap.add_argument('--xpreset', default='medium')
     ap.add_argument('--x264', default='', help='use an x264 binary instead of ffmpeg')
     ap.add_argument('--bin', default=os.path.join(build, 'aegenc'))
