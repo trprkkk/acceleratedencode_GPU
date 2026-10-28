@@ -683,12 +683,28 @@ static int p_should_use_2refs(const struct aeg_encoder *e)
      * reference to offer. */
     return e->cur_is_p && e->ndpb > 1 && e->p.refs >= 2;
 }
+static void refctl_drop(struct aeg_encoder *e, int i)
+{
+    int k = e->refctl.n_mmco++;
+    e->refctl.mmco_diff[k] = e->frame_num - e->dpb[i].fn - 1;
+    e->refctl.mmco_slot[k] = e->dpb[i].slot;
+}
+
+static int ref2_anchor_only(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_REF2ANCHOR");
+        v = ev ? atoi(ev) != 0 : 0;
+    }
+    return v;
+}
+
 static void set_current_refs(struct aeg_encoder *e)
 {
     int l0 = -1, l1 = -1, l0b = -1, i, bref = 0;
 
     memset(&e->refctl, 0, sizeof(e->refctl));
-    e->refctl.l0_mod = -1;
     for (i = 0; i < e->ndpb; i++)
         bref |= !e->dpb[i].anchor;
     if (e->cur_is_b) {
@@ -697,29 +713,63 @@ static void set_current_refs(struct aeg_encoder *e)
             if (p < e->cur_poc && (l0 < 0 || p > e->dpb[l0].poc)) l0 = i;
             if (p > e->cur_poc && (l1 < 0 || p < e->dpb[l1].poc)) l1 = i;
         }
+        /* A reference B picture of a pyramid with two P references: the
+         * buffer holds the group's two anchors and the second reference of
+         * the later one; that one goes, or the sliding window would drop the
+         * earlier anchor (smallest frame_num) that the group still needs. */
+        if (e->cur_bref && e->p.b_pyramid && e->p.refs >= 2)
+            for (i = 0; i < e->ndpb; i++)
+                if (i != l0 && i != l1)
+                    refctl_drop(e, i);
     } else {
+        int two;
         for (i = 0; i < e->ndpb; i++)
             if (e->dpb[i].anchor && (l0 < 0 || e->dpb[i].poc > e->dpb[l0].poc))
                 l0 = i;
+        /* The second P reference: the older anchor without a pyramid; with
+         * one, the newest other picture -- the reference B of the group just
+         * coded when there is one (closer than the older anchor). */
         for (i = 0; i < e->ndpb; i++)
-            if (i != l0 && e->dpb[i].anchor &&
+            if (i != l0 && (e->dpb[i].anchor || (e->p.b_pyramid &&
+                                                 !ref2_anchor_only())) &&
                 (l0b < 0 || e->dpb[i].poc > e->dpb[l0b].poc))
                 l0b = i;
+        two = p_should_use_2refs(e) && l0 >= 0 && l0b >= 0;
         if (l0 >= 0 && e->cur_is_p) {
-            int top = 0;
-            for (i = 1; i < e->ndpb; i++)
-                if (e->dpb[i].fn > e->dpb[top].fn)
-                    top = i;
-            if (top != l0)
-                e->refctl.l0_mod = e->frame_num - e->dpb[l0].fn - 1;
-        }
-        if (bref && l0 >= 0)
-            for (i = 0; i < e->ndpb; i++)
-                if (i != l0) {
-                    int k = e->refctl.n_mmco++;
-                    e->refctl.mmco_diff[k] = e->frame_num - e->dpb[i].fn - 1;
-                    e->refctl.mmco_slot[k] = e->dpb[i].slot;
+            /* the default list 0 orders by decreasing frame_num; modify it
+             * whenever its first entries are not the wanted ones */
+            int want[2], n = two ? 2 : 1, dflt[3], nd = 0, j, k, ok = 1;
+            want[0] = l0;
+            want[1] = l0b;
+            for (i = 0; i < e->ndpb; i++) {
+                for (j = nd; j > 0 && e->dpb[dflt[j - 1]].fn < e->dpb[i].fn; j--)
+                    dflt[j] = dflt[j - 1];
+                dflt[j] = i;
+                nd++;
+            }
+            for (k = 0; k < n; k++)
+                ok &= k < nd && dflt[k] == want[k];
+            if (!ok) {
+                int pred = e->frame_num;       /* CurrPicNum */
+                for (k = 0; k < n; k++) {
+                    int pn = e->dpb[want[k]].fn;
+                    if (pn < pred) {
+                        e->refctl.mod_idc[k] = 0;
+                        e->refctl.mod_abs[k] = pred - pn - 1;
+                    } else {
+                        e->refctl.mod_idc[k] = 1;
+                        e->refctl.mod_abs[k] = pn - pred - 1;
+                    }
+                    pred = pn;
                 }
+                e->refctl.n_mod = n;
+                e->refctl.n_mod_1ref = nd < 1 || dflt[0] != l0;
+            }
+        }
+        if (l0 >= 0 && (bref || (two && e->p.b_pyramid)))
+            for (i = 0; i < e->ndpb; i++)
+                if (i != l0 && !(two && i == l0b))
+                    refctl_drop(e, i);
     }
     e->cur_l1_slot = l1 >= 0 ? e->dpb[l1].slot : -1;
     if (p_should_use_2refs(e) && l0 >= 0 && l0b >= 0) {
@@ -2786,6 +2836,16 @@ static int me_part_on(void)
  * MV predictor.  `refine` selects the quarter-pel stage: the P_8x8 shape trials
  * run integer only (they compare shapes, not vectors) and the winning shape is
  * searched again with the refinement, which is where the quality comes from. */
+static int ref1_cands_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_REF1C");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                          int p, const int geo[4], int pmvx, int pmvy, int ref,
                          int *mvx, int *mvy, int *sad, int refine)
@@ -2796,13 +2856,30 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
     /* the whole-macroblock vector is where a partition usually ends up near */
     int whole[1][2] = { { e->mb_mv[0], e->mb_mv[1] } };
     int nwhole = (!ref && e->mb_inter_ok && me_part_on()) ? 1 : 0;
+    int seed[2], *sp = NULL;
+    /* The second reference: the first one's whole-macroblock vector carried
+     * on to the older picture at constant velocity, and the half-resolution
+     * pre-search's vector against it. */
+    if (ref && e->mb_inter_ok && ref1_cands_on()) {
+        int d0 = e->cur_poc - e->ref_poc[0], d1 = e->cur_poc - e->ref_poc[1];
+        if (d0 > 0) {
+            whole[0][0] = e->mb_mv[0] * d1 / d0;
+            whole[0][1] = e->mb_mv[1] * d1 / d0;
+            nwhole = 1;
+        }
+    }
+    if (ref && e->lr_valid > 1 && ref1_cands_on()) {
+        seed[0] = e->lr_mv[1][(mby * e->mb_w + mbx) * 2];
+        seed[1] = e->lr_mv[1][(mby * e->mb_w + mbx) * 2 + 1];
+        sp = seed;
+    }
     aeg_me_block_l(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, NULL,
+                 refine ? e->p.subme : 0, pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
                  mvx, mvy, sad);
     if (!refine && e->p.subme > 0) {
@@ -3644,7 +3721,7 @@ static void lr_seed_frame(struct aeg_encoder *e)
         !(e->cur_is_p || e->cur_is_b) || (e->cur_is_b && !e->has_ref2))
         return;
     aeg_lowres_build(&e->lr_pic[0], e->srcp[0], e->stride[0], e->w, e->h);
-    for (l = 0; l < (e->cur_is_b ? 2 : 1); l++) {
+    for (l = 0; l < (e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1); l++) {
         aeg_lowres_build(&e->lr_pic[1 + l], l ? e->ref2p[0] : e->refp[0],
                          e->stride[0], e->w, e->h);
         aeg_lowres_cost(&e->lr_pic[0], &e->lr_pic[1 + l], NULL, NULL,
@@ -3652,7 +3729,8 @@ static void lr_seed_frame(struct aeg_encoder *e)
         for (i = 0; i < 2 * n; i++)
             e->lr_mv[l][i] = (int16_t)e->lr_scratch[i];
     }
-    e->lr_valid = 1;
+    /* 2: list0[1] of a two-reference P picture has its vectors in lr_mv[1] */
+    e->lr_valid = e->cur_is_p && e->cur_l0_active > 1 ? 2 : 1;
 }
 
 /* Search every macroblock of the current P picture in parallel and remember the
@@ -8506,7 +8584,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * picture, see set_current_refs). */
     if (pp->b_pyramid < 0)
         pp->b_pyramid = 1;
-    if (pp->bframes < 2 || pp->direct != 1 || pp->refs != 1)
+    if (pp->bframes < 2 || pp->direct != 1)
         pp->b_pyramid = 0;
     pp->b_pyramid = pp->b_pyramid ? 1 : 0;
     /* A buffer model without a rate target makes no sense -- a constant-QP

@@ -284,12 +284,16 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
 /* pred_weight_table() of a P slice (7.3.3.2): list 0 only, one entry per
  * active reference.  A flag of 0 means the default (unweighted) prediction. */
 /* Reference list modification and marking of one slice header (7.3.3.1,
- * 7.3.3.3), B pyramid only.  l0_mod >= 0: one modification_of_pic_nums_idc
- * 0 with abs_diff_pic_num_minus1 = l0_mod.  n_mmco > 0: adaptive marking
+ * 7.3.3.3), B pyramid only.  n_mod > 0: list 0 modifications, entry k being
+ * modification_of_pic_nums_idc mod_idc[k] (0 = subtract, 1 = add) with
+ * abs_diff_pic_num_minus1 = mod_abs[k].  n_mmco > 0: adaptive marking
  * with one operation 1 (difference_of_pic_nums_minus1 = mmco_diff[k]) per
  * entry. */
 typedef struct aeg_refctl {
-    int l0_mod;
+    int n_mod;
+    int n_mod_1ref;     /* entries to write when the slice ends up with one
+                         * active reference (0 or 1: the first is the same) */
+    int mod_idc[2], mod_abs[2];
     int n_mmco;
     int mmco_diff[3];
     int mmco_slot[3];   /* encoder bookkeeping, not written */

@@ -1680,6 +1680,44 @@ gap is the coding of long groups (x264 gives the reference B picture QP+1
 and the others +2, we +4 for both; lowering ours was measured worse on the
 average).
 
+**Two P references with the B pyramid** (`--ref 2` with B pictures; the
+default stays one reference when there are B pictures).  x264's reference
+count is worth 0.39 points from 1 to 2 and 0.29 from 2 to 3 on these clips
+(global PSNR against x264 psy=0: ref=1 -2.28%, ref=2 -1.89%, ref=3 -1.60%).
+The pyramid no longer forces one reference:
+
+* list0[1] of a P picture is the newest other picture -- the reference B of
+  the group just coded when there is one (`AEG_REF2ANCHOR=1`: the older
+  anchor instead);
+* list 0 modification is now general (refctl.n_mod entries, subtract/add):
+  whenever the default list's first entries (decreasing frame_num) are not
+  the wanted ones, every wanted entry is placed explicitly; a slice that ends
+  up on one active reference writes only the first entry (n_mod_1ref) --
+  writing both made FFmpeg reject the header ("reference count overflow");
+* the P picture's MMCOs keep exactly its two references; the reference B
+  picture's MMCOs drop the one picture that is neither of its group's
+  anchors, so the buffer never exceeds max_num_ref_frames = 3;
+* the second reference's search gets two more starting points: the first
+  reference's vector scaled by the POC distances and the half-resolution
+  pre-search's vector against it (`AEG_REF1C`).
+
+Bit-exact on all real clips (CQP, ABR, slices/threads, -g 7, b-adapt 2,
+preset 4, the fade clip, the 420-picture stream), conformance cases
+`bpyr_ref2`, `bpyr_ref2s`.  But it does not pay (ours against ours):
+
+| change | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| --ref 2 with pyramid (list0[1] = reference B) | -0.16 | -0.63 | +0.41 | +0.47 | +0.02 | +0.02 |
+| same, list0[1] = older anchor | -0.18 | -0.83 | +0.55 | +0.47 | -0.01 | 0.00 |
+| second-reference start points, P only | -0.08 | +0.06 | -0.21 | +0.10 | 0.00 | -0.02 |
+
+Even P only, short is worse with two references (+0.21%) although only 1-5%
+of its inter macroblocks pick the second one; a fixed penalty on those
+candidates (4 or 16 lambda-bits) moves mega and short in opposite
+directions.  The per-macroblock RD choice does not see what a reference
+mismatch does to the neighbours' vector predictors (8.4.1.3.1) or to the
+pictures that predict from this one.  Left as an option.
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default

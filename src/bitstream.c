@@ -357,10 +357,14 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         } else {
             aeg_bw_put(bw, 1, 0);     /* num_ref_idx_active_override_flag   */
         }
-        if (nos == 0 && rc && rc->l0_mod >= 0) {
+        if (nos == 0 && rc &&
+            (num_ref_idx_l0_active > 1 ? rc->n_mod : rc->n_mod_1ref) > 0) {
+            int k, n = num_ref_idx_l0_active > 1 ? rc->n_mod : rc->n_mod_1ref;
             aeg_bw_put(bw, 1, 1);     /* ref_pic_list_modification_flag_l0  */
-            aeg_bw_ue(bw, 0);         /* modification_of_pic_nums_idc: -    */
-            aeg_bw_ue(bw, (uint32_t)rc->l0_mod); /* abs_diff_pic_num_minus1 */
+            for (k = 0; k < n; k++) {
+                aeg_bw_ue(bw, (uint32_t)rc->mod_idc[k]); /* 0: -, 1: +      */
+                aeg_bw_ue(bw, (uint32_t)rc->mod_abs[k]); /* abs_diff_pic_num_minus1 */
+            }
             aeg_bw_ue(bw, 3);         /* end of the modifications           */
         } else {
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l0  */
