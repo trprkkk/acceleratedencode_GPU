@@ -1236,10 +1236,11 @@ static int64_t trel_price(int64_t bits256, double lambda)
  * transform and one local price per candidate -- and the block that wins is
  * priced exactly before it is accepted, so the local price can only cost
  * choices, never correctness. */
-static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
-                            int16_t *lev, const uint8_t *src, int stride,
-                            const uint8_t *pred, int pred_stride, int qp,
-                            double lambda, int passes, int allow_empty)
+static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
+                               int16_t *lev, const uint8_t *src, int stride,
+                               const uint8_t *pred, int pred_stride, int qp,
+                               double lambda, int passes, int allow_empty,
+                               int64_t *out_sse, int64_t *out_bits)
 {
     int16_t cur[64], trial[64], best[64], scan[64];
     /* 8x8: the trials reuse the current levels' dequantised block and row
@@ -1253,7 +1254,7 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
     const int nat = t->side * t->side;
     const size_t natsz = sizeof(int16_t) * (size_t)nat;
     int i, pass, nnz = 0, last = -1;
-    int64_t bits, sse, cost, best_cost, orig_cost, best_sse, orig_bits;
+    int64_t bits, sse, cost, best_cost, orig_cost, best_sse, orig_bits, orig_sse;
 
     memcpy(cur, lev, natsz);
     for (i = 0; i < t->n; i++)
@@ -1268,8 +1269,14 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
     bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
     sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
     orig_cost = best_cost = cost = sse + trel_price(bits, lambda);
-    best_sse = sse;
+    best_sse = orig_sse = sse;
     orig_bits = bits;
+    /* what the levels left in lev[] measure and cost, for callers that need
+     * both (the price is aeg_cabac_residual_price() of them in scan order) */
+    if (out_sse) {
+        *out_sse = orig_sse;
+        *out_bits = orig_bits;
+    }
     memcpy(best, cur, natsz);
 
     /* Emptying a block only pays when there is almost nothing in it: the flag
@@ -1362,10 +1369,24 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
             scan[i] = best[t->scan[i]];
         bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
         /* best_sse is trel_sse() of `best`, measured when it was taken */
-        if (best_sse + trel_price(bits, lambda) < orig_cost)
+        if (best_sse + trel_price(bits, lambda) < orig_cost) {
             memcpy(lev, best, natsz);
+            if (out_sse) {
+                *out_sse = best_sse;
+                *out_bits = bits;
+            }
+        }
     }
     return best_cost;
+}
+
+static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
+                            int16_t *lev, const uint8_t *src, int stride,
+                            const uint8_t *pred, int pred_stride, int qp,
+                            double lambda, int passes, int allow_empty)
+{
+    return trel_descent_ex(sh, t, lev, src, stride, pred, pred_stride, qp,
+                           lambda, passes, allow_empty, NULL, NULL);
 }
 
 /* Whether the intra blocks (Intra_4x4, Intra_8x8) get the level selection
@@ -4593,12 +4614,21 @@ static int64_t intra_block_rd(struct aeg_encoder *e, int mbx, int mby,
         tr.cat = 5;
         tr.cbf_ctx = -1;
     }
-    if (trel)
+    if (trel) {
         /* the same level selection, and the same lambda for it, as the
          * block gets when it is coded (code_luma_i4x4, code_luma8_block) */
-        trel_descent(&e->cab_shadow, &tr, lev, sb, s, pred, side, t->qp,
-                     trellis_intra_lambda(side == 4 ? lambda : AEG_LAMBDA(t->qp)),
-                     side == 4 ? 2 : 1, side == 4);
+        int64_t tsse = -1, tbits = 0;
+        trel_descent_ex(&e->cab_shadow, &tr, lev, sb, s, pred, side, t->qp,
+                        trellis_intra_lambda(side == 4 ? lambda : AEG_LAMBDA(t->qp)),
+                        side == 4 ? 2 : 1, side == 4, &tsse, &tbits);
+        if (tsse >= 0) {
+            /* the search measured and priced the levels it left */
+            for (i = 0; i < n && !nzz; i++)
+                nzz |= lev[tr.scan[i]] != 0;
+            b256 = (nzz || side == 4) ? tbits : 0;
+            return tsse + trel_price(b256, lambda);
+        }
+    }
     for (i = 0; i < n; i++) {
         zz[i] = lev[tr.scan[i]];
         nzz |= zz[i] != 0;

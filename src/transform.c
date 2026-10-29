@@ -246,6 +246,13 @@ void aeg_itransform_dc2x2(const int16_t in[4], int16_t out[4])
 
 int aeg_quant_bias(int qbits, int den)
 {
+    /* the two denominators in use are exact shifts: 2^q * 3 / 6 and / 12 */
+    if (QUANT_BIAS_NUM == 3 && QUANT_BIAS_DEN == 2 && qbits >= 2) {
+        if (den == 3)
+            return 1 << (qbits - 1);
+        if (den == 6)
+            return 1 << (qbits - 2);
+    }
     return (int)(((int64_t)(1 << qbits) * QUANT_BIAS_NUM) /
                  (den * QUANT_BIAS_DEN));
 }
