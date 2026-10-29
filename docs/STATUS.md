@@ -2485,7 +2485,7 @@ against its scalar reference, the new ones in `tests/coef_check.c`):
 
 cock 90 frames, `-p 3 -q 28`, frame threads: 8.55 s (32e961c) -> about 7.0 s
 (~12.8 fps; this machine's timings drift by +-3 % between runs, the
-single-thread user time is 21 % lower).  Tried: link-time optimisation
+single-thread user time is about 16 % lower).  Tried: link-time optimisation
 (`-flto`) is slower.
 
 The main thread is still the critical path: P pictures are about 75 % of the
