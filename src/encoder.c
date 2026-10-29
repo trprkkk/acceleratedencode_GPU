@@ -7604,6 +7604,36 @@ static int64_t wp_cost(const uint8_t *cur, int lw, int lh, const uint8_t *ref,
     return tot;
 }
 
+/* wp_cost() refined around given block vectors (+-1) instead of a full
+ * +-WP_R search: the candidates of one picture differ by a level step. */
+static int64_t wp_cost_near(const uint8_t *cur, int lw, int lh,
+                            const uint8_t *ref, int ls, uint8_t *tmp,
+                            wp_cand c, const int8_t *mv)
+{
+    int64_t tot = 0;
+    int bx, by, i, n = 0;
+
+    for (i = 0; i < ls * (lh + 2 * WP_LPAD); i++)
+        tmp[i] = wp_px(ref[i], c);
+    for (by = 0; by + 8 <= lh; by += 8)
+        for (bx = 0; bx + 8 <= lw; bx += 8, n++) {
+            int best = 1 << 30, dx, dy, ie;
+            for (dy = mv[n * 2 + 1] - 1; dy <= mv[n * 2 + 1] + 1; dy++)
+                for (dx = mv[n * 2] - 1; dx <= mv[n * 2] + 1; dx++) {
+                    int sd;
+                    if (dx < -WP_R || dx > WP_R || dy < -WP_R || dy > WP_R)
+                        continue;
+                    sd = aeg_sad(8, 8, cur + by * lw + bx, lw,
+                                 tmp + (by + dy + WP_LPAD) * ls + bx + dx +
+                                     WP_LPAD, ls);
+                    if (sd < best) best = sd;
+                }
+            ie = wp_intra_est(cur + by * lw + bx, lw);
+            tot += best < ie ? best : ie;
+        }
+    return tot;
+}
+
 /* Chroma plane cost of `c` with the block vectors of the luma test. */
 static int64_t wp_cost_chroma(const struct aeg_encoder *e, int pl, int lw,
                               int lh, const int8_t *mv, wp_cand c)
@@ -7638,16 +7668,19 @@ static int wp_threshold(void)
     return v;
 }
 
+#define WP_LUMA_PERMILLE 998
+
 static void wp_analyse(struct aeg_encoder *e)
 {
     int lw = e->w / 2, lh = e->h / 2, ls = lw + 2 * WP_LPAD;
-    int x, y, i, pl, nblk = (lw / 8) * (lh / 8);
+    int x, y, pl, nblk = (lw / 8) * (lh / 8);
     double mc, vc, mr, vr;
     uint8_t *cur = NULL, *ref = NULL, *tmp = NULL;
-    int8_t *mv = NULL, *mvb = NULL;
-    wp_cand cand[2], none = { 64, 0, 6 };
-    int64_t c0, cb[2];
-    int th = wp_threshold(), best = -1;
+    int8_t *mv = NULL, *mvw = NULL;
+    wp_cand none = { 64, 0, 6 }, best = { 64, 0, 6 };
+    int64_t c0, bc;
+    int th = wp_threshold();
+    double sg;
 
     memset(&e->wp, 0, sizeof(e->wp));
     if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8)
@@ -7655,17 +7688,18 @@ static void wp_analyse(struct aeg_encoder *e)
 
     plane_stats(e->srcp[0], e->stride[0], e->w, e->h, &mc, &vc);
     plane_stats(e->refp[0], e->stride[0], e->w, e->h, &mr, &vr);
-    cand[0] = wp_guess(mc, vc, mr, vr, 1);
-    cand[1] = wp_guess(mc, vc, mr, vr, 0);
-    if (wp_identity(cand[0]) && wp_identity(cand[1]))
+    /* x264's early exit: no level shift worth half a step and no gain
+     * change worth a numerator step at denominator 128 */
+    sg = vr > 1.0 && vc > 0.0 ? sqrt(vc / vr) : 1.0;
+    if (fabs(mc - mr) < 0.5 && fabs(sg - 1.0) < 1.0 / 128)
         goto chroma_only;
 
     cur = (uint8_t *)malloc((size_t)lw * lh);
     ref = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
     tmp = (uint8_t *)malloc((size_t)ls * (lh + 2 * WP_LPAD));
     mv = (int8_t *)malloc((size_t)nblk * 2 + 2);
-    mvb = (int8_t *)malloc((size_t)nblk * 2 + 2);
-    if (!cur || !ref || !tmp || !mv || !mvb)
+    mvw = (int8_t *)malloc((size_t)nblk * 2 + 2);
+    if (!cur || !ref || !tmp || !mv || !mvw)
         goto done;
     for (y = 0; y < lh; y++)
         for (x = 0; x < lw; x++) {
@@ -7680,27 +7714,85 @@ static void wp_analyse(struct aeg_encoder *e)
                 (uint8_t)((s[0] + s[1] + s[e->stride[0]] +
                            s[e->stride[0] + 1] + 2) >> 2);
         }
-    c0 = wp_cost(cur, lw, lh, ref, ls, tmp, none, mv);
-    for (i = 0; i < 2; i++) {
-        cb[i] = wp_identity(cand[i]) ? c0
-                                     : wp_cost(cur, lw, lh, ref, ls, tmp,
-                                               cand[i], NULL);
-        /* a relative and an absolute saving: on a nearly flat picture
-         * (black) any offset is a large fraction of almost nothing */
-        if (cb[i] * 100 < c0 * th && c0 - cb[i] >= (int64_t)lw * lh / 4 &&
-            (best < 0 || cb[i] < cb[best]))
-            best = i;
+    c0 = bc = wp_cost(cur, lw, lh, ref, ls, tmp, none, mv);
+    {
+        /* A global level change moves the DC of most well-predicted blocks
+         * the same way; content moving in and out of the picture moves the
+         * mean without that consistency and must not take an offset (the
+         * synthetic pattern of the rate-control tests: -3..+4 mean change,
+         * 0.7-2% half-resolution saving for an offset, +36% bits coded). */
+        int bx, by, n = 0, npos = 0, nneg = 0, cons;
+        for (by = 0; by + 8 <= lh; by += 8)
+            for (bx = 0; bx + 8 <= lw; bx += 8, n++) {
+                const uint8_t *r = ref + (by + mv[2 * n + 1] + WP_LPAD) * ls +
+                                   bx + mv[2 * n] + WP_LPAD;
+                const uint8_t *c = cur + by * lw + bx;
+                int sc = 0, sr = 0, xx, yy;
+                if (aeg_sad(8, 8, c, lw, r, ls) >= wp_intra_est(c, lw))
+                    continue;
+                for (yy = 0; yy < 8; yy++)
+                    for (xx = 0; xx < 8; xx++) {
+                        sc += c[yy * lw + xx];
+                        sr += r[yy * ls + xx];
+                    }
+                if (sc - sr >= 32) npos++;
+                else if (sc - sr <= -32) nneg++;
+            }
+        /* dominant sign at least twice the other: short 2.5-3.7x, the
+         * synthetic pattern 1.1-1.2x; 1.5x is within 0.06 of this on cock
+         * and short, 3x loses a third of short's gain */
+        cons = getenv("AEG_WPCONS") ? atoi(getenv("AEG_WPCONS")) : 20;
+        if (getenv("AEG_WPDBG"))
+            fprintf(stderr, "WPS mdiff %.2f pos %d neg %d of %d\n", mc - mr, npos, nneg, n);
+        if ((npos > nneg ? npos : nneg) * 10 < (npos > nneg ? nneg : npos) * cons)
+            goto chroma_only;
+    }
+    {
+        /* x264's search (weights_analyse at subme 7): the gain matching the
+         * standard deviations and one step either side, each with the offset
+         * matching the means (truncated, as x264 does) and one either side,
+         * measured around the unweighted vectors.  Kept when it saves 0.2%
+         * (x264's own termination); the earlier rule -- 5% of the sum and a
+         * quarter of a sample per pixel -- rejected the -1/-2 offsets of a
+         * slow exposure drift that x264 uses on every P picture of short. */
+        int w0 = (int)floor(sg * 64 + 0.5), ws;
+        wp_cand g = { w0 > 127 ? 127 : w0, 0, 6 };
+
+        /* the guess itself with a full search: on a fade the unweighted
+         * vectors are wrong, and the other candidates are refined around
+         * the guess's */
+        g.o = (int)(mc - mr * g.w / 64.0);
+        g.o = g.o < -128 ? -128 : (g.o > 127 ? 127 : g.o);
+        if (!wp_identity(g)) {
+            int64_t k = wp_cost(cur, lw, lh, ref, ls, tmp, g, mvw);
+            if (k < bc) { bc = k; best = g; }
+        } else
+            memcpy(mvw, mv, (size_t)nblk * 2 + 2);
+        for (ws = w0 - 1; ws <= w0 + 1; ws++) {
+            int o0, o;
+            if (ws < 0 || ws > 127)
+                continue;
+            o0 = (int)(mc - mr * ws / 64.0);
+            for (o = o0 - 1; o <= o0 + 1; o++) {
+                wp_cand c = { ws, o < -128 ? -128 : (o > 127 ? 127 : o), 6 };
+                int64_t k;
+                if (wp_identity(c) || (c.w == g.w && c.o == g.o))
+                    continue;
+                k = wp_cost_near(cur, lw, lh, ref, ls, tmp, c, mvw);
+                if (k < bc) { bc = k; best = c; }
+            }
+        }
     }
     if (getenv("AEG_WPDBG"))
-        fprintf(stderr, "WPC c0 %lld s(%d,%d/%d) %lld o(%d,%d/%d) %lld\n",
-                (long long)c0, cand[0].w, cand[0].o, cand[0].d, (long long)cb[0],
-                cand[1].w, cand[1].o, cand[1].d, (long long)cb[1]);
-    if (best >= 0) {
-        wp_cost(cur, lw, lh, ref, ls, tmp, cand[best], mv);
+        fprintf(stderr, "WPL c0 %lld best (%d,%d) %lld\n", (long long)c0,
+                best.w, best.o, (long long)bc);
+    if (!wp_identity(best) && bc * 1000 <= c0 * WP_LUMA_PERMILLE) {
+        wp_cost(cur, lw, lh, ref, ls, tmp, best, mv);   /* chroma's vectors */
+        while (best.d > 0 && !(best.w & 1)) { best.w >>= 1; best.d--; }
         e->wp.lflag[0] = 1;
-        e->wp.luma_denom = cand[best].d;
-        e->wp.lw[0] = cand[best].w;
-        e->wp.lo[0] = cand[best].o;
+        e->wp.luma_denom = best.d;
+        e->wp.lw[0] = best.w;
+        e->wp.lo[0] = best.o;
     }
 
 chroma_only:
@@ -7763,7 +7855,7 @@ chroma_only:
     }
 
 done:
-    free(cur); free(ref); free(tmp); free(mv); free(mvb);
+    free(cur); free(ref); free(tmp); free(mv); free(mvw);
     if (e->wp.lflag[0]) {
         /* the weighted copy the motion search works on */
         size_t ls0 = (size_t)e->stride[0], lh0 = (size_t)(e->h + 2 * AEG_PAD);

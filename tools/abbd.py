@@ -58,14 +58,19 @@ def encode(args, extra, clip, w, h, q, tag):
     out = '/tmp/abbd_%s.264' % tag
     dec = '/tmp/abbd_%s.yuv' % tag
     # leading NAME=value tokens are environment variables for this side only
-    # (the AEG_* experiment switches), the rest are aegenc options
+    # (the AEG_* experiment switches), the rest are aegenc options; BIN=path
+    # runs that side with another build (e.g. a worktree of the last commit)
     env = dict(os.environ)
     toks = extra.split()
+    binary = args.bin
     while toks and '=' in toks[0] and not toks[0].startswith('-'):
         k, v = toks.pop(0).split('=', 1)
-        env[k] = v
+        if k == 'BIN':
+            binary = v
+        else:
+            env[k] = v
     t0 = time.time()
-    subprocess.run([args.bin, '-w', str(w), '-h', str(h), '-i', clip, '-o', out,
+    subprocess.run([binary, '-w', str(w), '-h', str(h), '-i', clip, '-o', out,
                     '-q', str(q), '-n', str(args.n), '-p', str(args.preset)] +
                    toks, check=True, capture_output=True, env=env)
     dt = time.time() - t0

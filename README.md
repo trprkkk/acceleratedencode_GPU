@@ -44,9 +44,9 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > [`docs/STATUS.md`](docs/STATUS.md).
 
 **Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
-22-37, five real clips, PSNR of the whole sequence's MSE): **-2.96 %** BD-rate
-on average against x264 at constant QP (cock +1.71, vtest -10.09, mega -4.67,
-short -5.11, tree +3.37), and **+1.57 %** against x264 at CRF with its own
+22-37, five real clips, PSNR of the whole sequence's MSE): **-3.30 %** BD-rate
+on average against x264 at constant QP (cock +1.89, vtest -10.09, mega -4.90,
+short -6.78, tree +3.37), and **+1.13 %** against x264 at CRF with its own
 macroblock tree (`aq-mode=0`), the way x264 is normally run.
 Since the text above was written the encoder gained B pyramid
 (`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock

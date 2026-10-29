@@ -1857,6 +1857,66 @@ still spend more bits than x264's for their PSNR at the same QP; where that
 goes (fewer skips: 135-170 per picture against x264's 150-186) is the open
 question for the B search.
 
+**What x264's features are worth here** (x264 against itself, CRF,
+`psy=0:aq-mode=0`, scene cuts off, `/tmp/w/xab.py`-style global-PSNR BD-rate;
+positive = turning the feature off costs that much):
+
+| x264 change | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| subme=6 (no RD in B pictures) | +3.95 | +0.07 | +1.84 | +1.99 | +1.78 | +1.93 |
+| subme=5 (no RD at all) | +7.75 | +2.34 | +5.81 | +4.82 | +3.84 | +4.91 |
+| trellis=0 | +0.60 | +2.57 | +0.90 | +3.57 | +4.32 | +2.39 |
+| 8x8dct=0 | +5.59 | +2.17 | +2.59 | +3.54 | +0.23 | +2.82 |
+| weightp=0 | -0.10 | -0.14 | +0.49 | **+4.20** | -0.37 | +0.82 |
+| weightp=1 (no duplicate refs) | -0.08 | -0.10 | +0.55 | +1.09 | -0.34 | +0.22 |
+| dct-decimate=0 | +0.01 | +0.70 | +0.16 | +1.22 | +0.97 | +0.61 |
+| mixed-refs=0 | +0.09 | +0.82 | +0.25 | +1.29 | -0.05 | +0.48 |
+| me=dia | +0.28 | +2.08 | +0.04 | +0.26 | -0.05 | +0.52 |
+| ref=1 | -0.27 | +1.45 | -0.39 | +0.72 | -0.40 | +0.22 |
+| fast-pskip=0 | -0.24 | +0.46 | +0.02 | -0.20 | +0.35 | +0.08 |
+| chroma-me=0 | -0.46 | -0.16 | -0.34 | +0.29 | -0.04 | -0.14 |
+
+Ours with `--weightp 0` was only +0.45 on short, against x264's +4.20.
+
+**Weighted prediction decision, x264's way.**  x264 weights every P picture
+of short with a plain luma offset of -1 or -2 (denominator 0, weight 1: a slow
+exposure drift; seen with `ffmpeg -bsf:v trace_headers`), and its smart mode
+adds the same picture again as ref 1 with another offset.  Ours never weighted
+short: the saving of an offset there is 1-2.5% of the half-resolution cost,
+under the old 5% / quarter-sample-per-pixel rule.  wp_analyse() now follows
+x264's weights_analyse(): exit early when the means differ by less than half
+a level and the gain guess is within 1/128 of 1; otherwise try the gain
+guess (sqrt of the variance ratio, /64) and one step either side, each with
+the truncated mean-matching offset and one either side, and keep the best
+when it saves 0.2%.  The guess is measured with the full +-4 search (on a
+fade the unweighted vectors are wrong) and the other eight around its
+vectors (`wp_cost_near`, +-1).
+
+On its own that took weights on the synthetic pattern of the rate-control
+tests (means moving by -3..+4 as content enters and leaves; 0.7-2% saving for
+an offset), where they cost +36% bits; ABR overshot by 14% and two-pass lost
+to one-pass.  SATD instead of SAD does not separate the two (short 0.7-1.2%,
+synthetic 0.7-0.8%).  What does is the *sign consistency* of the level change:
+among the blocks the unweighted search predicts better than intra, the DC
+moved by half a level or more one way on 2.5-3.7 times as many blocks as the
+other way on short, and on 1.1-1.2 times as many on the synthetic pattern.  A
+picture now needs a 2:1 majority (`AEG_WPCONS`, tenths) before any luma
+weight is tried.  The conformance fade (genyuv mode 5) now takes weights on
+four of the last four P pictures instead of two.
+
+| ab vs previous commit | cock | vtest | mega | short | tree | mean | fade |
+|---|---|---|---|---|---|---|---|
+| x264-style search, 0.2% | +0.01 | 0.00 | -0.19 | -1.46 | 0.00 | -0.33 | +3.81 |
+| + full search for the guess | | | | -1.41 | | | -1.60 |
+| + 2:1 sign majority (default) | +0.17 | 0.00 | -0.19 | -1.35 | 0.00 | **-0.28** | -1.60 |
+
+Against x264 (`bdx.sh`): CQP **-3.30%** (+1.89, -10.09, -4.90, -6.78, +3.37),
+CRF with its tree **+1.13%** (+2.55, +0.49, +2.30, -2.86, +3.16).  Still open
+from this: the duplicate reference (x264's weightp=2 over 1 is another 1.1 on
+short), which needs list0 to name one picture twice.  `tools/abbd.py` takes
+`BIN=path` as a leading token so one side can run another build (a worktree
+of the last commit).
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
