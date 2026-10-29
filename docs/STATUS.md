@@ -2385,6 +2385,64 @@ Two cores, cock 640x352, against the binary before the speed work
 180 frames (steady state, not just the flush): preset 1 14.3 -> 7.8 s, preset 3
 48.8 -> 23.8 s (2.05x, 3.7 -> 7.6 fps).
 
+## Early termination of the intra candidates
+
+The first round of speed work after the frame threads (the ones that *do* move
+decisions, each held to at most +0.1 % BD-rate on the five real clips).  Where
+the time goes was measured with a cycle counter per section of `code_mb()`
+(`AEG_CMTIME=1`; cock, 90 frames of the forward/backward loop, `-p 3 -q 28`,
+one thread): in a P picture the motion search is 24 %, the inter candidates
+20 %, Intra_16x16 16 %, Intra_8x8 16 %, Intra_4x4 14 %, the vector refinement
+9 %; in a B picture the search is 43 % and the three intra shapes 34 % -- for
+the one macroblock in sixty where intra wins in a B picture.
+
+A per-macroblock log of every candidate's price (now removed again) showed
+what separates the two cases:
+
+* **B pictures:** the best inter price against the SATD of the best
+  Intra_16x16 prediction.  Below 1.2 x, 65 % of the B macroblocks, there was
+  not a single intra winner on cock.  So a B picture now prices its inter
+  candidates *first* and skips every intra candidate under that gate
+  (`AEG_GIB`, percent).
+* **Intra_4x4/8x8 against Intra_16x16:** when the best inter price is below
+  half the best Intra_16x16 one, the finer intra shapes practically never win
+  (P: 24 % of their evaluations skipped, 44 of 9626 intra winners lost, with
+  0.005 % of the price; B: 79 %, none lost).  `AEG_GI48P` / `AEG_GI48B`.
+* **P pictures are different:** a quarter of cock's P macroblocks end up
+  intra, a third of those where the inter prediction's SATD is the lower one.
+  The B-style gate on P costs +0.24 % (mega +1.06), and no SATD rule for the
+  inter partitions came close either (x264's "16x8/8x16 only if 8x8 beats
+  16x16" loses 0.3-0.9 % of the price here: our partitions win on RD, not on
+  SATD).
+* **Three Intra_16x16 modes instead of four** (the SAD-worst one is never
+  RD-priced; `AEG_I16N`): -0.01 %, -6 %.  Two modes: +0.04 %, -9 % (mega
+  +0.25), held back.
+* **Exact:** the luma distortion is a lower bound of a candidate's price, so a
+  candidate whose SSE alone already loses is not given to the CABAC pricer --
+  it was only done at preset 4 (with the chroma decision); now everywhere,
+  byte-identical (a third of the Intra_4x4 candidates, a fifth of Intra_8x8).
+
+Together, against the same binary with the gates off (`tools/real/ab.sh`,
+`ABBD_GLOBAL=1`): preset 1 -0.02 % / -8.4 % time, preset 3 +0.01 % / -21.4 %,
+preset 4 +0.02 % / -16.7 %.  cock 90 frames `-p 3 -q 28` with frame threads:
+9.73 -> 8.47 s (10.6 fps); the main thread (P and reference-B pictures and the
+lookahead) is still the critical path -- the B worker is busy 4.4 s of it.
+
+Tried and rejected in the same round:
+
+* x264's early skip *before* the analysis (a P_Skip whose residual quantises
+  to zero everywhere): +0.67 % (cock +2.2 %); a SSE limit on top of it either
+  never fires or loses as much.
+* Skipping already-measured positions in the motion search (a per-thread
+  visited table: 14 % of the integer and 24 % of the sub-pel evaluations are
+  repeats) is exact but measured no faster -- the table costs what the SADs
+  did.
+
+`tools/prof/` has the sampling profiler used for this (`sprof.so`, an
+`LD_PRELOAD` SIGPROF sampler that walks frame pointers, split by main/worker
+thread; `an.py` prints self, inclusive, `--callers=` and `--children=`
+tables), and `tools/real/spd.sh` times two binaries with alternating runs.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,

@@ -5289,12 +5289,13 @@ static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
     mbenc f;
     int64_t dc;
 
-    if (!chroma_decide_on(e))
-        return rd_price(e, mbx, mby, (mbenc *)t, est, lambda);
-    /* the luma distortion alone is a lower bound of the price: a candidate
-     * it already rules out needs no chroma (and no coder) at all */
+    /* The luma distortion alone is a lower bound of the price (the rate term
+     * is never negative): a candidate it already rules out needs no coder.
+     * (A third of the Intra_4x4 candidates, a fifth of the Intra_8x8 ones.) */
     if (e->p.cabac && t->sse >= bound)
         return t->sse;
+    if (!chroma_decide_on(e))
+        return rd_price(e, mbx, mby, (mbenc *)t, est, lambda);
     f = *t;
     dc = rd_chroma(e, mbx, mby, &f, is_inter_type(t->type),
                    is_inter_type(t->type) ? t->chroma_mode : cmode, lambda);
@@ -5315,6 +5316,79 @@ static int skip_check_on(void)
 
 #define P_MODE_LAMBDA 0.65
 
+/* AEG_CMTIME=1: cycles per code_mb() section and picture kind (P, B, I),
+ * printed at exit.  Section 6 is analyse_mb(). */
+#include <x86intrin.h>
+static uint64_t cm_cyc[3][8];
+static uint64_t cm_cnt[3][8];
+static const char *cm_name[8] = { "i16", "inter", "i4", "i8", "refine_mv",
+                                  "chroma+skip+final", "analyse", "?" };
+static void cm_dump(void)
+{
+    int k, i;
+    for (k = 0; k < 3; k++)
+        for (i = 0; i < 8; i++)
+            if (cm_cyc[k][i])
+                fprintf(stderr, "cm %c %-18s %8.1f Mcyc  n %8llu\n", "PBI"[k],
+                        cm_name[i], cm_cyc[k][i] / 1e6,
+                        (unsigned long long)cm_cnt[k][i]);
+}
+static int cm_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = ENV_INT("AEG_CMTIME", 0);
+        if (v)
+            atexit(cm_dump);
+    }
+    return v;
+}
+#define CM_KIND(e) ((e)->cur_is_p ? 0 : (e)->cur_is_b ? 1 : 2)
+#define CM_T0() uint64_t cm_t_ = cm_on() ? __rdtsc() : 0
+#define CM_LAP(e, i) do { if (cm_t_) { uint64_t n_ = __rdtsc();        \
+        cm_cyc[CM_KIND(e)][i] += n_ - cm_t_; cm_cnt[CM_KIND(e)][i]++;   \
+        cm_t_ = n_; } } while (0)
+
+/* The intra gates of code_mb(), in percent (0 = off; AEG_GIB, AEG_GIP,
+ * AEG_GI48B and AEG_GI48P override).  Measured on the real clips at -p 3
+ * with the full search as reference (ABBD_GLOBAL=1, tools/real/ab.sh):
+ *
+ *   gate_b_intra, B 120 + gate_i48, B 50    -0.00 %   -9.4 % time
+ *   + gate_i48, P 50                        +0.02 %   -8.5 % more
+ *   gate_b_intra, P 60                      +0.24 %   (mega +1.06: no)
+ *   gate_i48, P 60 instead of 50            +0.03 %   -1.4 %
+ *
+ * In a B picture intra wins about one macroblock in sixty, and on cock none
+ * of the 65 % that the first gate skips; the second one skips 79 % of the
+ * Intra_4x4/8x8 evaluations that are left, again without a winner among
+ * them.  P pictures are a different matter -- a quarter of cock's P
+ * macroblocks end up intra, a third of them where the inter prediction's
+ * SATD is the lower -- so only the Intra_16x16-relative gate is used there,
+ * at the point where it still misses almost nothing. */
+static int gate_b_intra(const struct aeg_encoder *e)
+{
+    return e->cur_is_b ? ENV_INT("AEG_GIB", 120) : e->cur_is_p ? ENV_INT("AEG_GIP", 0) : 0;
+}
+static int gate_i48(const struct aeg_encoder *e)
+{
+    return e->cur_is_b ? ENV_INT("AEG_GI48B", 50) : ENV_INT("AEG_GI48P", 50);
+}
+/* SATD of the best (by SAD) Intra_16x16 prediction of the macroblock. */
+static int i16_satd(struct aeg_encoder *e, int mbx, int mby)
+{
+    const uint8_t *p = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
+    uint8_t left[16], buf[256];
+    int y;
+    if (e->mb_nmodes <= 0)
+        return 0;
+    for (y = 0; y < 16; y++)
+        left[y] = p[-1 + y * e->stride[0]];
+    aeg_intra_predict_16x16(buf, 16, p - e->stride[0], left,
+                            mby > e->top_row, mbx > 0,
+                            mby > e->top_row && mbx > 0, e->mb_modes[0]);
+    return aeg_satd(16, 16, buf, 16, src, e->stride[0]);
+}
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -5369,53 +5443,80 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 
     /* luma: the SAD-best modes (all of them from preset 2 on) plus every inter
      * partitioning the motion search produced */
+    CM_T0();
     int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
-    if (n16 > ENV_INT("AEG_I16N", 4))
-        n16 = ENV_INT("AEG_I16N", 4);
+    if (n16 > ENV_INT("AEG_I16N", 3))
+        n16 = ENV_INT("AEG_I16N", 3);
     if (e->mb_inter_ok && ENV_INT("AEG_I16G", 0) > 0 &&
         e->mb_inter_sad * ENV_INT("AEG_I16G", 0) < e->mb_sad * 100)
         n16 = 1;
-    for (i = 0; i < n16; i++) {
-        int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
-                               e->mb_modes[i], lambda, -1);
-        cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
-        if (cost < best_cost) {
-            best_cost = cost;
-            best = t;
-            snap_luma(e, mbx, mby, snap_l);
-        }
-    }
-    if (e->rd_batch && e->mb_ncand > 0) {
-        best_cost = rd_luma_inter_batch(e, mbx, mby, &best, snap_l, best_cost,
-                                        lambda, c->qp);
-        /* The batch ranks the inter candidates against each other with the
-         * estimate; the winner is then priced with the coder's own model, so
-         * that comparing it with the intra candidates is like for like. */
-        if (e->p.cabac && best_cost != INT64_MAX)
-            best_cost = full_price(e, mbx, mby, &best, best_cost, c->chroma_mode, lambda, INT64_MAX);
-    } else {
-        for (i = 0; i < e->mb_ncand; i++) {
-            int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
-                                   lambda, i);
-            cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
-            /* Refining a candidate costs a macroblock evaluation per
-             * neighbour, so only the candidates that are still in the running
-             * get it: one that is already worse than the best so far cannot be
-             * rescued by a quarter pel, and a looser test than this one
-             * measured no better (see docs/STATUS.md). */
-            if (e->p.cabac && e->p.refine_cand > 0 && e->p.refine_mv > 0 &&
-                cost <= best_cost) {
-                refine_cand(e, mbx, mby, i, c->qp, lambda);
-                cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
-                               lambda, i);
+    /* The best price of each kind, for the intra gates below. */
+    int64_t j16 = INT64_MAX, jinter = INT64_MAX;
+    /* A B picture prices its inter candidates first and skips every intra
+     * candidate when the best of them already costs less than gate_b_intra()
+     * percent of the SATD of the best Intra_16x16 prediction (see there). */
+    const int gb = e->mb_inter_ok ? gate_b_intra(e) : 0;
+    int pass, skip_intra = 0;
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == (gb ? 1 : 0)) {
+            if (gb && jinter != INT64_MAX &&
+                jinter * 100 < (int64_t)gb * i16_satd(e, mbx, mby)) {
+                skip_intra = 1;
+                continue;
+            }
+            for (i = 0; i < n16; i++) {
+                int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
+                                       e->mb_modes[i], lambda, -1);
                 cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
+                if (cost < j16)
+                    j16 = cost;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = t;
+                    snap_luma(e, mbx, mby, snap_l);
+                }
             }
-            if (cost < best_cost) {
-                best_cost = cost;
-                best = t;
-                snap_luma(e, mbx, mby, snap_l);
+            CM_LAP(e, 0);
+            continue;
+        }
+        if (e->rd_batch && e->mb_ncand > 0) {
+            best_cost = rd_luma_inter_batch(e, mbx, mby, &best, snap_l, best_cost,
+                                            lambda, c->qp);
+            /* The batch ranks the inter candidates against each other with
+             * the estimate; the winner is then priced with the coder's own
+             * model, so that comparing it with the intra candidates is like
+             * for like. */
+            if (e->p.cabac && best_cost != INT64_MAX)
+                best_cost = full_price(e, mbx, mby, &best, best_cost, c->chroma_mode, lambda, INT64_MAX);
+            if (is_inter_type(best.type))
+                jinter = best_cost;
+        } else {
+            for (i = 0; i < e->mb_ncand; i++) {
+                int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
+                                       lambda, i);
+                cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
+                /* Refining a candidate costs a macroblock evaluation per
+                 * neighbour, so only the candidates that are still in the
+                 * running get it: one that is already worse than the best so
+                 * far cannot be rescued by a quarter pel, and a looser test
+                 * than this one measured no better (see docs/STATUS.md). */
+                if (e->p.cabac && e->p.refine_cand > 0 && e->p.refine_mv > 0 &&
+                    cost <= best_cost) {
+                    refine_cand(e, mbx, mby, i, c->qp, lambda);
+                    cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
+                                   lambda, i);
+                    cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
+                }
+                if (cost < jinter)
+                    jinter = cost;
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = t;
+                    snap_luma(e, mbx, mby, snap_l);
+                }
             }
         }
+        CM_LAP(e, 1);
     }
     /* Intra_4x4: its own mode decision per block, so it is a candidate of its
      * own rather than one of the Intra_16x16 prediction modes.  It costs a
@@ -5424,7 +5525,14 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * a match that is already twice as good as the best Intra_16x16
      * prediction: sixteen mode decisions cannot turn that around, and this is
      * where most of the encode time of the candidate goes. */
-    if (!(e->mb_inter_ok &&
+    /* ... and both are skipped as well when the best inter candidate costs
+     * less than gate_i48() percent of the best Intra_16x16 one: an
+     * Intra_16x16 prediction that far behind is not one the finer intra
+     * shapes turn around. */
+    if (!skip_intra && j16 != INT64_MAX && jinter != INT64_MAX &&
+        jinter * 100 < (int64_t)gate_i48(e) * j16)
+        skip_intra = 1;
+    if (!skip_intra && !(e->mb_inter_ok &&
           e->mb_inter_sad * ENV_INT("AEG_IGATE", 200) < e->mb_sad * 100)) {
         int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
         cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
@@ -5433,6 +5541,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             best = t;
             snap_luma(e, mbx, mby, snap_l);
         }
+        CM_LAP(e, 2);
         /* Intra_8x8: four mode decisions instead of sixteen, so it is much
          * cheaper to evaluate than Intra_4x4, and it reconstructs smooth
          * regions with fewer coefficients.  It only exists in the High
@@ -5448,6 +5557,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             }
         }
     }
+    CM_LAP(e, 3);
     restore_luma(e, mbx, mby, snap_l);
     inter = is_inter_type(best.type);
 
@@ -5617,6 +5727,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         c->qp = mb_qp;
     }
 
+    CM_LAP(e, 4);
     /* chroma: every legal intra mode, or the motion-compensated prediction */
     if (!inter) {
         int64_t best_chroma = INT64_MAX;
@@ -5727,6 +5838,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * macroblock's decisions are priced against. */
     if (e->p.cabac)
         rd_cabac_bits(e, mbx, mby, c, cur_slice_kind(e), 1);
+    CM_LAP(e, 5);
     if (getenv("AEG_MBDBG") && atoi(getenv("AEG_MBDBG")) == 2 &&
         e->cur_is_p) {
         int q, n = mb_part_count(&best);
@@ -7349,7 +7461,11 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             int64_t t0 = aeg_now_ns();
 
             reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
-            analyse_mb(e, mbx, mby, tmp);
+            {
+                CM_T0();
+                analyse_mb(e, mbx, mby, tmp);
+                CM_LAP(e, 6);
+            }
             e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
 
             t0 = aeg_now_ns();
@@ -8567,10 +8683,10 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
             if (k == AEG_MB_I4x4 || k == AEG_MB_I8x8 || k == AEG_MB_I16x16 ||
                 k == AEG_MB_IPCM)
                 in += e->stat_type[k] - dbg_type0[k];
-        fprintf(stderr, "PIC %c poc %d qp %d bits %d skip %lld intra %lld\n",
-                is_idr ? 'I' : (e->cur_is_b ? 'B' : (e->cur_is_p ? 'P' : 'i')),
+        fprintf(stderr, "PIC %c poc %d qp %d bits %d skip %lld intra %lld ms %.1f\n",
+                is_idr ? 'I' : (e->cur_is_b ? (e->cur_bref ? 'b' : 'B') : (e->cur_is_p ? 'P' : 'i')),
                 e->cur_poc, e->cur_qp, (int)(out_len * 8), (long long)sk,
-                (long long)in);
+                (long long)in, (aeg_now_ns() - t_all) / 1e6);
     }
     if (getenv("AEG_RCDBG"))
         fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f vbv %.0f\n",
@@ -8990,7 +9106,15 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
 }
 
 /* Fill the job queue with the next coding step, if the input has arrived. */
+static void schedule_(struct aeg_encoder *e);
+int64_t aeg_sched_ns, aeg_ft_wait_ns, aeg_ft_worker_ns;
 static void schedule(struct aeg_encoder *e)
+{
+    int64_t t0 = aeg_now_ns();
+    schedule_(e);
+    aeg_sched_ns += aeg_now_ns() - t0;
+}
+static void schedule_(struct aeg_encoder *e)
 {
     struct mbt_ent pl[AEG_RING];
 
@@ -9689,7 +9813,10 @@ static int ft_alloc(struct aeg_encoder *e)
 static void *ft_thread(void *arg)
 {
     struct ft_worker *w = (struct ft_worker *)arg;
+    int64_t t0 = aeg_now_ns();
+    extern int64_t aeg_ft_worker_ns;
     w->rc = encode_frame(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt);
+    aeg_ft_worker_ns += aeg_now_ns() - t0;
     return NULL;
 }
 
@@ -9822,8 +9949,12 @@ static int ft_join(struct aeg_encoder *e)
 
     if (!w->busy)
         return AEG_OK;
-    if (w->busy == 1)
+    if (w->busy == 1) {
+        extern int64_t aeg_ft_wait_ns;
+        int64_t t0 = aeg_now_ns();
         pthread_join(w->th, NULL);
+        aeg_ft_wait_ns += aeg_now_ns() - t0;
+    }
     w->busy = 0;
     /* buffers the coder may have grown */
     w->out = c->out;
@@ -10112,6 +10243,9 @@ void aeg_encoder_close(aeg_encoder *enc)
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
     if (!e)
         return;
+    if (getenv("AEG_LATIME"))
+        fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms\n",
+                aeg_sched_ns / 1e6, aeg_ft_wait_ns / 1e6, aeg_ft_worker_ns / 1e6);
     ft_free(e);
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);

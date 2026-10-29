@@ -1,0 +1,4 @@
+gcc -O2 -shared -fPIC tools/prof/sprof.c -o /tmp/sprof.so
+CFLAGS="-O3 -g -fno-omit-frame-pointer" make BUILD=/tmp/bprof
+LD_PRELOAD=/tmp/sprof.so SPROF_OUT=/tmp/sp.out /tmp/bprof/aegenc ...
+python3 tools/prof/an.py /tmp/bprof/aegenc /tmp/sp.out 40 --thread=main [--callers=FN] [--children=FN]
