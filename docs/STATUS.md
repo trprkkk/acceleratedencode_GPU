@@ -2335,55 +2335,79 @@ flat, see the table in *Slices*).
 
 ## Frame threads
 
-`--frame-threads N` (`0` = auto: on with more than one CPU unless `-t 1`;
-`1` = off; `2` = on) codes every non-reference B picture on a second thread
-while the main thread codes the next picture in coding order -- the anchor of
-the following group, or the other B picture of a pyramid.  The stream is the
-same byte for byte as the serial one (`tools/real/same.sh`: 50/50 identical
-over presets 0-4, five clips, two QPs, and the conformance suite), so unlike
-slices it costs nothing in bytes.
+`--frame-threads N` (`0` = auto: CPU count + 1, at most 8, unless `-t 1`; `1` =
+off; env `AEG_FTW=n` overrides) codes up to N pictures at once on a pool of
+worker threads.  The stream is the same byte for byte as the serial one
+(`tools/real/same.sh`, the conformance suite, and a frame-threads-versus-serial
+matrix of 15 option sets x 5 clips with 2-8 workers), so unlike slices it costs
+nothing in bytes.
 
-A non-reference B picture is the end of a dependency chain -- nothing reads its
-reconstruction, its decisions, or anything it leaves in the encoder -- and that
-is the whole argument.  What it takes to make it hold in this code:
+The first version (`705d11e`) only moved each non-reference B picture to a
+second thread -- the end of a dependency chain, nothing reads it.  That left the
+P chain on the main thread as the critical path (about 75 % of the wall time),
+and the present version overlaps consecutive reference pictures as a **row
+wavefront**:
 
-* The worker runs `encode_frame()` on a copy of `struct aeg_encoder` (as the
-  slice threads do), but here every buffer the copy *writes* is private:
-  macroblock decisions, coefficient/seed scratch, the half-resolution
-  pre-search, the fractional-pel planes, slice and packet buffers, and the
-  picture it reconstructs into.  What it shares (source ring, reference
-  pictures, the co-located decisions) it only reads.
-* What coding the B picture does to the main encoder -- the frame counter, the
-  zeroed seed vectors, the buffer rotation of a non-reference picture -- the
-  main thread does itself at the hand-over; the statistics are merged at the
-  join.
-* At most one picture is coded on the main thread next to a given B picture:
-  that picture's reference marking may drop the B picture's list-0 reference,
-  and the freed buffer is where the picture after it is reconstructed.
+* **Prologue on the encoder, body on a worker.**  Each picture's prologue
+  (slice type, reference lists, macroblock-tree offsets, adaptive
+  quantisation) runs on the main thread in the serial order; the coding itself
+  (`frame_body`) runs on a worker's copy of `struct aeg_encoder` whose every
+  *written* buffer is private (macroblock decisions, coefficient/seed scratch,
+  half-resolution pre-search, fractional and weighted planes, slice and packet
+  buffers).  What coding the picture does to the encoder -- frame counters,
+  zeroed seed vectors, reference marking, buffer rotation -- the main thread
+  does at launch; statistics are merged at the join.
+* **Rows, not pictures.**  A reference picture is reconstructed straight into
+  the buffer its successors read and post-processed row by row behind the
+  decision pass (deblocking row k once row k+1 is decided, padding, the
+  half-resolution and half-pel planes a row later -- the same order as the
+  whole-picture versions, so the same samples; `3c0d0af`).  Each finished row
+  is published; a picture predicting from it waits per macroblock row for the
+  rows its search can reach: macroblock row r reads reference lines up to
+  16r + 15 + range + 4 (the vector is bounded by the search range, the 6-tap
+  filter adds 3), the half-resolution pre-search a row further.  The samples
+  read are therefore final and the decisions are the serial ones -- no
+  vertical vector limit is needed beyond the one the search already has.
+  Weighted prediction analyses the whole reference, so a weighted P picture
+  waits for all of it.  `AEG_POISON=1` (serial) fills every row that would
+  not be final yet with noise: the streams stay identical, which proves the
+  bounds.
+* **Buffers.**  A non-reference picture reconstructs into its worker's own
+  buffer.  A buffer that reference marking drops stays in use while a picture
+  in flight still reads it (`pic_busy`), hence NW + 2 more picture buffers;
+  an input ring slot is not overwritten while a picture coded from it is in
+  flight (`ft_ring_guard`).
 * **Every picture starts in the same `aeg_encoder_encode()` call as it would
   serially.**  The macroblock tree refines a queued picture's offsets as more
-  input arrives, so starting a picture one call early changes its QPs (the
-  first attempt coded greedily and differed at presets 1-2).  While input
-  arrives each call therefore codes exactly the serial job; only when flushing,
-  where nothing changes between calls any more, does the next queued picture
-  start next to the B picture at once.
-* A B picture launched in one call is joined by the end of the next, and the
-  input ring keeps two more pictures (`in_slots()`), so its source cannot be
-  overwritten.
-* Packets leave in coding order through a small queue, one call later than
-  serially (the first B picture's call returns `AEG_EAGAIN`); each entry keeps
-  its reconstruction and macroblock QPs for `aeg_encoder_recon()`.
+  input arrives, so starting a picture one call early changes its QPs.  While
+  input arrives each call launches exactly the serial job; when flushing,
+  where nothing changes between calls any more, queued pictures start as soon
+  as a worker is free.
+* **Packets** leave in coding order through a queue that holds at most
+  `FT_Q - 1` packets when a call returns (the oldest is finished first
+  whenever a launch fills it, so every call can hand one out).  An earlier
+  loop that waited for a free entry joined every worker and failed on a queue
+  full of finished packets -- a rare truncated stream under load, reproduced
+  every time with a 4-entry queue and fixed.  Each entry keeps its
+  reconstruction and macroblock QPs for `aeg_encoder_recon()`.
 
 Gate: B pictures, constant QP (rate control and VBV feed each picture's size
 into the next picture's QP), one slice, the CPU backend.  ThreadSanitizer is
-clean (it found one real race, a `static` scan table in the CAVLC writer, now
-a local).
+clean (the environment-variable caches the workers would race to fill are
+settled before the threads start).
 
-Two cores, cock 640x352, against the binary before the speed work
-(`6831122`): 30 frames, presets 0-4: 1.57 / 1.76 / 1.84 / 1.98 / 1.98x
-(Step 1's single-thread SIMD work alone was 1.20 / 1.29 / 1.32 / 1.42 / 1.43x).
-180 frames (steady state, not just the flush): preset 1 14.3 -> 7.8 s, preset 3
-48.8 -> 23.8 s (2.05x, 3.7 -> 7.6 fps).
+Two cores, cock 640x352, 90 frames, `-p 3 -q 28`: serial 10.16 s, frame
+threads 5.87 s (1.73x, about 15.3 fps; user time 10.23 s, so the threading
+overhead is ~2 %).  With `--weightp 0` 5.28 s (1.89x, near the two-core
+ceiling) -- the weighted P picture's whole-reference wait is what is left of
+the P chain.  `same.sh` against `32e961c` (30 frames, five clips): 1.35x
+overall, preset 1 1.61x, preset 3 1.33x, preset 4 1.31x.  The worker count
+hardly matters on two cores (2: 6.04 s, 4: 5.85 s, 6: 5.78 s); on 4-8 cores
+the bound is the P chain with its weighted-prediction waits, roughly 3.2 s
+for these 90 frames (~28 fps).
+
+Earlier numbers (B-only frame threads, against `6831122`): 30 frames, presets
+0-4: 1.57 / 1.76 / 1.84 / 1.98 / 1.98x; 180 frames preset 3 48.8 -> 23.8 s.
 
 ## Early termination of the intra candidates
 
@@ -2492,7 +2516,8 @@ The main thread is still the critical path: P pictures are about 75 % of the
 wall time (6.1 s of P, 1.1 s of reference B against 4.1 s of non-reference B on
 the worker), so more B workers cannot help, and an exact speed-up beyond this
 on two cores needs consecutive P pictures to overlap (row-wavefront frame
-threads with a fixed vertical vector limit).
+threads with a fixed vertical vector limit).  That is what *Frame threads*
+above now does, exactly -- the search range already is the limit.
 
 ## The skip candidate
 

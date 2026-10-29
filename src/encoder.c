@@ -10238,34 +10238,42 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
 /* ------------------------------------------------------------------ */
 /* Frame threads                                                        */
 /* ------------------------------------------------------------------ */
-/* A non-reference B picture is the end of a dependency chain: nothing reads
- * its reconstruction, its decisions or anything it leaves in the encoder.  So
- * it can be coded by a second thread while the main thread codes the next
- * picture in coding order (the anchor of the following group, or the other B
- * picture of a pyramid), and the stream is the same byte for byte as the
- * serial one.  What makes that true:
+/* Pictures are coded by a pool of worker threads, several at a time, and the
+ * stream is the same byte for byte as the serial one.  What makes that true:
  *
- *  - The worker runs encode_frame() on its own copy of the encoder struct
- *    whose every *written* buffer is private: macroblock decisions, the
- *    coefficient and seed scratch, the half-resolution pre-search, the
- *    fractional planes, the slice and packet buffers, and the picture it
- *    reconstructs into.  Everything it shares with the main thread (source
- *    ring, reference pictures, co-located decisions) it only reads.
- *  - What coding the B picture would have done to the main encoder, the main
- *    thread does itself when it hands the picture over (the frame counter,
- *    the zeroed seed vectors, the buffer rotation of a non-reference picture),
- *    and the statistics are merged after the join.
- *  - The main thread codes at most one picture while a B picture is in
- *    flight: that picture's reference marking may drop the B picture's list0
- *    reference, and the buffer it frees is where the picture after it would
- *    be reconstructed.  The ring keeps two more input pictures for the same
- *    reason (in_slots()).
+ *  - Each call starts exactly the picture the serial encoder would code in
+ *    it (while input still arrives): its prologue -- slice type, references,
+ *    macroblock-tree offsets, adaptive quantisation -- runs on the encoder
+ *    itself, in the serial order, and reads only what the lookahead knows at
+ *    that moment.  The picture is then coded (frame_body) by a worker on its
+ *    own copy of the encoder struct whose every *written* buffer is private:
+ *    macroblock decisions, coefficient and seed scratch, the half-resolution
+ *    pre-search, the fractional and weighted planes, the slice and packet
+ *    buffers.  What coding the picture would have done to the encoder (the
+ *    frame counters, the zeroed seed vectors, reference marking and buffer
+ *    rotation) the main thread does at launch; statistics merge at the join.
+ *  - Row wavefront: a reference picture is reconstructed into the buffer the
+ *    pictures predicting from it read, and post-processed (deblocked, padded,
+ *    filtered down, interpolated) row by row behind the decision pass; each
+ *    finished row is published (slot_publish).  A picture predicting from it
+ *    waits per macroblock row (ref_rows_ensure -> ref_wait) only for the
+ *    rows its search can reach: the vector is bounded by the search range,
+ *    so the samples it reads are final and the decisions are the serial
+ *    ones.  Weighted prediction analyses the whole reference, so a weighted
+ *    P picture waits for all of it.  AEG_POISON=1 (serial) fills the rows
+ *    that would not be final yet with noise to prove the bounds.
+ *  - A non-reference picture reconstructs into its worker's own buffer.  A
+ *    buffer that reference marking drops stays in use while a picture in
+ *    flight still reads it (pic_busy), so there are NW + 2 more buffers.
+ *  - An input picture's ring slot is not overwritten while a picture coded
+ *    from it is in flight (ft_ring_guard).
  *  - Packets leave in coding order through a small queue; the reconstruction
  *    of each is kept with it for aeg_encoder_recon().
  *
- * Gate (frame_threads_ok()): B pictures, constant QP (rate control and the
- * VBV model feed every picture's size into the next picture's QP), one slice
- * per picture, the CPU backend, and more than one CPU. */
+ * Gate (aeg_encoder_open): B pictures, constant QP (rate control and the VBV
+ * model feed every picture's size into the next picture's QP), one slice per
+ * picture, the CPU backend, and more than one CPU.  NW defaults to the CPU
+ * count + 1 (the workers wait for each other's rows), up to FT_MAXW. */
 #ifndef FT_Q
 #define FT_Q 16
 #endif
