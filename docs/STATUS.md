@@ -2470,9 +2470,23 @@ against its scalar reference, the new ones in `tests/coef_check.c`):
   initial and final pricing, not the trials) and was dropped.
 * The CABAC residual pricer used by the RD pass keeps the context states and
   the running sum in locals instead of going through the generic coder per bin.
+* **Motion search:** each stage of the hexagon / square / UMH patterns depends
+  only on where the stage starts, so its positions are listed, their SADs
+  measured four at a time with one load of the block per row (`aeg_sad_x4`)
+  and compared in the listed order -- the same winner.  -3.8 %.
+* **Quarter-pel SATD without storing the prediction** (`aeg_satd_avg`: the
+  pavgb of the two planes inside the AVX2 SATD), also for the bi-predicted
+  partition SATD of B pictures.  SSE2 chroma MC.
+* **No measurement twice:** the trellis keeps the SSE of the levels it settles
+  on (and the original price), and the intra block RD takes both from it
+  instead of reconstructing and pricing the block again (-2.9 %); the
+  coefficient price of the level search is inline; the quantiser's rounding
+  offset is a shift, not a 64-bit division per block.
 
-cock 90 frames, `-p 3 -q 28`, frame threads: 8.55 s (32e961c) -> 7.35 s
-(12.2 fps).  Tried: link-time optimisation (`-flto`) is slower.
+cock 90 frames, `-p 3 -q 28`, frame threads: 8.55 s (32e961c) -> about 7.0 s
+(~12.8 fps; this machine's timings drift by +-3 % between runs, the
+single-thread user time is 21 % lower).  Tried: link-time optimisation
+(`-flto`) is slower.
 
 The main thread is still the critical path: P pictures are about 75 % of the
 wall time (6.1 s of P, 1.1 s of reference B against 4.1 s of non-reference B on
