@@ -1309,7 +1309,40 @@ int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int x, y, sum = 0;
 #if defined(__SSE2__)
-    if (w == 16 || w == 8 || w == 4) {
+    if (w == 16) {
+        /* the motion searches' common case: two rows per step, two sums */
+        __m128i acc0 = _mm_setzero_si128(), acc1 = _mm_setzero_si128();
+        for (y = 0; y + 1 < h; y += 2) {
+            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(
+                _mm_loadu_si128((const __m128i *)pa),
+                _mm_loadu_si128((const __m128i *)pb)));
+            acc1 = _mm_add_epi64(acc1, _mm_sad_epu8(
+                _mm_loadu_si128((const __m128i *)(pa + sa)),
+                _mm_loadu_si128((const __m128i *)(pb + sb))));
+        }
+        if (y < h)
+            sad_row(&acc0, a + (size_t)y * sa, b + (size_t)y * sb, 16);
+        return sad_reduce(_mm_add_epi64(acc0, acc1));
+    }
+    if (w == 8) {
+        /* two 8-byte rows fill one register */
+        __m128i acc = _mm_setzero_si128();
+        for (y = 0; y + 1 < h; y += 2) {
+            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            __m128i va = _mm_unpacklo_epi64(
+                _mm_loadl_epi64((const __m128i *)pa),
+                _mm_loadl_epi64((const __m128i *)(pa + sa)));
+            __m128i vb = _mm_unpacklo_epi64(
+                _mm_loadl_epi64((const __m128i *)pb),
+                _mm_loadl_epi64((const __m128i *)(pb + sb)));
+            acc = _mm_add_epi64(acc, _mm_sad_epu8(va, vb));
+        }
+        if (y < h)
+            sad_row(&acc, a + (size_t)y * sa, b + (size_t)y * sb, 8);
+        return sad_reduce(acc);
+    }
+    if (w == 4) {
         __m128i acc = _mm_setzero_si128();
         for (y = 0; y < h; y++)
             sad_row(&acc, a + (size_t)y * sa, b + (size_t)y * sb, w);
@@ -1643,6 +1676,39 @@ static int satd_w16_avx2(int w, int h, const uint8_t *a, int sa,
     return _mm_cvtsi128_si32(lo);
 }
 
+/* Eight columns, eight rows at a time: rows y..y+3 in the low lane and
+ * y+4..y+7 in the high lane. */
+__attribute__((target("avx2")))
+static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i acc = _mm256_setzero_si256();
+    __m128i lo;
+    int y;
+#define LD8X2(p, s) _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(                 \
+        _mm_loadl_epi64((const __m128i *)(p)),                               \
+        _mm_loadl_epi64((const __m128i *)((p) + 4 * (size_t)(s)))))
+    for (y = 0; y < h; y += 8) {
+        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        __m256i r0 = _mm256_sub_epi16(LD8X2(pa, sa), LD8X2(pb, sb));
+        __m256i r1 = _mm256_sub_epi16(LD8X2(pa + sa, sa), LD8X2(pb + sb, sb));
+        __m256i r2 = _mm256_sub_epi16(LD8X2(pa + 2 * sa, sa), LD8X2(pb + 2 * sb, sb));
+        __m256i r3 = _mm256_sub_epi16(LD8X2(pa + 3 * sa, sa), LD8X2(pb + 3 * sb, sb)), o;
+        SATD8X4_HALF(__m256i, _mm256_add_epi16, _mm256_sub_epi16,
+                     _mm256_unpacklo_epi16, _mm256_unpackhi_epi16,
+                     _mm256_unpacklo_epi32, _mm256_unpackhi_epi32,
+                     _mm256_unpacklo_epi64, _mm256_unpackhi_epi64,
+                     _mm256_max_epi16, _mm256_abs_epi16, _mm256_madd_epi16,
+                     ones, r0, r1, r2, r3, o);
+        acc = _mm256_add_epi32(acc, o);
+    }
+#undef LD8X2
+    lo = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(lo);
+}
+
 static int cpu_avx2(void)
 {
     static int v = -1;
@@ -1663,6 +1729,8 @@ int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 #if defined(AEG_HAVE_AVX2_SATD)
         if ((w & 15) == 0 && cpu_avx2())
             return satd_w16_avx2(w, h, a, sa, b, sb);
+        if (w == 8 && (h & 7) == 0 && cpu_avx2())
+            return satd_w8_avx2(h, a, sa, b, sb);
 #endif
         if ((w & 7) == 0)
             return satd_w8_sse2(w, h, a, sa, b, sb);
