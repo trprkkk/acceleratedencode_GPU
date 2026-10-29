@@ -384,6 +384,18 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
     }
 }
 
+/* aeg_satd() of aeg_mc_luma_p()'s prediction at a quarter-pel position
+ * (one that averages two planes) against `cur`, without storing it. */
+static int mc_satd_qpel(const aeg_mc_ctx *mc, const uint8_t *src, int w, int h,
+                        int fx, int fy, const uint8_t *cur, int cstride)
+{
+    const ptrdiff_t off = src - mc->base[0];
+    const int idx = (fy << 2) | fx;
+    const uint8_t *r1 = mc->base[hpel_ref0[idx]] + off + (fy == 3 ? mc->stride : 0);
+    const uint8_t *r2 = mc->base[hpel_ref1[idx]] + off + (fx == 3 ? 1 : 0);
+    return aeg_satd_avg(w, h, cur, cstride, r1, r2, mc->stride);
+}
+
 void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
                    int w, int h, int fx, int fy)
 {
@@ -717,13 +729,12 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                     const ptrdiff_t off = ref + iy * rstride + ix - mc->base[0];
                     d = aeg_satd(bw, bh, mc->base[hpel_ref0[((ny & 3) << 2) | (nx & 3)]] + off,
                                  rstride, cur, cstride);
+                } else if (mc && mc->ready) {
+                    d = mc_satd_qpel(mc, ref + iy * rstride + ix, bw, bh,
+                                     nx & 3, ny & 3, cur, cstride);
                 } else {
-                    if (mc && mc->ready)
-                        aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
-                                      nx & 3, ny & 3);
-                    else
-                        aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
-                                    bh, nx & 3, ny & 3);
+                    aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
+                                bh, nx & 3, ny & 3);
                     d = aeg_satd(bw, bh, buf, bw, cur, cstride);
                 }
                 if (cme)

@@ -2789,13 +2789,10 @@ static int b_part_satd_bi(struct aeg_encoder *e, int mbx, int mby,
             aeg_mc_luma(b, geo[2], rq, e->stride[0], geo[2], geo[3],
                         mv1x & 3, mv1y & 3);
     }
-    for (y = 0; y < geo[3]; y++)
-        for (x = 0; x < geo[2]; x++)
-            a[y * geo[2] + x] = (uint8_t)((a[y * geo[2] + x] +
-                                           b[y * geo[2] + x] + 1) >> 1);
-    return aeg_satd(geo[2], geo[3], a, geo[2],
-                    e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
-                        mbx * 16 + geo[0], e->stride[0]);
+    (void)x; (void)y;
+    return aeg_satd_avg(geo[2], geo[3],
+                        e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                            mbx * 16 + geo[0], e->stride[0], a, b, geo[2]);
 }
 
 static int part_satd_ref(struct aeg_encoder *e, int mbx, int mby, const int geo[4],

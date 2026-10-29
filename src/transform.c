@@ -2077,6 +2077,102 @@ static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int s
 #endif
 #endif
 
+#if defined(AEG_HAVE_AVX2_SATD)
+/* satd_w16_avx2()/satd_w8_avx2() of the rounded average of two blocks
+ * (both with stride sr) against `a`: the average is pavgb, exactly. */
+__attribute__((target("avx2")))
+static int satd_avg_avx2(int w, int h, const uint8_t *a, int sa,
+                         const uint8_t *r1, const uint8_t *r2, int sr)
+{
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i acc = _mm256_setzero_si256();
+    __m128i lo;
+    int x, y;
+    if (w == 8) {
+#define LDA8(p, s) _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(                  \
+        _mm_loadl_epi64((const __m128i *)(p)),                               \
+        _mm_loadl_epi64((const __m128i *)((p) + 4 * (size_t)(s)))))
+#define LDB8(o) _mm256_cvtepu8_epi16(_mm_avg_epu8(                           \
+        _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(r1 + (o))),     \
+                           _mm_loadl_epi64((const __m128i *)(r1 + (o) + 4 * (size_t)sr))), \
+        _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(r2 + (o))),     \
+                           _mm_loadl_epi64((const __m128i *)(r2 + (o) + 4 * (size_t)sr)))))
+        for (y = 0; y < h; y += 8) {
+            const uint8_t *pa = a + (size_t)y * sa;
+            const size_t o = (size_t)y * sr;
+            __m256i q0 = _mm256_sub_epi16(LDA8(pa, sa), LDB8(o));
+            __m256i q1 = _mm256_sub_epi16(LDA8(pa + sa, sa), LDB8(o + sr));
+            __m256i q2 = _mm256_sub_epi16(LDA8(pa + 2 * sa, sa), LDB8(o + 2 * sr));
+            __m256i q3 = _mm256_sub_epi16(LDA8(pa + 3 * sa, sa), LDB8(o + 3 * sr)), v;
+            SATD8X4_HALF(__m256i, _mm256_add_epi16, _mm256_sub_epi16,
+                         _mm256_unpacklo_epi16, _mm256_unpackhi_epi16,
+                         _mm256_unpacklo_epi32, _mm256_unpackhi_epi32,
+                         _mm256_unpacklo_epi64, _mm256_unpackhi_epi64,
+                         _mm256_max_epi16, _mm256_abs_epi16, _mm256_madd_epi16,
+                         ones, q0, q1, q2, q3, v);
+            acc = _mm256_add_epi32(acc, v);
+        }
+#undef LDA8
+#undef LDB8
+    } else {
+#define LDA16(p) _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p)))
+#define LDB16(o) _mm256_cvtepu8_epi16(_mm_avg_epu8(                          \
+        _mm_loadu_si128((const __m128i *)(r1 + (o))),                        \
+        _mm_loadu_si128((const __m128i *)(r2 + (o)))))
+        for (y = 0; y < h; y += 4) {
+            const uint8_t *pa = a + (size_t)y * sa;
+            const size_t o = (size_t)y * sr;
+            for (x = 0; x < w; x += 16) {
+                __m256i q0 = _mm256_sub_epi16(LDA16(pa + x), LDB16(o + x));
+                __m256i q1 = _mm256_sub_epi16(LDA16(pa + sa + x), LDB16(o + sr + x));
+                __m256i q2 = _mm256_sub_epi16(LDA16(pa + 2 * sa + x), LDB16(o + 2 * sr + x));
+                __m256i q3 = _mm256_sub_epi16(LDA16(pa + 3 * sa + x), LDB16(o + 3 * sr + x)), v;
+                SATD8X4_HALF(__m256i, _mm256_add_epi16, _mm256_sub_epi16,
+                             _mm256_unpacklo_epi16, _mm256_unpackhi_epi16,
+                             _mm256_unpacklo_epi32, _mm256_unpackhi_epi32,
+                             _mm256_unpacklo_epi64, _mm256_unpackhi_epi64,
+                             _mm256_max_epi16, _mm256_abs_epi16, _mm256_madd_epi16,
+                             ones, q0, q1, q2, q3, v);
+                acc = _mm256_add_epi32(acc, v);
+            }
+        }
+#undef LDA16
+#undef LDB16
+    }
+    lo = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(lo);
+}
+#endif
+
+/* aeg_satd(w, h, a, sa, avg, w) where avg is the rounded average of the two
+ * blocks r1 and r2 (stride sr) -- a quarter-pel prediction measured without
+ * being stored first. */
+int aeg_satd_avg(int w, int h, const uint8_t *a, int sa, const uint8_t *r1,
+                 const uint8_t *r2, int sr)
+{
+    uint8_t buf[16 * 16];
+    int x, y;
+#if defined(AEG_HAVE_AVX2_SATD)
+    if ((((w & 15) == 0 && (h & 3) == 0) || (w == 8 && (h & 7) == 0)) && cpu_avx2())
+        return satd_avg_avx2(w, h, a, sa, r1, r2, sr);
+#endif
+    if (w > 16 || h > 16) {
+        int s = 0;
+        for (y = 0; y < h; y += 16)
+            for (x = 0; x < w; x += 16)
+                s += aeg_satd_avg(w - x < 16 ? w - x : 16, h - y < 16 ? h - y : 16,
+                                  a + (size_t)y * sa + x, sa,
+                                  r1 + (size_t)y * sr + x, r2 + (size_t)y * sr + x, sr);
+        return s;
+    }
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++)
+            buf[y * w + x] = (uint8_t)((r1[(size_t)y * sr + x] + r2[(size_t)y * sr + x] + 1) >> 1);
+    return aeg_satd(w, h, buf, w, a, sa);
+}
+
 int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
 #if defined(__SSE2__) && defined(__GNUC__)
