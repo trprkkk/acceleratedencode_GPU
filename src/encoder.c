@@ -1242,7 +1242,10 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                             double lambda, int passes, int allow_empty)
 {
     int16_t cur[64], trial[64], best[64], scan[64];
+    /* 8x8: the trials reuse the current levels' dequantised block and row
+     * pass (aeg_idct8_cache_*, exactly trel_sse()'s numbers) */
     aeg_idct8_cache c8;
+    int cache_ready = 0;
     /* The levels are held in natural (raster) order, so every array covers
      * the whole block -- an AC block lists 15 coefficients but its levels
      * still span 16 positions -- while `last` is a position in the scan,
@@ -1292,10 +1295,6 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
             cost = sse + trel_price(bits, lambda);
         }
     }
-    /* 8x8: the trials reuse the current levels' dequantised block and row
-     * pass (aeg_idct8_cache_*, exactly trel_sse()'s numbers) */
-    if (t->side == 8 && passes > 0)
-        aeg_idct8_cache_init(&c8, cur, qp);
     for (pass = 0; pass < passes; pass++) {
         for (i = 0; i < t->n; i++) {
             int pos = t->scan[i], step;
@@ -1320,6 +1319,12 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                 if (trel_price(bits + dbits, lambda) >= cost)
                     continue;
                 /* the trial is the current levels with this one moved */
+                if (!cache_ready) {
+                    /* built on the first trial that gets this far */
+                    if (t->side == 8)
+                        aeg_idct8_cache_init(&c8, cur, qp);
+                    cache_ready = 1;
+                }
                 if (t->side == 8)
                     sse2 = aeg_idct8_cache_ssd(&c8, pos, newlev, pred,
                                                pred_stride, src, stride);
