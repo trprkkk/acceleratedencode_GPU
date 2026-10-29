@@ -1950,6 +1950,53 @@ all five (vtest +0.40); P at 0.9x of the new value: +0.07.  Presets 1 and 4
 Against x264 (`bdx.sh`): CQP **-3.98%** (+0.65, -9.76, -5.63, -8.62, +3.44),
 CRF with its tree **+0.29%** (+0.94, +0.88, +1.47, -5.05, +3.23).
 
+**Intra block modes by rate and distortion; a trellis bug.**  Coding only
+every fourth picture of cock with P pictures (`cock4`, motion four times as
+long) turned our -1.4% bit excess against x264 at equal PSNR into +1.8%, with
+almost 60% of the macroblocks intra in both encoders -- and all-intra coding
+(`-g 1`, x264 `keyint=1`) was behind on every clip: cock +1.9%, vtest +2.9%,
+tree +2.2%, short +0.9%, mega +0.9% (`/tmp/w/gap2.py`, x264's q28..q30 slope;
+the same in chroma).  Two causes:
+
+* The Intra_8x8 modes were chosen by SATD plus lambda/2 per mode bit, which
+  is several times x264's weight at high QP; x264 picks I8x8 for 49% of the
+  cock macroblocks, we picked it for 40%.  The Intra_4x4 modes were already
+  chosen by rate and distortion (preset 3), but with the CAVLC cost of the
+  levels under CABAC, and the mode bits at lambda/2.
+* `trel_descent()` copied only `n` levels in natural order -- 15 for the
+  AC blocks of Intra_16x16 and chroma, leaving position 15 uninitialised --
+  and took `last` as a raster position where the price uses the scan
+  position.  The output depended on stack contents (a build with
+  `-ftrivial-auto-var-init=pattern` coded 3% differently); now every build
+  is identical.  On its own the fix measured +0.03 (noise).
+
+Now, from preset 3 under CABAC, every legal mode of an Intra_4x4 or Intra_8x8
+block is priced exactly -- quantised, reconstructed, SSE plus lambda times the
+CABAC price in the current context plus lambda per mode bit -- and the best two
+are priced again with the levels the trellis will choose
+(`intra_rd_modes()`; `AEG_IRDK` = how many, default 2).
+
+| all-intra, bit excess vs x264 | cock | vtest | tree |
+|---|---|---|---|
+| before | +1.90 | +2.91 | +2.18 |
+| RD modes, no trellis look | -0.44 | +1.20 | +0.55 |
+| + trellis look at the best 2 | -0.68 | +0.47 | +0.35 |
+| + trellis look at the best 3 | -0.71 | +0.30 | +0.27 |
+| + trellis look at all modes | -0.38 | +0.25 | +0.13 |
+
+On the five clips (normal encode): RD modes -0.53% for +7% time; the trellis
+look at two modes another -0.20% for +11%; at three -0.02% more; at all modes
+(the first try) -0.28% for +47%.  Correcting the lambda of the mode bits
+alone (the SATD paths) was within 0.3 everywhere.
+
+| ab vs previous commit | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| intra RD modes + trellis fix | -0.75 | -1.00 | -0.47 | -0.06 | -1.33 | **-0.72** (+21% time) |
+
+Against x264 (`bdx.sh`): CQP **-4.61%** (-0.03, -10.68, -6.09, -8.57, +2.31),
+CRF with its tree **-0.30%** (+0.48, -0.15, +1.01, -4.95, +2.10) -- the first
+time ahead of x264 as it is normally run.
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
