@@ -1253,7 +1253,7 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
     const int nat = t->side * t->side;
     const size_t natsz = sizeof(int16_t) * (size_t)nat;
     int i, pass, nnz = 0, last = -1;
-    int64_t bits, sse, cost, best_cost, orig_cost;
+    int64_t bits, sse, cost, best_cost, orig_cost, best_sse, orig_bits;
 
     memcpy(cur, lev, natsz);
     for (i = 0; i < t->n; i++)
@@ -1268,6 +1268,8 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
     bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
     sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
     orig_cost = best_cost = cost = sse + trel_price(bits, lambda);
+    best_sse = sse;
+    orig_bits = bits;
     memcpy(best, cur, natsz);
 
     /* Emptying a block only pays when there is almost nothing in it: the flag
@@ -1283,16 +1285,18 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
         cost = sse + trel_price(bits, lambda);
         if (cost < best_cost) {
             best_cost = cost;
+            best_sse = sse;
             memcpy(cur, trial, natsz);
             memcpy(best, trial, natsz);
             last = -1;
         } else {
-            /* reprice the original, its bits were overwritten above */
+            /* back to the original levels and their price (the reconstruction
+             * and the pricer are deterministic) */
             for (i = 0; i < t->n; i++)
                 scan[i] = cur[t->scan[i]];
-            bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
-            sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
-            cost = sse + trel_price(bits, lambda);
+            bits = orig_bits;
+            sse = best_sse;
+            cost = orig_cost;
         }
     }
     for (pass = 0; pass < passes; pass++) {
@@ -1343,6 +1347,7 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                     last = last2;
                     if (c < best_cost) {
                         best_cost = c;
+                        best_sse = sse2;
                         memcpy(best, cur, natsz);
                     }
                 }
@@ -1356,8 +1361,8 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
         for (i = 0; i < t->n; i++)
             scan[i] = best[t->scan[i]];
         bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
-        sse = trel_sse(t, src, stride, pred, pred_stride, best, qp);
-        if (sse + trel_price(bits, lambda) < orig_cost)
+        /* best_sse is trel_sse() of `best`, measured when it was taken */
+        if (best_sse + trel_price(bits, lambda) < orig_cost)
             memcpy(lev, best, natsz);
     }
     return best_cost;
