@@ -18,7 +18,29 @@
 #include <pthread.h>
 #include "backend.h"
 
-#define AEG_LAMBDA(qp) (0.85 * pow(2.0, ((qp) - 12) / 3.0))
+/* The rate-distortion lambda of a QP, 0.85 * 2^((qp - 12) / 3), from a table
+ * built with that same expression (the trellis asks for it per block). */
+static double lambda_tab[128];
+static pthread_once_t lambda_once = PTHREAD_ONCE_INIT;
+static void lambda_init(void)
+{
+    int i;
+    for (i = 0; i < 128; i++)
+        lambda_tab[i] = 0.85 * pow(2.0, ((i - 32) - 12) / 3.0);
+}
+static inline double aeg_lambda_of(int qp)
+{
+    if (qp < -32 || qp >= 96)
+        return 0.85 * pow(2.0, (qp - 12) / 3.0);
+    pthread_once(&lambda_once, lambda_init);
+    return lambda_tab[qp + 32];
+}
+#define AEG_LAMBDA(qp) aeg_lambda_of(qp)
+
+/* An integer tuning switch from the environment, read once. */
+#define ENV_INT(name, dflt) __extension__ ({ static int v_ = -0x7fffffff;  \
+    if (v_ == -0x7fffffff) { const char *e_ = getenv(name);              \
+        v_ = e_ ? atoi(e_) : (dflt); } v_; })
 
 typedef struct mbenc {
     int16_t  level[AEG_BLK_COUNT][16];
@@ -84,7 +106,7 @@ typedef struct mbenc {
 /* The macroblock tree looks this many pictures past the group being coded at
  * most; the input ring holds them on top of a group and its next anchor. */
 #define AEG_MAX_LOOKAHEAD 60
-#define AEG_RING (2 * AEG_MAX_BFRAMES + 4 + AEG_MAX_LOOKAHEAD)
+#define AEG_RING (2 * AEG_MAX_BFRAMES + 6 + AEG_MAX_LOOKAHEAD)
 #define LA_CACHE 512
 typedef struct {
     int     type;
@@ -387,7 +409,18 @@ struct aeg_encoder {
     int    last_anchor_bits;
     int    last_anchor_qp;
     int    mbt_qoff;        /* mean macroblock-tree offset of this picture */
+    /* Frame threads (see "Frame threads" near aeg_encoder_encode): a worker
+     * that codes non-reference B pictures next to the main thread, and the
+     * queue that hands the packets out in coding order. */
+    int    ft_on;
+    struct ft_worker *ftw;
+    struct ft_entry  *ftq;
+    int    ftq_head, ftq_n, ft_ret;
 };
+
+static int ft_alloc(struct aeg_encoder *e);
+static void ft_free(struct aeg_encoder *e);
+static int ft_join(struct aeg_encoder *e);
 
 /* Which of the two batched coefficient code paths to use for this picture.
  * Both need the device to own *both* coefficient stages: an inter candidate
@@ -1274,6 +1307,11 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                     last2 = j;
                 }
                 dbits = trel_dbits(sh, t, cur, i, newlev, last);
+                /* the distortion is never negative, so a move whose bits
+                 * alone already cost what the current levels do cannot be
+                 * taken: no need to reconstruct it */
+                if (trel_price(bits + dbits, lambda) >= cost)
+                    continue;
                 /* the trial is the current levels with this one moved */
                 cur[pos] = (int16_t)newlev;
                 sse2 = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
@@ -4570,6 +4608,35 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
     int64_t cost[9];
     int order[9], k, j, best = modes[0], kk = intra_refine_k();
     int64_t best_cost = INT64_MAX;
+    int sel[9];
+    const int pre = side == 4 ? ENV_INT("AEG_I4K", 0) : ENV_INT("AEG_I8K", 0);
+
+    /* Pre-selection by SATD: only the `pre` modes whose prediction looks best
+     * (SATD + mode bits in the SATD domain) get the exact price. */
+    if (pre > 0 && nmodes > pre) {
+        int64_t sc[9];
+        int ord[9], n2 = 0;
+        const double ls = sqrt(lambda);
+        for (k = 0; k < nmodes; k++) {
+            int m = modes[k];
+            if (side == 4)
+                aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
+                                      left_avail, top_avail && left_avail);
+            else
+                aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
+                                      left_avail, top_avail && left_avail);
+            sc[k] = (side == 4 ? aeg_satd_4x4(pred, 4, sb, s)
+                               : aeg_sa8d_8x8(pred, 8, sb, s)) +
+                    (int64_t)(ls * (m == pmode ? 1 : 4) + 0.5);
+            for (j = k; j > 0 && sc[ord[j - 1]] > sc[k]; j--)
+                ord[j] = ord[j - 1];
+            ord[j] = k;
+        }
+        for (k = 0; k < pre; k++)
+            sel[n2++] = modes[ord[k]];
+        modes = sel;
+        nmodes = n2;
+    }
 
     for (k = 0; k < nmodes; k++) {
         int m = modes[k];
@@ -5302,7 +5369,13 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 
     /* luma: the SAD-best modes (all of them from preset 2 on) plus every inter
      * partitioning the motion search produced */
-    for (i = 0; i < (e->p.preset >= 2 ? e->mb_nmodes : 1); i++) {
+    int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
+    if (n16 > ENV_INT("AEG_I16N", 4))
+        n16 = ENV_INT("AEG_I16N", 4);
+    if (e->mb_inter_ok && ENV_INT("AEG_I16G", 0) > 0 &&
+        e->mb_inter_sad * ENV_INT("AEG_I16G", 0) < e->mb_sad * 100)
+        n16 = 1;
+    for (i = 0; i < n16; i++) {
         int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
                                e->mb_modes[i], lambda, -1);
         cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
@@ -5351,7 +5424,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * a match that is already twice as good as the best Intra_16x16
      * prediction: sixteen mode decisions cannot turn that around, and this is
      * where most of the encode time of the candidate goes. */
-    if (!(e->mb_inter_ok && e->mb_inter_sad * 2 < e->mb_sad)) {
+    if (!(e->mb_inter_ok &&
+          e->mb_inter_sad * ENV_INT("AEG_IGATE", 200) < e->mb_sad * 100)) {
         int64_t cost = rd_luma_i4x4(e, mbx, mby, &t, c->qp, lambda);
         cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
         if (cost < best_cost) {
@@ -8531,7 +8605,9 @@ static int in_slots(const struct aeg_encoder *e)
      * it could be, and the scheduler can run up to a group behind the input
      * (the first picture alone, or a long group followed by a short one), so
      * the B pictures still waiting must survive another group of input. */
-    return e->p.bframes + 3 + (e->la_depth ? e->la_depth + e->p.bframes + 1 : 0);
+    /* (+2: a non-reference B picture coded by the frame thread is still being
+     * read while the next two pictures come in) */
+    return e->p.bframes + 5 + (e->la_depth ? e->la_depth + e->p.bframes + 1 : 0);
 }
 
 static void copy_yuv(const struct aeg_encoder *e, uint8_t *p[3],
@@ -9406,9 +9482,461 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->rd_force = ev ? atoi(ev) != 0 : -1;
         resolve_coef_stages(e);
     }
+    /* frame threads: 0 = auto (on with more than one CPU, unless -t 1) */
+    {
+        int ft = pp->frame_threads;
+        if (ft <= 0) {
+            long nc = sysconf(_SC_NPROCESSORS_ONLN);
+            ft = (nc > 1 && pp->threads != 1) ? 2 : 1;
+        }
+        if (ft >= 2 && e->p.bframes > 0 && !e->rc_active && !e->vbv_active &&
+            e->n_slices == 1 && e->d.ops.backend == AEG_BACKEND_CPU &&
+            e->coef_force != 1 && e->rd_force != 1 && !getenv("AEG_SEED")) {
+            if (ft_alloc(e) != AEG_OK) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+            e->ft_on = 1;
+        }
+    }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
     return e;
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame threads                                                        */
+/* ------------------------------------------------------------------ */
+/* A non-reference B picture is the end of a dependency chain: nothing reads
+ * its reconstruction, its decisions or anything it leaves in the encoder.  So
+ * it can be coded by a second thread while the main thread codes the next
+ * picture in coding order (the anchor of the following group, or the other B
+ * picture of a pyramid), and the stream is the same byte for byte as the
+ * serial one.  What makes that true:
+ *
+ *  - The worker runs encode_frame() on its own copy of the encoder struct
+ *    whose every *written* buffer is private: macroblock decisions, the
+ *    coefficient and seed scratch, the half-resolution pre-search, the
+ *    fractional planes, the slice and packet buffers, and the picture it
+ *    reconstructs into.  Everything it shares with the main thread (source
+ *    ring, reference pictures, co-located decisions) it only reads.
+ *  - What coding the B picture would have done to the main encoder, the main
+ *    thread does itself when it hands the picture over (the frame counter,
+ *    the zeroed seed vectors, the buffer rotation of a non-reference picture),
+ *    and the statistics are merged after the join.
+ *  - The main thread codes at most one picture while a B picture is in
+ *    flight: that picture's reference marking may drop the B picture's list0
+ *    reference, and the buffer it frees is where the picture after it would
+ *    be reconstructed.  The ring keeps two more input pictures for the same
+ *    reason (in_slots()).
+ *  - Packets leave in coding order through a small queue; the reconstruction
+ *    of each is kept with it for aeg_encoder_recon().
+ *
+ * Gate (frame_threads_ok()): B pictures, constant QP (rate control and the
+ * VBV model feed every picture's size into the next picture's QP), one slice
+ * per picture, the CPU backend, and more than one CPU. */
+#define FT_Q 8
+
+struct ft_entry {
+    uint8_t *buf;
+    size_t   cap, size;
+    int64_t  pts;
+    int      keyframe, qp;
+    double   psnr;
+    int      pending;           /* in the worker, not joined yet */
+    uint8_t *rec_mem;
+    int     *mbqp;
+};
+
+struct ft_worker {
+    pthread_t th;
+    int busy;                   /* 1 = thread running, 2 = done inline */
+    int syncs;                  /* pictures the main thread coded since */
+    int age;                    /* calls since the launch */
+    struct aeg_encoder *c;
+    aeg_mb *mbs;
+    mbenc *mb_encs;
+    int8_t *mb_dqp;
+    int16_t *seed_mv, *prev_seed, *seed_cand, *par_pos, *par_mv;
+    int32_t *seed_sad, *seed_cost, *par_cost;
+    int *lr_scratch;
+    int16_t *lr_mv[2];
+    aeg_lowres lr_pic[3];
+    aeg_mc_ctx mc, mc1;
+    uint8_t *pic_mem, *plane[3];
+    uint8_t *slice_bs[AEG_MAX_SLICES];
+    size_t slice_bs_cap[AEG_MAX_SLICES];
+    uint8_t *out;
+    size_t out_cap;
+    int slice, idr, d, rc;
+    int64_t pts;
+    aeg_packet pkt;
+    struct ft_entry *ent;
+};
+
+static size_t pic_bytes(const struct aeg_encoder *e)
+{
+    size_t ls = (size_t)plane_stride(e->w), lh = (size_t)(e->h + 2 * AEG_PAD);
+    size_t cs = (size_t)plane_stride((e->w + 1) / 2);
+    size_t ch = (size_t)((e->h + 1) / 2 + 2 * AEG_PAD);
+    return ls * lh + 2 * cs * ch;
+}
+
+static void ft_free(struct aeg_encoder *e)
+{
+    struct ft_worker *w = e->ftw;
+    int k;
+
+    if (w) {
+        if (w->busy == 1)
+            pthread_join(w->th, NULL);
+        free(w->c);
+        aeg_free(w->mbs);
+        aeg_free(w->mb_encs);
+        aeg_free(w->mb_dqp);
+        aeg_free(w->seed_mv);
+        aeg_free(w->prev_seed);
+        aeg_free(w->seed_cand);
+        aeg_free(w->par_pos);
+        aeg_free(w->par_mv);
+        aeg_free(w->seed_sad);
+        aeg_free(w->seed_cost);
+        aeg_free(w->par_cost);
+        aeg_free(w->lr_scratch);
+        aeg_free(w->lr_mv[0]);
+        aeg_free(w->lr_mv[1]);
+        for (k = 0; k < 3; k++)
+            if (w->lr_pic[k].mem)
+                aeg_lowres_free(&w->lr_pic[k]);
+        aeg_mc_ctx_free(&w->mc);
+        aeg_mc_ctx_free(&w->mc1);
+        aeg_free(w->pic_mem);
+        for (k = 0; k < AEG_MAX_SLICES; k++)
+            aeg_free(w->slice_bs[k]);
+        aeg_free(w->out);
+        free(w);
+        e->ftw = NULL;
+    }
+    if (e->ftq) {
+        for (k = 0; k < FT_Q; k++) {
+            aeg_free(e->ftq[k].buf);
+            aeg_free(e->ftq[k].rec_mem);
+            free(e->ftq[k].mbqp);
+        }
+        free(e->ftq);
+        e->ftq = NULL;
+    }
+    e->ft_on = 0;
+}
+
+static int ft_alloc(struct aeg_encoder *e)
+{
+    struct ft_worker *w;
+    size_t n = (size_t)e->mb_count;
+    int k;
+
+    w = (struct ft_worker *)calloc(1, sizeof(*w));
+    e->ftw = w;
+    e->ftq = (struct ft_entry *)calloc(FT_Q, sizeof(*e->ftq));
+    if (!w || !e->ftq)
+        return AEG_ENOMEM;
+    w->c = (struct aeg_encoder *)calloc(1, sizeof(*w->c));
+    w->mbs = (aeg_mb *)aeg_alloc(n * sizeof(aeg_mb));
+    w->mb_encs = (mbenc *)aeg_alloc(n * sizeof(mbenc));
+    w->mb_dqp = (int8_t *)aeg_alloc(n);
+    w->seed_mv = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    w->prev_seed = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    w->seed_cand = (int16_t *)aeg_alloc(n * ME_ROUND_CAND * 4 * sizeof(int16_t));
+    w->par_pos = (int16_t *)aeg_alloc(n * ME_ROUND_CAND * 4 * sizeof(int16_t));
+    w->par_mv = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    w->seed_sad = (int32_t *)aeg_alloc(n * ME_ROUND_CAND * sizeof(int32_t));
+    w->seed_cost = (int32_t *)aeg_alloc(n * sizeof(int32_t));
+    w->par_cost = (int32_t *)aeg_alloc(n * sizeof(int32_t));
+    w->lr_scratch = (int *)aeg_alloc(n * 4 * sizeof(int));
+    w->lr_mv[0] = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    w->lr_mv[1] = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    for (k = 0; k < 3; k++)
+        if (aeg_lowres_alloc(&w->lr_pic[k], e->mb_w, e->mb_h))
+            w->lr_pic[k].mem = NULL;
+    aeg_mc_ctx_init(&w->mc, e->w, e->h, e->stride[0]);
+    aeg_mc_ctx_init(&w->mc1, e->w, e->h, e->stride[0]);
+    if (!w->c || !w->mbs || !w->mb_encs || !w->mb_dqp || !w->seed_mv ||
+        !w->prev_seed || !w->seed_cand || !w->par_pos || !w->par_mv ||
+        !w->seed_sad || !w->seed_cost || !w->par_cost || !w->lr_scratch ||
+        !w->lr_mv[0] || !w->lr_mv[1] || !w->lr_pic[0].mem ||
+        !w->lr_pic[1].mem || !w->lr_pic[2].mem || !w->mc.buf || !w->mc1.buf)
+        return AEG_ENOMEM;
+    {
+        /* enc_alloc_picture() also sets the strides; they are the same */
+        int st[3] = { e->stride[0], e->stride[1], e->stride[2] };
+        if (enc_alloc_picture(e, &w->pic_mem, w->plane) != AEG_OK)
+            return AEG_ENOMEM;
+        e->stride[0] = st[0], e->stride[1] = st[1], e->stride[2] = st[2];
+    }
+    memset(w->par_mv, 0, n * 2 * sizeof(int16_t));
+    memset(w->prev_seed, 0, n * 2 * sizeof(int16_t));
+    for (k = 0; k < FT_Q; k++) {
+        e->ftq[k].rec_mem = (uint8_t *)aeg_alloc(pic_bytes(e));
+        e->ftq[k].mbqp = (int *)malloc(n * sizeof(int));
+        if (!e->ftq[k].rec_mem || !e->ftq[k].mbqp)
+            return AEG_ENOMEM;
+    }
+    e->ft_ret = -1;
+    return AEG_OK;
+}
+
+static void *ft_thread(void *arg)
+{
+    struct ft_worker *w = (struct ft_worker *)arg;
+    w->rc = encode_frame(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt);
+    return NULL;
+}
+
+static struct ft_entry *ft_push(struct aeg_encoder *e)
+{
+    struct ft_entry *q = &e->ftq[(e->ftq_head + e->ftq_n) % FT_Q];
+    e->ftq_n++;
+    q->pending = 0;
+    q->size = 0;
+    return q;
+}
+
+static int ft_fill(struct aeg_encoder *e, struct ft_entry *q,
+                   const aeg_packet *pkt, const uint8_t *rec_mem,
+                   const aeg_mb *mbs, double psnr)
+{
+    int i;
+
+    if (ensure_buf(&q->buf, &q->cap, pkt->size + 1) != AEG_OK)
+        return AEG_ENOMEM;
+    memcpy(q->buf, pkt->data, pkt->size);
+    q->size = pkt->size;
+    q->pts = pkt->pts;
+    q->keyframe = pkt->keyframe;
+    q->qp = pkt->qp;
+    q->psnr = psnr;
+    memcpy(q->rec_mem, rec_mem, pic_bytes(e));
+    for (i = 0; i < e->mb_count; i++)
+        q->mbqp[i] = mbs[i].qp;
+    return AEG_OK;
+}
+
+/* Hand the job at the head of the queue (a non-reference B picture) to the
+ * worker. */
+static void ft_launch(struct aeg_encoder *e)
+{
+    struct ft_worker *w = e->ftw;
+    struct aeg_encoder *c = w->c;
+    int d = e->job_d[0], i, k;
+
+    w->d = d;
+    w->slice = e->job_slice[0];
+    w->idr = e->job_idr[0];
+    w->pts = e->in_pts[d % in_slots(e)];
+    e->cur_bref = e->job_bref[0];
+    for (i = 1; i < e->job_n; i++) {
+        e->job_d[i - 1] = e->job_d[i];
+        e->job_slice[i - 1] = e->job_slice[i];
+        e->job_idr[i - 1] = e->job_idr[i];
+        e->job_bref[i - 1] = e->job_bref[i];
+    }
+    e->job_n--;
+    bind_source(e, d);
+
+    *c = *e;
+    c->ft_on = 0;
+    c->ftw = NULL;
+    c->ftq = NULL;
+    c->mbs = w->mbs;
+    c->mb_encs = w->mb_encs;
+    c->mb_dqp = w->mb_dqp;
+    c->seed_mv = w->seed_mv;
+    c->prev_seed = w->prev_seed;
+    c->seed_cand = w->seed_cand;
+    c->par_pos = w->par_pos;
+    c->par_mv = w->par_mv;
+    c->seed_sad = w->seed_sad;
+    c->seed_cost = w->seed_cost;
+    c->par_cost = w->par_cost;
+    c->lr_scratch = w->lr_scratch;
+    c->lr_mv[0] = w->lr_mv[0];
+    c->lr_mv[1] = w->lr_mv[1];
+    for (k = 0; k < 3; k++)
+        c->lr_pic[k] = w->lr_pic[k];
+    c->mc.buf = w->mc.buf;
+    c->mc1.buf = w->mc1.buf;
+    for (k = 1; k < 4; k++) {
+        c->mc.base[k] = w->mc.base[k];
+        c->mc1.base[k] = w->mc1.base[k];
+    }
+    for (k = 0; k < 3; k++) {
+        c->pic_plane[c->role_cur][k] = w->plane[k];
+        c->recp[k] = w->plane[k];
+        c->pic.plane[k] = w->plane[k];
+    }
+    for (k = 0; k < AEG_MAX_SLICES; k++) {
+        c->slice_bs[k] = w->slice_bs[k];
+        c->slice_bs_cap[k] = w->slice_bs_cap[k];
+    }
+    c->out = w->out;
+    c->out_cap = w->out_cap;
+    c->n_threads = 1;
+    /* statistics are merged as deltas after the join */
+    c->st.bytes = 0;
+    c->st.frames = 0;
+    c->st.enc_ns = 0;
+    memset(c->st.stage_ns, 0, sizeof(c->st.stage_ns));
+    memset(c->st.stage_gpu_ns, 0, sizeof(c->st.stage_gpu_ns));
+    memset(c->st.stage_cpu_ns, 0, sizeof(c->st.stage_cpu_ns));
+    c->stat_mbs = 0;
+    c->stat_skipped = 0;
+    memset(c->stat_type, 0, sizeof(c->stat_type));
+
+    /* what coding the picture does to the encoder, done here */
+    memset(e->seed_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    e->par_valid = 0;
+    e->par_full = 0;
+    e->frame_count++;
+    e->enc_pos++;
+    picture_rotate(e, 0, 0);
+    e->pic.plane[0] = e->recp[0];
+    e->pic.plane[1] = e->recp[1];
+    e->pic.plane[2] = e->recp[2];
+
+    w->ent = ft_push(e);
+    w->ent->pending = 1;
+    w->syncs = 0;
+    w->age = 0;
+    w->busy = 1;
+    if (pthread_create(&w->th, NULL, ft_thread, w) != 0) {
+        ft_thread(w);
+        w->busy = 2;
+    }}
+
+static int ft_join(struct aeg_encoder *e)
+{
+    struct ft_worker *w = e->ftw;
+    struct aeg_encoder *c = w->c;
+    int k, rc;
+
+    if (!w->busy)
+        return AEG_OK;
+    if (w->busy == 1)
+        pthread_join(w->th, NULL);
+    w->busy = 0;
+    /* buffers the coder may have grown */
+    w->out = c->out;
+    w->out_cap = c->out_cap;
+    for (k = 0; k < AEG_MAX_SLICES; k++) {
+        w->slice_bs[k] = c->slice_bs[k];
+        w->slice_bs_cap[k] = c->slice_bs_cap[k];
+    }
+    e->st.bytes += c->st.bytes;
+    e->st.frames += c->st.frames;
+    e->st.enc_ns += c->st.enc_ns;
+    for (k = 0; k < AEG_STAGE_COUNT; k++) {
+        e->st.stage_ns[k] += c->st.stage_ns[k];
+        e->st.stage_gpu_ns[k] += c->st.stage_gpu_ns[k];
+        e->st.stage_cpu_ns[k] += c->st.stage_cpu_ns[k];
+    }
+    e->stat_mbs += c->stat_mbs;
+    e->stat_skipped += c->stat_skipped;
+    for (k = 0; k < AEG_MB_TYPE_COUNT; k++)
+        e->stat_type[k] += c->stat_type[k];
+    w->ent->pending = 0;
+    if (w->rc != AEG_OK)
+        return w->rc;
+    rc = ft_fill(e, w->ent, &w->pkt, w->pic_mem, w->mbs, c->st.psnr_avg);
+    return rc;
+}
+
+/* One call's worth of coding with the frame thread: run what can run, then
+ * hand out the oldest packet. */
+/* Code the job at the head of the queue: hand it to the worker if it is a
+ * non-reference B picture and the worker is free, else code it here. */
+static int ft_step(struct aeg_encoder *e, int *synced)
+{
+    struct ft_worker *w = e->ftw;
+    struct ft_entry *q;
+    aeg_packet tmp;
+    int rc;
+
+    if (e->job_slice[0] == AEG_SLICE_B && !e->job_bref[0] && !w->busy &&
+        e->ftq_n < FT_Q - 1) {
+        ft_launch(e);
+        return AEG_OK;
+    }
+    /* a second picture next to the same B picture could be reconstructed
+     * into the buffer of one of its references */
+    if (w->busy && w->syncs >= 1 && (rc = ft_join(e)) != AEG_OK)
+        return rc;
+    q = ft_push(e);
+    rc = run_job(e, &tmp);
+    if (rc != AEG_OK)
+        return rc;
+    rc = ft_fill(e, q, &tmp, e->pic_mem[e->role_last], e->mbs, e->st.psnr_avg);
+    if (rc != AEG_OK)
+        return rc;
+    if (w->busy)
+        w->syncs++;
+    *synced = 1;
+    return AEG_OK;
+}
+
+/* One call's worth of coding with the frame thread, then the oldest packet.
+ *
+ * While input still arrives, a call codes exactly the job the serial encoder
+ * would code in it: what the lookahead knows when a picture is coded (its
+ * macroblock-tree offsets are refined as more input comes in) is part of the
+ * result, so no picture may start in a different call than it would
+ * serially.  When flushing nothing changes between calls any more, and the
+ * next queued picture can start next to the B picture right away. */
+static int ft_run(struct aeg_encoder *e, aeg_packet *pkt, int flushing)
+{
+    struct ft_worker *w = e->ftw;
+    struct ft_entry *q;
+    int synced = 0, rc;
+
+    e->ft_ret = -1;             /* the previous call's packet is released */
+    if (w->busy)
+        w->age++;
+    if (e->job_n && (rc = ft_step(e, &synced)) != AEG_OK)
+        return rc;
+    for (;;) {
+        /* a B picture launched in an earlier call is joined now: its source
+         * picture is only guaranteed to stay in the ring for one more input */
+        if (!flushing && w->busy && w->age >= 1 && (rc = ft_join(e)) != AEG_OK)
+            return rc;
+        if (!e->ftq_n)
+            return AEG_EAGAIN;
+        q = &e->ftq[e->ftq_head];
+        if (!q->pending)
+            break;
+        if (synced || (flushing && !e->job_n && (schedule(e), !e->job_n))) {
+            if ((rc = ft_join(e)) != AEG_OK)
+                return rc;
+            break;
+        }
+        /* nothing else to do in this call: leave the B picture running while
+         * the caller reads the next input */
+        if (!flushing)
+            return AEG_EAGAIN;
+        if ((rc = ft_step(e, &synced)) != AEG_OK)
+            return rc;
+    }
+    if (pkt) {
+        pkt->data = q->buf;
+        pkt->size = q->size;
+        pkt->pts = q->pts;
+        pkt->keyframe = q->keyframe;
+        pkt->qp = q->qp;
+    }
+    e->st.psnr_avg = q->psnr;
+    e->ft_ret = e->ftq_head;
+    e->ftq_head = (e->ftq_head + 1) % FT_Q;
+    e->ftq_n--;
+    return AEG_OK;
 }
 
 int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
@@ -9451,6 +9979,8 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
      * ring first and the scheduler decides what can be coded now. */
     push_input(e, yuv420p, pts);
     schedule(e);
+    if (e->ft_on)
+        return ft_run(e, pkt, 0);
     if (!e->job_n)
         return AEG_EAGAIN;
     return run_job(e, pkt);
@@ -9464,6 +9994,15 @@ int aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt)
         pkt->data = NULL, pkt->size = 0;
     if (!e || !e->p.bframes)
         return AEG_EOF;
+    if (e->ft_on) {
+        int rc;
+        if (!e->job_n) {
+            e->flushing = 1;
+            schedule(e);
+        }
+        rc = ft_run(e, pkt, 1);
+        return rc == AEG_EAGAIN ? AEG_EOF : rc;
+    }
     if (e->job_n)
         return run_job(e, pkt);
     /* No more input: the groups the lookahead was waiting on can go now, and
@@ -9511,6 +10050,26 @@ int aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3], int stride[3],
     int i;
     if (!e)
         return AEG_EINVAL;
+    if (e->ft_on && e->ft_ret >= 0) {
+        /* frame threads: the copy kept with the packet just handed out */
+        const struct ft_entry *q = &e->ftq[e->ft_ret];
+        size_t ls = (size_t)e->stride[0];
+        size_t lh = (size_t)(e->h + 2 * AEG_PAD);
+        size_t cs = (size_t)e->stride[1];
+        size_t ch = (size_t)((e->h + 1) / 2 + 2 * AEG_PAD);
+        for (i = 0; i < 3; i++) {
+            if (plane)
+                plane[i] = q->rec_mem + (i ? ls * lh + (size_t)(i - 1) * cs * ch +
+                                             AEG_PAD * cs + AEG_PAD
+                                           : AEG_PAD * ls + AEG_PAD);
+            if (stride)
+                stride[i] = e->stride[i];
+        }
+        if (mb_qp)
+            for (i = 0; i < e->mb_count; i++)
+                mb_qp[i] = q->mbqp[i];
+        return AEG_OK;
+    }
     for (i = 0; i < 3; i++) {
         if (plane)
             /* the frame that was just encoded: the picture it was coded into,
@@ -9553,6 +10112,7 @@ void aeg_encoder_close(aeg_encoder *enc)
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
     if (!e)
         return;
+    ft_free(e);
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);
     aeg_mc_ctx_free(&e->mc1);

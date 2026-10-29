@@ -179,7 +179,7 @@ level_done:
 void aeg_cavlc_write_block(aeg_bitwriter *bw, const int16_t *coef, int nC,
                            int kind)
 {
-    static uint8_t ac_scan[15];
+    uint8_t ac_scan[15];
     int i;
     switch (kind) {
     case 1:

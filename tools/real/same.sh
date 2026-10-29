@@ -14,7 +14,7 @@ for p in ${PRESETS:-0 1 2 3 4}; do
  for n in ${CLIPS:-cock vtest mega short tree}; do
   IFS=x read w h <<<"${W[$n]}"
   for q in ${QPS:-24 32}; do
-   tot=$((tot+1))
+   tot=$((tot+1)); rm -f $T/ref.264 $T/new.264
    s=$(date +%s%N)
    $REF -w $w -h $h -n 30 -i $REAL/$n.yuv -o $T/ref.264 -p $p -q $q $opts >/dev/null 2>&1
    m=$(date +%s%N)

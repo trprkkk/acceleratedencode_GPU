@@ -26,6 +26,21 @@ import sys
 import time
 
 
+_TMP = []
+
+
+def _cleanup():
+    for f in _TMP:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+import atexit
+atexit.register(_cleanup)
+
+
 def psnr(a, b, fs):
     m = min(len(a), len(b)) // fs
     if m <= 0:
@@ -55,8 +70,11 @@ def psnr(a, b, fs):
 
 
 def encode(args, extra, clip, w, h, q, tag):
-    out = '/tmp/abbd_%s.264' % tag
-    dec = '/tmp/abbd_%s.yuv' % tag
+    d = os.environ.get('TMPDIR', '/tmp')
+    out = os.path.join(d, 'abbd_%d_%s.264' % (os.getpid(), tag))
+    dec = os.path.join(d, 'abbd_%d_%s.yuv' % (os.getpid(), tag))
+    if out not in _TMP:
+        _TMP.extend([out, dec])
     # leading NAME=value tokens are environment variables for this side only
     # (the AEG_* experiment switches), the rest are aegenc options; BIN=path
     # runs that side with another build (e.g. a worktree of the last commit)

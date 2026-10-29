@@ -2333,6 +2333,58 @@ the deblocking filter its vertical reach, which is the price of the
 parallelism, and it is paid in bytes, not in quality (the PSNR at a fixed QP is
 flat, see the table in *Slices*).
 
+## Frame threads
+
+`--frame-threads N` (`0` = auto: on with more than one CPU unless `-t 1`;
+`1` = off; `2` = on) codes every non-reference B picture on a second thread
+while the main thread codes the next picture in coding order -- the anchor of
+the following group, or the other B picture of a pyramid.  The stream is the
+same byte for byte as the serial one (`tools/real/same.sh`: 50/50 identical
+over presets 0-4, five clips, two QPs, and the conformance suite), so unlike
+slices it costs nothing in bytes.
+
+A non-reference B picture is the end of a dependency chain -- nothing reads its
+reconstruction, its decisions, or anything it leaves in the encoder -- and that
+is the whole argument.  What it takes to make it hold in this code:
+
+* The worker runs `encode_frame()` on a copy of `struct aeg_encoder` (as the
+  slice threads do), but here every buffer the copy *writes* is private:
+  macroblock decisions, coefficient/seed scratch, the half-resolution
+  pre-search, the fractional-pel planes, slice and packet buffers, and the
+  picture it reconstructs into.  What it shares (source ring, reference
+  pictures, the co-located decisions) it only reads.
+* What coding the B picture does to the main encoder -- the frame counter, the
+  zeroed seed vectors, the buffer rotation of a non-reference picture -- the
+  main thread does itself at the hand-over; the statistics are merged at the
+  join.
+* At most one picture is coded on the main thread next to a given B picture:
+  that picture's reference marking may drop the B picture's list-0 reference,
+  and the freed buffer is where the picture after it is reconstructed.
+* **Every picture starts in the same `aeg_encoder_encode()` call as it would
+  serially.**  The macroblock tree refines a queued picture's offsets as more
+  input arrives, so starting a picture one call early changes its QPs (the
+  first attempt coded greedily and differed at presets 1-2).  While input
+  arrives each call therefore codes exactly the serial job; only when flushing,
+  where nothing changes between calls any more, does the next queued picture
+  start next to the B picture at once.
+* A B picture launched in one call is joined by the end of the next, and the
+  input ring keeps two more pictures (`in_slots()`), so its source cannot be
+  overwritten.
+* Packets leave in coding order through a small queue, one call later than
+  serially (the first B picture's call returns `AEG_EAGAIN`); each entry keeps
+  its reconstruction and macroblock QPs for `aeg_encoder_recon()`.
+
+Gate: B pictures, constant QP (rate control and VBV feed each picture's size
+into the next picture's QP), one slice, the CPU backend.  ThreadSanitizer is
+clean (it found one real race, a `static` scan table in the CAVLC writer, now
+a local).
+
+Two cores, cock 640x352, against the binary before the speed work
+(`6831122`): 30 frames, presets 0-4: 1.57 / 1.76 / 1.84 / 1.98 / 1.98x
+(Step 1's single-thread SIMD work alone was 1.20 / 1.29 / 1.32 / 1.42 / 1.43x).
+180 frames (steady state, not just the flush): preset 1 14.3 -> 7.8 s, preset 3
+48.8 -> 23.8 s (2.05x, 3.7 -> 7.6 fps).
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,

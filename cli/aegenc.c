@@ -88,6 +88,10 @@ static void usage(void)
 "                   picture into n row ranges, one NAL each)\n"
 "  -t <int>         slice threads (0 = auto, 1 = serial; -t N without\n"
 "                   --slices uses one slice per thread)\n"
+"  --frame-threads <n> 2 = code each non-reference B picture on a second\n"
+"                   thread next to the following picture (same stream),\n"
+"                   1 = off, 0 = auto (2 with several CPUs, unless -t 1;\n"
+"                   constant QP, one slice, CPU backend)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8 (8x8 with 8x4/4x8/4x4 sub-partitions)\n"
 "                   (default 15; P_8x8 is skipped by preset 0, and so\n"
@@ -263,6 +267,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--slices")) p.slices = atoi(argv[++i]);
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
             p.threads = atoi(argv[++i]);
+        else if (!strcmp(a, "--frame-threads"))
+            p.frame_threads = atoi(argv[++i]);
         else if (!strcmp(a, "--scenecut")) p.scenecut = atoi(argv[++i]);
         else if (!strcmp(a, "--pass")) pass = atoi(argv[++i]);
         else if (!strcmp(a, "--qcomp")) qcomp = atoi(argv[++i]);

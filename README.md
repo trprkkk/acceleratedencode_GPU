@@ -126,7 +126,10 @@ without a GPU simply reports no CUDA device at run time.
 constant QP to one-pass average-bitrate rate control (it lands within 0.2 % of
 the target over 90 frames), `--aq <tenths>` turns on variance-based adaptive
 quantisation (off by default: it is worth its PSNR cost only perceptually, see
-`docs/STATUS.md`), `-p 0..4` is the speed/quality
+`docs/STATUS.md`), `--frame-threads 0|1|2` codes each non-reference B
+picture on a second thread next to the following picture (0 = auto, on with
+more than one CPU unless `-t 1`; the stream is byte-identical to the serial
+one; constant QP, one slice), `-p 0..4` is the speed/quality
 preset (it scales the search range, the subpel refinement and, from 3 up, the
 rate-distortion refinement of the winning motion vector and the level
 selection), `--refine-mv 0|1|2`
