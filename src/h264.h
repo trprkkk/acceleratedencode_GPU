@@ -366,6 +366,12 @@ void aeg_itransform_dc2x2(const int16_t in[4], int16_t out[4]);
 void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
                         int qp, const uint8_t *pred, int pred_stride,
                         const int32_t *dc_in);
+void aeg_idct_add_block_c(uint8_t *dst, int stride, const int16_t *level,
+                          int qp, const uint8_t *pred, int pred_stride,
+                          const int32_t *dc_in);
+/* Sum of squared differences, w = 4, 8 or 16. */
+int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
+                int sb);
 /* The same inverse transform without the prediction add and without the clip:
  * `res` receives the signed residual in int16.  This is the form the batched
  * device path produces (iq_idct_batch), so it has to be bit-identical to
@@ -398,6 +404,8 @@ int  aeg_qp_chroma(int qp, int offset);
 int  aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
+int  aeg_satd_c(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
+int  aeg_sa8d_8x8_c(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_16x16(const uint8_t *a, int sa, const uint8_t *b, int sb);
 /* 8x8 Hadamard SA8D, scaled to be comparable with aeg_satd_4x4 (see

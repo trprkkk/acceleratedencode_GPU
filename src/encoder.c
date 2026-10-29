@@ -1132,12 +1132,7 @@ static void cab_nz4_chroma(struct aeg_encoder *e, int mbx, int mby,
 static int64_t cabac_block_price(const aeg_cabac *st, const int16_t *scan,
                                  int n, int cat, int cbf_ctx)
 {
-    aeg_cabac cb = *st;
-
-    cb.cost = 1;
-    cb.cost256 = 0;
-    aeg_cabac_residual(&cb, scan, n, cat, cbf_ctx);
-    return (int64_t)cb.cost256;
+    return aeg_cabac_residual_price(st, scan, n, cat, cbf_ctx);
 }
 
 /* What a block of levels reconstructs to, and what that costs. */
@@ -1154,27 +1149,15 @@ static int64_t trel_sse(const struct trel *t, const uint8_t *src, int stride,
                         const uint8_t *pred, int pred_stride,
                         const int16_t *lev, int qp)
 {
-    int64_t sse = 0;
-    int x, y;
-
     if (t->side == 4) {
         uint8_t r[16];
         aeg_idct_add_block(r, 4, lev, qp, pred, pred_stride, t->dc);
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int d = (int)r[y * 4 + x] - (int)src[y * stride + x];
-                sse += (int64_t)d * d;
-            }
+        return aeg_ssd(4, 4, r, 4, src, stride);
     } else {
         uint8_t r[64];
         aeg_idct_8x8_add(r, 8, lev, qp, pred, pred_stride);
-        for (y = 0; y < 8; y++)
-            for (x = 0; x < 8; x++) {
-                int d = (int)r[y * 8 + x] - (int)src[y * stride + x];
-                sse += (int64_t)d * d;
-            }
+        return aeg_ssd(8, 8, r, 8, src, stride);
     }
-    return sse;
 }
 
 /* What one coefficient's change does to the price of the block, with the levels
@@ -1279,12 +1262,11 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
             if (!cur[pos])
                 continue;
             for (step = -1; step <= 1; step += 2) {
-                int newlev = (int)cur[pos] + step;
+                const int16_t oldlev = cur[pos];
+                int newlev = (int)oldlev + step;
                 int last2 = last;
                 int64_t dbits, sse2, c;
 
-                memcpy(trial, cur, natsz);
-                trial[pos] = (int16_t)newlev;
                 if (i == last && !newlev) {
                     int j = i - 1;
                     while (j >= 0 && !cur[t->scan[j]])
@@ -1292,14 +1274,17 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                     last2 = j;
                 }
                 dbits = trel_dbits(sh, t, cur, i, newlev, last);
-                sse2 = trel_sse(t, src, stride, pred, pred_stride, trial, qp);
+                /* the trial is the current levels with this one moved */
+                cur[pos] = (int16_t)newlev;
+                sse2 = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
                 c = sse2 + trel_price(bits + dbits, lambda);
-                if (c < cost) {
+                if (c >= cost) {
+                    cur[pos] = oldlev;
+                } else {
                     cost = c;
                     sse = sse2;
                     bits += dbits;
                     last = last2;
-                    cur[pos] = trial[pos];
                     if (c < best_cost) {
                         best_cost = c;
                         memcpy(best, cur, natsz);

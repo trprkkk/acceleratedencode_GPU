@@ -372,6 +372,59 @@ int main(int argc, char **argv)
             bad++;
         }
     }
+    /* The Intra_16x16 AC blocks: coefficient 0 replaced by the DC Hadamard's
+     * value, vector path against the scalar loop, with DC-only blocks (the
+     * shortcut) and without a prediction (no shortcut). */
+    for (t = 0; t < rounds / 4; t++) {
+        int16_t lv[16];
+        uint8_t pr[16], o1[16], o2[16], a8[256], b8[256];
+        const int amp = (t % 3 == 0) ? 2000 : 40;
+        int32_t dc = (t % 5 == 0) ? rand() % 65536 - 32768 : rand() % 8001 - 4000;
+        int k, w = 4 << (t % 3), h = (t & 4) ? 8 : 4;
+        int64_t s1, s2 = 0;
+        qp = rand() % 52;
+        for (k = 0; k < 16; k++) {
+            lv[k] = (int16_t)((t & 1) ? 0 : ((rand() % 3 == 0) ? rand() % (2 * amp + 1) - amp : 0));
+            pr[k] = (uint8_t)(rand() & 255);
+        }
+        if (t % 7 == 0)
+            lv[0] = (int16_t)(rand() % 200 - 100);   /* ignored: dc replaces it */
+        aeg_idct_add_block(o1, 4, lv, qp, (t & 2) ? NULL : pr, 4, &dc);
+        aeg_idct_add_block_c(o2, 4, lv, qp, (t & 2) ? NULL : pr, 4, &dc);
+        cases++;
+        if (memcmp(o1, o2, sizeof(o1))) {
+            printf("   idct_add dc_in mismatch (round %d, qp %d, dc %d)\n", t, qp, (int)dc);
+            bad++;
+        }
+        for (k = 0; k < 256; k++) {
+            a8[k] = (uint8_t)(rand() & 255);
+            b8[k] = (uint8_t)((t & 8) ? rand() & 255 : (a8[k] + rand() % 9 - 4) & 255);
+        }
+        {
+            static const int ws[4] = { 4, 8, 16, 16 }, hs[4] = { 4, 8, 16, 8 };
+            int g;
+            for (g = 0; g < 4; g++)
+                if (aeg_satd(ws[g], hs[g], a8, 16, b8, 16) !=
+                    aeg_satd_c(ws[g], hs[g], a8, 16, b8, 16)) {
+                    printf("   satd %dx%d mismatch\n", ws[g], hs[g]);
+                    bad++;
+                }
+            if (aeg_sa8d_8x8(a8 + 3, 16, b8 + 17, 16) !=
+                aeg_sa8d_8x8_c(a8 + 3, 16, b8 + 17, 16)) {
+                printf("   sa8d mismatch\n");
+                bad++;
+            }
+        }
+        s1 = aeg_ssd(w, h, a8, 16, b8, 16);
+        for (k = 0; k < w * h; k++) {
+            int d = a8[(k / w) * 16 + k % w] - b8[(k / w) * 16 + k % w];
+            s2 += d * d;
+        }
+        if (s1 != s2) {
+            printf("   ssd %dx%d mismatch %lld %lld\n", w, h, (long long)s1, (long long)s2);
+            bad++;
+        }
+    }
     printf("   coef_check: %d cases, %s\n", cases,
            bad ? "MISMATCH" : "scalar, vector and batched paths bit-exact");
     return bad != 0;

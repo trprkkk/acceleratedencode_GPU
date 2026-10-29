@@ -540,44 +540,139 @@ static const uint8_t cab_lvl_next[2][8] = {
  * price local, so changing one level costs O(1) instead of a walk over the
  * whole list, and the block that comes out of the search is priced exactly
  * before it is accepted.  Returns 1/256 bit. */
+/* The price-only paths below read the contexts straight from the state they
+ * are given instead of running the coder on a copy of it (the copy is the
+ * whole 460-context state, and the level search asks tens of millions of
+ * these questions).  A context that is coded more than once inside the same
+ * question is advanced in a local copy of its state, so the prices are the
+ * coder's to the bin. */
+#define BIN_COST(s, b) aeg_cabac_bin_cost[(s)][(b)]
+#define BIN_NEXT(s, b) aeg_cabac_trans[(s)][(b)]
+
+/* Prefix bins of a level above 1 (the unary part after the first bin, all
+ * on one context) plus its escape suffix, from context state s. */
+static inline uint32_t level_rest_cost(int s, int abs)
+{
+    uint32_t c = 0;
+    int cnt;
+    for (cnt = 2; cnt < 15 && cnt < abs; cnt++) {
+        c += BIN_COST(s, 1);
+        s = BIN_NEXT(s, 1);
+    }
+    if (cnt < 15) {
+        c += BIN_COST(s, 0);
+    } else {
+        int rest = abs - 14, j = 0;
+        while (rest >= (1 << (j + 1)))
+            j++;
+        c += (uint32_t)(2 * j + 1) * 256;
+    }
+    return c;
+}
+
 int64_t aeg_cabac_coef_price(const aeg_cabac *st, int cat, int n, int pos,
                              int level, int is_last, int with_sig)
 {
     const struct cab_cat_ctx *k = &cab_cat[cat];
-    aeg_cabac cb = *st;
+    const uint8_t *state = st->state;
     int abs = level < 0 ? -level : level;
     int sig_last = n == 64;
+    uint32_t c = 0;
 
-    cb.cost = 1;
-    cb.cost256 = 0;
     if (with_sig)
-        aeg_cabac_decision(&cb, k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos),
-                           abs != 0);
+        c += BIN_COST(state[k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos)],
+                      abs != 0);
     if (abs) {
-        int cnt;
-        aeg_cabac_decision(&cb, k->last + (sig_last ? aeg_cabac_last8[pos] : pos),
-                           is_last);
-        aeg_cabac_decision(&cb, k->level + cab_lvl1[0], abs > 1);
-        if (abs > 1) {
-            int ctx = k->level + cab_gt1[0];
-            for (cnt = 2; cnt < 15 && cnt < abs; cnt++)
-                aeg_cabac_decision(&cb, ctx, 1);
-            if (cnt < 15) {
-                aeg_cabac_decision(&cb, ctx, 0);
-            } else {
-                int rest = abs - 14, j = 0;
-                while (rest >= (1 << (j + 1)))
-                    j++;
-                for (cnt = 0; cnt < j; cnt++)
-                    aeg_cabac_bypass(&cb, 1);
-                aeg_cabac_bypass(&cb, 0);
-                for (cnt = j - 1; cnt >= 0; cnt--)
-                    aeg_cabac_bypass(&cb, (rest >> cnt) & 1);
-            }
-        }
-        aeg_cabac_bypass(&cb, level < 0);
+        c += BIN_COST(state[k->last + (sig_last ? aeg_cabac_last8[pos] : pos)],
+                      is_last != 0);
+        c += BIN_COST(state[k->level + cab_lvl1[0]], abs > 1);
+        if (abs > 1)
+            c += level_rest_cost(state[k->level + cab_gt1[0]], abs);
+        c += 256;                                   /* sign */
     }
-    return (int64_t)cb.cost256;
+    return (int64_t)c;
+}
+
+/* aeg_cabac_residual() in price-only mode against `st`, which is left as it
+ * is.  Returns 1/256 bit. */
+int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
+                                 int n, int cat, int cbf_ctx)
+{
+    const struct cab_cat_ctx *k = &cab_cat[cat];
+    const uint8_t *state = st->state;
+    uint8_t sig[15], lst[15], lvl[10];
+    int i, last = -1, count = 0;
+    uint32_t c = 0;
+
+    for (i = 0; i < n; i++)
+        if (coef[i]) { last = i; count++; }
+    if (cbf_ctx >= 0) {
+        c += BIN_COST(state[cbf_ctx], count != 0);
+        if (!count)
+            return (int64_t)c;
+    }
+    if (n == 64) {
+        /* several positions share a context here: advance local copies */
+        memcpy(sig, state + k->sig, 15);
+        memcpy(lst, state + k->last, 9);
+        for (i = 0; i < 63; i++) {
+            int nz = coef[i] != 0, x = aeg_cabac_sig8[i], y;
+            c += BIN_COST(sig[x], nz);
+            sig[x] = BIN_NEXT(sig[x], nz);
+            if (!nz)
+                continue;
+            y = aeg_cabac_last8[i];
+            c += BIN_COST(lst[y], i == last);
+            lst[y] = BIN_NEXT(lst[y], i == last);
+            if (i == last)
+                break;
+        }
+    } else {
+        /* one context per position, each coded at most once */
+        for (i = 0; i < n - 1; i++) {
+            int nz = coef[i] != 0;
+            c += BIN_COST(state[k->sig + i], nz);
+            if (!nz)
+                continue;
+            c += BIN_COST(state[k->last + i], i == last);
+            if (i == last)
+                break;
+        }
+    }
+    memcpy(lvl, state + k->level, 10);
+    {
+        int node = 0;
+        for (i = last; i >= 0; i--) {
+            int v = coef[i], abs, x;
+            if (!v)
+                continue;
+            abs = v < 0 ? -v : v;
+            x = cab_lvl1[node];
+            c += BIN_COST(lvl[x], abs > 1);
+            lvl[x] = BIN_NEXT(lvl[x], abs > 1);
+            if (abs == 1) {
+                node = cab_lvl_next[0][node];
+            } else {
+                int cnt, y = cab_gt1[node];
+                node = cab_lvl_next[1][node];
+                for (cnt = 2; cnt < 15 && cnt < abs; cnt++) {
+                    c += BIN_COST(lvl[y], 1);
+                    lvl[y] = BIN_NEXT(lvl[y], 1);
+                }
+                if (cnt < 15) {
+                    c += BIN_COST(lvl[y], 0);
+                    lvl[y] = BIN_NEXT(lvl[y], 0);
+                } else {
+                    int rest = abs - 14, j = 0;
+                    while (rest >= (1 << (j + 1)))
+                        j++;
+                    c += (uint32_t)(2 * j + 1) * 256;
+                }
+            }
+            c += 256;                               /* sign */
+        }
+    }
+    return (int64_t)c;
 }
 
 /* One residual block: coded_block_flag (when the category has one), the

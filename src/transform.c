@@ -549,7 +549,8 @@ static inline void idct_pass(__m128i *a0, __m128i *a1, __m128i *a2, __m128i *a3)
  * this against the scalar loop on random levels at every QP to keep it that
  * way. */
 static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
-                         int qp, const uint8_t *pred, int pred_stride)
+                         int qp, const uint8_t *pred, int pred_stride,
+                         const int32_t *dc_in)
 {
     const int sh = qp / 6;
     const int qm = qp % 6;
@@ -588,7 +589,8 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
          * intermediate truncation a very large DC coefficient does depend on.
          */
         if (pred && _mm_movemask_epi8(_mm_cmpeq_epi16(ac, zero)) == 0xFFFF) {
-            const int dc = (int16_t)(((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
+            const int dc = dc_in ? (int16_t)*dc_in :
+                           (int16_t)(((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
                                       ls0) << sh);
             const int add = (dc + (1 << 5)) >> 6;
             const __m128i bias = _mm_set1_epi32(add);
@@ -620,6 +622,11 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
     a1 = _mm_srai_epi32(_mm_slli_epi32(a1, 16), 16);
     a2 = _mm_srai_epi32(_mm_slli_epi32(a2, 16), 16);
     a3 = _mm_srai_epi32(_mm_slli_epi32(a3, 16), 16);
+    /* the Intra_16x16 path replaces coefficient 0 with the DC Hadamard's
+     * value, truncated the same way */
+    if (dc_in)
+        a0 = _mm_or_si128(_mm_andnot_si128(_mm_setr_epi32(-1, 0, 0, 0), a0),
+                          _mm_cvtsi32_si128((int16_t)*dc_in));
     /* ... and only then the reference decoder's DC rounding, which the scalar
      * loop also adds after that cast */
     a0 = _mm_add_epi32(a0, _mm_setr_epi32(1 << 5, 0, 0, 0));
@@ -806,12 +813,60 @@ void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
                         const int32_t *dc_in)
 {
 #if defined(__SSE2__)
-    /* The Intra_16x16 DC path (dc_in) keeps the scalar loop: it is one block per
-     * macroblock and it overrides coefficient 0 from the DC Hadamard. */
-    if (!dc_in && idct_add_sse2(dst, stride, level, qp, pred, pred_stride))
+    /* The Intra_16x16 AC blocks (dc_in) too: coefficient 0 is overridden from
+     * the DC Hadamard at the scalar loop's truncation point. */
+    if (idct_add_sse2(dst, stride, level, qp, pred, pred_stride, dc_in))
         return;
 #endif
     idct_add_scalar(dst, stride, level, qp, pred, pred_stride, dc_in);
+}
+
+/* The scalar reference, for the differential test. */
+void aeg_idct_add_block_c(uint8_t *dst, int stride, const int16_t *level,
+                          int qp, const uint8_t *pred, int pred_stride,
+                          const int32_t *dc_in)
+{
+    idct_add_scalar(dst, stride, level, qp, pred, pred_stride, dc_in);
+}
+
+/* Sum of squared differences of two blocks of `w` x `h` (w = 4, 8 or 16). */
+int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
+                int sb)
+{
+#if defined(__SSE2__)
+    const __m128i z = _mm_setzero_si128();
+    __m128i acc = z;
+    int y;
+    for (y = 0; y < h; y++) {
+        __m128i va, vb, d;
+        if (w == 16) {
+            va = _mm_loadu_si128((const __m128i *)(a + (size_t)y * sa));
+            vb = _mm_loadu_si128((const __m128i *)(b + (size_t)y * sb));
+            d = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
+            acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
+        } else if (w == 8) {
+            va = _mm_loadl_epi64((const __m128i *)(a + (size_t)y * sa));
+            vb = _mm_loadl_epi64((const __m128i *)(b + (size_t)y * sb));
+        } else {
+            va = _mm_cvtsi32_si128(*(const int *)(a + (size_t)y * sa));
+            vb = _mm_cvtsi32_si128(*(const int *)(b + (size_t)y * sb));
+        }
+        d = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
+    }
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+    return (uint32_t)_mm_cvtsi128_si32(acc);
+#else
+    int64_t s = 0;
+    int x, y;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int d = (int)a[y * sa + x] - (int)b[y * sb + x];
+            s += d * d;
+        }
+    return s;
+#endif
 }
 
 void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
@@ -1374,14 +1429,96 @@ static void hadamard8(int *v)
             }
 }
 
+#if defined(__SSE2__)
+/* One row of eight differences, as int16. */
+static inline __m128i diff8(const uint8_t *a, const uint8_t *b)
+{
+    const __m128i z = _mm_setzero_si128();
+    return _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)a), z),
+                         _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)b), z));
+}
+
+/* Sum of |4x4 Hadamard| of the two 4x4 blocks side by side in four rows of
+ * eight differences: the vertical butterfly runs across the registers, the
+ * horizontal one inside each group of four lanes (two shuffle-and-add stages
+ * with alternating signs).  The coefficients come out permuted and with some
+ * signs flipped, which a sum of absolute values does not see. */
+static inline __m128i satd8x4_abs(__m128i r0, __m128i r1, __m128i r2, __m128i r3)
+{
+    const __m128i m1 = _mm_setr_epi16(0, -1, 0, -1, 0, -1, 0, -1);
+    const __m128i m2 = _mm_setr_epi16(0, 0, -1, -1, 0, 0, -1, -1);
+    const __m128i ones = _mm_set1_epi16(1);
+    __m128i v[4], acc;
+    int k;
+    hadamard4x4(&r0, &r1, &r2, &r3);
+    v[0] = r0; v[1] = r1; v[2] = r2; v[3] = r3;
+    for (k = 0; k < 4; k++) {
+        __m128i x = v[k], sw;
+        sw = _mm_shufflehi_epi16(_mm_shufflelo_epi16(x, _MM_SHUFFLE(2, 3, 0, 1)),
+                                 _MM_SHUFFLE(2, 3, 0, 1));
+        x = _mm_add_epi16(sw, _mm_sub_epi16(_mm_xor_si128(x, m1), m1));
+        sw = _mm_shufflehi_epi16(_mm_shufflelo_epi16(x, _MM_SHUFFLE(1, 0, 3, 2)),
+                                 _MM_SHUFFLE(1, 0, 3, 2));
+        x = _mm_add_epi16(sw, _mm_sub_epi16(_mm_xor_si128(x, m2), m2));
+        v[k] = _mm_max_epi16(x, _mm_sub_epi16(_mm_setzero_si128(), x));
+    }
+    acc = _mm_add_epi16(_mm_add_epi16(v[0], v[1]), _mm_add_epi16(v[2], v[3]));
+    return _mm_madd_epi16(acc, ones);
+}
+
+static inline int hsum_epi32(__m128i acc)
+{
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(acc);
+}
+
+/* Eight-point butterfly across eight registers (three stages). */
+static inline void hadamard8_v(__m128i r[8])
+{
+    int step, i, j;
+    for (step = 1; step < 8; step <<= 1)
+        for (i = 0; i < 8; i += 2 * step)
+            for (j = i; j < i + step; j++) {
+                __m128i a = r[j], b = r[j + step];
+                r[j] = _mm_add_epi16(a, b);
+                r[j + step] = _mm_sub_epi16(a, b);
+            }
+}
+#endif
+
 /* Sum of absolute 8x8 Hadamard coefficients of the difference, scaled like
  * aeg_satd_4x4 so that the two numbers are directly comparable: a flat
  * residual of v costs 8v per 4x4 SATD block and 16v per 8x8 block, while a
  * residual with detail at the 4x4 level costs more in the 8x8 measure.  That
  * is exactly the comparison the transform-size decision needs -- the 8x8
  * transform concentrates smooth energy into fewer coefficients, but it cannot
- * represent the high frequencies of a busy block without ringing. */
+ * represent the high frequencies of a busy block without ringing.
+ *
+ * The vector path keeps the transform in int16 (|coefficient| <= 255 * 64)
+ * and is therefore the scalar result exactly. */
 int aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+#if defined(__SSE2__)
+    __m128i r[8], acc = _mm_setzero_si128();
+    const __m128i ones = _mm_set1_epi16(1);
+    int k;
+    for (k = 0; k < 8; k++)
+        r[k] = diff8(a + (size_t)k * sa, b + (size_t)k * sb);
+    hadamard8_v(r);
+    tr8_epi16(r);
+    hadamard8_v(r);
+    for (k = 0; k < 8; k++) {
+        __m128i x = _mm_max_epi16(r[k], _mm_sub_epi16(_mm_setzero_si128(), r[k]));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(x, ones));
+    }
+    return (hsum_epi32(acc) + 2) >> 2;
+#else
+    return aeg_sa8d_8x8_c(a, sa, b, sb);
+#endif
+}
+
+int aeg_sa8d_8x8_c(const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int t[64], d[64], x, y, sum = 0;
     for (y = 0; y < 8; y++) {
@@ -1405,14 +1542,33 @@ int aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
 
 int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
-    int sum = 0, x, y;
-    for (y = 0; y < 8; y += 4)
-        for (x = 0; x < 8; x += 4)
-            sum += aeg_satd_4x4(a + y * sa + x, sa, b + y * sb + x, sb);
-    return sum;
+    return aeg_satd(8, 8, a, sa, b, sb);
 }
 
+/* The sum of a 4x4 block's absolute Hadamard coefficients is always even
+ * (their plain sum is 16 times the first sample), so aeg_satd_4x4()'s
+ * rounding is an exact halving and a larger block is the halved total. */
 int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+#if defined(__SSE2__)
+    if ((w & 7) == 0 && (h & 3) == 0) {
+        __m128i acc = _mm_setzero_si128();
+        int x, y;
+        for (y = 0; y < h; y += 4) {
+            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            for (x = 0; x < w; x += 8)
+                acc = _mm_add_epi32(acc, satd8x4_abs(
+                    diff8(pa + x, pb + x), diff8(pa + sa + x, pb + sb + x),
+                    diff8(pa + 2 * sa + x, pb + 2 * sb + x),
+                    diff8(pa + 3 * sa + x, pb + 3 * sb + x)));
+        }
+        return hsum_epi32(acc) >> 1;
+    }
+#endif
+    return aeg_satd_c(w, h, a, sa, b, sb);
+}
+
+int aeg_satd_c(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
     int sum = 0, x, y;
     for (y = 0; y < h; y += 4)

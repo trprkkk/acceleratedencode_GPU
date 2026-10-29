@@ -423,9 +423,7 @@ static inline int me_sad(const uint8_t *ref, int rstride, const uint8_t *cur,
 static inline int me_se_bits(int v)
 {
     unsigned m = (unsigned)(v < 0 ? -v : v) * 2u;
-    int n = 1;
-    while (m > 1) { n += 2; m >>= 1; }
-    return n;   /* 1 for 0, 3 for +-1, 5 for +-2..3, ... = 2*floor(log2(2|v|))+1 */
+    return m ? 2 * (31 - __builtin_clz(m)) + 1 : 1;   /* 1 for 0, 3 for +-1, 5 for +-2..3, ... = 2*floor(log2(2|v|))+1 */
 }
 
 /* What the search minimises: distortion plus lambda times the bits of the
@@ -631,13 +629,22 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
                     continue;
                 if (nx < -range * 4 || nx > range * 4 || ny < -range * 4 || ny > range * 4)
                     continue;
-                if (mc && mc->ready)
-                    aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
-                                  nx & 3, ny & 3);
-                else
-                    aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
-                                bh, nx & 3, ny & 3);
-                d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+                if (mc && mc->ready && mc->stride == rstride &&
+                    !(((ny & 3) << 2 | (nx & 3)) & 5)) {
+                    /* integer or half-pel: the samples are a plane's as they
+                     * are, so measure them in place instead of copying */
+                    const ptrdiff_t off = ref + iy * rstride + ix - mc->base[0];
+                    d = aeg_satd(bw, bh, mc->base[hpel_ref0[((ny & 3) << 2) | (nx & 3)]] + off,
+                                 rstride, cur, cstride);
+                } else {
+                    if (mc && mc->ready)
+                        aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
+                                      nx & 3, ny & 3);
+                    else
+                        aeg_mc_luma(buf, bw, ref + iy * rstride + ix, rstride, bw,
+                                    bh, nx & 3, ny & 3);
+                    d = aeg_satd(bw, bh, buf, bw, cur, cstride);
+                }
                 if (cme)
                     d += me_chroma_satd(mc, cur, rstride, bw, bh, nx, ny);
                 cost = d + me_mv_cost(rt, nx, ny);

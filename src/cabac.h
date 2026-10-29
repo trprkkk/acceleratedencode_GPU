@@ -162,5 +162,7 @@ int aeg_cabac_residual(aeg_cabac *c, const int16_t *coef, int n, int cat,
  * `pos` is the scan position, `n` the block's coefficient count. */
 int64_t aeg_cabac_coef_price(const aeg_cabac *c, int cat, int n, int pos,
                              int level, int is_last, int with_sig);
+int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
+                                 int n, int cat, int cbf_ctx);
 
 #endif
