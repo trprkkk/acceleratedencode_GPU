@@ -3425,3 +3425,17 @@ in quality for 15% more time.  It exists because on a device those 54 passes are
 54 launches over 240 macroblocks each, which is what a GPU is for;
 `tests/run_tests.sh` keeps the path conformant (`par_subpel` case) even though
 this machine always chooses the walk.
+
+### The trellis price of the last scan position
+
+AddressSanitizer (run while chasing the frame-thread queue bug) found the
+trellis' inline coefficient price reading `aeg_cabac_sig8[63]` and
+`aeg_cabac_last8[63]` -- one past both tables -- whenever the coefficient at the
+last scan position of an 8x8 block was priced; the 4x4 blocks read a
+neighbouring category's context for their last position the same way.  That
+position carries neither a significance nor a last flag (9.3.2.2), so its
+price now has neither.  The old value came from whatever the linker put after
+the tables, i.e. the stream could change with an unrelated edit.  BD-rate
+against the previous binary (five clips, global PSNR): preset 2 0.00 %, preset 3
++0.04 %, preset 4 -0.03 % -- noise; the streams of presets 3-4 change, presets
+0-2 do not.

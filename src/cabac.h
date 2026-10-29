@@ -163,14 +163,18 @@ static inline int64_t aeg_cabac_coef_price_inl(const aeg_cabac *st, int cat,
     const uint8_t *state = st->state;
     int abs = level < 0 ? -level : level;
     int sig_last = n == 64;
+    /* the last scan position carries neither flag: a coefficient there is
+     * significant and the last one by position alone (9.3.2.2) */
+    int flags = pos < n - 1;
     uint32_t c = 0;
 
-    if (with_sig)
+    if (with_sig && flags)
         c += aeg_cabac_bin_cost[state[k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos)]]
                                [abs != 0];
     if (abs) {
-        c += aeg_cabac_bin_cost[state[k->last + (sig_last ? aeg_cabac_last8[pos] : pos)]]
-                               [is_last != 0];
+        if (flags)
+            c += aeg_cabac_bin_cost[state[k->last + (sig_last ? aeg_cabac_last8[pos] : pos)]]
+                                   [is_last != 0];
         c += aeg_cabac_bin_cost[state[k->level + 1]][abs > 1];
         if (abs > 1) {
             int s = state[k->level + 5], cnt;
