@@ -530,7 +530,7 @@ int main(int argc, char **argv)
                 continue;
             }
             if (r != 0) {
-                fprintf(stderr, "encode failed: %s\n", aeg_last_error());
+                fprintf(stderr, "encode failed: %s (%d)\n", aeg_last_error(), r);
                 ret = 1;
                 break;
             }
@@ -563,8 +563,13 @@ int main(int argc, char **argv)
             aeg_packet pkt;
             int r = aeg_encoder_flush(enc, &pkt);
 
-            if (r == AEG_EOF || r != AEG_OK)
+            if (r == AEG_EOF)
                 break;
+            if (r != AEG_OK) {
+                fprintf(stderr, "flush failed: %s (%d)\n", aeg_last_error(), r);
+                ret = 1;
+                break;
+            }
             write_packet(out, dumppath, enc, &pkt, &dump_first,
                          width, height);
         }
