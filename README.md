@@ -44,9 +44,9 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > [`docs/STATUS.md`](docs/STATUS.md).
 
 **Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
-22-37, five real clips, PSNR of the whole sequence's MSE): **-4.61 %** BD-rate
-on average against x264 at constant QP (cock -0.03, vtest -10.68, mega -6.09,
-short -8.57, tree +2.31), and **-0.30 %** against x264 at CRF with its own
+22-37, five real clips, PSNR of the whole sequence's MSE): **-4.79 %** BD-rate
+on average against x264 at constant QP (cock -0.31, vtest -11.09, mega -6.33,
+short -8.62, tree +2.39), and **-0.50 %** against x264 at CRF with its own
 macroblock tree (`aq-mode=0`), the way x264 is normally run.
 Since the text above was written the encoder gained B pyramid
 (`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock
@@ -142,9 +142,9 @@ of BD-rate for about 40 % more time at preset 4; off by default, see
 level selection on the luma residual (priced by the CABAC coder; on from preset
 3 up, where it is worth 0.15-2.2 points for 12-14 % of the encode time, see
 *Rate-distortion level selection* in `docs/STATUS.md`), `--ref 1|2` gives P
-pictures a second reference picture (on from preset 3 up when there are no B
-pictures: -1.4 % mean BD-rate for about 15 % more time; neutral with B pictures,
-so off there by default, see *Two P references* in `docs/STATUS.md`),
+pictures a second reference picture (on from preset 3 up: -1.4 % mean BD-rate
+for about 15 % more time without B pictures, -0.18 % for 3 % with them, see
+*Two P references* in `docs/STATUS.md`),
 `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the

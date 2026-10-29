@@ -9115,10 +9115,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * -1.4 % mean BD-rate for +16 % time on P-only streams, but -0.2 % (noise)
      * with three B pictures, where the anchors are four pictures apart and the
      * older one is eight away -- and where a direct block cannot follow a
-     * co-located block on it (direct_group_ok).  So it follows the preset only
-     * when there are no B pictures; --ref 2 forces it either way. */
+     * co-located block on it (direct_group_ok).  On the five real clips, with
+     * the adaptive B decision, it is -0.18 % (four of five better) for +3 %
+     * time, so preset 3 and up use it with B pictures too. */
     if (pp->refs < 0)
-        pp->refs = (pp->preset >= 3 && pp->bframes == 0) ? 2 : 1;
+        pp->refs = pp->preset >= 3 ? 2 : 1;
     if (pp->i_qp_offset < 0)
         pp->i_qp_offset = 3;
     if (pp->direct < 0 || pp->direct > 1)

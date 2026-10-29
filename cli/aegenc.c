@@ -53,7 +53,7 @@ static void usage(void)
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 2)\n"
 "  --ref <n>        reference pictures for P pictures, 1 or 2 (default 2 from\n"
-"                   preset 3 up when --bframes is 0, otherwise 1)\n"
+"                   preset 3 up, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"

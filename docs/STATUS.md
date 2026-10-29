@@ -2015,6 +2015,36 @@ x264's is neutral; the propagation through the repeated pictures is
 legitimate, and the I picture ends up 3.9 QP below the refresh P pictures
 where x264 has 1.5 -- not pursued further.
 
+**Two P references with B pictures; three things that did not help.**
+
+* `--ref 2` with the adaptive B decision on the five real clips: -0.27,
+  -0.34, -0.30, -0.05, +0.06 = **-0.18%** for +3% time, so preset 3 and up
+  now use the second P reference with B pictures as well (it was P-only).
+  x264's own references are worth 0.77 points against us (`ref=1`: cock
+  0.66, vtest 1.71, mega 1.05, short 0.73, tree -0.29); its list0[1] is the
+  B-reference of the previous group (closer than our older anchor), which is
+  what is left here.
+* x264's dct-decimate on inter luma (8x8 groups scoring under 4 and the
+  macroblock under 6 dropped, after the trellis): +1.53 cock, +2.37 short;
+  the macroblock rule alone +0.08.  Our trellis and the coder-priced skip
+  decision already make that choice by price.
+* The b-adapt 1 of current x264 (greedy: picture j is a B picture when
+  "B..BBP" costs less than "B..BPP" by the lookahead's path cost) instead of
+  ours (the threshold rule of early x264): cock -1.90, vtest +1.36, mega
+  -4.21, short +5.73, tree +0.09 = +0.22 -- the same split as a fixed three
+  B pictures (and x264's own fixed 1B beats its 3B on short too, so this is
+  the content, not our B coding: at fixed structures, mbtree off, we are
+  ahead of x264 on every clip, 3B: cock -1.3, short -2.1, vtest -2.1, mega
+  -5.1).  The path-cost ratios of short (0.86-0.96) and mega (0.89-1.0) look
+  alike, so the lowres estimate cannot tell the two apart.  The B discount
+  `AEG_LABIAS=150` instead of 120: vtest -0.96, the rest 0.00, -0.19 mean;
+  not taken (one clip).
+
+| vs x264 (`bdx.sh`) | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| CQP | -0.31 | -11.09 | -6.33 | -8.62 | +2.39 | **-4.79** |
+| CRF + mbtree | +0.17 | -0.63 | +0.81 | -5.03 | +2.18 | **-0.50** |
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default
