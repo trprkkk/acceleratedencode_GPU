@@ -1917,6 +1917,39 @@ short), which needs list0 to name one picture twice.  `tools/abbd.py` takes
 `BIN=path` as a leading token so one side can run another build (a worktree
 of the last commit).
 
+**The mode lambda of P pictures.**  With identical per-type QPs (CQP, I -3,
+Bref +1, B +2) and x264's own q28..q30 slope as the yardstick
+(`/tmp/w/gap.sh`), our bit excess at equal PSNR on cock at q30 is 0.0% with
+one B picture per group, 1.5% with two and 2.5-2.8% with three (pyramid or
+not), so what we lose grows with the prediction distance; a full search of
+radius 24 changes nothing.  At constant QP the B pictures take fewer skips
+than x264's (45% against 53% on cock, 40% against 51% on short) and more
+bi-predicted partitions.
+
+Pricing the skipped macroblock higher in the skip check (x1.15) on P pictures
+was -0.49% (cock + short), x0.85 +2.1%; on B pictures both ways within 0.3.
+That pointed at the P lambda as a whole: the mode decision of P pictures now
+uses 0.65x the lambda of the QP (`P_MODE_LAMBDA`; 0.55 * 2^((QP-12)/3), close
+to HM's 0.57 for inter pictures, where 0.85 is the intra/JM constant).
+Everything else -- trellis, motion search, I and B pictures -- keeps its
+lambda.
+
+| P mode lambda, cock + short | 0.8x | 0.65x | 0.5x | 0.65x, all lambdas incl. trellis (0.75x) |
+|---|---|---|---|---|
+| BD-rate | -0.90 | **-1.38** | -1.00 | -0.08 |
+
+0.65x with `--mbtree 0`: -2.10; with `--bframes 0`: -2.56; on I pictures
+too: +0.08; another 0.8x on B pictures: -0.08 on cock + short but +0.07 on
+all five (vtest +0.40); P at 0.9x of the new value: +0.07.  Presets 1 and 4
+(cock + short): -1.43 / -1.58.
+
+| ab vs previous commit | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| P mode lambda 0.65x | -1.20 | -0.14 | -0.65 | -1.46 | +0.02 | **-0.69** |
+
+Against x264 (`bdx.sh`): CQP **-3.98%** (+0.65, -9.76, -5.63, -8.62, +3.44),
+CRF with its tree **+0.29%** (+0.94, +0.88, +1.47, -5.05, +3.23).
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default

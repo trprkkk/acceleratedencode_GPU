@@ -5120,6 +5120,8 @@ static int skip_check_on(void)
     return v;
 }
 
+#define P_MODE_LAMBDA 0.65
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -5139,6 +5141,19 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * nothing to undo and it is neutral; the same shift of the motion-search
      * lambda: +0.2 %. */
     double lambda = AEG_LAMBDA(c->qp - e->mode_lambda_off);
+    /* A P picture's modes are priced at 0.65x the lambda of its QP, i.e.
+     * 0.55 * 2^((QP - 12) / 3): what is decided in a reference picture is
+     * paid for again by every picture predicted from it, and the 0.85 of the
+     * formula is the intra/H.264-JM value (HM's inter pictures use 0.57).
+     * Measured on the mode decision only (cock + short): 0.8x -0.90%, 0.65x
+     * -1.38%, 0.5x -1.00%; P-only -2.56%, without the tree -2.10%; the same
+     * on the trellis lambda as well: -0.08%; on I pictures: +0.08%; another
+     * 0.8x on B pictures: -0.08% on cock + short, +0.07% on all five; a
+     * skip-only version (the skip check's cost x1.15) gets a third of it.
+     * Rate-distortion's other users (trellis, the motion search) keep the
+     * plain lambda. */
+    if (e->cur_is_p)
+        lambda *= P_MODE_LAMBDA;
     int i, inter;
 
     if ((e->p.preset <= 0 && !e->cur_is_b) || e->mb_nmodes == 0) {
