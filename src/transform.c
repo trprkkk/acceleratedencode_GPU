@@ -839,6 +839,32 @@ void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
     idct_add_scalar(dst, stride, level, qp, pred, pred_stride, dc_in);
 }
 
+/* aeg_idct_add_block() into a scratch block, and its SSE against src. */
+int64_t aeg_idct_add_ssd4(const int16_t *level, int qp, const uint8_t *pred,
+                          int pred_stride, const int32_t *dc_in,
+                          const uint8_t *src, int stride)
+{
+    uint8_t r[16];
+    aeg_idct_add_block(r, 4, level, qp, pred, pred_stride, dc_in);
+#if defined(__SSE2__)
+    {
+        const __m128i z = _mm_setzero_si128();
+        __m128i va = _mm_loadu_si128((const __m128i *)r);
+        __m128i vb = _mm_setr_epi32(*(const int *)src, *(const int *)(src + stride),
+                                    *(const int *)(src + 2 * stride),
+                                    *(const int *)(src + 3 * stride));
+        __m128i d0 = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+        __m128i d1 = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
+        __m128i acc = _mm_add_epi32(_mm_madd_epi16(d0, d0), _mm_madd_epi16(d1, d1));
+        acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+        acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+        return (uint32_t)_mm_cvtsi128_si32(acc);
+    }
+#else
+    return aeg_ssd(4, 4, r, 4, src, stride);
+#endif
+}
+
 /* The scalar reference, for the differential test. */
 void aeg_idct_add_block_c(uint8_t *dst, int stride, const int16_t *level,
                           int qp, const uint8_t *pred, int pred_stride,
@@ -1404,6 +1430,130 @@ void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res)
         for (y = 0; y < 8; y++)
             res[y * 8 + x] = (int16_t)(o[y] >> 6);
     }
+}
+
+/* Incremental 8x8 reconstruction for the level search: the dequantised
+ * block and its first (row) pass are kept for the current levels, so a trial
+ * that moves one level redoes one row of the first pass and the column pass
+ * only.  Every step is the one aeg_idct_8x8_add() takes -- same dequantiser,
+ * same int16 truncation after the rows, same shift, same clip -- so the SSE
+ * of a trial is exactly aeg_ssd() of what aeg_idct_8x8_add() would make. */
+static int16_t dq8_one(int lev, int qp, int pos)
+{
+    const int64_t v = ((int64_t)(int16_t)lev *
+                       (aeg_dequant8_ls[qp % 6][aeg_cls8[pos >> 3][pos & 7]] << (qp / 6)) * 16
+                       + 32) >> 6;
+    int16_t d = (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
+    return pos ? d : (int16_t)(d + 32);
+}
+
+static void idct8_row(const int16_t *d, int16_t *t)
+{
+    int s[8], o[8], x;
+    for (x = 0; x < 8; x++)
+        s[x] = d[x];
+    idct8_1d(s, o);
+    for (x = 0; x < 8; x++)
+        t[x] = (int16_t)o[x];
+}
+
+void aeg_idct8_cache_init(aeg_idct8_cache *c, const int16_t *level, int qp)
+{
+    int y;
+    aeg_dequant_8x8(level, c->d, qp);
+    c->d[0] = (int16_t)(c->d[0] + 32);
+    c->qp = qp;
+    for (y = 0; y < 8; y++)
+        idct8_row(c->d + 8 * y, c->t + 8 * y);
+}
+
+void aeg_idct8_cache_set(aeg_idct8_cache *c, int pos, int lev)
+{
+    c->d[pos] = dq8_one(lev, c->qp, pos);
+    idct8_row(c->d + (pos & ~7), c->t + (pos & ~7));
+}
+
+static int64_t col_ssd_c(const int16_t *t, const int16_t *trow, int ty,
+                         const uint8_t *pred, int ps, const uint8_t *src, int ss)
+{
+    int s[8], o[8], x, y;
+    int64_t sum = 0;
+    for (x = 0; x < 8; x++) {
+        for (y = 0; y < 8; y++)
+            s[y] = y == ty ? trow[x] : t[y * 8 + x];
+        idct8_1d(s, o);
+        for (y = 0; y < 8; y++) {
+            int v = (int)pred[y * ps + x] + (int16_t)(o[y] >> 6), dd;
+            v = v < 0 ? 0 : (v > 255 ? 255 : v);
+            dd = v - (int)src[y * ss + x];
+            sum += dd * dd;
+        }
+    }
+    return sum;
+}
+
+#if defined(AEG_X86_AVX2)
+__attribute__((target("avx2")))
+static int64_t col_ssd_avx2(const int16_t *t, const int16_t *trow, int ty,
+                            const uint8_t *pred, int ps, const uint8_t *src, int ss)
+{
+#define ADD _mm256_add_epi32
+#define SUB _mm256_sub_epi32
+#define SR(x, n) _mm256_srai_epi32(x, n)
+    __m256i s[8], d[8], acc = _mm256_setzero_si256();
+    const __m256i zero = _mm256_setzero_si256(), mx = _mm256_set1_epi32(255);
+    __m128i lo;
+    int k;
+    for (k = 0; k < 8; k++)
+        s[k] = _mm256_cvtepi16_epi32(_mm_loadu_si128(
+            (const __m128i *)(k == ty ? trow : t + 8 * k)));
+    {
+        const __m256i a0 = ADD(s[0], s[4]), a2 = SUB(s[0], s[4]);
+        const __m256i a4 = SUB(SR(s[2], 1), s[6]), a6 = ADD(SR(s[6], 1), s[2]);
+        const __m256i b0 = ADD(a0, a6), b2 = ADD(a2, a4), b4 = SUB(a2, a4), b6 = SUB(a0, a6);
+        const __m256i a1 = SUB(SUB(SUB(s[5], s[3]), s[7]), SR(s[7], 1));
+        const __m256i a3 = SUB(SUB(ADD(s[1], s[7]), s[3]), SR(s[3], 1));
+        const __m256i a5 = ADD(ADD(SUB(s[7], s[1]), s[5]), SR(s[5], 1));
+        const __m256i a7 = ADD(ADD(ADD(s[3], s[5]), s[1]), SR(s[1], 1));
+        const __m256i b1 = ADD(SR(a7, 2), a1), b3 = ADD(a3, SR(a5, 2));
+        const __m256i b5 = SUB(SR(a3, 2), a5), b7 = SUB(a7, SR(a1, 2));
+        d[0] = ADD(b0, b7); d[1] = ADD(b2, b5); d[2] = ADD(b4, b3); d[3] = ADD(b6, b1);
+        d[4] = SUB(b6, b1); d[5] = SUB(b4, b3); d[6] = SUB(b2, b5); d[7] = SUB(b0, b7);
+    }
+#undef ADD
+#undef SUB
+#undef SR
+    for (k = 0; k < 8; k++) {
+        __m256i r = _mm256_srai_epi32(d[k], 6);
+        __m256i p = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(pred + k * ps)));
+        __m256i o = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(src + k * ss)));
+        r = _mm256_srai_epi32(_mm256_slli_epi32(r, 16), 16);
+        r = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(p, r), zero), mx);
+        r = _mm256_sub_epi32(r, o);
+        acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(r, r));
+    }
+    lo = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    return (uint32_t)_mm_cvtsi128_si32(lo);
+}
+#endif
+
+int64_t aeg_idct8_cache_ssd(const aeg_idct8_cache *c, int pos, int lev,
+                            const uint8_t *pred, int ps, const uint8_t *src, int ss)
+{
+    int16_t drow[8], trow[8];
+    const int y = pos >> 3;
+    if (pos >= 0) {
+        memcpy(drow, c->d + 8 * y, sizeof(drow));
+        drow[pos & 7] = dq8_one(lev, c->qp, pos);
+        idct8_row(drow, trow);
+    }
+#if defined(AEG_X86_AVX2)
+    if (cpu_avx2())
+        return col_ssd_avx2(c->t, trow, pos >= 0 ? y : -1, pred, ps, src, ss);
+#endif
+    return col_ssd_c(c->t, trow, pos >= 0 ? y : -1, pred, ps, src, ss);
 }
 
 void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,

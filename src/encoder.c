@@ -1187,9 +1187,7 @@ static int64_t trel_sse(const struct trel *t, const uint8_t *src, int stride,
                         const int16_t *lev, int qp)
 {
     if (t->side == 4) {
-        uint8_t r[16];
-        aeg_idct_add_block(r, 4, lev, qp, pred, pred_stride, t->dc);
-        return aeg_ssd(4, 4, r, 4, src, stride);
+        return aeg_idct_add_ssd4(lev, qp, pred, pred_stride, t->dc, src, stride);
     } else {
         uint8_t r[64];
         aeg_idct_8x8_add(r, 8, lev, qp, pred, pred_stride);
@@ -1244,6 +1242,7 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                             double lambda, int passes, int allow_empty)
 {
     int16_t cur[64], trial[64], best[64], scan[64];
+    aeg_idct8_cache c8;
     /* The levels are held in natural (raster) order, so every array covers
      * the whole block -- an AC block lists 15 coefficients but its levels
      * still span 16 positions -- while `last` is a position in the scan,
@@ -1293,6 +1292,10 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
             cost = sse + trel_price(bits, lambda);
         }
     }
+    /* 8x8: the trials reuse the current levels' dequantised block and row
+     * pass (aeg_idct8_cache_*, exactly trel_sse()'s numbers) */
+    if (t->side == 8 && passes > 0)
+        aeg_idct8_cache_init(&c8, cur, qp);
     for (pass = 0; pass < passes; pass++) {
         for (i = 0; i < t->n; i++) {
             int pos = t->scan[i], step;
@@ -1317,12 +1320,18 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
                 if (trel_price(bits + dbits, lambda) >= cost)
                     continue;
                 /* the trial is the current levels with this one moved */
+                if (t->side == 8)
+                    sse2 = aeg_idct8_cache_ssd(&c8, pos, newlev, pred,
+                                               pred_stride, src, stride);
                 cur[pos] = (int16_t)newlev;
-                sse2 = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+                if (t->side != 8)
+                    sse2 = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
                 c = sse2 + trel_price(bits + dbits, lambda);
                 if (c >= cost) {
                     cur[pos] = oldlev;
                 } else {
+                    if (t->side == 8)
+                        aeg_idct8_cache_set(&c8, pos, newlev);
                     cost = c;
                     sse = sse2;
                     bits += dbits;

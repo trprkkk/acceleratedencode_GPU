@@ -675,6 +675,78 @@ int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
     return (int64_t)c;
 }
 
+/* aeg_cabac_residual() in price mode: the same bins, priced and advanced in
+ * the same order, with the state and the sum kept local (the generic
+ * decision has to reload both after every state byte it stores). */
+static int residual_cost(aeg_cabac *cb, const int16_t *coef, int n,
+                         const struct cab_cat_ctx *k, int cbf_ctx, int last,
+                         int count)
+{
+    uint8_t *st = cb->state;
+    uint32_t c = 0;
+    int i;
+#define DEC(ctx, b) do { int s_ = st[ctx], b_ = (b);                         \
+        c += BIN_COST(s_, b_); st[ctx] = BIN_NEXT(s_, b_); } while (0)
+    if (cbf_ctx >= 0) {
+        DEC(cbf_ctx, count != 0);
+        if (!count) {
+            cb->cost256 += c;
+            return 0;
+        }
+    }
+    if (n == 64) {
+        for (i = 0; i < 63; i++) {
+            int nz = coef[i] != 0;
+            DEC(k->sig + aeg_cabac_sig8[i], nz);
+            if (!nz)
+                continue;
+            DEC(k->last + aeg_cabac_last8[i], i == last);
+            if (i == last)
+                break;
+        }
+    } else {
+        for (i = 0; i < n - 1; i++) {
+            int nz = coef[i] != 0;
+            DEC(k->sig + i, nz);
+            if (!nz)
+                continue;
+            DEC(k->last + i, i == last);
+            if (i == last)
+                break;
+        }
+    }
+    {
+        int node = 0;
+        for (i = last; i >= 0; i--) {
+            int v = coef[i], abs, cnt, ctx;
+            if (!v)
+                continue;
+            abs = v < 0 ? -v : v;
+            DEC(k->level + cab_lvl1[node], abs > 1);
+            if (abs == 1) {
+                node = cab_lvl_next[0][node];
+            } else {
+                ctx = k->level + cab_gt1[node];
+                node = cab_lvl_next[1][node];
+                for (cnt = 2; cnt < 15 && cnt < abs; cnt++)
+                    DEC(ctx, 1);
+                if (cnt < 15) {
+                    DEC(ctx, 0);
+                } else {
+                    int rest = abs - 14, j = 0;
+                    while (rest >= (1 << (j + 1)))
+                        j++;
+                    c += (uint32_t)(2 * j + 1) * 256;
+                }
+            }
+            c += 256;                                   /* sign */
+        }
+    }
+#undef DEC
+    cb->cost256 += c;
+    return count;
+}
+
 /* One residual block: coded_block_flag (when the category has one), the
  * significance map with the last-coefficient flag, then the levels backwards
  * from the last significant coefficient.  `coef[i]` is the coefficient at scan
@@ -688,6 +760,8 @@ int aeg_cabac_residual(aeg_cabac *cb, const int16_t *coef, int n, int cat,
 
     for (i = 0; i < n; i++)
         if (coef[i]) { last = i; count++; }
+    if (cb->cost)
+        return residual_cost(cb, coef, n, k, cbf_ctx, last, count);
     if (cbf_ctx >= 0) {
         aeg_cabac_decision(cb, cbf_ctx, count != 0);
         if (!count)

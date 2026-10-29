@@ -349,6 +349,17 @@ void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef);
 void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef);
 void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra);
 void aeg_quant_8x8_c(const int16_t *coef, int16_t *level, int qp, int intra);
+/* Incremental 8x8 reconstruction for the trellis (see transform.c). */
+int64_t aeg_idct_add_ssd4(const int16_t *level, int qp, const uint8_t *pred,
+                          int pred_stride, const int32_t *dc_in,
+                          const uint8_t *src, int stride);
+typedef struct { int16_t d[64], t[64]; int qp; } aeg_idct8_cache;
+void aeg_idct8_cache_init(aeg_idct8_cache *c, const int16_t *level, int qp);
+void aeg_idct8_cache_set(aeg_idct8_cache *c, int pos, int lev);
+/* SSE against src of the current levels with level `pos` set to `lev`
+ * (pos < 0: the current levels as they are). */
+int64_t aeg_idct8_cache_ssd(const aeg_idct8_cache *c, int pos, int lev,
+                            const uint8_t *pred, int ps, const uint8_t *src, int ss);
 void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp);
 /* The portable versions of the three above (the SSE2 ones must match them
  * bit for bit; tests/kernel_check.c compares them). */

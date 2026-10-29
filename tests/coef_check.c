@@ -371,6 +371,29 @@ int main(int argc, char **argv)
             printf("   8x8 inverse transform mismatch (round %d, qp %d)\n", t, qp);
             bad++;
         }
+        {
+            /* the trellis' incremental reconstruction against the full one */
+            aeg_idct8_cache ic;
+            uint8_t pp[64], ss[64], rr[64];
+            int pos = rand() % 64, nl = l8[pos] + (rand() % 5) - 2;
+            for (k = 0; k < 64; k++) {
+                pp[k] = (uint8_t)rand();
+                ss[k] = (uint8_t)rand();
+            }
+            aeg_idct8_cache_init(&ic, l8, qp);
+            if (aeg_idct8_cache_ssd(&ic, -1, 0, pp, 8, ss, 8) !=
+                (aeg_idct_8x8_add(rr, 8, l8, qp, pp, 8), aeg_ssd(8, 8, rr, 8, ss, 8)))
+                bad++;
+            {
+                int64_t inc = aeg_idct8_cache_ssd(&ic, pos, nl, pp, 8, ss, 8);
+                l8[pos] = (int16_t)nl;
+                aeg_idct_8x8_add(rr, 8, l8, qp, pp, 8);
+                if (inc != aeg_ssd(8, 8, rr, 8, ss, 8)) {
+                    printf("   8x8 incremental reconstruction mismatch (round %d)\n", t);
+                    bad++;
+                }
+            }
+        }
         aeg_quant_8x8(c1, r1, qp, t & 1);
         aeg_quant_8x8_c(c1, r2, qp, t & 1);
         if (memcmp(r1, r2, sizeof(r1))) {
