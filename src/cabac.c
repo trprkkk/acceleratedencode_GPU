@@ -509,8 +509,9 @@ size_t aeg_cabac_flush(aeg_cabac *c)
  * reference decoder's residual_block_cabac. */
 /* Residual categories (ctxBlockCat) of a 4:2:0 picture: the three context
  * offsets each, and the coded_block_flag base (Table 9-40). */
-struct cab_cat_ctx { uint16_t sig, last, level; };
-static const struct cab_cat_ctx cab_cat[6] = {
+#define cab_cat_ctx aeg_cab_cat_ctx
+#define cab_cat aeg_cab_cat
+const struct cab_cat_ctx cab_cat[6] = {
     { 105, 166, 227 },  /* 0: Intra_16x16 luma DC */
     { 120, 181, 237 },  /* 1: Intra_16x16 luma AC */
     { 134, 195, 247 },  /* 2: luma 4x4            */
@@ -573,24 +574,8 @@ static inline uint32_t level_rest_cost(int s, int abs)
 int64_t aeg_cabac_coef_price(const aeg_cabac *st, int cat, int n, int pos,
                              int level, int is_last, int with_sig)
 {
-    const struct cab_cat_ctx *k = &cab_cat[cat];
-    const uint8_t *state = st->state;
-    int abs = level < 0 ? -level : level;
-    int sig_last = n == 64;
-    uint32_t c = 0;
-
-    if (with_sig)
-        c += BIN_COST(state[k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos)],
-                      abs != 0);
-    if (abs) {
-        c += BIN_COST(state[k->last + (sig_last ? aeg_cabac_last8[pos] : pos)],
-                      is_last != 0);
-        c += BIN_COST(state[k->level + cab_lvl1[0]], abs > 1);
-        if (abs > 1)
-            c += level_rest_cost(state[k->level + cab_gt1[0]], abs);
-        c += 256;                                   /* sign */
-    }
-    return (int64_t)c;
+    (void)level_rest_cost;
+    return aeg_cabac_coef_price_inl(st, cat, n, pos, level, is_last, with_sig);
 }
 
 /* aeg_cabac_residual() in price-only mode against `st`, which is left as it

@@ -149,6 +149,49 @@ size_t aeg_cabac_flush(aeg_cabac *c);
 extern const uint8_t aeg_cabac_sig8[63];
 extern const uint8_t aeg_cabac_last8[63];
 
+/* Context offsets of the residual categories (sig, last, level). */
+struct aeg_cab_cat_ctx { uint16_t sig, last, level; };
+extern const struct aeg_cab_cat_ctx aeg_cab_cat[6];
+
+/* aeg_cabac_coef_price(), inline for the level search (see cabac.c): the
+ * level contexts are those of the state machine's first node (1 and 5). */
+static inline int64_t aeg_cabac_coef_price_inl(const aeg_cabac *st, int cat,
+                                               int n, int pos, int level,
+                                               int is_last, int with_sig)
+{
+    const struct aeg_cab_cat_ctx *k = &aeg_cab_cat[cat];
+    const uint8_t *state = st->state;
+    int abs = level < 0 ? -level : level;
+    int sig_last = n == 64;
+    uint32_t c = 0;
+
+    if (with_sig)
+        c += aeg_cabac_bin_cost[state[k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos)]]
+                               [abs != 0];
+    if (abs) {
+        c += aeg_cabac_bin_cost[state[k->last + (sig_last ? aeg_cabac_last8[pos] : pos)]]
+                               [is_last != 0];
+        c += aeg_cabac_bin_cost[state[k->level + 1]][abs > 1];
+        if (abs > 1) {
+            int s = state[k->level + 5], cnt;
+            for (cnt = 2; cnt < 15 && cnt < abs; cnt++) {
+                c += aeg_cabac_bin_cost[s][1];
+                s = aeg_cabac_trans[s][1];
+            }
+            if (cnt < 15) {
+                c += aeg_cabac_bin_cost[s][0];
+            } else {
+                int rest = abs - 14, j = 0;
+                while (rest >= (1 << (j + 1)))
+                    j++;
+                c += (uint32_t)(2 * j + 1) * 256;
+            }
+        }
+        c += 256;                                   /* sign */
+    }
+    return (int64_t)c;
+}
+
 /* One residual block (9.3.2.2): coded_block_flag when `cbf_ctx` is not
  * negative, the significance map, the last-coefficient flag and the levels,
  * from the last significant coefficient backwards.  `coef[i]` is the

@@ -393,6 +393,38 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
             memcpy(dst + y * dstride, src + y * sstride, (size_t)w);
         return;
     }
+#if defined(__SSE2__)
+    if (w == 8 || w == 4) {
+        /* the same four products and rounding, eight (or four) pixels at a
+         * time in int16: 64 * 255 fits */
+        const __m128i z = _mm_setzero_si128();
+        const __m128i wa = _mm_set1_epi16((short)((8 - fx) * (8 - fy)));
+        const __m128i wb = _mm_set1_epi16((short)(fx * (8 - fy)));
+        const __m128i wc = _mm_set1_epi16((short)((8 - fx) * fy));
+        const __m128i wd = _mm_set1_epi16((short)(fx * fy));
+        const __m128i r32 = _mm_set1_epi16(32);
+#define LDC(q) (w == 8 ? _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(q)), z) \
+                       : _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)(q)), z))
+        __m128i a = LDC(src), b = LDC(src + 1);
+        for (y = 0; y < h; y++) {
+            const uint8_t *q = src + (size_t)(y + 1) * sstride;
+            __m128i c = LDC(q), d = LDC(q + 1), v;
+            v = _mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(a, wa), _mm_mullo_epi16(b, wb)),
+                              _mm_add_epi16(_mm_mullo_epi16(c, wc), _mm_mullo_epi16(d, wd)));
+            v = _mm_srli_epi16(_mm_add_epi16(v, r32), 6);
+            v = _mm_packus_epi16(v, v);
+            if (w == 8)
+                _mm_storel_epi64((__m128i *)(dst + (size_t)y * dstride), v);
+            else
+                *(int *)(dst + (size_t)y * dstride) = _mm_cvtsi128_si32(v);
+            a = c;
+            b = d;
+        }
+#undef LDC
+        (void)x;
+        return;
+    }
+#endif
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
             const uint8_t *p = src + y * sstride + x;

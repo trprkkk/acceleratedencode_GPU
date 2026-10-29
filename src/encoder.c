@@ -1205,9 +1205,9 @@ static int64_t trel_dbits(const aeg_cabac *sh, const struct trel *t,
     int pos = t->scan[idx];
     int oldlev = cur[pos];
     int sig_last = idx == last;
-    int64_t d = aeg_cabac_coef_price(sh, t->cat, t->n, idx, newlev,
+    int64_t d = aeg_cabac_coef_price_inl(sh, t->cat, t->n, idx, newlev,
                                      sig_last && newlev != 0, 1) -
-                aeg_cabac_coef_price(sh, t->cat, t->n, idx, oldlev,
+                aeg_cabac_coef_price_inl(sh, t->cat, t->n, idx, oldlev,
                                      sig_last, 1);
 
     if (sig_last && newlev == 0) {
@@ -1216,9 +1216,9 @@ static int64_t trel_dbits(const aeg_cabac *sh, const struct trel *t,
         while (j >= 0 && !cur[t->scan[j]])
             j--;
         if (j >= 0)
-            d += aeg_cabac_coef_price(sh, t->cat, t->n, j, cur[t->scan[j]], 1,
+            d += aeg_cabac_coef_price_inl(sh, t->cat, t->n, j, cur[t->scan[j]], 1,
                                       0) -
-                 aeg_cabac_coef_price(sh, t->cat, t->n, j, cur[t->scan[j]], 0,
+                 aeg_cabac_coef_price_inl(sh, t->cat, t->n, j, cur[t->scan[j]], 0,
                                       0);
     }
     return d;
