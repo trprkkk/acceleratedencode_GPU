@@ -27,6 +27,24 @@
 #include <emmintrin.h>
 #endif
 
+/* AVX2 kernels are compiled per function (target attribute) and chosen at run
+ * time, so the build stays baseline x86-64; AEG_NOAVX2=1 forces the SSE2 ones.
+ * Every AVX2 kernel computes exactly what its SSE2/C counterpart does. */
+#if defined(__SSE2__) && defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#define AEG_X86_AVX2 1
+static int cpu_avx2(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_NOAVX2");
+        __builtin_cpu_init();
+        v = (ev && atoi(ev)) ? 0 : __builtin_cpu_supports("avx2") != 0;
+    }
+    return v;
+}
+#endif
+
 #if defined(__SSE2__)
 /* 4x4 transpose of int16 held four lanes per register (the upper four lanes of
  * each register are zero): the two column pairs the unpacks produce are split
@@ -837,6 +855,31 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
     const __m128i z = _mm_setzero_si128();
     __m128i acc = z;
     int y;
+    if ((w == 4 && (h & 3) == 0) || (w == 8 && (h & 1) == 0)) {
+        /* four 4-byte rows or two 8-byte rows per register */
+        for (y = 0; y < h; y += 16 / w) {
+            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            __m128i va, vb, d0, d1;
+            if (w == 4) {
+                va = _mm_setr_epi32(*(const int *)pa, *(const int *)(pa + sa),
+                                    *(const int *)(pa + 2 * sa),
+                                    *(const int *)(pa + 3 * sa));
+                vb = _mm_setr_epi32(*(const int *)pb, *(const int *)(pb + sb),
+                                    *(const int *)(pb + 2 * sb),
+                                    *(const int *)(pb + 3 * sb));
+            } else {
+                va = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)pa),
+                                        _mm_loadl_epi64((const __m128i *)(pa + sa)));
+                vb = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)pb),
+                                        _mm_loadl_epi64((const __m128i *)(pb + sb)));
+            }
+            d0 = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
+            d1 = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
+            acc = _mm_add_epi32(acc, _mm_add_epi32(_mm_madd_epi16(d0, d0),
+                                                   _mm_madd_epi16(d1, d1)));
+        }
+        h = 0;
+    }
     for (y = 0; y < h; y++) {
         __m128i va, vb, d;
         if (w == 16) {
@@ -1069,7 +1112,63 @@ void aeg_transform_8x8_c(const int16_t *res, int stride, int16_t *coef)
     }
 }
 
+#if defined(__SSE2__)
+/* The level clamp below for every QP and position. */
+static int32_t q8_lim[52][64];
+static void q8_init(void)
+{
+    int q, i;
+    for (q = 0; q < 52; q++)
+        for (i = 0; i < 64; i++)
+            q8_lim[q][i] = (int32_t)(((int64_t)32767 << 6) /
+                ((int64_t)aeg_dequant8_ls[q % 6][aeg_cls8[i >> 3][i & 7]] << (q / 6)));
+}
+static pthread_once_t q8_once = PTHREAD_ONCE_INIT;
+#endif
+
 void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra)
+{
+#if defined(__SSE2__)
+    /* The scalar loop eight at a time: |coef| <= 32768 and mf < 65536, so the
+     * product and the rounding offset (< 2^24) fit an unsigned 32-bit lane;
+     * the level is clamped as below, then wrapped to 16 bits and signed the
+     * way the scalar int16 store does. */
+    if (qp >= 0 && qp < 52) {
+        const int qbits = DCT8_QUANT_SHIFT + qp / 6, m = qp % 6;
+        const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+        const __m128i fv = _mm_set1_epi32(f), qb = _mm_cvtsi32_si128(qbits);
+        int k;
+        pthread_once(&q8_once, q8_init);
+        for (k = 0; k < 64; k += 8) {
+            __m128i c = _mm_loadu_si128((const __m128i *)(coef + k));
+            __m128i mf = _mm_loadu_si128((const __m128i *)(aeg_quant8_mf[m] + k));
+            __m128i sg = _mm_srai_epi16(c, 15);
+            __m128i ab = _mm_sub_epi16(_mm_xor_si128(c, sg), sg);
+            __m128i lo = _mm_mullo_epi16(ab, mf), hi = _mm_mulhi_epu16(ab, mf);
+            __m128i p0 = _mm_unpacklo_epi16(lo, hi), p1 = _mm_unpackhi_epi16(lo, hi);
+            __m128i l0 = _mm_loadu_si128((const __m128i *)(q8_lim[qp] + k));
+            __m128i l1 = _mm_loadu_si128((const __m128i *)(q8_lim[qp] + k + 4));
+            __m128i m0, m1;
+            p0 = _mm_srl_epi32(_mm_add_epi32(p0, fv), qb);
+            p1 = _mm_srl_epi32(_mm_add_epi32(p1, fv), qb);
+            m0 = _mm_cmpgt_epi32(p0, l0);
+            m1 = _mm_cmpgt_epi32(p1, l1);
+            p0 = _mm_or_si128(_mm_andnot_si128(m0, p0), _mm_and_si128(m0, l0));
+            p1 = _mm_or_si128(_mm_andnot_si128(m1, p1), _mm_and_si128(m1, l1));
+            p0 = _mm_srai_epi32(_mm_slli_epi32(p0, 16), 16);
+            p1 = _mm_srai_epi32(_mm_slli_epi32(p1, 16), 16);
+            c = _mm_packs_epi32(p0, p1);
+            _mm_storeu_si128((__m128i *)(level + k),
+                             _mm_sub_epi16(_mm_xor_si128(c, sg), sg));
+        }
+        return;
+    }
+#endif
+    aeg_quant_8x8_c(coef, level, qp, intra);
+}
+
+/* The scalar reference, for the differential test. */
+void aeg_quant_8x8_c(const int16_t *coef, int16_t *level, int qp, int intra)
 {
     const int qbits = DCT8_QUANT_SHIFT + qp / 6;
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
@@ -1190,8 +1289,69 @@ static inline void idct8_pass(__m128i r[8], int shift)
 }
 #endif
 
+#if defined(AEG_X86_AVX2)
+/* idct8_pass() with all eight lanes of a row in one int32 register. */
+__attribute__((target("avx2")))
+static inline void idct8_pass_avx2(__m128i r[8], int shift)
+{
+#define ADD _mm256_add_epi32
+#define SUB _mm256_sub_epi32
+#define SR(x, n) _mm256_srai_epi32(x, n)
+    __m256i s[8], d[8];
+    int k;
+    for (k = 0; k < 8; k++)
+        s[k] = _mm256_cvtepi16_epi32(r[k]);
+    {
+        const __m256i a0 = ADD(s[0], s[4]), a2 = SUB(s[0], s[4]);
+        const __m256i a4 = SUB(SR(s[2], 1), s[6]), a6 = ADD(SR(s[6], 1), s[2]);
+        const __m256i b0 = ADD(a0, a6), b2 = ADD(a2, a4), b4 = SUB(a2, a4), b6 = SUB(a0, a6);
+        const __m256i a1 = SUB(SUB(SUB(s[5], s[3]), s[7]), SR(s[7], 1));
+        const __m256i a3 = SUB(SUB(ADD(s[1], s[7]), s[3]), SR(s[3], 1));
+        const __m256i a5 = ADD(ADD(SUB(s[7], s[1]), s[5]), SR(s[5], 1));
+        const __m256i a7 = ADD(ADD(ADD(s[3], s[5]), s[1]), SR(s[1], 1));
+        const __m256i b1 = ADD(SR(a7, 2), a1), b3 = ADD(a3, SR(a5, 2));
+        const __m256i b5 = SUB(SR(a3, 2), a5), b7 = SUB(a7, SR(a1, 2));
+        d[0] = ADD(b0, b7); d[1] = ADD(b2, b5); d[2] = ADD(b4, b3); d[3] = ADD(b6, b1);
+        d[4] = SUB(b6, b1); d[5] = SUB(b4, b3); d[6] = SUB(b2, b5); d[7] = SUB(b0, b7);
+    }
+#undef ADD
+#undef SUB
+#undef SR
+    for (k = 0; k < 8; k++) {
+        __m256i v = _mm256_srai_epi32(d[k], shift);
+        v = _mm256_srai_epi32(_mm256_slli_epi32(v, 16), 16);
+        r[k] = _mm_packs_epi32(_mm256_castsi256_si128(v),
+                               _mm256_extracti128_si256(v, 1));
+    }
+}
+
+__attribute__((target("avx2")))
+static void idct_8x8_residual_avx2(const int16_t *level, int qp, int16_t *res)
+{
+    int16_t d[64];
+    __m128i r[8];
+    int k;
+    aeg_dequant_8x8(level, d, qp);
+    d[0] = (int16_t)(d[0] + 32);
+    for (k = 0; k < 8; k++)
+        r[k] = _mm_loadu_si128((const __m128i *)(d + 8 * k));
+    tr8_epi16(r);
+    idct8_pass_avx2(r, 0);
+    tr8_epi16(r);
+    idct8_pass_avx2(r, 6);
+    for (k = 0; k < 8; k++)
+        _mm_storeu_si128((__m128i *)(res + 8 * k), r[k]);
+}
+#endif
+
 void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
 {
+#if defined(AEG_X86_AVX2)
+    if (cpu_avx2()) {
+        idct_8x8_residual_avx2(level, qp, res);
+        return;
+    }
+#endif
 #if defined(__SSE2__)
     {
         int16_t d[64];
@@ -1639,8 +1799,7 @@ static int satd_w8_sse2(int w, int h, const uint8_t *a, int sa,
     return hsum_epi32(acc);
 }
 
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
+#if defined(AEG_X86_AVX2)
 #define AEG_HAVE_AVX2_SATD 1
 /* Sixteen columns at a time: rows of sixteen differences widened to int16
  * fill a 256-bit register whose two lanes are two 8x4 halves. */
@@ -1709,16 +1868,6 @@ static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int s
     return _mm_cvtsi128_si32(lo);
 }
 
-static int cpu_avx2(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *ev = getenv("AEG_NOAVX2");
-        __builtin_cpu_init();
-        v = (ev && atoi(ev)) ? 0 : __builtin_cpu_supports("avx2") != 0;
-    }
-    return v;
-}
 #endif
 #endif
 

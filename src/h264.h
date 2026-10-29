@@ -348,6 +348,7 @@ void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef);
  * order the reference decoder's inverse transform reads. */
 void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef);
 void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra);
+void aeg_quant_8x8_c(const int16_t *coef, int16_t *level, int qp, int intra);
 void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp);
 /* The portable versions of the three above (the SSE2 ones must match them
  * bit for bit; tests/kernel_check.c compares them). */

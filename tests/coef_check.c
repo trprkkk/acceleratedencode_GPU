@@ -371,6 +371,12 @@ int main(int argc, char **argv)
             printf("   8x8 inverse transform mismatch (round %d, qp %d)\n", t, qp);
             bad++;
         }
+        aeg_quant_8x8(c1, r1, qp, t & 1);
+        aeg_quant_8x8_c(c1, r2, qp, t & 1);
+        if (memcmp(r1, r2, sizeof(r1))) {
+            printf("   8x8 quantiser mismatch (round %d, qp %d)\n", t, qp);
+            bad++;
+        }
     }
     /* The Intra_16x16 AC blocks: coefficient 0 replaced by the DC Hadamard's
      * value, vector path against the scalar loop, with DC-only blocks (the
