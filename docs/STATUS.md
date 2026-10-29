@@ -2443,6 +2443,43 @@ Tried and rejected in the same round:
 thread; `an.py` prints self, inclusive, `--callers=` and `--children=`
 tables), and `tools/real/spd.sh` times two binaries with alternating runs.
 
+## Exact kernel work (second round)
+
+Byte-identical again (`tools/real/same.sh` against 32e961c, presets 1/3/4,
+30/30 streams identical; every kernel has a randomized differential test
+against its scalar reference, the new ones in `tests/coef_check.c`):
+
+* **SATD** the x264 way: vertical butterflies, a per-lane 4x4 transpose, one
+  horizontal stage and `|a+b| + |a-b| = 2 max(|a|, |b|)` in place of the last
+  one -- which is also the halving SATD applies, so no shift.  AVX2 for
+  16-wide blocks (two 8x4 halves per register) and for 8-wide ones (rows y..y+3
+  and y+4..y+7 in the two lanes), SSE2 otherwise.  16x16: 76 -> 27 ns.  The
+  AVX2 code is compiled per function and picked at run time (`AEG_NOAVX2=1`
+  forces SSE2), so the build stays baseline x86-64.
+* **CAVLC bit estimates are no longer computed under CABAC** -- every CABAC
+  decision goes through the real pricer, nothing read them.
+* **8x8 quantiser** in SSE2 (it was the scalar loop with a 64-bit division
+  per level for the int16 clamp; now a table): 207 -> 32 ns.  AVX2 8x8 inverse
+  transform (a whole row of int32 per register), SAD and SSD loops with two
+  rows (or four 4-byte rows) per register.
+* **Trellis, 8x8:** a trial that moves one level redoes the dequantiser for
+  that level, *one* row of the first inverse pass and the column pass, against
+  a cache of the current levels' row pass (`aeg_idct8_cache_*`); same int16
+  truncation points, so the SSE is the full reconstruction's to the unit.  The
+  same idea for 4x4 blocks measured no faster (most of the 4x4 time is the
+  initial and final pricing, not the trials) and was dropped.
+* The CABAC residual pricer used by the RD pass keeps the context states and
+  the running sum in locals instead of going through the generic coder per bin.
+
+cock 90 frames, `-p 3 -q 28`, frame threads: 8.55 s (32e961c) -> 7.35 s
+(12.2 fps).  Tried: link-time optimisation (`-flto`) is slower.
+
+The main thread is still the critical path: P pictures are about 75 % of the
+wall time (6.1 s of P, 1.1 s of reference B against 4.1 s of non-reference B on
+the worker), so more B workers cannot help, and an exact speed-up beyond this
+on two cores needs consecutive P pictures to overlap (row-wavefront frame
+threads with a fixed vertical vector limit).
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
