@@ -14,6 +14,7 @@
  * reconstruction (see tools/aegverify).
  */
 #include "h264.h"
+#include <pthread.h>
 
 /* The distortion metrics are the innermost loop of the motion search -- a
  * 320x192 picture at preset 2 runs ~480 block comparisons per macroblock, so a
@@ -847,6 +848,26 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
  *
  * The 8x8 transform is not in the batched interface yet (tq_batch and
  * iq_idct_batch take 4x4 blocks), so it always runs on the CPU. */
+#if defined(__SSE2__)
+/* 8x8 transpose of int16 rows, in place. */
+static inline void tr8_epi16(__m128i r[8])
+{
+    __m128i a0 = _mm_unpacklo_epi16(r[0], r[1]), a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    __m128i a2 = _mm_unpacklo_epi16(r[2], r[3]), a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    __m128i a4 = _mm_unpacklo_epi16(r[4], r[5]), a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    __m128i a6 = _mm_unpacklo_epi16(r[6], r[7]), a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2);
+    __m128i b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3);
+    __m128i b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6);
+    __m128i b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+    r[0] = _mm_unpacklo_epi64(b0, b4); r[1] = _mm_unpackhi_epi64(b0, b4);
+    r[2] = _mm_unpacklo_epi64(b1, b5); r[3] = _mm_unpackhi_epi64(b1, b5);
+    r[4] = _mm_unpacklo_epi64(b2, b6); r[5] = _mm_unpackhi_epi64(b2, b6);
+    r[6] = _mm_unpacklo_epi64(b3, b7); r[7] = _mm_unpackhi_epi64(b3, b7);
+}
+
+#endif
+
 #define DCT8_QUANT_SHIFT 16
 
 static inline void fdct8_1d(const int *s, int *d)
@@ -892,7 +913,82 @@ static inline void idct8_1d(const int *s, int *d)
     d[7] = b0 - b7;
 }
 
+#if defined(__SSE2__)
+/* fdct8_1d() across eight vectors of four int32 lanes. */
+static inline void fdct8_v(const __m128i *s, __m128i *d)
+{
+#define ADD _mm_add_epi32
+#define SUB _mm_sub_epi32
+#define SR(x, n) _mm_srai_epi32(x, n)
+    const __m128i s07 = ADD(s[0], s[7]), s16 = ADD(s[1], s[6]);
+    const __m128i s25 = ADD(s[2], s[5]), s34 = ADD(s[3], s[4]);
+    const __m128i d07 = SUB(s[0], s[7]), d16 = SUB(s[1], s[6]);
+    const __m128i d25 = SUB(s[2], s[5]), d34 = SUB(s[3], s[4]);
+    const __m128i a0 = ADD(s07, s34), a1 = ADD(s16, s25);
+    const __m128i a2 = SUB(s07, s34), a3 = SUB(s16, s25);
+    const __m128i a4 = ADD(ADD(d16, d25), ADD(d07, SR(d07, 1)));
+    const __m128i a5 = SUB(SUB(d07, d34), ADD(d25, SR(d25, 1)));
+    const __m128i a6 = SUB(ADD(d07, d34), ADD(d16, SR(d16, 1)));
+    const __m128i a7 = ADD(SUB(d16, d25), ADD(d34, SR(d34, 1)));
+    d[0] = ADD(a0, a1);
+    d[1] = ADD(a4, SR(a7, 2));
+    d[2] = ADD(a2, SR(a3, 1));
+    d[3] = ADD(a5, SR(a6, 2));
+    d[4] = SUB(a0, a1);
+    d[5] = SUB(a6, SR(a5, 2));
+    d[6] = SUB(SR(a2, 1), a3);
+    d[7] = SUB(SR(a4, 2), a7);
+#undef ADD
+#undef SUB
+#undef SR
+}
+
+static inline void fdct8_pass(__m128i r[8])
+{
+    __m128i lo[8], hi[8], dl[8], dh[8];
+    int k;
+    for (k = 0; k < 8; k++) {
+        lo[k] = _mm_srai_epi32(_mm_unpacklo_epi16(r[k], r[k]), 16);
+        hi[k] = _mm_srai_epi32(_mm_unpackhi_epi16(r[k], r[k]), 16);
+    }
+    fdct8_v(lo, dl);
+    fdct8_v(hi, dh);
+    for (k = 0; k < 8; k++)
+        r[k] = _mm_packs_epi32(dl[k], dh[k]);
+}
+#endif
+
+/* The SIMD path keeps the row pass in sixteen bits, which is exact for any
+ * residual of eight-bit samples (|res| <= 255: the largest row output is
+ * 8 * 255); anything wider takes the C path. */
 void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef)
+{
+#if defined(__SSE2__)
+    {
+        __m128i r[8], mx = _mm_setzero_si128(), mn = _mm_setzero_si128();
+        int k;
+        for (k = 0; k < 8; k++) {
+            r[k] = _mm_loadu_si128((const __m128i *)(res + k * stride));
+            mx = _mm_max_epi16(mx, r[k]);
+            mn = _mm_min_epi16(mn, r[k]);
+        }
+        mx = _mm_max_epi16(mx, _mm_sub_epi16(_mm_setzero_si128(), mn));
+        mx = _mm_cmpgt_epi16(mx, _mm_set1_epi16(255));
+        if (!_mm_movemask_epi8(mx)) {
+            tr8_epi16(r);
+            fdct8_pass(r);
+            tr8_epi16(r);
+            fdct8_pass(r);
+            for (k = 0; k < 8; k++)
+                _mm_storeu_si128((__m128i *)(coef + 8 * k), r[k]);
+            return;
+        }
+    }
+#endif
+    aeg_transform_8x8_c(res, stride, coef);
+}
+
+void aeg_transform_8x8_c(const int16_t *res, int stride, int16_t *coef)
 {
     int tmp[64], out[64], s[8], d[8];
     int x, y;
@@ -944,7 +1040,43 @@ void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra)
         }
 }
 
+#if defined(__SSE2__)
+/* level * (V8 << qp/6) for every position and QP: at most 58 << 8, so it fits
+ * in int16 and the product in int32 (16 * x + 32 >> 6 == x + 2 >> 2). */
+static int16_t dq8_mul[52][64];
+static void dq8_init(void)
+{
+    int q, i;
+    for (q = 0; q < 52; q++)
+        for (i = 0; i < 64; i++)
+            dq8_mul[q][i] = (int16_t)(aeg_dequant8_ls[q % 6][aeg_cls8[i >> 3][i & 7]] << (q / 6));
+}
+static pthread_once_t dq8_once = PTHREAD_ONCE_INIT;
+#endif
+
 void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp)
+{
+#if defined(__SSE2__)
+    if (qp >= 0 && qp < 52) {
+        const __m128i two = _mm_set1_epi32(2);
+        int k;
+        pthread_once(&dq8_once, dq8_init);
+        for (k = 0; k < 64; k += 8) {
+            __m128i l = _mm_loadu_si128((const __m128i *)(level + k));
+            __m128i m = _mm_loadu_si128((const __m128i *)(dq8_mul[qp] + k));
+            __m128i lo16 = _mm_mullo_epi16(l, m), hi16 = _mm_mulhi_epi16(l, m);
+            __m128i a = _mm_unpacklo_epi16(lo16, hi16), b = _mm_unpackhi_epi16(lo16, hi16);
+            a = _mm_srai_epi32(_mm_add_epi32(a, two), 2);
+            b = _mm_srai_epi32(_mm_add_epi32(b, two), 2);
+            _mm_storeu_si128((__m128i *)(coef + k), _mm_packs_epi32(a, b));
+        }
+        return;
+    }
+#endif
+    aeg_dequant_8x8_c(level, coef, qp);
+}
+
+void aeg_dequant_8x8_c(const int16_t *level, int16_t *coef, int qp)
 {
     const int m = qp % 6, sh = qp / 6;
     int x, y;
@@ -958,7 +1090,76 @@ void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp)
         }
 }
 
+#if defined(__SSE2__)
+/* idct8_1d() across eight vectors of four int32 lanes. */
+static inline void idct8_v(const __m128i *s, __m128i *d)
+{
+#define ADD _mm_add_epi32
+#define SUB _mm_sub_epi32
+#define SR(x, n) _mm_srai_epi32(x, n)
+    const __m128i a0 = ADD(s[0], s[4]), a2 = SUB(s[0], s[4]);
+    const __m128i a4 = SUB(SR(s[2], 1), s[6]), a6 = ADD(SR(s[6], 1), s[2]);
+    const __m128i b0 = ADD(a0, a6), b2 = ADD(a2, a4), b4 = SUB(a2, a4), b6 = SUB(a0, a6);
+    const __m128i a1 = SUB(SUB(SUB(s[5], s[3]), s[7]), SR(s[7], 1));
+    const __m128i a3 = SUB(SUB(ADD(s[1], s[7]), s[3]), SR(s[3], 1));
+    const __m128i a5 = ADD(ADD(SUB(s[7], s[1]), s[5]), SR(s[5], 1));
+    const __m128i a7 = ADD(ADD(ADD(s[3], s[5]), s[1]), SR(s[1], 1));
+    const __m128i b1 = ADD(SR(a7, 2), a1), b3 = ADD(a3, SR(a5, 2));
+    const __m128i b5 = SUB(SR(a3, 2), a5), b7 = SUB(a7, SR(a1, 2));
+    d[0] = ADD(b0, b7); d[1] = ADD(b2, b5); d[2] = ADD(b4, b3); d[3] = ADD(b6, b1);
+    d[4] = SUB(b6, b1); d[5] = SUB(b4, b3); d[6] = SUB(b2, b5); d[7] = SUB(b0, b7);
+#undef ADD
+#undef SUB
+#undef SR
+}
+
+/* One 1-D pass down the columns of eight int16 rows: lanes 0-3 and 4-7 in
+ * int32, each result truncated to sixteen bits (wrapped, as the scalar
+ * path's int16 store does) after `shift`. */
+static inline void idct8_pass(__m128i r[8], int shift)
+{
+    __m128i lo[8], hi[8], dl[8], dh[8];
+    int k;
+    for (k = 0; k < 8; k++) {
+        lo[k] = _mm_srai_epi32(_mm_unpacklo_epi16(r[k], r[k]), 16);
+        hi[k] = _mm_srai_epi32(_mm_unpackhi_epi16(r[k], r[k]), 16);
+    }
+    idct8_v(lo, dl);
+    idct8_v(hi, dh);
+    for (k = 0; k < 8; k++) {
+        __m128i l = _mm_srai_epi32(dl[k], shift), h = _mm_srai_epi32(dh[k], shift);
+        l = _mm_srai_epi32(_mm_slli_epi32(l, 16), 16);
+        h = _mm_srai_epi32(_mm_slli_epi32(h, 16), 16);
+        r[k] = _mm_packs_epi32(l, h);
+    }
+}
+#endif
+
 void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
+{
+#if defined(__SSE2__)
+    {
+        int16_t d[64];
+        __m128i r[8];
+        int k;
+        aeg_dequant_8x8(level, d, qp);
+        d[0] = (int16_t)(d[0] + 32);
+        for (k = 0; k < 8; k++)
+            r[k] = _mm_loadu_si128((const __m128i *)(d + 8 * k));
+        /* rows: transpose so that a pass down the columns runs along them */
+        tr8_epi16(r);
+        idct8_pass(r, 0);
+        tr8_epi16(r);
+        idct8_pass(r, 6);
+        for (k = 0; k < 8; k++)
+            _mm_storeu_si128((__m128i *)(res + 8 * k), r[k]);
+        return;
+    }
+#endif
+    aeg_idct_8x8_residual_c(level, qp, res);
+}
+
+void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res)
 {
     int16_t d[64];
     int16_t t[64];
@@ -996,6 +1197,20 @@ void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
     int16_t res[64];
     int x, y;
     aeg_idct_8x8_residual(level, qp, res);
+#if defined(__SSE2__)
+    {
+        const __m128i z = _mm_setzero_si128();
+        for (y = 0; y < 8; y++) {
+            __m128i p = _mm_unpacklo_epi8(
+                _mm_loadl_epi64((const __m128i *)(pred + y * pred_stride)), z);
+            __m128i r = _mm_loadu_si128((const __m128i *)(res + 8 * y));
+            _mm_storel_epi64((__m128i *)(dst + y * stride),
+                             _mm_packus_epi16(_mm_adds_epi16(p, r), z));
+        }
+        (void)x;
+        return;
+    }
+#endif
     for (y = 0; y < 8; y++)
         for (x = 0; x < 8; x++) {
             int p = (int)pred[y * pred_stride + x] + (int)res[y * 8 + x];

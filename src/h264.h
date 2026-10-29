@@ -349,6 +349,11 @@ void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef);
 void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef);
 void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra);
 void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp);
+/* The portable versions of the three above (the SSE2 ones must match them
+ * bit for bit; tests/kernel_check.c compares them). */
+void aeg_transform_8x8_c(const int16_t *res, int stride, int16_t *coef);
+void aeg_dequant_8x8_c(const int16_t *level, int16_t *coef, int qp);
+void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res);
 void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res);
 void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
                       const uint8_t *pred, int pred_stride);

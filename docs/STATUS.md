@@ -1997,6 +1997,24 @@ Against x264 (`bdx.sh`): CQP **-4.61%** (-0.03, -10.68, -6.09, -8.57, +2.31),
 CRF with its tree **-0.30%** (+0.48, -0.15, +1.01, -4.95, +2.10) -- the first
 time ahead of x264 as it is normally run.
 
+**SSE2 for the 8x8 transform.**  After the intra RD the 8x8 inverse
+transform was the largest single function of a preset-3 encode (14% in
+gprof: the trellis prices every 8x8 candidate level with a full
+reconstruction).  The forward transform, the dequantiser and the inverse
+transform (with the scalar path's int16 wrap between the passes) now have
+SSE2 versions, checked bit for bit against the portable ones by
+`tests/coef_check.c` (int16-extreme levels included); every stream is
+byte-identical to before, preset 3 is 5-7% faster.
+
+Tools: `tools/real/gap.py` (our bit excess over x264 at equal PSNR at one QP,
+from x264's own q-2..q slope; any clip, x264 and aegenc options, `PL=` plane)
+and `tools/real/frames.py` (per-picture type, size, mean QP and PSNR of
+several streams of one source).  On `tree` (a 7 fps clip with every picture
+repeated 6-7 times, not a slideshow) our macroblock tree costs +1.35% while
+x264's is neutral; the propagation through the repeated pictures is
+legitimate, and the I picture ends up 3.9 QP below the refresh P pictures
+where x264 has 1.5 -- not pursued further.
+
 **Chroma in the quarter-pel cost** (x264's chroma-me; `AEG_CHROMAME=1`):
 the SATD of both chroma planes added to the luma SATD at every quarter-pel
 candidate of blocks of 8x8 and up.  -0.02% for +18% time, so off by default

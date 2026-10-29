@@ -337,6 +337,41 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* The 8x8 transform pipeline: forward transform (eight-bit residuals,
+     * and wider ones, which take the C path), dequantiser and inverse
+     * transform, SSE2 against the library's portable versions -- with levels
+     * from small to the int16 extremes, where the inverse transform's
+     * sixteen-bit truncation between the passes matters. */
+    for (t = 0; t < rounds / 4; t++) {
+        int16_t res8[8 * 24], c1[64], c2[64], l8[64], r1[64], r2[64];
+        const int st8 = (t & 1) ? 8 : 24;
+        const int ramp = (t % 7 == 0) ? 2000 : 255;
+        const int lamp = (t % 3 == 0) ? 32767 : ((t % 3 == 1) ? 300 : 20);
+        int k;
+        qp = rand() % 52;
+        for (k = 0; k < 8 * st8; k++)
+            res8[k] = (int16_t)(rand() % (2 * ramp + 1) - ramp);
+        if (t % 11 == 0)
+            for (k = 0; k < 8 * st8; k++)
+                res8[k] = (int16_t)((rand() & 1) ? 255 : -255);
+        aeg_transform_8x8(res8, st8, c1);
+        aeg_transform_8x8_c(res8, st8, c2);
+        for (k = 0; k < 64; k++)
+            l8[k] = (int16_t)((rand() % 4 == 0) ? rand() % (2 * lamp + 1) - lamp : 0);
+        aeg_dequant_8x8(l8, r1, qp);
+        aeg_dequant_8x8_c(l8, r2, qp);
+        cases++;
+        if (memcmp(c1, c2, sizeof(c1)) || memcmp(r1, r2, sizeof(r1))) {
+            printf("   8x8 transform/dequant mismatch (round %d, qp %d)\n", t, qp);
+            bad++;
+        }
+        aeg_idct_8x8_residual(l8, qp, r1);
+        aeg_idct_8x8_residual_c(l8, qp, r2);
+        if (memcmp(r1, r2, sizeof(r1))) {
+            printf("   8x8 inverse transform mismatch (round %d, qp %d)\n", t, qp);
+            bad++;
+        }
+    }
     printf("   coef_check: %d cases, %s\n", cases,
            bad ? "MISMATCH" : "scalar, vector and batched paths bit-exact");
     return bad != 0;
