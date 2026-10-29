@@ -1016,6 +1016,10 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     /* The intra 16x16 DC block is context-coded with the nC of luma block
      * (0, 0) -- the reference decoder computes pred_non_zero_count(0) for it
      * (n >= LUMA_DC_BLOCK_INDEX -> (n - 48) * 16). */
+    /* (The CAVLC estimate of the bits: a CABAC encode prices the macroblock
+     * with the coder itself, rd_price(), and never reads it.) */
+    if (e->p.cabac)
+        return;
     if (nz_dc)
         c->bits += aeg_cavlc_block_cost(c->level[AEG_BLK_LUMA_DC],
                                         luma_ac_nc(e, mbx, mby, c, 0), 1);
@@ -1117,7 +1121,7 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
             }
     }
     c->cbp = (c->cbp & 0x30) | luma_cbp;
-    {
+    if (!e->p.cabac) {                  /* CAVLC estimate, see above */
         int g, k;
         for (g = 0; g < 4; g++) {
             if (!(c->cbp & (1 << g)))
@@ -1590,8 +1594,9 @@ static void luma8_costs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         for (k = 0; k < 4; k++) {
             int b = group_blk[g][k];
             if (flag) {
-                c->bits += aeg_cavlc_block_cost8(c->level8[g], k,
-                                                 luma_nc(e, mbx, mby, c, b));
+                if (!e->p.cabac)        /* CAVLC estimate */
+                    c->bits += aeg_cavlc_block_cost8(c->level8[g], k,
+                                                     luma_nc(e, mbx, mby, c, b));
                 c->nz[b] = (int8_t)aeg_cavlc_nz8(c->level8[g], k);
             } else {
                 c->nz[b] = 0;
@@ -1775,9 +1780,10 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         }
         if (nz_dc) {
             c->cbp |= (pl == 0) ? 0x10 : 0x10;
-            c->bits += aeg_cavlc_block_cost(c->level[AEG_BLK_CHROMA_DC + pl], 0, 2);
+            if (!e->p.cabac)            /* CAVLC estimate */
+                c->bits += aeg_cavlc_block_cost(c->level[AEG_BLK_CHROMA_DC + pl], 0, 2);
         }
-        for (blk = 0; blk < 4; blk++)
+        for (blk = 0; blk < 4 && !e->p.cabac; blk++)
             if (c->nz[AEG_BLK_CHROMA_CB + pl * 4 + blk])
                 c->bits += aeg_cavlc_block_cost(
                     c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
@@ -4831,8 +4837,9 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
 
     t->bits += mode_bits;
     /* The blocks of every coded 8x8 group are coded, in the order the group
-     * table lists them; the context of a block comes from its neighbours. */
-    for (g = 0; g < 4; g++) {
+     * table lists them; the context of a block comes from its neighbours.
+     * (CAVLC estimate only.) */
+    for (g = 0; g < 4 && !e->p.cabac; g++) {
         if (!(t->cbp & (1 << g)))
             continue;
         for (k = 0; k < 4; k++) {

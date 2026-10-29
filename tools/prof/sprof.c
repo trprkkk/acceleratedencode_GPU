@@ -24,7 +24,7 @@ static void handler(int sig, siginfo_t *si, void *uc_)
 {
     ucontext_t *uc = (ucontext_t *)uc_;
     int k = __sync_fetch_and_add(&n, 1), d = 0;
-    uintptr_t *fp, *s;
+    uintptr_t *fp, *s, lo, hi;
     (void)sig; (void)si;
     if (k >= MAXS)
         return;
@@ -32,9 +32,14 @@ static void handler(int sig, siginfo_t *si, void *uc_)
     s[0] = (uintptr_t)(syscall(SYS_gettid) == mainpid);
     s[2 + d++] = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
     fp = (uintptr_t *)uc->uc_mcontext.gregs[REG_RBP];
-    while (d < DEPTH && fp && ((uintptr_t)fp & 7) == 0) {
+    /* frames live on the interrupted stack: anything outside [rsp, rsp + 512K)
+     * is a general-purpose rbp (code without frame pointers), stop there */
+    lo = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    hi = lo + (512u << 10);
+    while (d < DEPTH && (uintptr_t)fp >= lo && (uintptr_t)fp + 16 <= hi &&
+           ((uintptr_t)fp & 7) == 0) {
         uintptr_t ret = fp[1], *nfp = (uintptr_t *)fp[0];
-        if (!ret || nfp <= fp || (uintptr_t)nfp - (uintptr_t)fp > (1 << 20))
+        if (!ret || nfp <= fp)
             break;
         s[2 + d++] = ret - 1;
         fp = nfp;

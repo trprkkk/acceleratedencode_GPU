@@ -1548,7 +1548,131 @@ int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
 /* The sum of a 4x4 block's absolute Hadamard coefficients is always even
  * (their plain sum is 16 times the first sample), so aeg_satd_4x4()'s
  * rounding is an exact halving and a larger block is the halved total. */
+#if defined(__SSE2__) && defined(__GNUC__)
+/* Half the summed |4x4 Hadamard| of the two 4x4 blocks in four rows of eight
+ * differences, x264's way: the vertical butterflies across the registers, a
+ * transpose of each 4x4 (within each 128-bit lane, so the AVX2 version below
+ * is the same code on two lanes), the first horizontal stage, and in place of
+ * the last one the identity |a + b| + |a - b| = 2 max(|a|, |b|) -- which is
+ * also exactly the halving aeg_satd() applies, so the result needs no shift
+ * and is the same integer as satd8x4_abs() >> 1.  36 instructions instead of
+ * 56 per 8x4. */
+#define SATD8X4_HALF(V, add16, sub16, ulo16, uhi16, ulo32, uhi32, ulo64, uhi64, \
+                     max16, abs16, madd, ones, r0, r1, r2, r3, out)            \
+    do {                                                                       \
+        V s0_ = add16(r0, r1), d0_ = sub16(r0, r1);                            \
+        V s1_ = add16(r2, r3), d1_ = sub16(r2, r3);                            \
+        V h0_ = add16(s0_, s1_), h1_ = sub16(s0_, s1_);                        \
+        V h2_ = sub16(d0_, d1_), h3_ = add16(d0_, d1_);                        \
+        V t0_ = ulo16(h0_, h1_), t1_ = ulo16(h2_, h3_);                        \
+        V t2_ = uhi16(h0_, h1_), t3_ = uhi16(h2_, h3_);                        \
+        /* block A: u0 = columns 0|1, u1 = columns 2|3; block B: u2, u3 */      \
+        V u0_ = ulo32(t0_, t1_), u1_ = uhi32(t0_, t1_);                        \
+        V u2_ = ulo32(t2_, t3_), u3_ = uhi32(t2_, t3_);                        \
+        V a0_ = abs16(add16(u0_, u1_)), a1_ = abs16(sub16(u0_, u1_));          \
+        V b0_ = abs16(add16(u2_, u3_)), b1_ = abs16(sub16(u2_, u3_));          \
+        V ma_ = max16(ulo64(a0_, a1_), uhi64(a0_, a1_));                       \
+        V mb_ = max16(ulo64(b0_, b1_), uhi64(b0_, b1_));                       \
+        out = madd(add16(ma_, mb_), ones);                                     \
+    } while (0)
+
+static inline __m128i abs16_sse2(__m128i x)
+{
+    return _mm_max_epi16(x, _mm_sub_epi16(_mm_setzero_si128(), x));
+}
+
+static int satd_w8_sse2(int w, int h, const uint8_t *a, int sa,
+                        const uint8_t *b, int sb)
+{
+    const __m128i ones = _mm_set1_epi16(1);
+    __m128i acc = _mm_setzero_si128();
+    int x, y;
+    for (y = 0; y < h; y += 4) {
+        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        for (x = 0; x < w; x += 8) {
+            __m128i r0 = diff8(pa + x, pb + x);
+            __m128i r1 = diff8(pa + sa + x, pb + sb + x);
+            __m128i r2 = diff8(pa + 2 * sa + x, pb + 2 * sb + x);
+            __m128i r3 = diff8(pa + 3 * sa + x, pb + 3 * sb + x), o;
+            SATD8X4_HALF(__m128i, _mm_add_epi16, _mm_sub_epi16,
+                         _mm_unpacklo_epi16, _mm_unpackhi_epi16,
+                         _mm_unpacklo_epi32, _mm_unpackhi_epi32,
+                         _mm_unpacklo_epi64, _mm_unpackhi_epi64,
+                         _mm_max_epi16, abs16_sse2, _mm_madd_epi16, ones,
+                         r0, r1, r2, r3, o);
+            acc = _mm_add_epi32(acc, o);
+        }
+    }
+    return hsum_epi32(acc);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define AEG_HAVE_AVX2_SATD 1
+/* Sixteen columns at a time: rows of sixteen differences widened to int16
+ * fill a 256-bit register whose two lanes are two 8x4 halves. */
+__attribute__((target("avx2")))
+static int satd_w16_avx2(int w, int h, const uint8_t *a, int sa,
+                         const uint8_t *b, int sb)
+{
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i acc = _mm256_setzero_si256();
+    __m128i lo;
+    int x, y;
+#define LD16(p) _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p)))
+    for (y = 0; y < h; y += 4) {
+        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        for (x = 0; x < w; x += 16) {
+            __m256i r0 = _mm256_sub_epi16(LD16(pa + x), LD16(pb + x));
+            __m256i r1 = _mm256_sub_epi16(LD16(pa + sa + x), LD16(pb + sb + x));
+            __m256i r2 = _mm256_sub_epi16(LD16(pa + 2 * sa + x), LD16(pb + 2 * sb + x));
+            __m256i r3 = _mm256_sub_epi16(LD16(pa + 3 * sa + x), LD16(pb + 3 * sb + x)), o;
+            SATD8X4_HALF(__m256i, _mm256_add_epi16, _mm256_sub_epi16,
+                         _mm256_unpacklo_epi16, _mm256_unpackhi_epi16,
+                         _mm256_unpacklo_epi32, _mm256_unpackhi_epi32,
+                         _mm256_unpacklo_epi64, _mm256_unpackhi_epi64,
+                         _mm256_max_epi16, _mm256_abs_epi16, _mm256_madd_epi16,
+                         ones, r0, r1, r2, r3, o);
+            acc = _mm256_add_epi32(acc, o);
+        }
+    }
+#undef LD16
+    lo = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(lo);
+}
+
+static int cpu_avx2(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_NOAVX2");
+        __builtin_cpu_init();
+        v = (ev && atoi(ev)) ? 0 : __builtin_cpu_supports("avx2") != 0;
+    }
+    return v;
+}
+#endif
+#endif
+
 int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+{
+#if defined(__SSE2__) && defined(__GNUC__)
+    if ((h & 3) == 0) {
+#if defined(AEG_HAVE_AVX2_SATD)
+        if ((w & 15) == 0 && cpu_avx2())
+            return satd_w16_avx2(w, h, a, sa, b, sb);
+#endif
+        if ((w & 7) == 0)
+            return satd_w8_sse2(w, h, a, sa, b, sb);
+    }
+#endif
+    return aeg_satd_c(w, h, a, sa, b, sb);
+}
+
+/* The previous SSE2 form, kept as a second reference for the test. */
+int aeg_satd_sse2_ref(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 {
 #if defined(__SSE2__)
     if ((w & 7) == 0 && (h & 3) == 0) {
