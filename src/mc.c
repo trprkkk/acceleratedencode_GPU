@@ -131,6 +131,16 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
                               : NULL;
 }
 
+void aeg_mc_ctx_own(aeg_mc_ctx *mc, int h)
+{
+    size_t rows = (size_t)h + 2 * AEG_PAD;
+    int i;
+    for (i = 1; i < 4; i++)
+        mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * mc->stride * rows +
+                                (size_t)AEG_PAD * mc->stride + AEG_PAD
+                              : NULL;
+}
+
 void aeg_mc_ctx_free(aeg_mc_ctx *mc)
 {
     aeg_free(mc->buf);
@@ -241,14 +251,21 @@ static inline __m128i hpel_hv8(const uint8_t *p, int s)
 }
 #endif
 
-void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
-                         int rstride, int w, int h, int which)
+/* Rows ya..yb (picture coordinates, -AEG_PAD..h+AEG_PAD-1) of one plane.
+ * Output row y reads reference rows y-2..y+3; the replicated rows above y0 and
+ * below y1 are written by the call whose range reaches them (they copy y0 and
+ * y1, so those must be part of the same call or an earlier one).  Covering
+ * the rows in several calls gives the same plane as one call over all of
+ * them, which is what lets a reference be filtered band by band as it is
+ * reconstructed (frame threads). */
+void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
+                         int rstride, int w, int h, int which, int ya, int yb)
 {
     int x0 = -AEG_PAD + 2, x1 = w + AEG_PAD - 4;
     int y0 = -AEG_PAD + 2, y1 = h + AEG_PAD - 4;
-    int x, y;
+    int x, y, ys = ya < y0 ? y0 : ya, ye = yb > y1 ? y1 : yb;
 
-    for (y = y0; y <= y1; y++) {
+    for (y = ys; y <= ye; y++) {
         const uint8_t *rrow = ref + (ptrdiff_t)y * rstride;
         uint8_t *orow = pl + (ptrdiff_t)y * dstride;
 #if defined(__SSE2__)
@@ -297,14 +314,21 @@ void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
         for (x = x1 + 1; x < w + AEG_PAD; x++)
             orow[x] = orow[x1];
     }
-    for (y = -AEG_PAD; y < y0; y++)
+    for (y = ya < -AEG_PAD ? -AEG_PAD : ya; y < y0 && y <= yb; y++)
         memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
                pl + (ptrdiff_t)y0 * dstride - AEG_PAD,
                (size_t)(w + 2 * AEG_PAD));
-    for (y = y1 + 1; y < h + AEG_PAD; y++)
+    for (y = ya > y1 + 1 ? ya : y1 + 1; y < h + AEG_PAD && y <= yb; y++)
         memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
                pl + (ptrdiff_t)y1 * dstride - AEG_PAD,
                (size_t)(w + 2 * AEG_PAD));
+}
+
+void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
+                         int rstride, int w, int h, int which)
+{
+    aeg_hpel_plane_rows(pl, dstride, ref, rstride, w, h, which, -AEG_PAD,
+                        h + AEG_PAD - 1);
 }
 
 void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const uint8_t *ref)

@@ -154,6 +154,24 @@ struct aeg_encoder {
     aeg_mb *slot_mbs[AEG_NPIC];
     int slot_ref_poc[AEG_NPIC][2];
     int slot_col_ok[AEG_NPIC];
+    /* Per buffer: what the pictures predicting from the reference in it need
+     * besides its samples -- the three half-sample planes and the half-
+     * resolution copy of the lowres pre-search -- built once, by the picture
+     * itself, band by band as its rows become final (rowpost_*).  slot_rows
+     * counts the macroblock rows whose samples (padding included), half-pel
+     * rows and lowres rows are final; mb_h means the whole picture, borders
+     * and all. */
+    aeg_mc_ctx slot_mc[AEG_NPIC];
+    aeg_lowres slot_low[AEG_NPIC];
+    int slot_rows[AEG_NPIC];
+    int ref_slot[2];         /* buffer of refp[0] / ref2p[0], or -1      */
+    /* row-by-row post-processing of the reference picture being coded */
+    int rp_on;               /* deblocking etc. follow the decision rows  */
+    int rp_dbk;              /* rows deblocked                            */
+    int rp_band;             /* rows padded (and lowres-built)            */
+    int rp_hpel;             /* rows with their half-pel planes           */
+    int rp_qp;               /* the bitstream pass's QP, mirrored         */
+    aeg_mb *rp_mbs;          /* final decisions the filter reads          */
     int job_bref[AEG_MAX_BFRAMES + 4];
     int cur_bref;            /* the picture being coded is a reference B */
     uint8_t *recp[3], *refp[3], *ref2p[3];
@@ -277,6 +295,9 @@ struct aeg_encoder {
     int     *lr_scratch;
     int16_t *lr_mv[2];
     int      lr_valid;
+    int      lr_rows;        /* macroblock rows of lr_mv computed so far  */
+    int      lr_nl;          /* lists searched                            */
+    const aeg_lowres *lr_ref[2];
     int16_t *par_pos;      /* 4 int16 per candidate for satd_batch       */
     int16_t *par_mv;       /* quarter-pel result per macroblock          */
     int32_t *par_cost;
@@ -834,6 +855,8 @@ static void set_current_refs(struct aeg_encoder *e)
         }
         e->ref_poc[0] = e->pic_poc[a];
         e->ref_poc[1] = e->pic_poc[b];
+        e->ref_slot[0] = a;
+        e->ref_slot[1] = b;
         e->has_ref = 1;
         e->has_ref2 = 1;               /* second list0 entry lives in ref2p */
         e->cur_l0_active = 2;
@@ -845,6 +868,8 @@ static void set_current_refs(struct aeg_encoder *e)
     }
     e->ref_poc[0] = l0 >= 0 ? e->dpb[l0].poc : 0;
     e->ref_poc[1] = l1 >= 0 ? e->dpb[l1].poc : 0;
+    e->ref_slot[0] = l0 >= 0 ? e->dpb[l0].slot : -1;
+    e->ref_slot[1] = l1 >= 0 ? e->dpb[l1].slot : -1;
     e->has_ref = l0 >= 0;
     e->has_ref2 = l1 >= 0;
     e->cur_l0_active = 1;
@@ -3805,23 +3830,54 @@ static int lr_seed_on(const struct aeg_encoder *e)
  * search (lookahead.c) on half-resolution copies of the current source and
  * of each list's reference reconstruction, whose half-sample vectors are
  * whole samples at full resolution. */
-static void lr_seed_frame(struct aeg_encoder *e)
+/* The vectors of block rows lr_rows..upto (both lists). */
+static void lr_seed_rows(struct aeg_encoder *e, int upto)
 {
     int l, i, n = e->mb_count;
 
+    if (upto > e->mb_h - 1)
+        upto = e->mb_h - 1;
+    if (upto < e->lr_rows)
+        return;
+    for (l = 0; l < e->lr_nl; l++) {
+        int *mv = e->lr_scratch + 2 * n * l;
+        aeg_lowres_mv_rows(&e->lr_pic[0], e->lr_ref[l], mv, e->lr_rows, upto);
+        for (i = 2 * e->lr_rows * e->mb_w; i < 2 * (upto + 1) * e->mb_w; i++)
+            e->lr_mv[l][i] = (int16_t)mv[i];
+    }
+    e->lr_rows = upto + 1;
+}
+
+/* Sets the pre-search up; the vectors themselves are computed a row ahead of
+ * the macroblock rows that read them (lr_seed_rows from code_slice), so they
+ * only need the reference rows those macroblocks reach anyway.  The
+ * reference's half-resolution copy is the one its own coding built
+ * (slot_low) unless the list predicts from something else (the weighted copy
+ * of weighted prediction). */
+static void lr_seed_frame(struct aeg_encoder *e)
+{
+    int l;
+
     e->lr_valid = 0;
+    e->lr_rows = 0;
     if (e->par_valid || !lr_seed_on(e) || e->p.subme <= 0 || !e->has_ref ||
         !(e->cur_is_p || e->cur_is_b) || (e->cur_is_b && !e->has_ref2))
         return;
     aeg_lowres_build(&e->lr_pic[0], e->srcp[0], e->stride[0], e->w, e->h);
-    for (l = 0; l < (e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1); l++) {
-        aeg_lowres_build(&e->lr_pic[1 + l], l ? e->ref2p[0] : e->refp[0],
-                         e->stride[0], e->w, e->h);
-        aeg_lowres_cost(&e->lr_pic[0], &e->lr_pic[1 + l], NULL, NULL,
-                        e->lr_scratch);
-        for (i = 0; i < 2 * n; i++)
-            e->lr_mv[l][i] = (int16_t)e->lr_scratch[i];
+    e->lr_nl = e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1;
+    for (l = 0; l < e->lr_nl; l++) {
+        const uint8_t *ref = l ? e->ref2p[0] : e->refp[0];
+        int s = e->ref_slot[l];
+        if (s >= 0 && ref == e->pic_plane[s][0] && e->slot_low[s].mem) {
+            e->lr_ref[l] = &e->slot_low[s];
+        } else {
+            aeg_lowres_build(&e->lr_pic[1 + l], ref, e->stride[0], e->w, e->h);
+            e->lr_ref[l] = &e->lr_pic[1 + l];
+        }
     }
+    /* several slices may be coded at once (slice threads): all rows now */
+    if (e->n_slices > 1)
+        lr_seed_rows(e, e->mb_h - 1);
     /* 2: list0[1] of a two-reference P picture has its vectors in lr_mv[1] */
     e->lr_valid = e->cur_is_p && e->cur_l0_active > 1 ? 2 : 1;
 }
@@ -7467,6 +7523,156 @@ static int is_scene_cut(struct aeg_encoder *e, int is_idr, int display)
     return p_sad * 100 > ac * (int64_t)e->p.scenecut;
 }
 
+/* ------------------------------------------------------------------ */
+/* Row-by-row post-processing of a reference picture                   */
+/* ------------------------------------------------------------------ */
+/* A reference picture is deblocked, padded, half-resolution filtered and
+ * half-pel interpolated a few rows behind the decision pass instead of after
+ * it, so that a picture predicting from it can start before it is finished
+ * (frame threads; slot_rows says how far it is).  The order of every step is
+ * the order of the whole-picture version, so the samples are the same:
+ *
+ *  - macroblock row k is deblocked once row k+1 is decided, because the
+ *    intra prediction of row k+1 reads row k unfiltered;  in raster order
+ *    that is exactly aeg_deblock_frame();
+ *  - deblocking row k+1 still changes the bottom three lines of row k, so
+ *    row k is final (and padded, and filtered down) after that;
+ *  - the half-pel rows of row k read three lines into row k+1, so they
+ *    follow once row k+1 is final.
+ *
+ * The filter reads the decisions as the bitstream pass leaves them (QP of a
+ * macroblock without residual, skip, transform flag, non-zero counts); the
+ * bitstream pass runs after the whole decision pass, so rowpost_finalize
+ * applies the same rules to a copy as the rows come (the decision pass of
+ * the following rows must keep reading the decision values). */
+static void rowpost_finalize(struct aeg_encoder *e, int mby, int slice)
+{
+    int mbx, i;
+
+    for (mbx = 0; mbx < e->mb_w; mbx++) {
+        int idx = mby * e->mb_w + mbx;
+        const mbenc *t = &e->mb_encs[idx];
+        aeg_mb *d = &e->rp_mbs[idx];
+        int qp = t->qp;
+
+        memcpy(d, &e->mbs[idx], sizeof(*d));
+        if (e->p.cabac) {
+            int skipped = 0;
+            if (t->cbp == 0 && t->type != AEG_MB_I16x16)
+                qp = e->rp_qp;
+            if (slice == AEG_SLICE_P && t->type == AEG_MB_P16x16 &&
+                t->cbp == 0 && t->ref[0] == 0) {
+                int pmvx, pmvy;
+                pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+                if (t->mv[0][0] == pmvx && t->mv[0][1] == pmvy)
+                    skipped = 1;
+            }
+            if (slice == AEG_SLICE_B && t->type == AEG_MB_B_DIRECT &&
+                t->cbp == 0)
+                skipped = 1;
+            d->skip = (uint8_t)skipped;
+            d->t8 = (uint8_t)mb_t8_coded(e, t, skipped);
+            for (i = 0; i < AEG_BLK_COUNT; i++)
+                d->nz[i] = skipped ? 0 : t->nz[i];
+            for (i = 0; i < 4; i++)
+                d->nz8[i] = (int8_t)(!skipped && t->nz8[i] != 0);
+        } else {
+            if (!luma_cbp_on(t) && !chroma_cbp(t) && t->type != AEG_MB_I16x16)
+                qp = e->rp_qp;
+        }
+        d->qp = (int8_t)qp;
+        e->rp_qp = qp;
+    }
+}
+
+/* Left/right padding of macroblock row b (all three planes), the rows above
+ * the picture with row 0 and the rows below it with the last one. */
+static void rowpost_pad(struct aeg_encoder *e, int b)
+{
+    int i, y;
+
+    for (i = 0; i < 3; i++) {
+        uint8_t *p = e->recp[i];
+        int st = e->stride[i], w = i ? e->cw : e->w, h = i ? e->ch : e->h;
+        int bh = i ? 8 : 16, y0 = b * bh, y1 = y0 + bh;
+
+        if (y1 > h || b == e->mb_h - 1)
+            y1 = h;
+        for (y = y0; y < y1; y++) {
+            memset(p + y * st - AEG_PAD, p[y * st], AEG_PAD);
+            memset(p + y * st + w, p[y * st + w - 1], AEG_PAD);
+        }
+        if (b == 0)
+            for (y = 1; y <= AEG_PAD; y++)
+                memcpy(p - y * st - AEG_PAD, p - AEG_PAD,
+                       (size_t)(w + 2 * AEG_PAD));
+        if (b == e->mb_h - 1)
+            for (y = 1; y <= AEG_PAD; y++)
+                memcpy(p + (h - 1 + y) * st - AEG_PAD,
+                       p + (h - 1) * st - AEG_PAD, (size_t)(w + 2 * AEG_PAD));
+    }
+}
+
+static void rowpost_hpel(struct aeg_encoder *e, int m)
+{
+    aeg_mc_ctx *mc = &e->slot_mc[e->role_cur];
+    int ya = m == 0 ? -AEG_PAD : 16 * m;
+    int yb = m == e->mb_h - 1 ? e->h + AEG_PAD - 1 : 16 * m + 15;
+    int k;
+
+    if (!mc->buf)
+        return;
+    for (k = 1; k < 4; k++)
+        aeg_hpel_plane_rows((uint8_t *)mc->base[k], mc->stride, e->recp[0],
+                            e->stride[0], e->w, e->h, k, ya, yb);
+}
+
+/* Everything that rows < `final` being final allows. */
+static void rowpost_bands(struct aeg_encoder *e, int final)
+{
+    aeg_lowres *lo = &e->slot_low[e->role_cur];
+
+    while (e->rp_band < final) {
+        rowpost_pad(e, e->rp_band);
+        if (lo->mem)
+            aeg_lowres_build_rows(lo, e->recp[0], e->stride[0], e->w, e->h,
+                                  8 * e->rp_band, 8 * e->rp_band + 7);
+        e->rp_band++;
+    }
+    while (e->rp_hpel + 1 < e->rp_band ||
+           (e->rp_band == e->mb_h && e->rp_hpel < e->mb_h)) {
+        rowpost_hpel(e, e->rp_hpel);
+        e->rp_hpel++;
+    }
+    e->slot_rows[e->role_cur] = e->rp_hpel;
+}
+
+static void rowpost_deblock_row(struct aeg_encoder *e, const aeg_mb *mbs, int y)
+{
+    int x;
+    for (x = 0; x < e->mb_w; x++)
+        aeg_deblock_mb(&e->pic, mbs, e->mb_w, x, y, e->p.deblock_alpha,
+                       e->p.deblock_beta);
+}
+
+/* After the decision pass of row mby. */
+static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
+{
+    int64_t t0;
+
+    if (!e->rp_on)
+        return;
+    t0 = aeg_now_ns();
+    rowpost_finalize(e, mby, slice);
+    if (mby >= 1) {
+        if (e->p.deblock)
+            rowpost_deblock_row(e, e->rp_mbs, mby - 1);
+        e->rp_dbk = mby;
+        rowpost_bands(e, mby - 1);
+    }
+    e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
+}
+
 /* One slice of the current picture: macroblock rows `first_row` to `last_row`
  * (inclusive), written as a complete NAL payload (RBSP) of its own.
  *
@@ -7506,6 +7712,9 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
      * bitstream, so the macroblocks only have to be processed in an order that
      * respects their neighbours (see the note above aeg_encoder_encode). */
     for (mby = first_row; mby <= last_row; mby++) {
+        /* the pre-search vectors this row reads (its own and the row below) */
+        if (e->lr_valid && e->lr_rows <= mby + 1)
+            lr_seed_rows(e, mby + 1);
         for (mbx = 0; mbx < e->mb_w; mbx++) {
             int idx = mby * e->mb_w + mbx;
             mbenc *tmp = &e->mb_encs[idx];
@@ -7561,6 +7770,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             }
             m->cost = (int32_t)tmp->sse;
         }
+        rowpost_row(e, mby, slice);
     }
 
     /* The slice header is written after the decision pass, because one of
@@ -8466,6 +8676,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 const uint8_t *ref = list ? e->ref2p[0] : e->refp[0];
                 int i;
 
+                aeg_mc_ctx_own(ctx, e->h);
                 aeg_mc_ctx_setref(ctx, ref);
                 for (i = 1; i < 4; i++)
                     e->d.ops.interp_plane(e->d.ops.priv, ref, e->stride[0],
@@ -8474,9 +8685,23 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 ctx->ready = 1;
             }
         } else {
-            aeg_mc_ctx_refresh(&e->mc, e->refp[0], e->w, e->h);
-            if (e->cur_is_b || e->cur_l0_active > 1)
-                aeg_mc_ctx_refresh(&e->mc1, e->ref2p[0], e->w, e->h);
+            /* the reference's own planes (built as it was coded), unless the
+             * list predicts from a weighted copy */
+            for (list = 0; list < (e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1); list++) {
+                aeg_mc_ctx *ctx = list ? &e->mc1 : &e->mc;
+                const uint8_t *ref = list ? e->ref2p[0] : e->refp[0];
+                int s = e->ref_slot[list], i;
+
+                if (s >= 0 && ref == e->pic_plane[s][0] && e->slot_mc[s].buf) {
+                    ctx->base[0] = ref;
+                    for (i = 1; i < 4; i++)
+                        ctx->base[i] = e->slot_mc[s].base[i];
+                    ctx->ready = 1;
+                } else {
+                    aeg_mc_ctx_own(ctx, e->h);
+                    aeg_mc_ctx_refresh(ctx, ref, e->w, e->h);
+                }
+            }
         }
         {
             /* chroma in the quarter-pel cost (x264's chroma-me) */
@@ -8532,6 +8757,17 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
                                      3, 8, pps, pl, 0);
         }
     }
+    /* a reference picture coded as one slice is post-processed row by row
+     * behind its decision pass (rowpost_row) */
+    e->rp_on = e->cur_is_ref && e->n_slices == 1 && e->slot_mbs[e->role_cur] &&
+               slice_thread_count(e) == 1 && !getenv("AEG_NORP");
+    e->rp_dbk = e->rp_band = e->rp_hpel = 0;
+    e->rp_qp = e->cur_qp;
+    e->rp_mbs = e->slot_mbs[e->role_cur];
+    e->slot_rows[e->role_cur] = 0;
+    e->pic.plane[0] = e->recp[0];
+    e->pic.plane[1] = e->recp[1];
+    e->pic.plane[2] = e->recp[2];
     {
         size_t lens[AEG_MAX_SLICES];
         int si;
@@ -8650,24 +8886,34 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     }
     e->top_row = 0;
 
-    /* deblock the reconstructed picture */
+    /* deblock the reconstructed picture (what rowpost_row has not done yet)
+     * and, for a reference, finish its border, half-resolution copy and
+     * half-pel planes */
     {
         int64_t t0 = aeg_now_ns();
-        if (e->p.deblock) {
-            e->pic.plane[0] = e->recp[0];
-            e->pic.plane[1] = e->recp[1];
-            e->pic.plane[2] = e->recp[2];
+        e->pic.plane[0] = e->recp[0];
+        e->pic.plane[1] = e->recp[1];
+        e->pic.plane[2] = e->recp[2];
+        if (e->rp_on) {
+            int y;
+            if (e->p.deblock)
+                for (y = e->rp_dbk; y < e->mb_h; y++)
+                    rowpost_deblock_row(e, e->rp_mbs, y);
+        } else if (e->p.deblock) {
             aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
                               e->p.deblock_beta, 1);
         }
+        if (e->cur_is_ref) {
+            if (!e->rp_on)
+                e->rp_band = e->rp_hpel = 0;
+            rowpost_bands(e, e->mb_h);
+        } else {
+            int i;
+            for (i = 0; i < 3; i++)
+                pad_edges(e->recp[i], e->stride[i], i ? e->cw : e->w,
+                          i ? e->ch : e->h);
+        }
         e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
-    }
-
-    /* the deblocked reconstruction is the next reference: refresh its border */
-    {
-        int i;
-        for (i = 0; i < 3; i++)
-            pad_edges(e->recp[i], e->stride[i], i ? e->cw : e->w, i ? e->ch : e->h);
     }
 
     /* distortion statistics */
@@ -8711,8 +8957,35 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
      * A reference picture may be some later B picture's list1[0], whose
      * direct mode reads this picture's decisions: keep them with its buffer. */
     if (e->cur_is_ref && e->slot_mbs[e->role_cur]) {
-        memcpy(e->slot_mbs[e->role_cur], e->mbs,
-               (size_t)e->mb_count * sizeof(e->mbs[0]));
+        /* rowpost_finalize has already stored them (as the filter reads
+         * them); AEG_RPCHK=1 checks that against the bitstream pass */
+        if (!e->rp_on)
+            memcpy(e->slot_mbs[e->role_cur], e->mbs,
+                   (size_t)e->mb_count * sizeof(e->mbs[0]));
+        else if (getenv("AEG_RPCHK")) {
+            int i, k;
+            for (i = 0; i < e->mb_count; i++) {
+                const aeg_mb *a = &e->mbs[i], *b = &e->rp_mbs[i];
+                int bad = a->type != b->type || a->qp != b->qp ||
+                          a->t8 != b->t8 || a->cbp != b->cbp ||
+                          a->skip != b->skip ||
+                          memcmp(a->mv, b->mv, sizeof(a->mv)) ||
+                          memcmp(a->mv1, b->mv1, sizeof(a->mv1)) ||
+                          memcmp(a->ref_idx, b->ref_idx, sizeof(a->ref_idx)) ||
+                          memcmp(a->blist, b->blist, sizeof(a->blist));
+                for (k = 0; k < AEG_BLK_COUNT; k++)
+                    bad |= a->nz[k] != b->nz[k];
+                for (k = 0; k < 4; k++)
+                    bad |= a->nz8[k] != b->nz8[k];
+                if (bad) {
+                    fprintf(stderr, "RPCHK poc %d mb %d: type %d/%d qp %d/%d "
+                            "t8 %d/%d skip %d/%d\n", e->cur_poc, i, a->type,
+                            b->type, a->qp, b->qp, a->t8, b->t8, a->skip,
+                            b->skip);
+                    abort();
+                }
+            }
+        }
         e->slot_ref_poc[e->role_cur][0] = e->ref_poc[0];
         e->slot_ref_poc[e->role_cur][1] = e->ref_poc[1];
         e->slot_col_ok[e->role_cur] = 1;
@@ -8720,6 +8993,7 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     /* The reconstruction becomes a reference picture and the buffer it occupied
      * is handed to the next picture (or, for a B picture, kept: a B is not a
      * reference, so its buffer is simply reused). */
+    e->rp_on = 0;
     wp_finish(e);
     picture_rotate(e, e->cur_is_ref, is_idr);
     e->pic.plane[0] = e->recp[0];
@@ -9489,12 +9763,16 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     {
         int i;
-        for (i = 0; i < AEG_NPIC; i++)
+        for (i = 0; i < AEG_NPIC; i++) {
             if (enc_alloc_picture(e, &e->pic_mem[i], e->pic_plane[i]) != AEG_OK) {
                 aeg_set_last_error("out of memory");
                 aeg_encoder_close(e);
                 return NULL;
             }
+            aeg_mc_ctx_init(&e->slot_mc[i], e->w, e->h, e->stride[0]);
+            if (aeg_lowres_alloc(&e->slot_low[i], e->mb_w, e->mb_h))
+                e->slot_low[i].mem = NULL;
+        }
         e->role_cur = 0;
         e->role_last = 0;
         e->ndpb = 0;
@@ -10344,6 +10622,8 @@ void aeg_encoder_close(aeg_encoder *enc)
         aeg_free(e->la_scratch);
         for (i = 0; i < AEG_NPIC; i++) {
             aeg_free(e->pic_mem[i]);
+            aeg_mc_ctx_free(&e->slot_mc[i]);
+            aeg_lowres_free(&e->slot_low[i]);
             aeg_free(e->slot_mbs[i]);
         }
         aeg_free(e->wp_mem);

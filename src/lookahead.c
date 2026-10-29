@@ -63,9 +63,19 @@ void aeg_lowres_free(aeg_lowres *l)
 void aeg_lowres_build(aeg_lowres *l, const uint8_t *src, int sstride,
                       int w, int h)
 {
+    aeg_lowres_build_rows(l, src, sstride, w, h, 0, l->h - 1);
+}
+
+/* Rows y0..y1 of aeg_lowres_build(); the padding above follows row 0 and the
+ * padding below the last row, in the call that builds them. */
+void aeg_lowres_build_rows(aeg_lowres *l, const uint8_t *src, int sstride,
+                           int w, int h, int y0, int y1)
+{
     int x, y;
 
-    for (y = 0; y < l->h; y++) {
+    if (y1 > l->h - 1)
+        y1 = l->h - 1;
+    for (y = y0; y <= y1; y++) {
         int y0 = 2 * y, y1 = 2 * y + 1;
         uint8_t *d = l->plane + (size_t)y * l->stride;
 
@@ -84,11 +94,13 @@ void aeg_lowres_build(aeg_lowres *l, const uint8_t *src, int sstride,
         memset(d + l->w, d[l->w - 1], LA_PAD);
     }
     for (y = 1; y <= LA_PAD; y++) {
-        memcpy(l->plane - LA_PAD - (size_t)y * l->stride, l->plane - LA_PAD,
-               (size_t)l->stride);
-        memcpy(l->plane - LA_PAD + (size_t)(l->h - 1 + y) * l->stride,
-               l->plane - LA_PAD + (size_t)(l->h - 1) * l->stride,
-               (size_t)l->stride);
+        if (y0 == 0)
+            memcpy(l->plane - LA_PAD - (size_t)y * l->stride, l->plane - LA_PAD,
+                   (size_t)l->stride);
+        if (y1 == l->h - 1)
+            memcpy(l->plane - LA_PAD + (size_t)(l->h - 1 + y) * l->stride,
+                   l->plane - LA_PAD + (size_t)(l->h - 1) * l->stride,
+                   (size_t)l->stride);
     }
 }
 
@@ -355,6 +367,45 @@ int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
     if (intra_mbs)
         *intra_mbs = intra;
     return total;
+}
+
+/* The list-0 vectors aeg_lowres_cost(cur, r0, NULL, ...) finds, for the
+ * block rows y0..y1 only (rows before y0 must already be in `mv`, 2 ints per
+ * macroblock): the same search in the same order, without the intra
+ * estimate the vectors do not depend on.  Block row y reads `r0` down to
+ * lowres row 8 * y + 23 (LA_RANGE below the block, plus the half-sample
+ * tap). */
+void aeg_lowres_mv_rows(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
+                        int y0, int y1)
+{
+    int mb_w = cur->mb_w, x, y;
+
+    if (y1 > cur->mb_h - 1)
+        y1 = cur->mb_h - 1;
+    for (y = y0; y <= y1; y++)
+        for (x = 0; x < mb_w; x++) {
+            int i = y * mb_w + x, bx = 8 * x, by = 8 * y;
+            int cand[3][2], nc = 0, px, py;
+            int a[2] = {0, 0}, b[2] = {0, 0}, cc[2] = {0, 0};
+
+            if (x > 0) {
+                a[0] = mv[2 * (i - 1)]; a[1] = mv[2 * (i - 1) + 1];
+                cand[nc][0] = a[0]; cand[nc][1] = a[1]; nc++;
+            }
+            if (y > 0) {
+                b[0] = mv[2 * (i - mb_w)]; b[1] = mv[2 * (i - mb_w) + 1];
+                cand[nc][0] = b[0]; cand[nc][1] = b[1]; nc++;
+                if (x < mb_w - 1) {
+                    cc[0] = mv[2 * (i - mb_w + 1)];
+                    cc[1] = mv[2 * (i - mb_w + 1) + 1];
+                    cand[nc][0] = cc[0]; cand[nc][1] = cc[1]; nc++;
+                }
+            }
+            px = median3(a[0], b[0], cc[0]);
+            py = median3(a[1], b[1], cc[1]);
+            block_search(cur, r0, bx, by, (const int (*)[2])cand, nc, px, py,
+                         mv + 2 * i);
+        }
 }
 
 /* Per-macroblock version of aeg_lowres_cost() for the macroblock tree: the

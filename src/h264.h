@@ -499,11 +499,17 @@ void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h);
 /* Register the reference picture without filling the planes: used when a
  * backend fills them (aeg_be_ops.interp_plane). */
 void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const uint8_t *ref);
+/* Point the fractional planes back at the context's own buffer (after they
+ * were borrowed from a reference's planes). */
+void aeg_mc_ctx_own(aeg_mc_ctx *mc, int h);
 /* Fill one fractional plane (`which` 1 = horizontal, 2 = vertical, 3 = both) of
  * the padded reference picture into `pl`.  CPU reference implementation of the
  * `interp_plane` backend operation. */
 void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
                          int rstride, int w, int h, int which);
+/* Rows ya..yb of the same plane (see mc.c). */
+void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
+                         int rstride, int w, int h, int which, int ya, int yb);
 /* Plane-aware motion compensation: `src` points into mc->base[0]. */
 void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
                    const uint8_t *src, int w, int h, int fx, int fy);
@@ -590,6 +596,10 @@ int  aeg_lowres_alloc(aeg_lowres *l, int mb_w, int mb_h);
 void aeg_lowres_free(aeg_lowres *l);
 void aeg_lowres_build(aeg_lowres *l, const uint8_t *src, int sstride,
                       int w, int h);
+void aeg_lowres_build_rows(aeg_lowres *l, const uint8_t *src, int sstride,
+                           int w, int h, int y0, int y1);
+void aeg_lowres_mv_rows(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
+                        int y0, int y1);
 /* Estimated cost of coding `cur` as a P picture from r0 (r1 NULL) or as a B
  * picture between r0 and r1; `scratch` holds 4 ints per macroblock. */
 int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
