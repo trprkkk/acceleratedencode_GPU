@@ -414,6 +414,8 @@ int  aeg_qp_chroma(int qp, int offset);
 
 /* distortion metrics */
 int  aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
+void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4],
+                int sb, int out[4]);
 int  aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);
 int  aeg_satd_c(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb);

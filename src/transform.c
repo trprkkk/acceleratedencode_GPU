@@ -1675,6 +1675,62 @@ int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
     return sum;
 }
 
+/* aeg_sad() of one block against four candidate positions, each row of
+ * the block loaded once (the motion searches' patterns). */
+void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4],
+                int sb, int out[4])
+{
+#if defined(__SSE2__)
+    if (w == 16) {
+        __m128i s0 = _mm_setzero_si128(), s1 = s0, s2 = s0, s3 = s0;
+        const uint8_t *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
+        int y;
+        for (y = 0; y < h; y++) {
+            const __m128i va = _mm_loadu_si128((const __m128i *)(a + (size_t)y * sa));
+            const size_t o = (size_t)y * sb;
+            s0 = _mm_add_epi64(s0, _mm_sad_epu8(va, _mm_loadu_si128((const __m128i *)(b0 + o))));
+            s1 = _mm_add_epi64(s1, _mm_sad_epu8(va, _mm_loadu_si128((const __m128i *)(b1 + o))));
+            s2 = _mm_add_epi64(s2, _mm_sad_epu8(va, _mm_loadu_si128((const __m128i *)(b2 + o))));
+            s3 = _mm_add_epi64(s3, _mm_sad_epu8(va, _mm_loadu_si128((const __m128i *)(b3 + o))));
+        }
+        out[0] = sad_reduce(s0);
+        out[1] = sad_reduce(s1);
+        out[2] = sad_reduce(s2);
+        out[3] = sad_reduce(s3);
+        return;
+    }
+    if (w == 8 && (h & 1) == 0) {
+        __m128i s0 = _mm_setzero_si128(), s1 = s0, s2 = s0, s3 = s0;
+        int y, k;
+        for (y = 0; y < h; y += 2) {
+            const uint8_t *pa = a + (size_t)y * sa;
+            const size_t o = (size_t)y * sb;
+            const __m128i va = _mm_unpacklo_epi64(
+                _mm_loadl_epi64((const __m128i *)pa),
+                _mm_loadl_epi64((const __m128i *)(pa + sa)));
+            __m128i vb[4];
+            for (k = 0; k < 4; k++)
+                vb[k] = _mm_unpacklo_epi64(
+                    _mm_loadl_epi64((const __m128i *)(b[k] + o)),
+                    _mm_loadl_epi64((const __m128i *)(b[k] + o + sb)));
+            s0 = _mm_add_epi64(s0, _mm_sad_epu8(va, vb[0]));
+            s1 = _mm_add_epi64(s1, _mm_sad_epu8(va, vb[1]));
+            s2 = _mm_add_epi64(s2, _mm_sad_epu8(va, vb[2]));
+            s3 = _mm_add_epi64(s3, _mm_sad_epu8(va, vb[3]));
+        }
+        out[0] = sad_reduce(s0);
+        out[1] = sad_reduce(s1);
+        out[2] = sad_reduce(s2);
+        out[3] = sad_reduce(s3);
+        return;
+    }
+#endif
+    out[0] = aeg_sad(w, h, a, sa, b[0], sb);
+    out[1] = aeg_sad(w, h, a, sa, b[1], sb);
+    out[2] = aeg_sad(w, h, a, sa, b[2], sb);
+    out[3] = aeg_sad(w, h, a, sa, b[3], sb);
+}
+
 #define HADAMARD4(d0,d1,d2,d3,s0,s1,s2,s3) do {                      \
     int t0_ = (s0) + (s1);                                           \
     int t1_ = (s0) - (s1);                                           \

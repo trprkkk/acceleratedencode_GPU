@@ -419,6 +419,24 @@ static inline int me_sad(const uint8_t *ref, int rstride, const uint8_t *cur,
     return aeg_sad(bw, bh, cur, cstride, ref + dy * rstride + dx, rstride);
 }
 
+/* me_sad() of n integer positions pts[i] (all inside the range), four at a
+ * time through aeg_sad_x4(). */
+static void me_sad_list(const uint8_t *ref, int rstride, const uint8_t *cur,
+                        int cstride, int bw, int bh, const int (*pts)[2], int n,
+                        int *out)
+{
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const uint8_t *b[4];
+        int k;
+        for (k = 0; k < 4; k++)
+            b[k] = ref + pts[i + k][1] * rstride + pts[i + k][0];
+        aeg_sad_x4(bw, bh, cur, cstride, b, rstride, out + i);
+    }
+    for (; i < n; i++)
+        out[i] = me_sad(ref, rstride, cur, cstride, bw, bh, pts[i][0], pts[i][1]);
+}
+
 /* Bits of one signed Exp-Golomb mvd component (quarter-pel units). */
 static inline int me_se_bits(int v)
 {
@@ -459,13 +477,21 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         improved = 1;
         while (improved) {
             int bx = cx, by = cy, bc = best, bdd = bd;
+            int pts[8][2], sads[8], np = 0;
             improved = 0;
             for (i = 1; i < n; i++) {
-                int nx = cx + dx[i], ny = cy + dy[i], c, d;
+                int nx = cx + dx[i], ny = cy + dy[i];
                 if (nx < -range || nx > range || ny < -range || ny > range)
                     continue;
-                d = me_sad(ref, rstride, cur, cstride, bw, bh, nx, ny);
-                c = d + me_mv_cost(rt, nx * 4, ny * 4);
+                pts[np][0] = nx;
+                pts[np][1] = ny;
+                np++;
+            }
+            me_sad_list(ref, rstride, cur, cstride, bw, bh,
+                        (const int (*)[2])pts, np, sads);
+            for (i = 0; i < np; i++) {
+                int nx = pts[i][0], ny = pts[i][1], d = sads[i];
+                int c = d + me_mv_cost(rt, nx * 4, ny * 4);
                 if (c < bc) { bc = c; bdd = d; bx = nx; by = ny; improved = 1; }
             }
             cx = bx; cy = by; best = bc; bd = bdd;
@@ -490,14 +516,30 @@ static void umh_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         { 2, 3}, { 0, 4}, {-2, 3}, { 2, -3}, { 0, -4}, {-2, -3}
     };
     int cx = *mvx, cy = *mvy, best = *best_cost, bx = cx, by = cy, i, j;
+    /* Each stage's positions depend only on where the stage starts, so a
+     * stage is listed first, its SADs measured four at a time, and then
+     * compared in the listed order -- the same winner as one at a time. */
+    enum { UMH_MAX = 512 };
+    int pts[UMH_MAX][2], sads[UMH_MAX], np = 0;
 
 #define UMH_TRY(X, Y) do {                                                  \
-        int x_ = (X), y_ = (Y), c_;                                          \
-        if (x_ >= -range && x_ <= range && y_ >= -range && y_ <= range) {    \
-            c_ = me_sad(ref, rstride, cur, cstride, bw, bh, x_, y_) +        \
-                 me_mv_cost(rt, x_ * 4, y_ * 4);                             \
-            if (c_ < best) { best = c_; bx = x_; by = y_; }                  \
+        int x_ = (X), y_ = (Y);                                              \
+        if (x_ >= -range && x_ <= range && y_ >= -range && y_ <= range &&    \
+            np < UMH_MAX) {                                                  \
+            pts[np][0] = x_;                                                 \
+            pts[np][1] = y_;                                                 \
+            np++;                                                            \
         }                                                                    \
+    } while (0)
+#define UMH_FLUSH() do {                                                    \
+        int k_;                                                              \
+        me_sad_list(ref, rstride, cur, cstride, bw, bh,                      \
+                    (const int (*)[2])pts, np, sads);                        \
+        for (k_ = 0; k_ < np; k_++) {                                        \
+            int c_ = sads[k_] + me_mv_cost(rt, pts[k_][0] * 4, pts[k_][1] * 4); \
+            if (c_ < best) { best = c_; bx = pts[k_][0]; by = pts[k_][1]; }  \
+        }                                                                    \
+        np = 0;                                                              \
     } while (0)
     for (i = 1; i <= r; i += 2) {
         UMH_TRY(cx + i, cy);
@@ -507,16 +549,23 @@ static void umh_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         UMH_TRY(cx, cy + i);
         UMH_TRY(cx, cy - i);
     }
+    UMH_FLUSH();
     cx = bx; cy = by;
     for (j = -2; j <= 2; j++)
         for (i = -2; i <= 2; i++)
             if (i || j)
                 UMH_TRY(cx + i, cy + j);
+    UMH_FLUSH();
     cx = bx; cy = by;
-    for (j = 1; j <= r / 4; j++)
+    for (j = 1; j <= r / 4; j++) {
         for (i = 0; i < 16; i++)
             UMH_TRY(cx + hex16[i][0] * j, cy + hex16[i][1] * j);
+        if (np > UMH_MAX - 16)
+            UMH_FLUSH();
+    }
+    UMH_FLUSH();
 #undef UMH_TRY
+#undef UMH_FLUSH
     *mvx = bx; *mvy = by; *best_cost = best;
 }
 
