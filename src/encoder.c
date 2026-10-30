@@ -7986,6 +7986,27 @@ static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
 
 static void wp_analyse(struct aeg_encoder *e);
 
+/* Would the analysis find weights?  The same analysis on the reference's
+ * source instead of its reconstruction (which may not exist yet). */
+static int wp_predict(struct aeg_encoder *e)
+{
+    int slots = in_slots(e), d = e->ref_poc[0], r;
+    uint8_t *save[3] = { e->refp[0], e->refp[1], e->refp[2] };
+
+    if (e->in_count - d > slots || d < 0)
+        return -1;
+    e->refp[0] = e->in_plane[d % slots][0];
+    e->refp[1] = e->in_plane[d % slots][1];
+    e->refp[2] = e->in_plane[d % slots][2];
+    wp_analyse(e);
+    r = e->wp.lflag[0] || e->wp.cflag[0];
+    memset(&e->wp, 0, sizeof(e->wp));
+    e->refp[0] = save[0];
+    e->refp[1] = save[1];
+    e->refp[2] = save[2];
+    return r;
+}
+
 /* A weighted P picture running ahead of its analysis (ft_spec) codes as if
  * the analysis had found no weights.  Once its list 0 reference is whole the
  * analysis runs: no weights, and everything coded so far is what the serial
@@ -9037,10 +9058,18 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
         pthread_mutex_unlock(&e->fsync->mu);
     }
     if (e->p.weightp && e->cur_is_p && e->has_ref) {
+        int pred = -1;
         if (e->fsync && !getenv("AEG_NOWPSPEC") &&
-            !__atomic_load_n(&e->fsync->wp_hist, __ATOMIC_RELAXED) &&
             __atomic_load_n(&e->fsync->rows[e->ref_slot[0]], __ATOMIC_ACQUIRE) <
                 e->mb_h) {
+            /* the analysis on the reference's source predicts the one on
+             * its reconstruction well (cock 27 of 28 P pictures, short 25
+             * of 32); without the source, what the last analysis found */
+            pred = wp_predict(e);
+            if (pred < 0)
+                pred = __atomic_load_n(&e->fsync->wp_hist, __ATOMIC_RELAXED);
+        }
+        if (pred == 0) {
             e->ft_spec = 1;
             memset(&e->wp, 0, sizeof(e->wp));
         } else {
@@ -10412,8 +10441,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
  *    (stale).  Rows are published only while every reference read is still
  *    the current generation, and a picture's last rows only after its
  *    analysis, so a picture whose last rows are out never restarts and a
- *    finished picture read nothing stale.  If the last analysis did use
- *    weights the next picture waits instead (wp_hist).
+ *    finished picture read nothing stale.  A picture the same analysis on
+ *    the reference's source (wp_predict) expects to be weighted waits for
+ *    the reference instead.
  *  - A non-reference picture reconstructs into its worker's own buffer.  A
  *    buffer that reference marking drops stays in use while a picture in
  *    flight still reads it (pic_busy), so there are NW + 2 more buffers.
@@ -10466,6 +10496,8 @@ struct ft_worker {
     uint8_t *out;
     size_t out_cap;
     int slice, idr, d, rc;
+    int dref;                   /* input picture of the list 0 reference
+                                 * (wp_predict reads its source), or -1 */
     int rec_slot;               /* buffer reconstructed into, -1 = private */
     int uses[3], nuses;         /* buffers counted in pic_busy */
     int64_t pts, t_all, ns;
@@ -10816,7 +10848,9 @@ static int ft_ring_guard(struct aeg_encoder *e)
     int slots = in_slots(e), slot = e->in_count % slots, k, rc;
     for (k = 0; k < e->ft_nw; k++) {
         struct ft_worker *w = &e->ftw[k];
-        if (w->busy && w->d % slots == slot && (rc = ft_join(e, w)) != AEG_OK)
+        if (w->busy && (w->d % slots == slot ||
+                        (w->dref >= 0 && w->dref % slots == slot)) &&
+            (rc = ft_join(e, w)) != AEG_OK)
             return rc;
     }
     return AEG_OK;
@@ -10867,6 +10901,7 @@ static int ft_launch(struct aeg_encoder *e)
     if ((rc = frame_prologue(e, &slice, &idr, d)) != AEG_OK)
         return rc;
     w->d = d;
+    w->dref = e->p.weightp && e->cur_is_p && e->has_ref ? e->ref_poc[0] : -1;
     w->slice = slice;
     w->idr = idr;
     w->t_all = t_all;

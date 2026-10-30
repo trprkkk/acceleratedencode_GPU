@@ -2421,17 +2421,23 @@ all of them have stopped -- so there is no read of a row being rewritten
 (ThreadSanitizer clean, restarts included).  Rows are published only while
 every reference read is still current, and a picture's last rows only after
 its analysis; by induction over the coding order a picture whose last rows
-are out never restarts, so a finished picture never read anything stale.  If
-the previous analysis did use weights the next picture waits instead of
-guessing (`AEG_NOWPSPEC=1` always waits).  Streams identical to serial on
+are out never restarts, so a finished picture never read anything stale.  Whether
+to run ahead is predicted by the same analysis on the reference's *source*
+(`wp_predict`; the source is kept in the input ring while the picture is in
+flight): it agrees with the reconstruction's on cock 27 of 28 P pictures,
+fade 33/34, mega 24/26, vtest 26/26, short 25/32; a picture predicted to be
+weighted waits for its reference (`AEG_NOWPSPEC=1` always waits).  Running
+ahead *with* the predicted weights does not pay: on the fade clip they are
+the exact final weights for only 3 of 17 pictures.  Streams identical to serial on
 the 16 option sets of `tools/real/ftopts.txt` x six clips including the fade
-clip (`tools/real/ftcmp.sh`), with 2-8 workers; cock 90 frames has about 12
-restarts, short (an exposure drift, weights on most P pictures) about 9 per
-30 frames.
+clip (`tools/real/ftcmp.sh`), with 2-8 workers; cock 90 frames has about 10
+restarts (one wrong guess also restarts the pictures that read it), short (an
+exposure drift) about 6 per 30 frames.
 
 cock 90 frames `-p 3 -q 28`, same machine state (this sandbox had become
 ~8 % slower than for the numbers above): serial 11.4 s, frame threads 7.4 s
-waiting for the analysis, **6.4 s** running ahead (-14 %), 5.7 s with
+waiting for the analysis, 6.4 s running ahead after every unweighted
+analysis, **6.2 s** with the source prediction (-16 %), 5.7 s with
 `--weightp 0` (the ceiling).  The single-thread time is unchanged (the
 environment-variable caches became `_Atomic`, which costs nothing measurable).
 
