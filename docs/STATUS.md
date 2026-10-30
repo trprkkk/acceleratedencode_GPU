@@ -2406,6 +2406,35 @@ hardly matters on two cores (2: 6.04 s, 4: 5.85 s, 6: 5.78 s); on 4-8 cores
 the bound is the P chain with its weighted-prediction waits, roughly 3.2 s
 for these 90 frames (~28 fps).
 
+**Running ahead of the weighted-prediction analysis.**  The analysis compares
+the picture with the *whole* list-0 reconstruction (source-based analysis
+loses 0.2 % BD-rate, see the dead ends), which serialised every P picture
+behind its reference.  Now a frame-thread P picture whose reference is still
+being coded starts as if the analysis had found no weights, and runs it as
+soon as the reference is whole -- always before its own last row, which needs
+the whole reference anyway.  No weights (most pictures): what it coded is
+exactly the serial result.  Weights: it restarts from the copy of the encoder
+it was launched with.  A restarting reference bumps a generation counter;
+every picture reading it notices at its next macroblock row (or while waiting
+for rows), stops, and restarts too, and the reference is rewritten only after
+all of them have stopped -- so there is no read of a row being rewritten
+(ThreadSanitizer clean, restarts included).  Rows are published only while
+every reference read is still current, and a picture's last rows only after
+its analysis; by induction over the coding order a picture whose last rows
+are out never restarts, so a finished picture never read anything stale.  If
+the previous analysis did use weights the next picture waits instead of
+guessing (`AEG_NOWPSPEC=1` always waits).  Streams identical to serial on
+the 16 option sets of `tools/real/ftopts.txt` x six clips including the fade
+clip (`tools/real/ftcmp.sh`), with 2-8 workers; cock 90 frames has about 12
+restarts, short (an exposure drift, weights on most P pictures) about 9 per
+30 frames.
+
+cock 90 frames `-p 3 -q 28`, same machine state (this sandbox had become
+~8 % slower than for the numbers above): serial 11.4 s, frame threads 7.4 s
+waiting for the analysis, **6.4 s** running ahead (-14 %), 5.7 s with
+`--weightp 0` (the ceiling).  The single-thread time is unchanged (the
+environment-variable caches became `_Atomic`, which costs nothing measurable).
+
 Earlier numbers (B-only frame threads, against `6831122`): 30 frames, presets
 0-4: 1.57 / 1.76 / 1.84 / 1.98 / 1.98x; 180 frames preset 3 48.8 -> 23.8 s.
 

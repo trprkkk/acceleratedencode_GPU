@@ -648,7 +648,7 @@ static int me_umh_radius(const aeg_mc_ctx *mc, int bw, int bh)
 
 static int me_try_pmv(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_MEPMV");
         v = ev ? atoi(ev) != 0 : 0;
@@ -850,7 +850,7 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
         }
     }
     {
-        static int fr = -1;
+        static _Atomic int fr = -1;
         if (fr < 0) { const char *ev = getenv("AEG_MEFULL"); fr = ev ? atoi(ev) : 0; }
         if (fr > 0) {
             int x, y, cx = 0, cy = 0;

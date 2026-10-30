@@ -35,7 +35,7 @@
 #define AEG_X86_AVX2 1
 static int cpu_avx2(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_NOAVX2");
         __builtin_cpu_init();

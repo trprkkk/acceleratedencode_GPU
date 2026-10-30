@@ -38,7 +38,7 @@ static inline double aeg_lambda_of(int qp)
 #define AEG_LAMBDA(qp) aeg_lambda_of(qp)
 
 /* An integer tuning switch from the environment, read once. */
-#define ENV_INT(name, dflt) __extension__ ({ static int v_ = -0x7fffffff;  \
+#define ENV_INT(name, dflt) __extension__ ({ static _Atomic int v_ = -0x7fffffff; \
     if (v_ == -0x7fffffff) { const char *e_ = getenv(name);              \
         v_ = e_ ? atoi(e_) : (dflt); } v_; })
 
@@ -168,6 +168,15 @@ struct aeg_encoder {
     struct ft_sync *fsync;   /* frame threads: slot_rows shared, waitable */
     int npic;                /* picture buffers in use (AEG_NPIC max)    */
     int pic_busy[AEG_NPIC];  /* frame threads: jobs still reading/writing */
+    /* frame threads, in a worker's copy: the generation of each reference
+     * buffer as the picture started reading it (a reference that restarts
+     * bumps its generation, and everything that read it restarts too), and
+     * whether the picture runs ahead of its weighted-prediction analysis */
+    int ft_gslot[2];
+    unsigned ft_gen[2];
+    int ft_reg;              /* counted in fsync->readers                 */
+    int ft_spec;             /* coding unweighted until the ref is whole  */
+    int ft_abort;            /* a stale reference was seen: start again   */
     int ref_slot[2];         /* buffer of refp[0] / ref2p[0], or -1      */
     /* row-by-row post-processing of the reference picture being coded */
     int rp_on;               /* deblocking etc. follow the decision rows  */
@@ -807,7 +816,7 @@ static void refctl_drop(struct aeg_encoder *e, int i)
 
 static int ref2_anchor_only(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_REF2ANCHOR");
         v = ev ? atoi(ev) != 0 : 0;
@@ -1458,7 +1467,7 @@ static int64_t trel_descent(const aeg_cabac *sh, const struct trel *t,
  * too.  AEG_TINTRA=0/1 overrides, for measurements. */
 static int trellis_intra_mode(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_TINTRA");
         v = ev ? atoi(ev) : 3;
@@ -1473,7 +1482,7 @@ static int trellis_intra_mode(void)
 /* Whether the chroma AC blocks get the level selection.  AEG_TCHROMA. */
 static int trellis_chroma_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_TCHROMA");
         v = ev ? atoi(ev) != 0 : 1;
@@ -1488,7 +1497,7 @@ static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                            int blk, const uint8_t *src, int stride,
                            const uint8_t *pred, int qp, const int32_t *dcv)
 {
-    static int on = -1;
+    static _Atomic int on = -1;
     struct trel t;
     int a, b, va, vb;
 
@@ -2916,7 +2925,7 @@ static int part_satd(struct aeg_encoder *e, int mbx, int mby, const int geo[4],
 static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
                               int list, int nb[8][2])
 {
-    static int on = -1, lrnb = -1;
+    static _Atomic int on = -1, lrnb = -1;
     const aeg_mb *m;
     int n = 0;
 
@@ -2973,19 +2982,19 @@ static int env_flag(const char *name, int dflt)
 }
 static int me_bnb_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) v = env_flag("AEG_MEBNB", 1);
     return v;
 }
 static int env_flag_cached_bscale(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) v = env_flag("AEG_MEBSCALE", 1);
     return v;
 }
 static int me_part_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) v = env_flag("AEG_MEPART", 1);
     return v;
 }
@@ -2996,7 +3005,7 @@ static int me_part_on(void)
  * searched again with the refinement, which is where the quality comes from. */
 static int ref1_cands_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_REF1C");
         v = ev ? atoi(ev) != 0 : 1;
@@ -3176,7 +3185,7 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
  * the time each.  From preset 2 up; AEG_PSUB overrides. */
 static int part_subpel(const struct aeg_encoder *e)
 {
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_PSUB");
         v = ev ? atoi(ev) : -1;
@@ -3192,7 +3201,7 @@ static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
 
 static int bidir_part_on(const struct aeg_encoder *e)
 {
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_BIDIRP");
         v = ev ? atoi(ev) : -1;
@@ -3852,7 +3861,7 @@ static void me_par_subpel(struct aeg_encoder *e, int range4)
 
 static int lr_seed_on(const struct aeg_encoder *e)
 {
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_LRSEED");
         v = ev ? atoi(ev) : -1;
@@ -4030,7 +4039,7 @@ static void me_seed_frame(struct aeg_encoder *e)
  */
 static int bidir_on(const struct aeg_encoder *e)
 {
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_BIDIR");
         v = ev ? atoi(ev) : -1;
@@ -4664,7 +4673,7 @@ static int intra4_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
  * AEG_IRDK overrides, for measurements. */
 static int intra_refine_k(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_IRDK");
         v = ev ? atoi(ev) : 2;
@@ -5423,7 +5432,7 @@ static int chroma_decide_on(const struct aeg_encoder *e)
 {
     /* -0.34% of BD-rate for 10% of the time on the real clips, so it sits
      * with the slowest preset */
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_CDECIDE");
         v = ev ? atoi(ev) != 0 : -1;
@@ -5455,7 +5464,7 @@ static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
  * AEG_SKIPCHK=0 turns it off. */
 static int skip_check_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_SKIPCHK");
         v = ev ? atoi(ev) != 0 : 1;
@@ -5484,7 +5493,7 @@ static void cm_dump(void)
 }
 static int cm_on(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         v = ENV_INT("AEG_CMTIME", 0);
         if (v)
@@ -7569,15 +7578,64 @@ struct ft_sync {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int rows[AEG_NPIC];
+    unsigned gen[AEG_NPIC];  /* bumped when a picture restarts (rows -> 0) */
+    int readers[AEG_NPIC];   /* pictures reading the current generation   */
+    int stale[AEG_NPIC];     /* ... and an older one, not stopped yet      */
+    int wp_hist;             /* the last weighted-prediction analysis used
+                              * weights: do not run ahead of the next one */
     int64_t wait_ns;
+    int64_t restarts;
 };
+
+/* A frame-thread picture starts again from the copy it was launched with. */
+#define FT_RESTART (-100)
+
+/* This picture stops reading its references (under fsync->mu): a picture
+ * restarting waits until nothing reads what it is about to overwrite. */
+static void ft_release(struct aeg_encoder *e)
+{
+    struct ft_sync *f = e->fsync;
+    int l;
+
+    if (!e->ft_reg)
+        return;
+    for (l = 0; l < 2; l++) {
+        int sl = e->ft_gslot[l];
+        if (sl < 0)
+            continue;
+        if (f->gen[sl] == e->ft_gen[l])
+            f->readers[sl]--;
+        else
+            f->stale[sl]--;
+    }
+    e->ft_reg = 0;
+    pthread_cond_broadcast(&f->cv);
+}
+
+/* Has a reference this picture reads restarted since it began reading it?
+ * (Under fsync->mu, or racy-but-safe outside: generations only grow.) */
+static int ft_refs_changed(const struct aeg_encoder *e)
+{
+    int l;
+    for (l = 0; l < 2; l++)
+        if (e->ft_gslot[l] >= 0 &&
+            __atomic_load_n(&e->fsync->gen[e->ft_gslot[l]], __ATOMIC_ACQUIRE) !=
+                e->ft_gen[l])
+            return 1;
+    return 0;
+}
 
 static void slot_publish(struct aeg_encoder *e, int s, int rows)
 {
     e->slot_rows[s] = rows;
     if (e->fsync) {
         pthread_mutex_lock(&e->fsync->mu);
-        __atomic_store_n(&e->fsync->rows[s], rows, __ATOMIC_RELEASE);
+        /* rows computed from a reference that has since restarted are not
+         * final: this picture restarts as well (at its next row) */
+        if (e->ft_abort || ft_refs_changed(e) || (e->ft_spec && rows >= e->mb_h))
+            e->ft_abort = 1;
+        else
+            __atomic_store_n(&e->fsync->rows[s], rows, __ATOMIC_RELEASE);
         pthread_cond_broadcast(&e->fsync->cv);
         pthread_mutex_unlock(&e->fsync->mu);
     }
@@ -7585,19 +7643,26 @@ static void slot_publish(struct aeg_encoder *e, int s, int rows)
 
 /* Wait until buffer s holds at least `rows` final rows (frame threads; a
  * serial encoder has coded every reference completely already). */
-static void ref_wait(struct aeg_encoder *e, int s, int rows)
+static int ref_wait(struct aeg_encoder *e, int s, int rows)
 {
     struct ft_sync *f = e->fsync;
     int64_t t0;
+    int rc = 0;
 
     if (!f || s < 0 || __atomic_load_n(&f->rows[s], __ATOMIC_ACQUIRE) >= rows)
-        return;
+        return 0;
     t0 = aeg_now_ns();
     pthread_mutex_lock(&f->mu);
-    while (__atomic_load_n(&f->rows[s], __ATOMIC_ACQUIRE) < rows)
+    while (__atomic_load_n(&f->rows[s], __ATOMIC_ACQUIRE) < rows) {
+        if (ft_refs_changed(e)) {
+            rc = -1;
+            break;
+        }
         pthread_cond_wait(&f->cv, &f->mu);
+    }
     f->wait_ns += aeg_now_ns() - t0;
     pthread_mutex_unlock(&f->mu);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -7740,7 +7805,7 @@ static void rowpost_deblock_row(struct aeg_encoder *e, const aeg_mb *mbs, int y)
  * block row.  mb_h means all of it, borders included. */
 static int ref_rows_needed(const struct aeg_encoder *e, int r)
 {
-    static int less = -1;
+    static _Atomic int less = -1;
     int range = e->p.search_range ? e->p.search_range : 16;
     int line = 16 * r + 15 + range + 8, n;
 
@@ -7769,21 +7834,22 @@ static void pz_copy_rows(uint8_t *dst, const uint8_t *src, int stride,
 }
 
 /* Before the decision pass of row mby: make sure the references are there. */
-static void ref_rows_ensure(struct aeg_encoder *e, int mby)
+static int ref_rows_ensure(struct aeg_encoder *e, int mby)
 {
     int need, l, k;
 
     if (e->fsync) {
         int nl = e->cur_is_b || e->cur_l0_active > 1 ? 2 : 1;
         if (!e->has_ref || !(e->cur_is_p || e->cur_is_b))
-            return;
+            return 0;
         need = ref_rows_needed(e, mby);
         for (l = 0; l < nl; l++)
-            ref_wait(e, e->ref_slot[l], need);
-        return;
+            if (ref_wait(e, e->ref_slot[l], need))
+                return -1;
+        return 0;
     }
     if (!e->pz_on)
-        return;
+        return 0;
     need = ref_rows_needed(e, mby);
     for (l = 0; l < e->pz_nl; l++) {
         int b0 = e->pz_rows[l];
@@ -7808,6 +7874,7 @@ static void ref_rows_ensure(struct aeg_encoder *e, int mby)
                    (size_t)(need - b0) * e->mb_w * sizeof(aeg_mb));
         e->pz_rows[l] = need;
     }
+    return 0;
 }
 
 /* Put the poisoned copies in place of this picture's references (the lists
@@ -7917,6 +7984,38 @@ static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
     e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
 }
 
+static void wp_analyse(struct aeg_encoder *e);
+
+/* A weighted P picture running ahead of its analysis (ft_spec) codes as if
+ * the analysis had found no weights.  Once its list 0 reference is whole the
+ * analysis runs: no weights, and everything coded so far is what the serial
+ * encoder codes; weights, and the picture starts again (FT_RESTART).  The
+ * last row of the picture waits for the whole reference, so this always
+ * happens before the picture's own last rows are published. */
+static int ft_wp_check(struct aeg_encoder *e, int wait)
+{
+    int s = e->ref_slot[0];
+
+    if (!e->ft_spec)
+        return 0;
+    if (__atomic_load_n(&e->fsync->rows[s], __ATOMIC_ACQUIRE) < e->mb_h) {
+        if (!wait)
+            return 0;
+        if (ref_wait(e, s, e->mb_h))
+            return -1;
+    }
+    if (ft_refs_changed(e))
+        return -1;
+    e->ft_spec = 0;
+    wp_analyse(e);
+    if (e->wp.lflag[0] || e->wp.cflag[0]) {
+        __atomic_store_n(&e->fsync->wp_hist, 1, __ATOMIC_RELAXED);
+        return -1;
+    }
+    __atomic_store_n(&e->fsync->wp_hist, 0, __ATOMIC_RELAXED);
+    return 0;
+}
+
 /* One slice of the current picture: macroblock rows `first_row` to `last_row`
  * (inclusive), written as a complete NAL payload (RBSP) of its own.
  *
@@ -7956,7 +8055,10 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
      * bitstream, so the macroblocks only have to be processed in an order that
      * respects their neighbours (see the note above aeg_encoder_encode). */
     for (mby = first_row; mby <= last_row; mby++) {
-        ref_rows_ensure(e, mby);
+        if (ref_rows_ensure(e, mby) || (e->fsync && (e->ft_abort ||
+                                                      ft_refs_changed(e) ||
+                                                      ft_wp_check(e, 0))))
+            return FT_RESTART;   /* the worker starts the picture again */
         /* the pre-search vectors this row reads (its own and the row below) */
         if (e->lr_valid && e->lr_rows <= mby + 1)
             lr_seed_rows(e, mby + 1);
@@ -8499,7 +8601,7 @@ static int64_t wp_cost_chroma(const struct aeg_encoder *e, int pl, int lw,
 
 static int wp_threshold(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_WPTH");
         v = ev ? atoi(ev) : 95;
@@ -8745,7 +8847,7 @@ static void umh_radii(const struct aeg_encoder *e, int r[3])
 
 static int chroma_me_on(const struct aeg_encoder *e)
 {
-    static int v = -2;
+    static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_CHROMAME");
         v = ev ? atoi(ev) : -1;
@@ -8757,7 +8859,7 @@ static int chroma_me_on(const struct aeg_encoder *e)
 
 static int bref_qp_num(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_BREFQP");   /* offset in halves */
         v = ev ? atoi(ev) : 2;
@@ -8916,10 +9018,42 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                    (size_t)e->mb_count * 400 * 3 + 65536) != AEG_OK)
         return AEG_ENOMEM;
     /* weighted prediction compares the picture with the whole of its list 0
-     * reference */
-    if (e->p.weightp && e->cur_is_p && e->has_ref)
-        ref_wait(e, e->ref_slot[0], e->mb_h);
-    wp_analyse(e);
+     * reference.  A frame-thread picture whose reference is still being
+     * coded starts unweighted instead, and checks once it is whole
+     * (ft_wp_check) -- unless the last analysis did use weights. */
+    e->ft_spec = 0;
+    e->ft_abort = 0;
+    if (e->fsync) {
+        int l;
+        pthread_mutex_lock(&e->fsync->mu);
+        for (l = 0; l < 2; l++) {
+            int sl = e->ref_slot[l];
+            e->ft_gslot[l] = (l ? e->has_ref2 : e->has_ref) && sl >= 0 ? sl : -1;
+            e->ft_gen[l] = sl >= 0 ? e->fsync->gen[sl] : 0;
+            if (e->ft_gslot[l] >= 0)
+                e->fsync->readers[sl]++;
+        }
+        e->ft_reg = 1;
+        pthread_mutex_unlock(&e->fsync->mu);
+    }
+    if (e->p.weightp && e->cur_is_p && e->has_ref) {
+        if (e->fsync && !getenv("AEG_NOWPSPEC") &&
+            !__atomic_load_n(&e->fsync->wp_hist, __ATOMIC_RELAXED) &&
+            __atomic_load_n(&e->fsync->rows[e->ref_slot[0]], __ATOMIC_ACQUIRE) <
+                e->mb_h) {
+            e->ft_spec = 1;
+            memset(&e->wp, 0, sizeof(e->wp));
+        } else {
+            if (ref_wait(e, e->ref_slot[0], e->mb_h))
+                return FT_RESTART;
+            wp_analyse(e);
+            if (e->fsync)
+                __atomic_store_n(&e->fsync->wp_hist,
+                                 e->wp.lflag[0] || e->wp.cflag[0], __ATOMIC_RELAXED);
+        }
+    } else {
+        wp_analyse(e);
+    }
     if ((is_p || e->cur_is_b) && e->p.subme > 0) {
         /* Build the fractional-pel planes of the reference picture once for the
          * whole picture (AEG_STAGE_INTER_PRED).  Every subpel candidate of every
@@ -9129,9 +9263,12 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                     break;
                 if (last_row > e->mb_h)
                     last_row = e->mb_h;
-                if (code_slice(e, e->slice_bs[si], e->slice_bs_cap[si],
-                               first_row, last_row - 1, slice, is_idr,
-                               &sl_len) != AEG_OK)
+                int rc = code_slice(e, e->slice_bs[si], e->slice_bs_cap[si],
+                                    first_row, last_row - 1, slice, is_idr,
+                                    &sl_len);
+                if (rc == FT_RESTART)
+                    return FT_RESTART;
+                if (rc != AEG_OK)
                     return AEG_ENOMEM;
                 lens[si] = sl_len;
             }
@@ -9149,6 +9286,8 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
         }
     }
     e->top_row = 0;
+    if (e->fsync && (ft_wp_check(e, 1) || e->ft_abort))
+        return FT_RESTART;
 
     /* deblock the reconstructed picture (what rowpost_row has not done yet)
      * and, for a reference, finish its border, half-resolution copy and
@@ -9429,7 +9568,7 @@ static int run_job(struct aeg_encoder *e, aeg_packet *pkt)
  *    fails is the anchor. */
 static int la_bias(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) {
         const char *ev = getenv("AEG_LABIAS");
         v = ev ? atoi(ev) : 120;
@@ -9483,7 +9622,7 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
         if (thresh < 30)
             thresh = 30;
         {
-            static int ts = -1;
+            static _Atomic int ts = -1;
             if (ts < 0) {
                 const char *ev = getenv("AEG_LATHRESH");
                 ts = ev ? atoi(ev) : 100;
@@ -9633,7 +9772,7 @@ static int mbt_group(const struct aeg_encoder *e, struct mbt_ent *pl, int n,
 
 static double mbt_strength(void)
 {
-    static double v = -1.0;
+    static _Atomic double v = -1.0;
     if (v < 0.0) {
         const char *ev = getenv("AEG_MBTS");
         v = ev ? atoi(ev) / 10.0 : 1.3;
@@ -10259,9 +10398,22 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
  *    waits per macroblock row (ref_rows_ensure -> ref_wait) only for the
  *    rows its search can reach: the vector is bounded by the search range,
  *    so the samples it reads are final and the decisions are the serial
- *    ones.  Weighted prediction analyses the whole reference, so a weighted
- *    P picture waits for all of it.  AEG_POISON=1 (serial) fills the rows
- *    that would not be final yet with noise to prove the bounds.
+ *    ones.  AEG_POISON=1 (serial) fills the rows that would not be final yet
+ *    with noise to prove the bounds.
+ *  - Weighted prediction analyses the whole reference.  Rather than wait for
+ *    it, a P picture starts as if the analysis had found no weights
+ *    (ft_spec) and runs the analysis once the reference is whole -- always
+ *    before its own last rows, which need the whole reference anyway.  No
+ *    weights: everything coded is what the serial encoder codes.  Weights:
+ *    the picture restarts (FT_RESTART) from the copy it was launched with.
+ *    A restarting reference bumps its generation; every picture that read
+ *    it (counted in readers) notices at its next row, stops reading, and
+ *    restarts in turn, and the reference is rewritten only after that
+ *    (stale).  Rows are published only while every reference read is still
+ *    the current generation, and a picture's last rows only after its
+ *    analysis, so a picture whose last rows are out never restarts and a
+ *    finished picture read nothing stale.  If the last analysis did use
+ *    weights the next picture waits instead (wp_hist).
  *  - A non-reference picture reconstructs into its worker's own buffer.  A
  *    buffer that reference marking drops stays in use while a picture in
  *    flight still reads it (pic_busy), so there are NW + 2 more buffers.
@@ -10296,6 +10448,8 @@ struct ft_worker {
     int done;                   /* the body has returned (atomic) */
     int64_t seq;                /* launch order */
     struct aeg_encoder *c;
+    struct aeg_encoder *c0;     /* c as launched, for a restart */
+    int8_t *mb_dqp0;
     aeg_mb *mbs;
     mbenc *mb_encs;
     int8_t *mb_dqp;
@@ -10326,6 +10480,8 @@ static void ft_worker_free(struct ft_worker *w)
     if (w->busy == 1)
         pthread_join(w->th, NULL);
     free(w->c);
+    free(w->c0);
+    aeg_free(w->mb_dqp0);
     aeg_free(w->mbs);
     aeg_free(w->mb_encs);
     aeg_free(w->mb_dqp);
@@ -10386,6 +10542,8 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
     int k;
 
     w->c = (struct aeg_encoder *)calloc(1, sizeof(*w->c));
+    w->c0 = (struct aeg_encoder *)calloc(1, sizeof(*w->c0));
+    w->mb_dqp0 = (int8_t *)aeg_alloc(n);
     w->mbs = (aeg_mb *)aeg_alloc(n * sizeof(aeg_mb));
     w->mb_encs = (mbenc *)aeg_alloc(n * sizeof(mbenc));
     w->mb_dqp = (int8_t *)aeg_alloc(n);
@@ -10405,7 +10563,8 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
             w->lr_pic[k].mem = NULL;
     aeg_mc_ctx_init(&w->mc, e->w, e->h, e->stride[0]);
     aeg_mc_ctx_init(&w->mc1, e->w, e->h, e->stride[0]);
-    if (!w->c || !w->mbs || !w->mb_encs || !w->mb_dqp || !w->seed_mv ||
+    if (!w->c || !w->c0 || !w->mb_dqp0 ||
+        !w->mbs || !w->mb_encs || !w->mb_dqp || !w->seed_mv ||
         !w->prev_seed || !w->seed_cand || !w->par_pos || !w->par_mv ||
         !w->seed_sad || !w->seed_cost || !w->par_cost || !w->lr_scratch ||
         !w->lr_mv[0] || !w->lr_mv[1] || !w->lr_pic[0].mem ||
@@ -10431,11 +10590,6 @@ static int ft_alloc(struct aeg_encoder *e, int nw)
     if (nw > FT_MAXW)
         nw = FT_MAXW;
     e->ft_nw = nw;
-    /* settle the environment caches the workers would all race to fill */
-    (void)wp_threshold();
-    (void)lr_seed_on(e);
-    (void)chroma_me_on(e);
-    (void)ref_rows_needed(e, 0);
     e->ftw = (struct ft_worker *)calloc((size_t)nw, sizeof(*e->ftw));
     e->ftq = (struct ft_entry *)calloc(FT_Q, sizeof(*e->ftq));
     e->fsync = (struct ft_sync *)calloc(1, sizeof(*e->fsync));
@@ -10465,11 +10619,79 @@ static int ft_alloc(struct aeg_encoder *e, int nw)
     return AEG_OK;
 }
 
+/* Start the worker's picture again: a reference it read has restarted, or
+ * its weighted-prediction analysis found weights after it ran ahead
+ * unweighted.  If it is a reference itself, whatever it published goes, and
+ * the pictures that read it restart in turn (generation). */
+static void ft_restart(struct ft_worker *w)
+{
+    struct aeg_encoder *c = w->c;
+    struct ft_sync *f = c->fsync;
+    uint8_t *out = c->out, *wp_mem = c->wp_mem, *wp_plane[3];
+    uint8_t *slice_bs[AEG_MAX_SLICES];
+    size_t out_cap = c->out_cap, slice_bs_cap[AEG_MAX_SLICES];
+    int k;
+
+    pthread_mutex_lock(&f->mu);
+    ft_release(c);
+    if (w->rec_slot >= 0) {
+        /* what it published goes; it is rewritten once every picture that
+         * read it has noticed (they stop at their next row) */
+        int s = w->rec_slot;
+        __atomic_add_fetch(&f->gen[s], 1, __ATOMIC_RELEASE);
+        f->stale[s] += f->readers[s];
+        f->readers[s] = 0;
+        __atomic_store_n(&f->rows[s], 0, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&f->cv);
+        while (f->stale[s] > 0)
+            pthread_cond_wait(&f->cv, &f->mu);
+    }
+    f->restarts++;
+    pthread_mutex_unlock(&f->mu);
+    /* buffers the aborted run may have grown or allocated stay */
+    for (k = 0; k < 3; k++)
+        wp_plane[k] = c->wp_plane[k];
+    for (k = 0; k < AEG_MAX_SLICES; k++) {
+        slice_bs[k] = c->slice_bs[k];
+        slice_bs_cap[k] = c->slice_bs_cap[k];
+    }
+    *c = *w->c0;
+    c->out = out;
+    c->out_cap = out_cap;
+    c->wp_mem = wp_mem;
+    for (k = 0; k < 3; k++)
+        c->wp_plane[k] = wp_plane[k];
+    for (k = 0; k < AEG_MAX_SLICES; k++) {
+        c->slice_bs[k] = slice_bs[k];
+        c->slice_bs_cap[k] = slice_bs_cap[k];
+    }
+    memcpy(c->mb_dqp, w->mb_dqp0, (size_t)c->mb_count);
+}
+
 static void *ft_thread(void *arg)
 {
     struct ft_worker *w = (struct ft_worker *)arg;
     int64_t t0 = aeg_now_ns();
-    w->rc = frame_body(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt, w->t_all);
+    for (;;) {
+        w->rc = frame_body(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt, w->t_all);
+        if (w->rc == AEG_OK) {
+            /* the last check: every row it read was final */
+            int stale;
+            pthread_mutex_lock(&w->c->fsync->mu);
+            stale = ft_refs_changed(w->c);
+            if (!stale)
+                ft_release(w->c);
+            pthread_mutex_unlock(&w->c->fsync->mu);
+            if (!stale)
+                break;
+        } else if (w->rc != FT_RESTART) {
+            break;
+        }
+        ft_restart(w);
+    }
+    pthread_mutex_lock(&w->c->fsync->mu);
+    ft_release(w->c);
+    pthread_mutex_unlock(&w->c->fsync->mu);
     w->ns = aeg_now_ns() - t0;
     __atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
     return NULL;
@@ -10751,6 +10973,8 @@ static int ft_launch(struct aeg_encoder *e)
         e->idr_pic_id = (e->idr_pic_id + 1) & 0xffff;
     aeg_dispatch_update(&e->d);
 
+    *w->c0 = *c;
+    memcpy(w->mb_dqp0, w->mb_dqp, (size_t)e->mb_count);
     w->ent = ft_push(e);
     w->ent->pending = 1;
     w->seq = e->ft_seq++;
@@ -10997,8 +11221,9 @@ void aeg_encoder_close(aeg_encoder *enc)
     if (!e)
         return;
     if (getenv("AEG_LATIME"))
-        fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms\n",
-                aeg_sched_ns / 1e6, aeg_ft_wait_ns / 1e6, aeg_ft_worker_ns / 1e6);
+        fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms, "
+                "restarts %lld\n", aeg_sched_ns / 1e6, aeg_ft_wait_ns / 1e6,
+                aeg_ft_worker_ns / 1e6, e->fsync ? (long long)e->fsync->restarts : 0LL);
     ft_free(e);
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);

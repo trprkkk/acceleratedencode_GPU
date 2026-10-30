@@ -1,0 +1,17 @@
+# option sets for tools/real/ftcmp.sh (frame threads vs serial)
+-p 0 -q 26
+-p 1 -q 24
+-p 2 -q 30
+-p 3 -q 22
+-p 3 -q 28
+-p 3 -q 34
+-p 4 -q 26
+-p 3 -q 22 -g 12
+-p 3 -q 28 --weightp 0
+-p 3 -q 26 --b-pyramid 0
+-p 4 -q 30 --ref 1
+-p 2 -q 26 --b-adapt 2
+-p 3 -q 26 --b-adapt 0
+-p 1 -q 32 --bframes 1
+-p 3 -q 28 --aq 0
+-p 3 -q 30 --slices 1 --bframes 2
