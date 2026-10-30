@@ -2438,7 +2438,13 @@ cock 90 frames `-p 3 -q 28`, same machine state (this sandbox had become
 ~8 % slower than for the numbers above): serial 11.4 s, frame threads 7.4 s
 waiting for the analysis, 6.4 s running ahead after every unweighted
 analysis, **6.2 s** with the source prediction (-16 %), 5.7 s with
-`--weightp 0` (the ceiling).  The single-thread time is unchanged (the
+`--weightp 0` (the ceiling).  Preset 4, same clip: serial 15.2 s, frame threads 8.5 s
+(10.6 fps; two cores make 7.6 s the ceiling).  On two cores both presets are
+now within ~10 % of the CPU-bound limit, so more speed here means less work
+per macroblock; on 4-8 cores the P chain no longer waits for whole
+references.  (A vector-cost bound on the UMH positions -- skip a position
+whose vector alone costs more than the best -- is exact but prunes too few
+positions to measure.)  The single-thread time is unchanged (the
 environment-variable caches became `_Atomic`, which costs nothing measurable).
 
 Earlier numbers (B-only frame threads, against `6831122`): 30 frames, presets
