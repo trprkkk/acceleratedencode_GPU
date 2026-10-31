@@ -56,6 +56,12 @@ seeded by a half-resolution pre-search with a multi-hexagon stage, coder-priced
 partition/sub-pel/skip decisions and trellis quantisation of luma, chroma and
 intra blocks; the per-feature measurements are in `docs/STATUS.md`.
 
+**Speed now** (640x352, 90 frames, QP 28, the two-core sandbox): preset 3
+12.1 fps on one thread and 19.9 fps with frame threads (the default), preset 4
+10.7 / 18.4 fps; preset 3 started this round at ~4 fps.  libx264 `medium` runs
+at ~77 fps on the same machine.  The speed figures in the quoted text above are
+from an earlier, smaller test clip.
+
 ## Why this design
 
 Porting x264/x265 to the GPU is attractive because the expensive stages

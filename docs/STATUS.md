@@ -2720,6 +2720,20 @@ Without the predictor condition the exit costs more (threshold 1000, preset
 stream at every preset; decoder-exact at presets 3 and 4, frame threads
 identical 32/32.
 
+**The four together** against the defaults before them (57ebcb0; reproduced by
+`AEG_I16N=3 AEG_TI16=1 AEG_UMHET=0 --partitions 31`), since each was gated
+against the one before: preset 3 -0.10 / -0.13 % (5 clips / validation set)
+for -22 / -21 % of the one-thread time over the ten clips; preset 4 +0.11 /
++0.03 % (+0.07 % over the ten) for -20 / -19 %.  cock 90 frames, QP 28, back to
+back against 42f1f92 (the same streams as 57ebcb0), best of three:
+
+| | 42f1f92 | now |
+|---|---|---|
+| preset 3, one thread | 8.84 s (10.2 fps) | 7.47 s (12.1 fps) |
+| preset 3, frame threads | 5.22 s (17.2 fps) | 4.52 s (19.9 fps) |
+| preset 4, one thread | 10.70 s (8.4 fps) | 8.45 s (10.7 fps) |
+| preset 4, frame threads | 5.63 s (16.0 fps) | 4.89 s (18.4 fps) |
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
