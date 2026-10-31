@@ -4362,8 +4362,15 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
          * of the encode time, so it sits with the slow presets.  Prepending it
          * to the candidate list costs two integer searches per 8x8 group --
          * eight per macroblock -- and the exact RD comparison then rejects it
-         * on all but a handful of macroblocks. */
-        if (e->p.preset >= 3)
+         * on all but a handful of macroblocks.
+         *
+         * Re-measured once the rest had become cheaper (sub-8x8 P shapes off,
+         * UMH early exit), at preset 3 off measured +0.04 / +0.05 % (5 clips /
+         * validation set) for -3.7 / -2.5 % of the time, so it is preset 4
+         * only (there off is +0.08 / +0.06 % for -4.2 / -2.6 %).  AEG_B8X8
+         * overrides. */
+        if (ENV_INT("AEG_B8X8", -1) >= 0 ? ENV_INT("AEG_B8X8", -1) > 0
+                                          : e->p.preset >= 4)
             b_candidate_8x8(e, mbx, mby, (const int (*)[2])mv16);
     }
     /* direct: vectors derived, nothing sent */

@@ -2720,7 +2720,15 @@ Without the predictor condition the exit costs more (threshold 1000, preset
 stream at every preset; decoder-exact at presets 3 and 4, frame threads
 identical 32/32.
 
-**The four together** against the defaults before them (57ebcb0; reproduced by
+**B_8x8 at preset 4 only** (`AEG_B8X8=1` restores it at preset 3, `=0`
+turns it off at 4).  Once the other searches had become cheaper the shape's
+share of the time grew; off at preset 3 measured +0.04 / +0.05 % (5 clips /
+validation set) for -3.7 / -2.5 % of the time.  At preset 4 the same is
++0.08 / +0.06 % for -4.2 / -2.6 %, which the preset-4 budget no longer
+covers, so it stays there.  `AEG_B8X8=1` writes the previous preset-3 stream;
+decoder-exact at preset 3, frame threads identical 32/32.
+
+**The four before it together** against the defaults before them (57ebcb0; reproduced by
 `AEG_I16N=3 AEG_TI16=1 AEG_UMHET=0 --partitions 31`), since each was gated
 against the one before: preset 3 -0.10 / -0.13 % (5 clips / validation set)
 for -22 / -21 % of the one-thread time over the ten clips; preset 4 +0.11 /
