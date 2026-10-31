@@ -2775,6 +2775,36 @@ back against 42f1f92 (the same streams as 57ebcb0), best of three:
 | preset 4, one thread | 10.70 s (8.4 fps) | 8.45 s (10.7 fps) |
 | preset 4, frame threads | 5.63 s (16.0 fps) | 4.89 s (18.4 fps) |
 
+**All of this section together** (the seven gated changes up to 58dadaf:
+sub-8x8 shapes, I16N, TI16, UMH early exit, B_8x8 at preset 4, the B
+partition gate and its B_8x8 extension) against 57ebcb0, reproduced by
+`AEG_I16N=3 AEG_TI16=1 AEG_UMHET=0 AEG_B8X8=1 AEG_BPGL=0 --partitions 31`:
+preset 3 +0.01 / -0.04 % (5 clips / validation set) for -32 / -30 % of the
+one-thread time; preset 4 +0.15 / +0.02 % (+0.085 % over the ten clips) for
+-25 / -24 %.  Preset 4 is therefore at the edge of the 0.1 % budget and takes
+no further lossy prunes; preset 3 has spent none of it net.  Timed on a
+different (faster) sandbox from the table above, so both builds again back to
+back, cock 90 frames, QP 28, best of three:
+
+| | 42f1f92 | 58dadaf |
+|---|---|---|
+| preset 3, one thread | 6.98 s (12.9 fps) | 5.02 s (17.9 fps) |
+| preset 3, frame threads | 3.75 s (24.0 fps) | 2.87 s (31.3 fps) |
+| preset 4, one thread | 7.53 s (12.0 fps) | 5.89 s (15.3 fps) |
+| preset 4, frame threads | 4.13 s (21.8 fps) | 3.24 s (27.8 fps) |
+
+Also tried in this round and not taken (each against the then default,
+preset 3): the lambda-scaled gate on the second-reference 16x16 search (k =
+32: -0.01 % for -2.4 %, k = 64: +0.10 % for -1.1 % -- within the noise of the
+timer), skipping Intra_4x4 / Intra_8x8 when the best inter price is below k
+lambdas (k = 10-40: +0.02-0.11 % for at most -3 %, not monotone), the
+`AEG_PSUB=1` / `AEG_REF1C=0` / `AEG_MENB=0` / `AEG_BIDIR=0` switches (+0.52 /
++0.07 / +0.18 / +0.09 % for -2.7 / -0.1 / -0.6 / -1.6 %), and skipping
+measured positions in the joint bi-predictive walk (exact, but -0.2 %).
+Pruning inter candidates on their luma SSE inside the luma coding is not worth
+building: only 5 % of the inter candidates are ruled out by the luma
+distortion at all, and 2.4 % of them repeat an earlier candidate's motion.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
