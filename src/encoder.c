@@ -4352,9 +4352,21 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
 
         mv16[0][0] = mv[0][0]; mv16[0][1] = mv[0][1];
         mv16[1][0] = mv[1][0]; mv16[1][1] = mv[1][1];
-        if (e->p.partitions & 2)
+        /* A macroblock whose better one-list 16x16 prediction already
+         * costs less than k motion lambdas (SATD + vector bits) does not try
+         * the 16x8 / 8x16 shapes: they rarely win there, and their four
+         * searches plus two joint refinements are a third of a B
+         * macroblock's analysis.  k = 96 below preset 4 measured +0.07 /
+         * +0.04 % (5 clips / validation set) for -7.8 / -7.3 % of the time
+         * at preset 3; k = 64 at preset 4 +0.03 / -0.02 % for -6.2 / -4.2 %.
+         * A fixed threshold (not scaled by lambda) cost 0.3 % for the same
+         * time.  AEG_BPGL overrides, 0 = always try them. */
+        const int bpl = ENV_INT("AEG_BPGL", -1) >= 0 ? ENV_INT("AEG_BPGL", -1)
+                        : e->p.preset >= 4 ? 64 : 96;
+        const int parts_ok = !(bpl > 0 && e->mb_inter_sad < bpl * e->me_lambda);
+        if ((e->p.partitions & 2) && parts_ok)
             b_candidate_parts(e, mbx, mby, AEG_MB_B16x8, (const int (*)[2])mv16);
-        if (e->p.partitions & 4)
+        if ((e->p.partitions & 4) && parts_ok)
             b_candidate_parts(e, mbx, mby, AEG_MB_B8x16, (const int (*)[2])mv16);
         /* B_8x8 follows the preset rather than the partition mask: the mask's
          * bit 3 is documented as P_8x8, and this shape measured *neutral*

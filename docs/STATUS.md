@@ -2728,6 +2728,34 @@ validation set) for -3.7 / -2.5 % of the time.  At preset 4 the same is
 covers, so it stays there.  `AEG_B8X8=1` writes the previous preset-3 stream;
 decoder-exact at preset 3, frame threads identical 32/32.
 
+**B 16x8 / 8x16 only where the 16x16 prediction is poor** (`AEG_BPGL=k`,
+0 = always): a B macroblock whose better one-list 16x16 cost (SATD + vector
+bits, from the search) is below k motion lambdas skips the two partitioned
+shapes -- four searches and two joint refinements.  k = 96 below preset 4,
+64 at preset 4, ours against ours:
+
+| preset | k | 5 clips | validation set | time |
+|---|---|---|---|---|
+| 1 | 96 | +0.03 % | | -8.0 % |
+| 2 | 96 | +0.09 % | | -9.4 % |
+| 3 | 64 | +0.01 % | +0.01 % | -5.3 % / -2.8 % |
+| 3 | 96 | +0.07 % | +0.04 % | -7.8 % / -7.3 % |
+| 3 | 128 | +0.19 % | | -11.8 % |
+| 4 | 64 | +0.03 % | -0.02 % | -6.2 % / -4.2 % |
+
+A fixed threshold instead of one in lambdas is worse at every QP mix (512:
++0.08 % for -2.9 %, 1024: +0.26 % for -11 %), because the partitions matter
+more at the low QPs where lambda is small.  `AEG_BPGL=0` writes the previous
+stream at presets 2-4; decoder-exact at presets 3 and 4, frame threads
+identical 32/32.
+
+Also measured and not taken: pre-selecting the Intra_4x4 / Intra_8x8 modes
+by SATD before the exact price (`AEG_I4K` / `AEG_I8K` 5 or 6: +0.05-0.10 %
+for at most -1 % -- the exact price of a small block costs about what the SATD
+does), and an AVX2 four-way SAD for 16-wide blocks (two rows per register:
+no measurable change).  The SSE2 4x4 quantiser now does the sixteen
+coefficients at once (identical output, ~1 %).
+
 **The four before it together** against the defaults before them (57ebcb0; reproduced by
 `AEG_I16N=3 AEG_TI16=1 AEG_UMHET=0 --partitions 31`), since each was gated
 against the one before: preset 3 -0.10 / -0.13 % (5 clips / validation set)
