@@ -265,63 +265,39 @@ int aeg_quant_bias(int qbits, int den)
 static int quant_4x4_sse2(const int16_t *coef, int16_t *level, int qp,
                           int intra)
 {
+    /* All sixteen at once: |coef| <= 32768 read as unsigned and mf < 2^14,
+     * so the unsigned 16x16 product (mullo / mulhi_epu16) plus the rounding
+     * offset fits a 32-bit lane, and the level (< 2^15) packs back exactly. */
     const int qbits = 15 + (qp / 6);
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     const int mf0 = aeg_quant_mf[qp % 6][0];
     const int mf1 = aeg_quant_mf[qp % 6][1];
     const int mf2 = aeg_quant_mf[qp % 6][2];
-    const __m128i zero = _mm_setzero_si128();
     const __m128i qb = _mm_cvtsi32_si128(qbits);
     const __m128i fv = _mm_set1_epi32(f);
-    const __m128i me = _mm_setr_epi16(mf0, 0, mf1, 0, mf0, 0, mf1, 0);
-    const __m128i mo = _mm_setr_epi16(mf1, 0, mf2, 0, mf1, 0, mf2, 0);
-    __m128i r0 = _mm_loadu_si128((const __m128i *)(coef + 0));
-    __m128i r1 = _mm_loadu_si128((const __m128i *)(coef + 8));
-    __m128i o0, o1, o2, o3;
-
-    /* |coef| must fit 16 bits for the pmaddwd product below: the forward
-     * transform of a residual never gets near this, but a caller passing
-     * INT16_MIN would, and the scalar loop handles that case exactly. */
-    if (_mm_movemask_epi8(_mm_or_si128(
-            _mm_cmpeq_epi16(r0, _mm_set1_epi16(-32768)),
-            _mm_cmpeq_epi16(r1, _mm_set1_epi16(-32768)))))
-        return 0;
-
-#define QUANT_ROW(r, m, sgn)                                                   \
-    do {                                                                      \
-        (sgn) = _mm_srai_epi16((r), 15);                                       \
-        {                                                                     \
-            const __m128i ab = _mm_sub_epi16(_mm_xor_si128((r), (sgn)), (sgn));\
-            __m128i lv = _mm_madd_epi16(                                       \
-                _mm_unpacklo_epi16(_mm_srli_si128(ab, 0), zero), (m));         \
-            lv = _mm_sra_epi32(_mm_add_epi32(lv, fv), qb);                      \
-            (r) = _mm_srai_epi16((r), 15);                                      \
-            (r) = _mm_packs_epi32(                                             \
-                _mm_sub_epi32(_mm_xor_si128(lv, _mm_unpacklo_epi16(sgn, sgn)),  \
-                              _mm_unpacklo_epi16(sgn, sgn)), lv);              \
-        }                                                                     \
-    } while (0)
-
-    /* r0/r1 hold coef rows 0-3 and 4-7; the odd rows use the [mf1 mf2] pattern */
-    {
-        __m128i s0, s1, s2, s3;
-        __m128i c0 = _mm_unpacklo_epi64(r0, zero);      /* coef row 0 */
-        __m128i c1 = _mm_unpackhi_epi64(r0, zero);      /* coef row 1 */
-        __m128i c2 = _mm_unpacklo_epi64(r1, zero);      /* coef row 2 */
-        __m128i c3 = _mm_unpackhi_epi64(r1, zero);      /* coef row 3 */
-        QUANT_ROW(c0, me, s0);
-        QUANT_ROW(c1, mo, s1);
-        QUANT_ROW(c2, me, s2);
-        QUANT_ROW(c3, mo, s3);
-        o0 = c0; o1 = c1; o2 = c2; o3 = c3;
-    }
-#undef QUANT_ROW
-    /* level[y * 4 + x] = quant(coef[x * 4 + y]): one transpose at the end */
-    transpose4x4(&o0, &o1, &o2, &o3);
-    _mm_storel_epi64((__m128i *)(level + 0), o0);
-    _mm_storel_epi64((__m128i *)(level + 4), o1);
-    _mm_storel_epi64((__m128i *)(level + 8), o2);
-    _mm_storel_epi64((__m128i *)(level + 12), o3);
+    /* coef rows 0/2 use [mf0 mf1 mf0 mf1], rows 1/3 [mf1 mf2 mf1 mf2] */
+    const __m128i mf = _mm_setr_epi16(mf0, mf1, mf0, mf1, mf1, mf2, mf1, mf2);
+    __m128i a = _mm_loadu_si128((const __m128i *)(coef + 0));
+    __m128i b = _mm_loadu_si128((const __m128i *)(coef + 8));
+    __m128i sa = _mm_srai_epi16(a, 15), sb = _mm_srai_epi16(b, 15);
+    __m128i aa = _mm_sub_epi16(_mm_xor_si128(a, sa), sa);
+    __m128i ab = _mm_sub_epi16(_mm_xor_si128(b, sb), sb);
+    __m128i la = _mm_mullo_epi16(aa, mf), ha = _mm_mulhi_epu16(aa, mf);
+    __m128i lb = _mm_mullo_epi16(ab, mf), hb = _mm_mulhi_epu16(ab, mf);
+    __m128i p0 = _mm_srl_epi32(_mm_add_epi32(_mm_unpacklo_epi16(la, ha), fv), qb);
+    __m128i p1 = _mm_srl_epi32(_mm_add_epi32(_mm_unpackhi_epi16(la, ha), fv), qb);
+    __m128i p2 = _mm_srl_epi32(_mm_add_epi32(_mm_unpacklo_epi16(lb, hb), fv), qb);
+    __m128i p3 = _mm_srl_epi32(_mm_add_epi32(_mm_unpackhi_epi16(lb, hb), fv), qb);
+    __m128i t0, t1;
+    a = _mm_packs_epi32(p0, p1);
+    b = _mm_packs_epi32(p2, p3);
+    a = _mm_sub_epi16(_mm_xor_si128(a, sa), sa);
+    b = _mm_sub_epi16(_mm_xor_si128(b, sb), sb);
+    /* level[y * 4 + x] = quant(coef[x * 4 + y]): transpose the 4x4 */
+    t0 = _mm_unpacklo_epi16(a, b);
+    t1 = _mm_unpackhi_epi16(a, b);
+    _mm_storeu_si128((__m128i *)(level + 0), _mm_unpacklo_epi16(t0, t1));
+    _mm_storeu_si128((__m128i *)(level + 8), _mm_unpackhi_epi16(t0, t1));
     return 1;
 }
 #endif
