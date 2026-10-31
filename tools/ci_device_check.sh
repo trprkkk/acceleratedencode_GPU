@@ -26,7 +26,8 @@ ann "no OpenCL device (rc $rc)" "$(cat "$out")"
 ann "runner CPU" "$(grep -m1 'model name' /proc/cpuinfo) / $(nproc) cpus / \
 flags: $(grep -m1 '^flags' /proc/cpuinfo | grep -o 'avx[0-9a-z_]*' | sort -u | tr '\n' ' ')"
 ann "environment" "AEG_OPENCL_LIB=${AEG_OPENCL_LIB:-} PYOPENCL_HOME=${PYOPENCL_HOME:-} \
-LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} icd: $(ls "${PYOPENCL_HOME:-.}"/.libs 2>&1 | tr '\n' ' ')"
+LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} vendors: $(cat /etc/OpenCL/vendors/*.icd 2>&1 | tr '\n' ' ') \
+pocl: $(dpkg-query -W -f='${Version}' pocl-opencl-icd 2>/dev/null)"
 if [ -n "${PYOPENCL_HOME:-}" ]; then
     ann "pyopencl enumeration" "$(PYTHONPATH=$(dirname "$PYOPENCL_HOME") \
         python3 -c 'import pyopencl as cl

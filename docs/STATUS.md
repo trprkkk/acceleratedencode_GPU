@@ -608,7 +608,8 @@ Every push also runs `.github/workflows/ci.yml` on GitHub Actions
 
 * **cpu** — `make test`, plus `--frame-threads 4` against `--frame-threads 1`
   (`cmp`) at presets 1, 3 and 4.
-* **opencl-pocl** — PoCL from pip as a real OpenCL device: `--list-devices`
+* **opencl-pocl** — Ubuntu's PoCL (`pocl-opencl-icd`) as a real OpenCL
+  device: `--list-devices`
   must show it, `backend_check opencl` (106 checks), the whole conformance
   suite with `AEG_TEST_BACKEND=opencl`, and `gpu_validate.sh` at `-p 3 -t 1`
   and `-p 2 -t 2` (every device path byte-identical to the CPU stream).
@@ -621,7 +622,13 @@ Every push also runs `.github/workflows/ci.yml` on GitHub Actions
 
 Each step asserts its success line (`checks agree`, `bit-exact`,
 `kernels compile`), so a step that silently skipped (no ffmpeg, no device)
-fails instead of passing.  The first run was green on every job.
+fails instead of passing.  The device check (`tools/ci_device_check.sh`)
+reports a missing device as `::error::` annotations -- CPU model, the
+encoder's device list, the ICD setup, a `POCL_DEBUG` tail -- which the checks
+API returns even where the log archive cannot be fetched.  CI first used the
+pip PoCL that `tools/pocl_env.sh` installs (PoCL 3.0-rc2, LLVM 14); its device
+failed to enumerate in two of ten job runs, never locally, so CI now uses the
+distribution's PoCL; `pocl_env.sh` remains the no-root way to get a device.
 
 `make test` runs nine things (8 and 9 skip, and pass, without a device or
 NVRTC; see *GPU groundwork on a real OpenCL device* for running them on one):

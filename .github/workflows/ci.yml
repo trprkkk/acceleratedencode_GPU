@@ -14,7 +14,6 @@ on:
 env:
   # the same ffmpeg build the conformance cases were written against
   FFMPEG: ${{ github.workspace }}/.ci/ext/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2
-  AEG_POCL_DIR: ${{ github.workspace }}/.ci/pocl
 
 jobs:
   cpu:
@@ -71,35 +70,39 @@ jobs:
           python-version: "3.11"
       - uses: actions/cache@v4
         with:
-          path: |
-            .ci/ext
-            .ci/pocl
-          key: ffmpeg-imageio-v7.0.2-pocl-v1
+          path: .ci/ext
+          key: ffmpeg-imageio-v7.0.2
       - name: ffmpeg 7.0.2
         run: |
           [ -x "$FFMPEG" ] || python3 -m pip install -q --target .ci/ext imageio-ffmpeg
+      - name: PoCL (the distribution's OpenCL runtime on the CPU)
+        # Ubuntu's PoCL and the system ICD loader: found by the encoder's
+        # usual libOpenCL.so.1 lookup, no environment needed.  (The pip wheel
+        # tools/pocl_env.sh installs -- PoCL 3.0-rc2, LLVM 14, from 2022 --
+        # failed to enumerate on some runners, intermittently.)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            pocl-opencl-icd ocl-icd-libopencl1 >/dev/null
+          ls /etc/OpenCL/vendors
       - name: build (OPENCL=1)
         run: |
           make -j"$(nproc)" OPENCL=1
           make -s OPENCL=1 build/backend_check build/genyuv
       - name: device present
         run: |
-          . tools/pocl_env.sh
           sh tools/ci_device_check.sh ./build/aegenc
       - name: backend_check (every device operation, two threads)
         run: |
-          . tools/pocl_env.sh
           ./build/backend_check opencl | tee /tmp/bc
           grep -q "checks agree" /tmp/bc
       - name: conformance suite through the device
         run: |
-          . tools/pocl_env.sh
           BUILD=./build AEG_TEST_BACKEND=opencl sh tests/run_tests.sh | tee /tmp/rt
           grep -q "all conformance cases bit-exact" /tmp/rt
           ! grep -q skipped /tmp/rt
       - name: gpu_validate (device paths byte-identical to the CPU)
         run: |
-          . tools/pocl_env.sh
           ./build/genyuv 320 192 16 /tmp/v.yuv 1
           BE=opencl tools/gpu_validate.sh /tmp/v.yuv 320 192 16 26 -p 3 -t 1
           BE=opencl tools/gpu_validate.sh /tmp/v.yuv 320 192 16 26 -p 2 -t 2
@@ -146,13 +149,21 @@ jobs:
           python-version: "3.11"
       - uses: actions/cache@v4
         with:
-          path: |
-            .ci/ext
-            .ci/pocl
-          key: ffmpeg-imageio-v7.0.2-pocl-v1
+          path: .ci/ext
+          key: ffmpeg-imageio-v7.0.2
       - name: ffmpeg 7.0.2
         run: |
           [ -x "$FFMPEG" ] || python3 -m pip install -q --target .ci/ext imageio-ffmpeg
+      - name: PoCL (the distribution's OpenCL runtime on the CPU)
+        # Ubuntu's PoCL and the system ICD loader: found by the encoder's
+        # usual libOpenCL.so.1 lookup, no environment needed.  (The pip wheel
+        # tools/pocl_env.sh installs -- PoCL 3.0-rc2, LLVM 14, from 2022 --
+        # failed to enumerate on some runners, intermittently.)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            pocl-opencl-icd ocl-icd-libopencl1 >/dev/null
+          ls /etc/OpenCL/vendors
       - name: build with sanitizers
         env:
           # from the environment, not the make command line: the Makefile
@@ -174,7 +185,6 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: |
-          . tools/pocl_env.sh
           sh tools/ci_device_check.sh ./build-san/aegenc
           ./build-san/backend_check opencl | tee /tmp/bc
           grep -q "checks agree" /tmp/bc
@@ -182,7 +192,6 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: |
-          . tools/pocl_env.sh
           ./build-san/genyuv 176 144 12 /tmp/s.yuv 1
           B=./build-san/aegenc
           A="-w 176 -h 144 -n 12 -q 26 -i /tmp/s.yuv -v 0"
