@@ -85,8 +85,7 @@ jobs:
       - name: device present
         run: |
           . tools/pocl_env.sh
-          ./build/aegenc --list-devices | tee /tmp/devices
-          grep -q opencl /tmp/devices
+          sh tools/ci_device_check.sh ./build/aegenc
       - name: backend_check (every device operation, two threads)
         run: |
           . tools/pocl_env.sh
@@ -176,10 +175,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           . tools/pocl_env.sh
-          # (to a file first: "| grep -q" exits at the first match, and under
-          # pipefail the writer's SIGPIPE would fail the step at random)
-          ./build-san/aegenc --list-devices > /tmp/devices
-          grep -q opencl /tmp/devices
+          sh tools/ci_device_check.sh ./build-san/aegenc
           ./build-san/backend_check opencl | tee /tmp/bc
           grep -q "checks agree" /tmp/bc
       - name: encodes (CPU and device paths, B pictures, slice and frame threads)
