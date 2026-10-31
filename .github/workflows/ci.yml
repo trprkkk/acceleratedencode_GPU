@@ -39,7 +39,12 @@ jobs:
       - name: build
         run: make -j"$(nproc)"
       - name: make test
-        run: make test
+        # (the job shell is bash -eo pipefail, so tee keeps the exit status;
+        # the grep makes a silently skipped conformance run -- no ffmpeg --
+        # a failure instead of a green tick)
+        run: |
+          make test | tee /tmp/mt
+          grep -q "all conformance cases bit-exact" /tmp/mt
       - name: frame threads write the serial stream
         run: |
           make -s build/genyuv
@@ -90,7 +95,9 @@ jobs:
       - name: conformance suite through the device
         run: |
           . tools/pocl_env.sh
-          BUILD=./build AEG_TEST_BACKEND=opencl sh tests/run_tests.sh
+          BUILD=./build AEG_TEST_BACKEND=opencl sh tests/run_tests.sh | tee /tmp/rt
+          grep -q "all conformance cases bit-exact" /tmp/rt
+          ! grep -q skipped /tmp/rt
       - name: gpu_validate (device paths byte-identical to the CPU)
         run: |
           . tools/pocl_env.sh
@@ -169,7 +176,9 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           . tools/pocl_env.sh
-          ./build-san/backend_check opencl
+          ./build-san/aegenc --list-devices | grep -q opencl
+          ./build-san/backend_check opencl | tee /tmp/bc
+          grep -q "checks agree" /tmp/bc
       - name: encodes (CPU and device paths, B pictures, slice and frame threads)
         env:
           ASAN_OPTIONS: detect_leaks=0

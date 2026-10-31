@@ -236,6 +236,11 @@ preset.
   with NVRTC for every architecture (`AEG_NVRTC_LIB=` pointing at a
   `libnvrtc`, e.g. from `pip install nvidia-cuda-nvrtc-cu12`); both are in
   `make test` and skip without a device / NVRTC.
+* `.github/workflows/ci.yml` runs all of it on every push with no GPU: the
+  CPU suite and frame threads, the OpenCL backend on PoCL (`backend_check`,
+  the conformance suite through the device, `gpu_validate.sh`), the CUDA
+  kernels through NVRTC, and an ASan + UBSan build of the CPU and OpenCL host
+  paths.
 * `tests/run_tests.sh` encodes fifty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,

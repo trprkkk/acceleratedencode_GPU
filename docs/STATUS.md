@@ -600,6 +600,26 @@ make -j2
 FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 76 clip cases
 ```
 
+Every push also runs `.github/workflows/ci.yml` on GitHub Actions
+(ubuntu-24.04, no GPU), where items 8 and 9 do *not* skip:
+
+* **cpu** — `make test`, plus `--frame-threads 4` against `--frame-threads 1`
+  (`cmp`) at presets 1, 3 and 4.
+* **opencl-pocl** — PoCL from pip as a real OpenCL device: `--list-devices`
+  must show it, `backend_check opencl` (106 checks), the whole conformance
+  suite with `AEG_TEST_BACKEND=opencl`, and `gpu_validate.sh` at `-p 3 -t 1`
+  and `-p 2 -t 2` (every device path byte-identical to the CPU stream).
+* **cuda-nvrtc** — `nvrtc_check` with NVRTC from pip (no toolkit, no driver).
+* **sanitizers** — ASan + UBSan (`-fno-sanitize=alignment,shift`, no
+  recovery) on the `OPENCL=1` build: `kernel_check`, `coef_check`,
+  `backend_check` on PoCL, and encodes at presets 0/2/4 through the CPU, slice
+  threads, frame threads, the forced RD batch and the device search, with the
+  batch and frame-thread streams `cmp`'d against their CPU counterparts.
+
+Each step asserts its success line (`checks agree`, `bit-exact`,
+`kernels compile`), so a step that silently skipped (no ffmpeg, no device)
+fails instead of passing.  The first run was green on every job.
+
 `make test` runs nine things (8 and 9 skip, and pass, without a device or
 NVRTC; see *GPU groundwork on a real OpenCL device* for running them on one):
 
