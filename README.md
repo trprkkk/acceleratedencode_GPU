@@ -44,10 +44,10 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > [`docs/STATUS.md`](docs/STATUS.md).
 
 **Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
-22-37, five real clips, PSNR of the whole sequence's MSE): **-4.79 %** BD-rate
-on average against x264 at constant QP (cock -0.31, vtest -11.09, mega -6.33,
-short -8.62, tree +2.39), and **-0.50 %** against x264 at CRF with its own
-macroblock tree (`aq-mode=0`), the way x264 is normally run.
+22-37, five real clips, PSNR of the whole sequence's MSE): **-5.37 %** BD-rate
+on average against x264 at constant QP (cock -0.73, vtest -11.50, mega -7.28,
+short -9.39, tree +2.04); preset 4 -5.84 %; and **-0.99 %** against x264 at CRF
+with its own macroblock tree (`aq-mode=0`), the way x264 is normally run.
 Since the text above was written the encoder gained B pyramid
 (`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock
 tree over a lookahead window (`--mbtree`, `--rc-lookahead`), two P
@@ -56,12 +56,14 @@ seeded by a half-resolution pre-search with a multi-hexagon stage, coder-priced
 partition/sub-pel/skip decisions and trellis quantisation of luma, chroma and
 intra blocks; the per-feature measurements are in `docs/STATUS.md`.
 
-**Speed now** (640x352, 90 frames, QP 28, a two-core sandbox): preset 3
-17.9 fps on one thread and 31.3 fps with frame threads (the default), preset 4
-15.3 / 27.8 fps (the previous release point, 42f1f92, timed back to back on
-the same machine: 12.9 / 24.0 and 12.0 / 21.8).  The BD-rate cost of the
-speed-ups is +0.0 % at preset 3 and +0.085 % at preset 4 (`docs/STATUS.md`).
-The speed figures in the quoted text above are from an earlier, smaller test
+**Speed now** (640x352, 90 frames, QP 28, a two-core sandbox whose speed
+varies between sessions, so the builds are timed back to back): preset 3
+13.7 fps on one thread and 23.6 fps with frame threads (the default), preset
+4 12.0 / 21.5 fps, against 10.5 / 17.6 and 9.0 / 17.0 for 42f1f92 before the
+speed round.  The speed round itself cost +0.0 % BD-rate at preset 3 and
++0.085 % at preset 4; part of the time it bought at presets 2-3 was then spent
+on chroma in the mode decision (-0.5 to -0.7 %, see `docs/STATUS.md`).  The
+speed figures in the quoted text above are from an earlier, smaller test
 clip.
 
 ## Why this design

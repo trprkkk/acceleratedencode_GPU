@@ -2854,6 +2854,23 @@ clips / validation set) for +7 / +10 % of the time, preset 2 -0.49 / -0.58 %
 for +9 %.  The speed round bought ten times that time for a tenth of the
 loss, so this is the better place for it.  `AEG_CDECIDE=0` writes the
 previous stream; decoder-exact at presets 2 and 3, frame threads identical.
+After both (ab1405e), against x264 medium `psy=0` at constant QP: preset 3
+**-5.37 %** (cock -0.73, vtest -11.50, mega -7.28, short -9.39, tree +2.04;
+over QP 16-25 cock +0.64, tree +2.40), preset 4 -5.84 %, and -0.99 % against
+x264 at CRF with its macroblock tree (`aq-mode=0`).  Timed back to back with
+the end of the speed round (cock 90 frames, QP 28, best of three, this
+session's sandbox): preset 3 14.8 -> 13.7 fps on one thread, 25.0 -> 23.6
+with frame threads; preset 4 unchanged (11.8 / 21.0 -> 12.0 / 21.5); 42f1f92
+on the same machine 10.5 / 17.6 and 9.0 / 17.0.
+
+tree is the clip still behind, and it is a peculiar one: each picture is
+repeated six to ten times (four different pictures in thirty), so the result
+is the I picture and three P pictures.  Without the macroblock tree we are at
+parity with x264 there (QP 22: 69 038 B / 42.39 dB against 65 538 B / 42.07
+dB); with it we lose about 1 % at QP 16-25.  Bounding the tree's offsets
+(-4 QP: tree -1.27 %, vtest +3.99 %; -6: nothing) cannot tell tree's repeated
+pictures from vtest's static background, so it is left alone.
+
 Also measured at QP 16-25, preset 3, and not taken: chroma in the motion
 search (`AEG_CHROMAME=1`, -0.20 %), the inter chroma level selection at 0.75x
 / 1.3x lambda (-0.03 / +0.15 %), the Intra_8x8 level selection at 0.75x /
