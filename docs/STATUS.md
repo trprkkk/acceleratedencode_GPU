@@ -2684,6 +2684,15 @@ field that costs more than it predicts.  Decoder-exact (`exact.sh` presets 1
 and 3), frame threads identical (`ftcmp.sh` 32/32), `--partitions 31` writes
 exactly the old default's stream.
 
+The same kind of check on the Intra_16x16 candidates: code_mb() fully coded
+the three SAD-best modes; the best two now (`AEG_I16N=3` restores three).
+Preset 3: -0.05 / -0.06 % (5 clips / validation set) for -5.6 / -5.1 % time;
+preset 4: +0.01 / +0.07 % for -2.7 / -4.5 %; preset 2: +0.01 %, no time.
+One mode is +0.10 % at preset 3 (-10.6 %), too close to the gate; ranking the
+modes by SATD rather than SAD helped neither one nor two modes.  Tried and not
+taken: fewer sub-pel walk steps (the walk is cheap -- -1.5 % time at most),
+P_8x8 off entirely (+0.5 % at presets 3/4, +3.2 % at preset 1).
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,

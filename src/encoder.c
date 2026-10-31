@@ -5891,12 +5891,15 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         return;
     }
 
-    /* luma: the SAD-best modes (all of them from preset 2 on) plus every inter
-     * partitioning the motion search produced */
+    /* luma: the SAD-best Intra_16x16 modes (the best two from preset 2 on)
+     * plus every inter partitioning the motion search produced.  The third
+     * mode (AEG_I16N=3) measured -0.05 / -0.06 % better without it at preset
+     * 3 for -5 % time, +0.01 / +0.07 % at preset 4 for -3 / -4.5 %; ranking
+     * the modes by SATD instead of SAD helped neither two nor one. */
     CM_T0();
     int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
-    if (n16 > ENV_INT("AEG_I16N", 3))
-        n16 = ENV_INT("AEG_I16N", 3);
+    if (n16 > ENV_INT("AEG_I16N", 2))
+        n16 = ENV_INT("AEG_I16N", 2);
     if (e->mb_inter_ok && ENV_INT("AEG_I16G", 0) > 0 &&
         e->mb_inter_sad * ENV_INT("AEG_I16G", 0) < e->mb_sad * 100)
         n16 = 1;
