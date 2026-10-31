@@ -1532,7 +1532,10 @@ static int trellis_chroma_on(void)
 
 /* The AC levels of one Intra_16x16 block (cat 1) against the DC that is
  * already decided; raster order is also the order the flags' neighbours
- * become final in.  AEG_TI16=0 turns it off. */
+ * become final in.  Off unless AEG_TI16=1: ours against ours it is worth
+ * -0.04 / +0.07 % of BD-rate at preset 3 (5 clips / validation set) and
+ * -0.04 / +0.05 % at preset 4, for 6-9 % of the encode time -- every
+ * macroblock prices two Intra_16x16 candidates and few of them win. */
 static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                            int blk, const uint8_t *src, int stride,
                            const uint8_t *pred, int qp, const int32_t *dcv)
@@ -1543,7 +1546,7 @@ static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
 
     if (on < 0) {
         const char *ev = getenv("AEG_TI16");
-        on = ev ? atoi(ev) != 0 : 1;
+        on = ev ? atoi(ev) != 0 : 0;
     }
     if (!on)
         return;

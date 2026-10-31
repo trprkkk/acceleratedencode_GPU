@@ -2693,6 +2693,13 @@ modes by SATD rather than SAD helped neither one nor two modes.  Tried and not
 taken: fewer sub-pel walk steps (the walk is cheap -- -1.5 % time at most),
 P_8x8 off entirely (+0.5 % at presets 3/4, +3.2 % at preset 1).
 
+**No level selection on Intra_16x16 AC blocks** (`AEG_TI16=1` restores it):
+off is +0.04 / -0.07 % at preset 3 (5 clips / validation set, -7.9 / -9.3 %
+time), +0.04 / -0.05 % at preset 4 (-5.8 / -6.9 %), and +0.04 % on all-intra
+streams (`-g 1`, preset 3, -15 %).  The other two switches of the same kind
+stay: chroma level selection off is +2.2 %, the bi-predictive refinement of
+B partitions off +0.14 % for -4 %.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
