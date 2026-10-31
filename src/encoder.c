@@ -1297,11 +1297,32 @@ static int64_t trel_price(int64_t bits256, double lambda)
  * transform and one local price per candidate -- and the block that wins is
  * priced exactly before it is accepted, so the local price can only cost
  * choices, never correctness. */
+static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
+                               int16_t *lev, const uint8_t *src, int stride,
+                               const uint8_t *pred, int pred_stride, int qp,
+                               double lambda, int passes, int allow_empty,
+                               int64_t *out_sse, int64_t *out_bits,
+                               int64_t known_sse, int64_t known_bits);
+
 static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
                                int16_t *lev, const uint8_t *src, int stride,
                                const uint8_t *pred, int pred_stride, int qp,
                                double lambda, int passes, int allow_empty,
                                int64_t *out_sse, int64_t *out_bits)
+{
+    return trel_descent_kn(sh, t, lev, src, stride, pred, pred_stride, qp,
+                           lambda, passes, allow_empty, out_sse, out_bits, -1, 0);
+}
+
+/* trel_descent_ex(), for a caller that has already measured the levels it
+ * passes in: known_sse >= 0 is their trel_sse() and known_bits their
+ * cabac_block_price() against `sh`, the two numbers the descent starts from. */
+static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
+                               int16_t *lev, const uint8_t *src, int stride,
+                               const uint8_t *pred, int pred_stride, int qp,
+                               double lambda, int passes, int allow_empty,
+                               int64_t *out_sse, int64_t *out_bits,
+                               int64_t known_sse, int64_t known_bits)
 {
     int16_t cur[64], trial[64], best[64], scan[64];
     /* 8x8: the trials reuse the current levels' dequantised block and row
@@ -1329,8 +1350,13 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
     nnz = aeg_nz_last(scan, t->n, &last);
     if (!nnz)
         return 0;
-    bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
-    sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+    if (known_sse >= 0) {
+        bits = known_bits;
+        sse = known_sse;
+    } else {
+        bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
+        sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+    }
     orig_cost = best_cost = cost = sse + trel_price(bits, lambda);
     best_sse = orig_sse = sse;
     orig_bits = bits;
@@ -1639,9 +1665,22 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
  * reconstruction is written straight into the picture, because the blocks that
  * follow predict from it -- for Intra_8x8 that includes the next block of the
  * same macroblock. */
+static void code_luma8_block_lv(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                                int g, const uint8_t *pred, int pred_stride,
+                                int intra, int have_levels);
+
 static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                              int g, const uint8_t *pred, int pred_stride,
                              int intra)
+{
+    code_luma8_block_lv(e, mbx, mby, c, g, pred, pred_stride, intra, 0);
+}
+
+/* have_levels: c->level8[g] already holds the levels this would select
+ * (the Intra_8x8 mode decision measured them) */
+static void code_luma8_block_lv(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                                int g, const uint8_t *pred, int pred_stride,
+                                int intra, int have_levels)
 {
     const int s = e->stride[0];
     const uint8_t *src = e->srcp[0] + mby * 16 * s + mbx * 16;
@@ -1654,9 +1693,11 @@ static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         for (x = 0; x < 8; x++)
             res[y * 8 + x] = (int16_t)((int)src[(by + y) * s + bx + x] -
                                        (int)pred[y * pred_stride + x]);
-    aeg_transform_8x8(res, 8, coef);
-    aeg_quant_8x8(coef, c->level8[g], c->qp, intra);
-    if (!intra || trellis_intra_on())
+    if (!have_levels) {
+        aeg_transform_8x8(res, 8, coef);
+        aeg_quant_8x8(coef, c->level8[g], c->qp, intra);
+    }
+    if (!have_levels && (!intra || trellis_intra_on()))
         trellis_luma8(e, src + by * s + bx, s, pred, pred_stride, c->level8[g],
                       c->qp, intra ? trellis_intra_lambda(AEG_LAMBDA(c->qp))
                                    : AEG_LAMBDA(c->qp));
@@ -4711,16 +4752,31 @@ static int intra_refine_k(void)
  * optionally run through the level selection, reconstructed, and its SSE is
  * weighed against what the CABAC coder charges for the levels in the current
  * context.  The prediction mode's own bits are the caller's business. */
+/* What intra_block_rd() without the level selection measured of one
+ * prediction, so that pricing the same prediction again with it (the refine
+ * pass of intra_rd_modes()) starts where the first evaluation ended instead of
+ * transforming, quantising, reconstructing and pricing the block again. */
+struct ib_memo {
+    struct trel tr;
+    int16_t lev[64];
+    int64_t sse, bits;        /* trel_sse() and the price of lev[] */
+    int64_t cost;             /* what intra_block_rd(.., 0) returned */
+};
+
+static int64_t intra_block_rd_memo(struct aeg_encoder *e, const struct ib_memo *mo,
+                                   const uint8_t *sb, int s, const uint8_t *pred,
+                                   int qp, double lambda, int16_t *out_lev);
+
 static int64_t intra_block_rd(struct aeg_encoder *e, int mbx, int mby,
                               const mbenc *t, int side, int rb,
                               const uint8_t *sb, int s, const uint8_t *pred,
-                              double lambda, int trel)
+                              double lambda, int trel, struct ib_memo *mo)
 {
     int16_t res[64], coef[64], lev[64], zz[64];
     struct trel tr;
     const int n = side * side;
     int x, y, i, nzz = 0;
-    int64_t sse = 0, b256 = 0;
+    int64_t sse = 0, b256 = 0, cost;
 
     for (y = 0; y < side; y++)
         for (x = 0; x < side; x++)
@@ -4769,7 +4825,40 @@ static int64_t intra_block_rd(struct aeg_encoder *e, int mbx, int mby,
      * coded_block_flag, which the price includes. */
     if (nzz || side == 4)
         b256 = cabac_block_price(&e->cab_shadow, zz, n, tr.cat, tr.cbf_ctx);
-    return sse + trel_price(b256, lambda);
+    cost = sse + trel_price(b256, lambda);
+    if (mo) {
+        mo->tr = tr;
+        memcpy(mo->lev, lev, sizeof(int16_t) * (size_t)n);
+        mo->sse = sse;
+        mo->bits = b256;
+        mo->cost = cost;
+    }
+    return cost;
+}
+
+/* intra_block_rd(.., trel = 1, ..) of the prediction `mo` was measured
+ * with: the same levels, the same descent, the same numbers. */
+static int64_t intra_block_rd_memo(struct aeg_encoder *e, const struct ib_memo *mo,
+                                   const uint8_t *sb, int s, const uint8_t *pred,
+                                   int qp, double lambda, int16_t *lev)
+{
+    const struct trel *tr = &mo->tr;
+    const int side = tr->side, n = tr->n;
+    int64_t tsse = -1, tbits = 0, b256;
+    int i, nzz = 0;
+
+    /* lev[] receives the levels the selection settles on */
+    memcpy(lev, mo->lev, sizeof(int16_t) * (size_t)n);
+    trel_descent_kn(&e->cab_shadow, tr, lev, sb, s, pred, side, qp,
+                    trellis_intra_lambda(side == 4 ? lambda : AEG_LAMBDA(qp)),
+                    side == 4 ? 2 : 1, side == 4, &tsse, &tbits,
+                    mo->sse, mo->bits);
+    if (tsse < 0)
+        return mo->cost;        /* no levels: nothing to select */
+    for (i = 0; i < n && !nzz; i++)
+        nzz |= lev[tr->scan[i]] != 0;
+    b256 = (nzz || side == 4) ? tbits : 0;
+    return tsse + trel_price(b256, lambda);
 }
 
 /* The mode decision of one Intra_4x4 / Intra_8x8 block by rate and
@@ -4784,10 +4873,13 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
                           int s, const uint8_t *top, const uint8_t *left,
                           int tl, int top_avail, int left_avail,
                           const int *modes, int nmodes, int pmode,
-                          double lambda)
+                          double lambda, int16_t *lev_out, int *lev_ok)
 {
-    uint8_t pred[64];
-    int64_t cost[9];
+    uint8_t pred[64], preds[9][64];
+    struct ib_memo memo[9];
+    int64_t cost[9], rcost[9];
+    int16_t levs[9][64];
+    int same[9], rlev[9], bj = -1;
     int order[9], k, j, best = modes[0], kk = intra_refine_k();
     int64_t best_cost = INT64_MAX;
     int sel[9];
@@ -4821,14 +4913,23 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
     }
 
     for (k = 0; k < nmodes; k++) {
-        int m = modes[k];
+        int m = modes[k], d;
+        uint8_t *pk = preds[k];
         if (side == 4)
-            aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
+            aeg_intra_predict_4x4(pk, 4, top, left, tl, m, top_avail,
                                   left_avail, top_avail && left_avail);
         else
-            aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
+            aeg_intra_predict_8x8(pk, 8, top, left, tl, m, top_avail,
                                   left_avail, top_avail && left_avail);
-        cost[k] = intra_block_rd(e, mbx, mby, t, side, rb, sb, s, pred, lambda, 0) +
+        /* Two modes that predict the same samples (flat neighbours, missing
+         * ones) code the same residual: only the mode's own bits differ. */
+        for (d = 0; d < k; d++)
+            if (!memcmp(preds[d], pk, (size_t)(side * side)))
+                break;
+        same[k] = d < k ? same[d] : k;
+        if (same[k] == k)
+            intra_block_rd(e, mbx, mby, t, side, rb, sb, s, pk, lambda, 0, &memo[k]);
+        cost[k] = memo[same[k]].cost +
                   trel_price(256 * (m == pmode ? 1 : 4), lambda);
         /* insertion into the ranking */
         for (j = k; j > 0 && cost[order[j - 1]] > cost[k]; j--)
@@ -4840,20 +4941,30 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
     if (kk > nmodes)
         kk = nmodes;
     for (j = 0; j < kk; j++) {
-        int m = modes[order[j]];
+        int m = modes[order[j]], g = same[order[j]], d;
         int64_t c;
-        if (side == 4)
-            aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
-        else
-            aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
-        c = intra_block_rd(e, mbx, mby, t, side, rb, sb, s, pred, lambda, 1) +
-            trel_price(256 * (m == pmode ? 1 : 4), lambda);
+        for (d = 0; d < j; d++)
+            if (same[order[d]] == g)
+                break;
+        if (d < j) {
+            rcost[j] = rcost[d];
+            rlev[j] = rlev[d];
+        } else {
+            rlev[j] = j;
+            rcost[j] = intra_block_rd_memo(e, &memo[g], sb, s, preds[g], t->qp,
+                                           lambda, levs[j]);
+        }
+        c = rcost[j] + trel_price(256 * (m == pmode ? 1 : 4), lambda);
         if (c < best_cost) {
             best_cost = c;
             best = m;
+            bj = j;
         }
+    }
+    /* the winner's levels are the ones coding it will select again */
+    if (lev_out && bj >= 0) {
+        memcpy(lev_out, levs[rlev[bj]], sizeof(int16_t) * (size_t)(side * side));
+        *lev_ok = 1;
     }
     return best;
 }
@@ -4895,6 +5006,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         const uint8_t *sb = src + by * s + bx;
         uint8_t *db = dst + by * s + bx;
         int tl, nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
+        int lev_ok = 0;
 
         if (top_avail) {
             const uint8_t *tr = by ? dst + (by - 1) * s + bx : dst - s + bx;
@@ -4920,7 +5032,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         if (e->p.preset >= 3 && e->p.cabac) {
             best = intra_rd_modes(e, mbx, mby, t, 4, rb, sb, s, top, left, tl,
                                   top_avail, left_avail, modes, nmodes, pmode,
-                                  lambda);
+                                  lambda, t->level[rb], &lev_ok);
         } else for (k = 0; k < nmodes; k++) {
             int cost;
             m = modes[k];
@@ -4979,9 +5091,13 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                 for (x = 0; x < 4; x++)
                     res[y * 4 + x] = (int16_t)((int)sb[y * s + x] -
                                                (int)pred[y * 4 + x]);
-            aeg_transform_4x4(res, 4, coef);
-            aeg_quant_4x4(coef, t->level[rb], t->qp, 1);
-            if (e->p.trellis > 0 && e->p.cabac && trellis_intra_on()) {
+            /* lev_ok: the mode decision quantised and selected these
+             * levels already, with the same numbers */
+            if (!lev_ok) {
+                aeg_transform_4x4(res, 4, coef);
+                aeg_quant_4x4(coef, t->level[rb], t->qp, 1);
+            }
+            if (!lev_ok && e->p.trellis > 0 && e->p.cabac && trellis_intra_on()) {
                 /* the same level selection the inter blocks get; the block's
                  * neighbours inside the macroblock are already final */
                 struct trel tr;
@@ -5105,6 +5221,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         uint8_t top[16], left[8];
         int tl, tr_avail;
         int nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
+        int lev_ok = 0;
         uint8_t pred[64];
 
         /* The sixteen top samples.  Inside the macroblock the row above the
@@ -5148,7 +5265,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         if (e->p.preset >= 3 && e->p.cabac) {
             best = intra_rd_modes(e, mbx, mby, t, 8, 0, src + by * s + bx, s,
                                   top, left, tl, top_avail, left_avail, modes,
-                                  nmodes, pmode, lambda);
+                                  nmodes, pmode, lambda, t->level8[g], &lev_ok);
         } else for (k = 0; k < nmodes; k++) {
             int cost;
             m = modes[k];
@@ -5168,7 +5285,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
 
         aeg_intra_predict_8x8(pred, 8, top, left, tl, best, top_avail,
                               left_avail, top_avail && left_avail);
-        code_luma8_block(e, mbx, mby, t, g, pred, 8, 1);
+        code_luma8_block_lv(e, mbx, mby, t, g, pred, 8, 1, lev_ok);
     }
 
     t->bits += mode_bits;
