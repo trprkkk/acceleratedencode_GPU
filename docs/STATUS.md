@@ -521,7 +521,10 @@ for each candidate k:                 /* 1. produce */
     residual = src - pred_l           -> rd_res[16 blocks * k]
     save pred_l                       -> rd_pred[k]
 tq_batch(rd_res, 16 * n)              /* one launch for all candidates */
-iq_idct_batch(rd_lev, 16 * n)         /* one launch for all candidates */
+level selection (trellis), on the host
+iq_idct_batch(rd_lev, 16 * n)         /* only without trellis: with it the
+                                         host reconstructs (see *A lighter
+                                         host side for the batch*) */
 for each candidate k:                 /* 2. decide */
     finish(k) -> nz, cbp, reconstruction, SSE, CAVLC bits -> cost
 ```
@@ -561,13 +564,13 @@ State of the implementation (this is the provisional part):
   4-10% more bits, found the first time it ran on a device.  The decide step
   now *is* the serial loop with the luma coefficients taken from the batch;
   see *GPU groundwork on a real OpenCL device*.)
-* **Not verifiable here**: whether two launches per macroblock actually beat
-  thirty-two calls.  On the CPU the forced path costs ~10% of the transform
-  stage (the prediction add, the clip and the SSE are scalar in the batched
-  form, where the serial path uses the SSE2 `aeg_idct_add_block`), so it is
-  correctly kept off there.  A device turns those thirty-two calls into two
-  launches of 64 blocks each; whether that wins depends on the launch cost the
-  dispatcher calibrates, which is what `aeg_backend_calibrate()` exists for.
+* **Not verifiable here**: whether the batch actually beats thirty-two calls on
+  a GPU.  On the CPU the forced path used to cost ~10% (a scalar add/clip/SSE
+  loop, every candidate's 8x8 decision made twice, 8x8 candidates sent through
+  the launches for nothing); since *A lighter host side for the batch* it costs
+  the same as the serial loop within noise, so the batch's host side is no
+  longer what a device has to beat.  Whether it wins on a GPU depends on the
+  launch round trip, which the dispatcher's trial measures.
 * **To be measured on hardware** with `tools/gpu_validate.sh clip.yuv W H
   FRAMES QP`: it encodes with the CPU backend, with the dispatcher free and
   with each batched path forced, then checks that the CPU/auto/coef/rd streams
@@ -3910,8 +3913,9 @@ on the CPU (the launch overhead of a CPU OpenCL runtime, ~1 ms per call, two
 calls per macroblock), settles on the CPU after two device pictures per kind,
 and the stream is the CPU's byte for byte.  On PoCL that is the right answer;
 whether a GPU's launch cost ever makes it come out the other way is the one
-thing still to be measured on hardware, along with the per-call cost the
-batch's host side adds.
+thing still to be measured on hardware.  (The batch's host side is now as
+cheap as the serial loop, and one launch per macroblock at presets 3-4; see
+*A lighter host side for the batch*.)
 
 **CUDA without a GPU.**  `pip install nvidia-cuda-nvrtc-cu12` gives NVRTC
 12.9, which compiles the kernels for every architecture it supports.  The
@@ -3931,3 +3935,66 @@ BE=opencl FFMPEG=ffmpeg tools/gpu_validate.sh clip.yuv W H FRAMES QP
 BUILD=./build AEG_TEST_BACKEND=opencl FFMPEG=ffmpeg sh tests/run_tests.sh
 AEG_NVRTC_LIB=.../nvidia/cuda_nvrtc/lib/libnvrtc.so.12 ./build/nvrtc_check   # CUDA=1 build
 ```
+
+## A lighter host side for the batch
+
+(2026-11-01.)  What a device has to beat in the placement trial is not only
+its kernels but everything the batched path does on the host around them.
+Profiling the batch with the CPU reference ops behind it (`AEG_RD_BATCH=1
+-b cpu`, cock x3, 90 pictures, preset 3) showed three things that were the
+batch's own and not the serial loop's:
+
+* **The reconstruction from batched residuals** was a scalar add, clip and
+  store per sample followed by a separate `aeg_ssd()` pass, where the serial
+  path uses the SSE2 inverse-and-add.  It is now `aeg_add_res16_ssd()`: one
+  SSE2 pass over the sixteen 4x4 residual blocks in batch layout, saturating
+  add + unsigned pack (which clips exactly as the scalar form does), the SSE
+  accumulated in the same pass.  `coef_check` compares it with its scalar
+  reference, including residuals at both int16 extremes.
+* **The 8x8 transform decision** (`use_t8()`: an SA8D and sixteen SATDs over
+  the macroblock) was made twice per candidate, and the candidates that chose
+  the 8x8 transform still went through both launches and the level-selection
+  prep before being re-coded serially.  It is now made once, when the
+  candidate is predicted, and such candidates stay out of the batch: fewer
+  blocks transferred, gathered and launched.
+* **The inverse launch under level selection.**  With trellis on (presets 3
+  and 4) the levels the inverse needs are the ones the host has just selected,
+  so the device inverse is an upload, a launch, a synchronisation and a
+  download, for work the host does in one SIMD pass per block (the serial
+  path's own `aeg_idct_add_block()`, so the bytes are the same).  The host now
+  reconstructs there (`batch_host_inverse()`), and the batch is one launch per
+  macroblock instead of two.  An explicitly placed inverse (`-s iq=...`) still
+  runs where it was put, so `gpu_validate`'s `stageforce` still exercises the
+  device inverse.
+
+The CPU reference op behind `iq_idct_batch` also takes the shortcut the serial
+path has for empty and DC-only blocks (most blocks of a batch).  Its DC value
+is `((int16)(dc + 32)) >> 6`, the residual's own arithmetic, which wraps at the
+int16 top end where the add path's shortcut does not; `coef_check` now feeds it
+DC-only blocks across the whole int16 range, and fails on the unwrapped form.
+
+Measured (minimum of three runs; everything byte-identical to the serial
+encoder):
+
+| | before | after |
+|---|---|---|
+| CPU ops, cock x3 p3 `-t 1`, serial loop ~6.9 s | 7.53 s | 6.98 s |
+| CPU ops, vtest p3 30 pictures (serial 819-827 ms) | 920 ms | 836 ms |
+| CPU ops, `same.sh` p2-4 five clips QP 24/32 | 32.80 s | 30.19 s |
+| PoCL, vtest 12 pictures, p2 `-t 1` | 1858 ms | 1481 ms |
+| PoCL, p3 | 3192 ms | 1854 ms |
+| PoCL, p4 | 3490 ms | 2253 ms |
+| PoCL placement trial, P pictures (device / CPU, us per MB) | 1147 / 80 | 770 / 78 |
+| PoCL placement trial, B pictures | 496 / 49 | 301 / 48 |
+
+The trial still keeps the stages on the CPU on PoCL, and should: what is left
+of the device side is about one PoCL launch per macroblock.  On a GPU the same
+trial now compares the CPU against one round trip per macroblock, plus a host
+side that costs what the serial loop costs.
+
+Verification: `make test` bit-exact; the conformance suite through PoCL
+bit-exact; `backend_check` 106 checks; `gpu_validate.sh` PASS at `-p 3 -t 2`,
+`-p 4 -t 1` and `-p 2 -t 2`; `same.sh` 25/25 against the previous commit with
+the default path (`-t 2`) and 30/30 with `AEG_RD_BATCH=1`; ASan + UBSan clean
+on CPU, coefficient-batch, RD-batch and forced-stage encodes at presets 2-4,
+all writing the same stream.

@@ -1187,16 +1187,12 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     uint8_t *dst = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
-    int blk, x, y, luma_cbp = 0, qp = c->qp;
+    int blk, luma_cbp = 0, qp = c->qp;
 
     if (lev != &c->level[0][0])
         memcpy(c->level, lev, 16 * 16 * sizeof(int16_t));
     for (blk = 0; blk < 16; blk++) {
-        int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
-        uint8_t *r = dst + by * e->stride[0] + bx;
-        const uint8_t *pr = pred + by * 16 + bx;
-        int n = 0;
-
+        int n;
         if (nz) {
             n = nz[blk];
         } else {
@@ -1206,21 +1202,21 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         c->nz[blk] = (int8_t)n;
         if (n)
             luma_cbp |= 1 << blk_group(blk);
-        if (rec) {
-            const int16_t *rr = rec + 16 * blk;
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++) {
-                    int p = (int)pr[y * 16 + x] + (int)rr[y * 4 + x];
-                    r[y * e->stride[0] + x] =
-                        (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
-                }
-        } else {
-            aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, pr, 16,
+    }
+    if (rec) {
+        /* the batch's residual: add, clip and measure in one pass */
+        c->sse += (int64_t)aeg_add_res16_ssd(dst, e->stride[0], pred, rec,
+                                             src, e->stride[0]);
+    } else {
+        for (blk = 0; blk < 16; blk++) {
+            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+            aeg_idct_add_block(dst + by * e->stride[0] + bx, e->stride[0],
+                               c->level[blk], qp, pred + by * 16 + bx, 16,
                                NULL);
         }
+        /* the sixteen blocks' SSE, summed as one */
+        c->sse += aeg_ssd(16, 16, dst, e->stride[0], src, e->stride[0]);
     }
-    /* the sixteen blocks' SSE, summed as one */
-    c->sse += aeg_ssd(16, 16, dst, e->stride[0], src, e->stride[0]);
     c->cbp = (c->cbp & 0x30) | luma_cbp;
     if (!e->p.cabac) {                  /* CAVLC estimate, see above */
         int g, k;
@@ -1660,6 +1656,22 @@ static void trellis_luma8(struct aeg_encoder *e, const uint8_t *src, int stride,
                  lambda, 1, 0);
 }
 
+/* Whether the batched paths reconstruct on the host instead of launching the
+ * inverse.  With the level selection on (trellis), the levels the inverse
+ * needs are the ones the host has just selected, so a device inverse is an
+ * upload of those levels, a launch, a synchronisation and a download of the
+ * residual -- a full round trip, for work the host does in one SIMD pass per
+ * block (aeg_idct_add_block(), the serial path's own reconstruction, so the
+ * result is the same bytes).  Any device's round trip costs more than that,
+ * so the batch keeps one launch per macroblock (the forward one, whose
+ * output the host needs anyway) instead of two.  An explicitly placed
+ * inverse (-s iq=...) still runs where it was put. */
+static int batch_host_inverse(const struct aeg_encoder *e)
+{
+    return e->p.trellis > 0 && e->p.cabac &&
+           e->d.forced[AEG_STAGE_IQUANT_IDCT] < 0;
+}
+
 static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
@@ -1683,6 +1695,11 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
              * rebuilt afterwards, because it was made from the old levels. */
             trellis_luma4(e, mbx, mby, c, qp, (int16_t (*)[16])e->coef_lev,
                           inter_trellis_lambda(qp));
+            if (batch_host_inverse(e)) {
+                luma_inter_finish(e, mbx, mby, c, e->coef_lev, NULL, NULL,
+                                  pred);
+                return;
+            }
             t0 = aeg_now_ns();
             e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp,
                                    e->coef_rec);
@@ -5529,6 +5546,9 @@ static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
  * once, and only then are the costs compared.  That is two kernel launches per
  * macroblock instead of two per candidate, and the launches grow with the
  * candidate count (64 blocks instead of 16), which is what a device needs.
+ * With the level selection on it is one: the host reconstructs from the
+ * levels it selected (batch_host_inverse()).  Candidates whose residual wants
+ * the 8x8 transform stay out of the launches altogether.
  *
  * It cannot be lifted to a whole picture without changing the bitstream: the
  * motion search predicts each macroblock's vectors from its neighbours'
@@ -5550,50 +5570,70 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     const int n = e->mb_ncand;
     const int trel = e->p.trellis > 0 && e->p.cabac;
-    int k;
+    const int host_inv = batch_host_inverse(e);
+    int k, nb = 0;
+    /* per candidate: its slot in the batch, or -1 when its residual wants the
+     * 8x8 transform -- the batch only produces 4x4 blocks, so such a candidate
+     * is coded by the serial 8x8 path in the decision below and has no
+     * business in the launches (decided once, here: use_t8() reads only the
+     * source and the candidate's prediction, so asking again later would give
+     * the same answer for the price of another SA8D and sixteen SATDs) */
+    int slot[AEG_MB_CAND_MAX];
     int64_t t0;
 
     /* 1. every candidate's prediction (luma and chroma: the chroma one is
-     *    what the decision prices the candidate's chroma against), and its
-     *    luma residual in the batch buffer */
+     *    what the decision prices the candidate's chroma against), and the
+     *    luma residual of each 4x4 candidate in the batch buffer */
     for (k = 0; k < n; k++) {
         mbenc c;
         cand_enc(e, k, qp, &c);
         inter_predict_typed(e, mbx, mby, &c);
-        luma_inter_gather(e, src, e->pred_l, e->rd_res + 256 * k);
         memcpy(e->rd_pred + 256 * k, e->pred_l, 256);
         memcpy(e->rd_predc + 128 * k, e->pred_c, 128);
+        if (use_t8(e, mbx, mby, &c)) {
+            slot[k] = -1;
+            continue;
+        }
+        slot[k] = nb;
+        luma_inter_gather(e, src, e->pred_l, e->rd_res + 256 * nb);
+        nb++;
     }
-    /* 2. one launch each for the whole macroblock's candidates */
-    t0 = aeg_now_ns();
-    e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * n, qp, 0, e->rd_lev,
-                      e->rd_nz);
-    stage_rec(e, AEG_STAGE_TRANSFORM,
-                        e->d.ops.backend != AEG_BACKEND_CPU,
-                        aeg_now_ns() - t0);
-    /* The level selection runs on the host between the two launches, on
-     * every candidate's levels exactly as code_luma_inter() runs it on one
-     * candidate's: it reads only the source, the candidate's prediction and
-     * its own levels (plus the neighbours, which no candidate changes), so
-     * running it for all of them first selects the same levels.  The
-     * reconstruction is then made from the selected levels. */
-    if (trel) {
-        for (k = 0; k < n; k++) {
-            mbenc c;
-            cand_enc(e, k, qp, &c);
-            memcpy(e->pred_l, e->rd_pred + 256 * k, 256);
-            if (use_t8(e, mbx, mby, &c))
-                continue;           /* coded by the 8x8 path below */
-            trellis_luma4(e, mbx, mby, &c, qp,
-                          (int16_t (*)[16])(e->rd_lev + 256 * k),
-                          inter_trellis_lambda(qp));
+    /* 2. one launch each for the whole macroblock's 4x4 candidates */
+    if (nb) {
+        t0 = aeg_now_ns();
+        e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * nb, qp, 0, e->rd_lev,
+                          e->rd_nz);
+        stage_rec(e, AEG_STAGE_TRANSFORM,
+                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_now_ns() - t0);
+        /* The level selection runs on the host between the two launches, on
+         * every candidate's levels exactly as code_luma_inter() runs it on
+         * one candidate's: it reads only the source, the candidate's
+         * prediction and its own levels (plus the neighbours, which no
+         * candidate changes), so running it for all of them first selects
+         * the same levels.  The reconstruction is then made from the selected
+         * levels. */
+        if (trel) {
+            for (k = 0; k < n; k++) {
+                mbenc c;
+                if (slot[k] < 0)
+                    continue;
+                cand_enc(e, k, qp, &c);
+                memcpy(e->pred_l, e->rd_pred + 256 * k, 256);
+                trellis_luma4(e, mbx, mby, &c, qp,
+                              (int16_t (*)[16])(e->rd_lev + 256 * slot[k]),
+                              inter_trellis_lambda(qp));
+            }
+        }
+        if (!host_inv) {
+            t0 = aeg_now_ns();
+            e->d.ops.iq_idct_batch(e->d.ops.priv, e->rd_lev, 16 * nb, qp,
+                                   e->rd_rec);
+            stage_rec(e, AEG_STAGE_IQUANT_IDCT,
+                                e->d.ops.backend != AEG_BACKEND_CPU,
+                                aeg_now_ns() - t0);
         }
     }
-    t0 = aeg_now_ns();
-    e->d.ops.iq_idct_batch(e->d.ops.priv, e->rd_lev, 16 * n, qp, e->rd_rec);
-    stage_rec(e, AEG_STAGE_IQUANT_IDCT,
-                        e->d.ops.backend != AEG_BACKEND_CPU,
-                        aeg_now_ns() - t0);
     /* 3. decide: the serial candidate loop of code_mb() step for step -- the
      *    same price (full_price() against the running best), the same
      *    refinement of a candidate still in the running, the same strict
@@ -5607,12 +5647,14 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
         memcpy(e->pred_c, e->rd_predc + 128 * k, 128);
         /* The batch only produces 4x4 blocks: a candidate whose residual wants
          * the 8x8 transform is coded through the serial path. */
-        if (use_t8(e, mbx, mby, &t)) {
+        if (slot[k] < 0) {
             code_luma_inter8(e, mbx, mby, &t);
         } else {
-            luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * k,
-                              trel ? NULL : e->rd_nz + 16 * k,
-                              e->rd_rec + 256 * k, e->rd_pred + 256 * k);
+            const int j = slot[k];
+            luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * j,
+                              trel ? NULL : e->rd_nz + 16 * j,
+                              host_inv ? NULL : e->rd_rec + 256 * j,
+                              e->rd_pred + 256 * k);
         }
         t.bits += inter_hdr_bits(e, &t);
         cost = t.sse + (int64_t)(lambda * t.bits + 0.5);

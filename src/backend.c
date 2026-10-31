@@ -80,8 +80,29 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
      * disagreed with the reference decoder -- exactly the trap that made the
      * first SIMD inverse transform look right.  It now calls the same function
      * the scalar path is built from, so there is one arithmetic to be wrong. */
-    for (b = 0; b < nblk; b++)
-        aeg_idct_residual(level + 16 * b, qp, res + 16 * b);
+    /* Most blocks of a batch are empty or DC-only (the quantiser and the
+     * level selection see to that), and for those the two passes reduce to a
+     * constant: d[0] = (int16)(level[0] * scale << qp/6) + 32 goes through
+     * the first pass truncated to int16 and through the second unchanged, so
+     * every sample is ((int16)d[0]) >> 6 -- the same value aeg_idct_residual()
+     * computes, including at the int16 extremes (coef_check covers both). */
+    for (b = 0; b < nblk; b++) {
+        const int16_t *l = level + 16 * b;
+        int16_t *r = res + 16 * b;
+        int i, ac = 0;
+        for (i = 1; i < 16; i++)
+            ac |= l[i];
+        if (!ac) {
+            int16_t d0 = (int16_t)((int16_t)((int32_t)l[0] *
+                                             aeg_dequant_ls[qp % 6][0]
+                                             << (qp / 6)) + 32);
+            int16_t v = (int16_t)(d0 >> 6);
+            for (i = 0; i < 16; i++)
+                r[i] = v;
+        } else {
+            aeg_idct_residual(l, qp, r);
+        }
+    }
     return AEG_OK;
 }
 

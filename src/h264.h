@@ -393,6 +393,14 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
 void aeg_idct_residual(const int16_t *level, int qp, int16_t *res);
 void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
                    int pred_stride, const int16_t *res, int w, int h);
+/* dst = clip(pred + rec) for a 16x16 luma block whose residual is sixteen
+ * contiguous 4x4 blocks (the batch layout), returning the SSE of dst against
+ * src; _c is the scalar reference the SIMD form is checked against. */
+uint64_t aeg_add_res16_ssd(uint8_t *dst, int stride, const uint8_t *pred,
+                           const int16_t *rec, const uint8_t *src, int sstride);
+uint64_t aeg_add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
+                             const int16_t *rec, const uint8_t *src,
+                             int sstride);
 
 /* forward quantisation of a 4x4 block, writes `level` (raster order) */
 /* Rounding offset of the forward quantiser for `1 << qbits` and the reference

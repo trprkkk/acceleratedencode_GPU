@@ -288,6 +288,16 @@ int main(int argc, char **argv)
                     break;
                 }
             }
+            /* the CPU op shortcuts empty and DC-only blocks: give it both,
+             * with DC levels across the whole int16 range (the dequantised
+             * DC and its +32 rounding wrap in int16 at the top end) */
+            if (q % 4 == 1) {
+                memset(levb + 16 * (q % 8), 0, 32);
+                levb[16 * ((q + 3) % 8)] =
+                    (int16_t)((q % 3 == 0) ? rand() % 65536 - 32768
+                                           : rand() % 4001 - 2000);
+                memset(levb + 16 * ((q + 3) % 8) + 1, 0, 30);
+            }
             /* inverse: the residual, then the same through the batch op */
             cpu.iq_idct_batch(cpu.priv, levb, 8, qp, resa);
             for (b = 0; b < 8; b++) {
@@ -452,6 +462,36 @@ int main(int argc, char **argv)
         if (s1 != s2) {
             printf("   ssd %dx%d mismatch %lld %lld\n", w, h, (long long)s1, (long long)s2);
             bad++;
+        }
+    }
+    /* the batch path's reconstruction + SSE against its scalar reference */
+    {
+        static uint8_t p16[256], src[48 * 20], d1[48 * 20], d2[48 * 20];
+        static int16_t rec[256];
+        int r2, k2;
+        for (r2 = 0; r2 < rounds / 50 + 10 && bad < 5; r2++) {
+            const int amp = (r2 % 3 == 0) ? 32767 : ((r2 % 3 == 1) ? 300 : 20);
+            const int ss = (r2 & 1) ? 48 : 16;
+            uint64_t s1, s2;
+            for (k2 = 0; k2 < 256; k2++) {
+                p16[k2] = (uint8_t)rand();
+                rec[k2] = (int16_t)(rand() % (2 * amp + 1) - amp);
+            }
+            if (r2 % 3 == 0)
+                rec[r2 % 256] = -32768;
+            for (k2 = 0; k2 < (int)sizeof(src); k2++)
+                src[k2] = (uint8_t)rand();
+            memset(d1, 0x33, sizeof(d1));
+            memset(d2, 0x33, sizeof(d2));
+            s1 = aeg_add_res16_ssd(d1 + 3, ss, p16, rec, src + 5, ss);
+            s2 = aeg_add_res16_ssd_c(d2 + 3, ss, p16, rec, src + 5, ss);
+            cases++;
+            if (s1 != s2 || memcmp(d1, d2, sizeof(d1))) {
+                printf("   add_res16_ssd: round %d: sse %llu vs %llu%s\n", r2,
+                       (unsigned long long)s1, (unsigned long long)s2,
+                       memcmp(d1, d2, sizeof(d1)) ? ", pixels differ" : "");
+                bad++;
+            }
         }
     }
     printf("   coef_check: %d cases, %s\n", cases,

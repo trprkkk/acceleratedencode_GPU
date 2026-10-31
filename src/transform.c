@@ -932,6 +932,76 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
         }
 }
 
+/* A macroblock's luma reconstruction from batched residuals: `rec` holds the
+ * sixteen 4x4 blocks (contiguous, raster order inside each block and between
+ * them, as iq_idct_batch() writes them), `pred` is 16x16 with stride 16.
+ * dst = clip(pred + rec), and the return value is the SSE of dst against
+ * src -- one pass instead of a per-pixel clip loop followed by aeg_ssd().
+ * Exact: pred + res saturated to int16 and then packed with unsigned
+ * saturation clips to 0..255 exactly as the scalar form does (a sum outside
+ * int16 is outside 0..255 either way), and the SSE is an integer sum
+ * (at most 256 * 255^2, so int32 lanes cannot overflow). */
+static uint64_t add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
+                                const int16_t *rec, const uint8_t *src,
+                                int sstride)
+{
+    uint64_t sse = 0;
+    int x, y;
+    for (y = 0; y < 16; y++)
+        for (x = 0; x < 16; x++) {
+            int r = rec[16 * ((y >> 2) * 4 + (x >> 2)) + (y & 3) * 4 + (x & 3)];
+            int p = (int)pred[y * 16 + x] + r, d;
+            p = p < 0 ? 0 : (p > 255 ? 255 : p);
+            dst[y * stride + x] = (uint8_t)p;
+            d = p - (int)src[y * sstride + x];
+            sse += (uint64_t)(d * d);
+        }
+    return sse;
+}
+
+uint64_t aeg_add_res16_ssd(uint8_t *dst, int stride, const uint8_t *pred,
+                           const int16_t *rec, const uint8_t *src, int sstride)
+{
+#if defined(__SSE2__)
+    const __m128i z = _mm_setzero_si128();
+    __m128i acc = z;
+    int y;
+    for (y = 0; y < 16; y++) {
+        const int16_t *r = rec + 64 * (y >> 2) + (y & 3) * 4;
+        __m128i lo = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i *)(r + 0)),
+            _mm_loadl_epi64((const __m128i *)(r + 16)));
+        __m128i hi = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i *)(r + 32)),
+            _mm_loadl_epi64((const __m128i *)(r + 48)));
+        __m128i p = _mm_loadu_si128((const __m128i *)(pred + y * 16));
+        __m128i o = _mm_packus_epi16(
+            _mm_adds_epi16(_mm_unpacklo_epi8(p, z), lo),
+            _mm_adds_epi16(_mm_unpackhi_epi8(p, z), hi));
+        __m128i sv = _mm_loadu_si128((const __m128i *)(src + y * sstride));
+        __m128i d0 = _mm_sub_epi16(_mm_unpacklo_epi8(o, z),
+                                   _mm_unpacklo_epi8(sv, z));
+        __m128i d1 = _mm_sub_epi16(_mm_unpackhi_epi8(o, z),
+                                   _mm_unpackhi_epi8(sv, z));
+        _mm_storeu_si128((__m128i *)(dst + y * stride), o);
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(d0, d0));
+        acc = _mm_add_epi32(acc, _mm_madd_epi16(d1, d1));
+    }
+    acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 8));
+    acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 4));
+    return (uint64_t)(uint32_t)_mm_cvtsi128_si32(acc);
+#else
+    return add_res16_ssd_c(dst, stride, pred, rec, src, sstride);
+#endif
+}
+
+uint64_t aeg_add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
+                             const int16_t *rec, const uint8_t *src,
+                             int sstride)
+{
+    return add_res16_ssd_c(dst, stride, pred, rec, src, sstride);
+}
+
 /* ------------------------------------------------------------------ */
 /* 8x8 transform (High profile)                                        */
 /* ------------------------------------------------------------------ */
