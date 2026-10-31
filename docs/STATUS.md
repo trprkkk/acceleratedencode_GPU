@@ -2743,6 +2743,11 @@ shapes -- four searches and two joint refinements.  k = 96 below preset 4,
 | 3 | 128 | +0.19 % | | -11.8 % |
 | 4 | 64 | +0.03 % | -0.02 % | -6.2 % / -4.2 % |
 
+At preset 4 the same gate also covers B_8x8 (`AEG_BPG8=0` lifts it): +0.01 /
++0.01 % for -1.3 / -1.5 %.  The same gate on the P partitions does not pay
+(16x8 / 8x16 / P_8x8 at k = 64: +0.06 % for -1.7 %; k = 128: +0.40 % for
+-4 %): a P macroblock's 16x16 cost says much less about its partitions.
+
 A fixed threshold instead of one in lambdas is worse at every QP mix (512:
 +0.08 % for -2.9 %, 1024: +0.26 % for -11 %), because the partitions matter
 more at the low QPs where lambda is small.  `AEG_BPGL=0` writes the previous

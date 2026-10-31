@@ -4380,9 +4380,12 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
          * UMH early exit), at preset 3 off measured +0.04 / +0.05 % (5 clips /
          * validation set) for -3.7 / -2.5 % of the time, so it is preset 4
          * only (there off is +0.08 / +0.06 % for -4.2 / -2.6 %).  AEG_B8X8
-         * overrides. */
-        if (ENV_INT("AEG_B8X8", -1) >= 0 ? ENV_INT("AEG_B8X8", -1) > 0
-                                          : e->p.preset >= 4)
+         * overrides.  The 16x8 / 8x16 gate above applies to it as well
+         * (+0.01 / +0.01 % at preset 4 for -1.3 / -1.5 %; AEG_BPG8=0 lifts
+         * it). */
+        if ((ENV_INT("AEG_B8X8", -1) >= 0 ? ENV_INT("AEG_B8X8", -1) > 0
+                                          : e->p.preset >= 4) &&
+            (parts_ok || !ENV_INT("AEG_BPG8", 1)))
             b_candidate_8x8(e, mbx, mby, (const int (*)[2])mv16);
     }
     /* direct: vectors derived, nothing sent */
