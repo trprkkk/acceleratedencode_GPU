@@ -1517,6 +1517,20 @@ static int trellis_intra_mode(void)
 #define trellis_intra_on() (trellis_intra_mode() == 1 || \
     (trellis_intra_mode() == 2 && (e->cur_is_p || e->cur_is_b)) || \
     trellis_intra_mode() == 3)
+/* The lambda of the level selection on inter luma blocks: 0.75x the plain
+ * one.  The mode decision already prices P pictures at 0.65x (they are the
+ * references); the selection used the plain lambda and so dropped levels a
+ * reference picture should keep.  Measured, ours against ours: preset 3
+ * -0.34 / -0.20 % (5 clips / validation set), preset 4 -0.33 / -0.15 %, and
+ * -0.40 % over QP 16-25, where the gap to x264 was largest (0.65x on P with
+ * 0.75x on B: -0.34 / -0.24 % at preset 3 but -0.28 / -0.09 % at 4; 0.75x on
+ * B alone -0.10 %, on P alone -0.33 %; 0.6x -0.28 %; 1.3x +0.89 % at QP
+ * 16-25).  AEG_TLI sets the factor in percent. */
+static double inter_trellis_lambda(int qp)
+{
+    return AEG_LAMBDA(qp) * ENV_INT("AEG_TLI", 75) / 100.0;
+}
+
 #define trellis_intra_lambda(l) (trellis_intra_mode() == 3 ? (l) * 0.5 : (l))
 
 /* Whether the chroma AC blocks get the level selection.  AEG_TCHROMA. */
@@ -1642,7 +1656,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
              * selection runs on them -- and the reconstruction has to be
              * rebuilt afterwards, because it was made from the old levels. */
             trellis_luma4(e, mbx, mby, c, qp, (int16_t (*)[16])e->coef_lev,
-                          AEG_LAMBDA(qp));
+                          inter_trellis_lambda(qp));
             t0 = aeg_now_ns();
             e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp,
                                    e->coef_rec);
@@ -1667,7 +1681,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         aeg_transform_4x4(e->coef_res + 16 * blk, 4, coef);
         aeg_quant_4x4(coef, c->level[blk], qp, 0);
     }
-    trellis_luma4(e, mbx, mby, c, qp, c->level, AEG_LAMBDA(qp));
+    trellis_luma4(e, mbx, mby, c, qp, c->level, inter_trellis_lambda(qp));
     luma_inter_finish(e, mbx, mby, c, &c->level[0][0], NULL, NULL, pred);
 }
 
@@ -1719,7 +1733,7 @@ static void code_luma8_block_lv(struct aeg_encoder *e, int mbx, int mby, mbenc *
     if (!have_levels && (!intra || trellis_intra_on()))
         trellis_luma8(e, src + by * s + bx, s, pred, pred_stride, c->level8[g],
                       c->qp, intra ? trellis_intra_lambda(AEG_LAMBDA(c->qp))
-                                   : AEG_LAMBDA(c->qp));
+                                   : inter_trellis_lambda(c->qp));
     {
         int dummy;
         c->nz8[g] = aeg_nz_last(c->level8[g], 64, &dummy) != 0;

@@ -2815,6 +2815,36 @@ Pruning inter candidates on their luma SSE inside the luma coding is not worth
 building: only 5 % of the inter candidates are ruled out by the luma
 distortion at all, and 2.4 % of them repeat an earlier candidate's motion.
 
+## Back to quality: the high-quality end
+
+Against x264 medium (`psy=0`, constant QP, whole-sequence PSNR) after the
+speed round, preset 3: -4.77 % (cock +0.46, vtest -10.98, mega -6.31, short
+-9.31, tree +2.31); preset 4 -5.58 %.  Split by QP: over 16-25 cock +2.32,
+vtest -12.11, mega -3.92, short -12.03, tree +2.75; over 28-37 -0.21, -12.90,
+-7.78, -8.20, +0.34.  Where the gap is:
+
+* not intra: all-intra (`-g 1 --bframes 0` against `keyint=1`) we are -1.3
+  to -2.6 % at QP 16-25 on every clip;
+* in P coding: P only (`--bframes 0` against `bframes=0`) we are -1.6 to
+  -5.6 % at QP 28-37 but +0.8 % (cock) and +1.7 % (tree) at 16-25;
+* not the motion refinement: `--refine-cand 1` is -0.17 % at QP 16-25 for
+  +62 % time, `--refine-mv 3` -0.08 % for +29 % (x264's own subme 7 -> 9 is
+  -1.9 % there, which our RD decisions already have most of);
+* not the mode lambda of P pictures (0.5x: +0.57 %, 0.85x: +0.29 % at QP
+  16-25, P only), nor the macroblock tree's strength (weaker below QP 28
+  helps cock and tree by 0.3-0.5 % and costs vtest 6-14 %), nor the I offset
+  (`--iqp 2`: -0.45 % at QP 16-25 but -0.02 / +0.53 % over the usual range);
+* a third reference is worth -0.29 % to x264 itself (-0.18 % at QP 16-25).
+
+**The level selection's lambda on inter blocks** was the plain lambda of the
+QP, while the mode decision prices P pictures at 0.65x.  At 0.75x (both P and
+B; `AEG_TLI` in percent): preset 3 -0.34 / -0.20 % (5 clips / validation set),
+preset 4 -0.33 / -0.15 %, and -0.40 % over QP 16-25 (cock -0.58, tree -0.18),
+for no time.  On P alone -0.33 %, on B alone -0.10 %; 0.6x -0.28 %, 0.45x
+-0.35 % at QP 16-25 (vtest turns positive); 1.3x +0.89 %.  `AEG_TLI=100`
+writes the previous stream; decoder-exact at presets 3 and 4, frame threads
+identical 32/32.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
