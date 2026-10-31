@@ -2845,6 +2845,20 @@ for no time.  On P alone -0.33 %, on B alone -0.10 %; 0.6x -0.28 %, 0.45x
 writes the previous stream; decoder-exact at presets 3 and 4, frame threads
 identical 32/32.
 
+**Chroma in the mode decision from preset 2** (`AEG_CDECIDE`; it was preset
+4 only, at -0.34 % for 10 % of the time when it was added).  Pricing each
+candidate with its chroma coded too measured, at QP 16-25 and preset 3,
+-1.02 % (cock -1.13, mega -2.30, short -1.22): the chroma share of the rate
+grows as the QP falls.  Over the usual range: preset 3 -0.51 / -0.73 % (5
+clips / validation set) for +7 / +10 % of the time, preset 2 -0.49 / -0.58 %
+for +9 %.  The speed round bought ten times that time for a tenth of the
+loss, so this is the better place for it.  `AEG_CDECIDE=0` writes the
+previous stream; decoder-exact at presets 2 and 3, frame threads identical.
+Also measured at QP 16-25, preset 3, and not taken: chroma in the motion
+search (`AEG_CHROMAME=1`, -0.20 %), the inter chroma level selection at 0.75x
+/ 1.3x lambda (-0.03 / +0.15 %), the Intra_8x8 level selection at 0.75x /
+0.65x lambda in P and B pictures (-0.04 / +0.03 %).
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,

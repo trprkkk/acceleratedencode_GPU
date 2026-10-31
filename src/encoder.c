@@ -5692,18 +5692,21 @@ static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
  * vector predicting luma a little better can predict chroma a lot worse, or
  * that a candidate's chroma residual costs bits.  `t` itself is left as it
  * was (luma only): the winner's chroma is coded once more afterwards, and the
- * chroma reconstruction this writes is overwritten then.  Preset 4;
+ * chroma reconstruction this writes is overwritten then.  Preset 2 and up;
  * AEG_CDECIDE=0/1 overrides. */
 static int chroma_decide_on(const struct aeg_encoder *e)
 {
-    /* -0.34% of BD-rate for 10% of the time on the real clips, so it sits
-     * with the slowest preset */
+    /* -0.34% of BD-rate for 10% of the time on the real clips when it was
+     * added, so it sat with the slowest preset.  Re-measured after the speed
+     * round: preset 3 -0.51 / -0.73 % (5 clips / validation set) for +7 /
+     * +10 % of the time, -1.02 % over QP 16-25; preset 2 -0.49 / -0.58 % for
+     * +9 %.  On from preset 2. */
     static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_CDECIDE");
         v = ev ? atoi(ev) != 0 : -1;
     }
-    return v >= 0 ? v : e->p.preset >= 4;
+    return v >= 0 ? v : e->p.preset >= 2;
 }
 
 static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
