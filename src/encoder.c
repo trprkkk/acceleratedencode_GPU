@@ -261,6 +261,22 @@ struct aeg_encoder {
     int rd_last_qp;
     int rd_last_dqp;
 
+    /* code_chroma() results of the current code_mb() call, keyed by what they
+     * depend on (see code_chroma()); cmemo_gen moves on per macroblock. */
+    struct cmemo {
+        unsigned gen;
+        int inter, qp;
+        uint8_t pred[2][64];
+        int16_t level[10][16];      /* AEG_BLK_CHROMA_DC .. CHROMA_CR + 3 */
+        int8_t nz[10];
+        int cbp;                    /* the chroma bits */
+        int64_t dsse;
+        int dbits;
+        uint8_t rec[2][64];
+    } cmemo[8];
+    unsigned cmemo_gen;
+    int cmemo_next;
+
     /* One RBSP buffer per slice: a slice is its own NAL unit, and with slice
      * threads the slices are written by different threads at the same time.
      * They are all allocated before the threads start, because the pointers
@@ -1832,13 +1848,85 @@ static int use_t8(const struct aeg_encoder *e, int mbx, int mby, const mbenc *c)
 /* ------------------------------------------------------------------ */
 /* Chroma coding                                                       */
 /* ------------------------------------------------------------------ */
+static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                            int inter);
+
+/* The chroma of a macroblock depends on the prediction (pred_c), the QP, and
+ * whether the macroblock is intra -- the neighbours' reconstruction and flags
+ * and the shadow coder's state do not change while code_mb() decides.  The
+ * decision codes the same chroma many times over (every intra candidate with
+ * the same chroma mode, the winner once more at the end), so the result is
+ * kept per macroblock and replayed, reconstruction included. */
 static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                         int inter)
+{
+    const int cs = e->stride[1];
+    struct cmemo *m;
+    int pl, y, k;
+    int64_t sse0;
+    int bits0;
+
+    if (!inter) {
+        int avail_l = mbx > 0, avail_t = mby > e->top_row;
+        /* both predictions first: each reads only the neighbours of its own
+         * plane, which the other plane's reconstruction does not touch */
+        for (pl = 0; pl < 2; pl++) {
+            uint8_t *base = e->recp[1 + pl] + mby * 8 * cs + mbx * 8;
+            /* The predictor wants a contiguous left column; the picture is
+             * strided, so gather it first (same as the luma path). */
+            uint8_t leftc[8];
+            for (y = 0; y < 8; y++)
+                leftc[y] = avail_l ? base[y * cs - 1] : 128;
+            aeg_intra_predict_chroma(e->pred_c[pl], 8, base - cs, leftc,
+                                     avail_t, avail_l, avail_t && avail_l,
+                                     c->chroma_mode);
+        }
+    }
+    for (k = 0; k < 8; k++) {
+        m = &e->cmemo[k];
+        if (m->gen == e->cmemo_gen && m->inter == inter && m->qp == c->qp &&
+            !memcmp(m->pred, e->pred_c, sizeof(m->pred))) {
+            memcpy(c->level[AEG_BLK_CHROMA_DC], m->level, sizeof(m->level));
+            memcpy(&c->nz[AEG_BLK_CHROMA_DC], m->nz, sizeof(m->nz));
+            c->cbp = (c->cbp & 0x0f) | m->cbp;
+            c->sse += m->dsse;
+            c->bits += m->dbits;
+            for (pl = 0; pl < 2; pl++) {
+                uint8_t *base = e->recp[1 + pl] + mby * 8 * cs + mbx * 8;
+                for (y = 0; y < 8; y++)
+                    memcpy(base + y * cs, m->rec[pl] + y * 8, 8);
+            }
+            return;
+        }
+    }
+    sse0 = c->sse;
+    bits0 = c->bits;
+    code_chroma_run(e, mbx, mby, c, inter);
+    m = &e->cmemo[e->cmemo_next];
+    e->cmemo_next = (e->cmemo_next + 1) & 7;
+    m->gen = e->cmemo_gen;
+    m->inter = inter;
+    m->qp = c->qp;
+    memcpy(m->pred, e->pred_c, sizeof(m->pred));
+    memcpy(m->level, c->level[AEG_BLK_CHROMA_DC], sizeof(m->level));
+    memcpy(m->nz, &c->nz[AEG_BLK_CHROMA_DC], sizeof(m->nz));
+    m->cbp = c->cbp & 0x30;
+    m->dsse = c->sse - sse0;
+    m->dbits = c->bits - bits0;
+    for (pl = 0; pl < 2; pl++) {
+        const uint8_t *base = e->recp[1 + pl] + mby * 8 * cs + mbx * 8;
+        for (y = 0; y < 8; y++)
+            memcpy(m->rec[pl] + y * 8, base + y * cs, 8);
+    }
+}
+
+/* code_chroma() itself; pred_c already holds the prediction of both planes */
+static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
+                            int inter)
 {
     static const int bxy[4][2] = { {0, 0}, {4, 0}, {0, 4}, {4, 4} };
     int qpc = aeg_qp_chroma(c->qp, 0);
     int pl, blk, i, x, y;
-    int avail_l = mbx > 0, avail_t = mby > e->top_row;
 
     c->cbp &= 0x0f;
     for (pl = 0; pl < 2; pl++) {
@@ -1849,16 +1937,6 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         int32_t dcout[4];
         int nz_dc = 0;
 
-        if (!inter) {
-            /* The predictor wants a contiguous left column; the picture is
-             * strided, so gather it first (same as the luma path). */
-            uint8_t leftc[8];
-            for (y = 0; y < 8; y++)
-                leftc[y] = avail_l ? base[y * e->stride[1] - 1] : 128;
-            aeg_intra_predict_chroma(pred, 8, base - e->stride[1], leftc,
-                                     avail_t, avail_l, avail_t && avail_l,
-                                     c->chroma_mode);
-        }
         for (blk = 0; blk < 4; blk++) {
             int16_t res[16], coef[16];
             for (y = 0; y < 4; y++)
@@ -5753,6 +5831,7 @@ static void mvref_order(struct aeg_encoder *e, int mbx, int mby,
 
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
+    e->cmemo_gen++;             /* code_chroma()'s results are per macroblock */
     /* Both snapshots are written by the first candidate that is evaluated, and
      * at least one always is (a preset above 0 with no legal Intra_16x16 mode
      * returns above), but initialising them keeps the compiler from warning

@@ -224,11 +224,15 @@ static inline int aeg_nz_last(const int16_t *v, int n, int *last)
 #if defined(__SSE2__)
     const __m128i z = _mm_setzero_si128();
     for (; i + 8 <= n; i += 8) {
-        unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi16(
-                         _mm_loadu_si128((const __m128i *)(v + i)), z)) ^ 0xffffu;
+        const __m128i e = _mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(v + i)), z);
+        /* one bit per value; the count by SWAR (the generic x86-64 target
+         * has no popcnt instruction and __builtin_popcount is a call) */
+        unsigned m = ((unsigned)_mm_movemask_epi8(_mm_packs_epi16(e, e)) & 0xffu) ^ 0xffu;
         if (m) {
-            cnt += __builtin_popcount(m) >> 1;
-            l = i + ((31 - __builtin_clz(m)) >> 1);
+            unsigned c = m - ((m >> 1) & 0x55u);
+            c = (c & 0x33u) + ((c >> 2) & 0x33u);
+            cnt += (int)((c + (c >> 4)) & 0x0fu);
+            l = i + (31 - __builtin_clz(m));
         }
     }
 #endif
