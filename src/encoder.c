@@ -3714,6 +3714,15 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
             int geo[4][4], b0, n = sub_cnt[s], satd_sum = 0, bits, mv[4][2],
                 pmv[4][2];
             int traded = 0;   /* the trial cannot beat the best shape */
+            /* The 8x4, 4x8 and 4x4 shapes only with --partitions bit 16:
+             * leaving them out is -0.10 / -0.12 % BD-rate at preset 3 (the
+             * two clip sets), +0.03 / -0.07 % at preset 4 and -0.3 / -1.0 %
+             * at presets 2 / 1, for 2-11 % of the time -- the shape decision
+             * by SATD picks them where the RD pass then does not want them,
+             * or where it does and is wrong (x264's medium preset leaves
+             * them out too). */
+            if (s && !(e->p.partitions & 16))
+                continue;
             memcpy(trial, cur, sizeof(trial));
             memcpy(tavail, avail, sizeof(tavail));
             bits = aeg_ue_bits((uint32_t)s);

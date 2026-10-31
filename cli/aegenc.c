@@ -94,7 +94,7 @@ static void usage(void)
 "                   1 = off, 0 = auto (CPUs + 1, max 8, unless -t 1;\n"
 "                   B pictures, constant QP, one slice, CPU backend)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
-"                   8=P_8x8 (8x8 with 8x4/4x8/4x4 sub-partitions)\n"
+"                   8=P_8x8  16=its 8x4/4x8/4x4 sub-partitions\n"
 "                   (default 15; P_8x8 is skipped by preset 0, and so\n"
 "                   are bits 1-3 for B pictures -- 16x8 and 8x16 are\n"
 "                   the only B shapes so far)\n"

@@ -199,7 +199,7 @@ typedef struct aeg_params {
      * off, 1 = the candidates that only remove or shrink coefficients (see
      * trellis_luma4() in encoder.c).  -1 means "as the preset says". */
     int trellis;
-    int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8  */
+    int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8, 16=8x8 split further */
     int chroma_me;            /* include chroma in motion SAD           */
     int verbose;              /* log verbosity                          */
     int force_cpu_reference;  /* also compute CPU path for validation   */

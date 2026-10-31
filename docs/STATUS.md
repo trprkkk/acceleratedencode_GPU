@@ -2663,6 +2663,27 @@ inverse transform 4 %, the CABAC pricer 4 %, nothing else above 3 %); what is
 left is mostly decisions, which is the early-termination stage (each gated at
 +0.1 % BD-rate).
 
+## P_8x8 without the sub-8x8 shapes
+
+The P_8x8 candidate chose, per 8x8 sub-macroblock, between 8x8, 8x4, 4x8 and
+4x4 by SATD plus header bits -- nine partition searches per sub-macroblock
+before the early exit.  Leaving the three smaller shapes out (they are now
+`--partitions` bit 16, off by default; x264's medium preset has no p4x4
+either), ours against ours, `ABBD_GLOBAL=1`, one thread:
+
+| preset | 5 clips | validation set | time |
+|---|---|---|---|
+| 1 | -1.04 % | | -10.5 % |
+| 2 | -0.27 % | | -11.0 % |
+| 3 | -0.10 % | -0.12 % | -5.8 % / -4.8 % |
+| 4 | +0.03 % | -0.07 % | -3.9 % / -2.3 % |
+
+So the small shapes were not paying at any preset: the SATD shape decision
+picks them, and the RD pass either rejects the macroblock or takes a motion
+field that costs more than it predicts.  Decoder-exact (`exact.sh` presets 1
+and 3), frame threads identical (`ftcmp.sh` 32/32), `--partitions 31` writes
+exactly the old default's stream.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
