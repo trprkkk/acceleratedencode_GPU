@@ -67,6 +67,7 @@ static const char aeg_cuda_preamble[] =
                                  unsigned int, unsigned int, unsigned int,    \
                                  unsigned int, unsigned int, CUstream,        \
                                  void **, void **))                           \
+    X(CUresult, cuCtxSetCurrent, (CUcontext))                                 \
     X(CUresult, cuCtxSynchronize, (void))
 
 #define NVRTC_SYMS(X)                                                         \
@@ -103,6 +104,8 @@ typedef struct cuda_ctx {
     /* the registered reference picture (see ref_upload) */
     int ref_stride, ref_w, ref_h, ref_valid;
     char name[96];
+    int16_t *pos;               /* sad_batch: the rebased positions */
+    size_t pos_cap;
 } cuda_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +138,15 @@ static int cuda_launch(CUfunction f, int count, void **args)
     return AEG_OK;
 }
 
+/* A driver-API context is current on the thread that created it only, and the
+ * operations are called from slice threads too (one at a time: the backend
+ * guard in backend.c serialises them), so every entry point makes it current
+ * on the calling thread first. */
+static int cuda_bind(cuda_ctx *o)
+{
+    return p_cuCtxSetCurrent(o->ctx) == CUDA_SUCCESS ? AEG_OK : AEG_EBACKEND;
+}
+
 /* ------------------------------------------------------------------ */
 /* Operations                                                          */
 /* ------------------------------------------------------------------ */
@@ -144,35 +156,36 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
 {
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dcur, dref, dmv, dout;
-    size_t cur_sz = (size_t)bw * bh;
-    size_t ref_sz = (size_t)rstride * (bh + 32);
-    static uint8_t *tmp;
-    static size_t tmp_cap;
-    int y, icur = bw, iref = rstride, ibw = bw, ibh = bh, icount = count;
+    int icur = cstride, iref = rstride, ibw = bw, ibh = bh, icount = count;
+    aeg_sad_span sp;
     void *args[9];
     int st;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
-    dcur = cuda_buf(o, 0, cur_sz);
-    dref = cuda_buf(o, 1, ref_sz);
+    if (count <= 0)
+        return AEG_OK;
+    if (o->pos_cap < (size_t)count) {
+        free(o->pos);
+        o->pos_cap = (size_t)count;
+        o->pos = (int16_t *)malloc(o->pos_cap * 8);
+        if (!o->pos) {
+            o->pos_cap = 0;
+            return AEG_ENOMEM;
+        }
+    }
+    /* only the span the candidates read, see aeg_sad_span_rebase() */
+    aeg_sad_span_rebase(mv, count, bw, bh, cstride, rstride, o->pos, &sp);
+    dcur = cuda_buf(o, 0, sp.cbytes);
+    dref = cuda_buf(o, 1, sp.rbytes);
     dmv = cuda_buf(o, 2, (size_t)count * 8);
     dout = cuda_buf(o, 3, (size_t)count * 4);
     if (!dcur || !dref || !dmv || !dout)
         return AEG_EBACKEND;
-
-    /* the kernel reads the current block contiguously */
-    if (tmp_cap < cur_sz) {
-        free(tmp);
-        tmp_cap = cur_sz;
-        tmp = (uint8_t *)malloc(tmp_cap);
-        if (!tmp)
-            return AEG_ENOMEM;
-    }
-    for (y = 0; y < bh; y++)
-        memcpy(tmp + (size_t)y * bw, cur + (size_t)y * cstride, (size_t)bw);
-
-    p_cuMemcpyHtoD_v2(dcur, tmp, cur_sz);
-    p_cuMemcpyHtoD_v2(dref, ref, ref_sz);
-    p_cuMemcpyHtoD_v2(dmv, mv, (size_t)count * 8);
+    if (p_cuMemcpyHtoD_v2(dcur, cur + sp.coff, sp.cbytes) != CUDA_SUCCESS ||
+        p_cuMemcpyHtoD_v2(dref, ref + sp.roff, sp.rbytes) != CUDA_SUCCESS ||
+        p_cuMemcpyHtoD_v2(dmv, o->pos, (size_t)count * 8) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
 
     args[0] = &dcur; args[1] = &icur; args[2] = &dref; args[3] = &iref;
     args[4] = &ibw;  args[5] = &ibh;  args[6] = &icount; args[7] = &dmv;
@@ -180,7 +193,8 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
     st = cuda_launch(o->k_sad, count, args);
     if (st != AEG_OK)
         return st;
-    p_cuMemcpyDtoH_v2(out, dout, (size_t)count * 4);
+    if (p_cuMemcpyDtoH_v2(out, dout, (size_t)count * 4) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
     return AEG_OK;
 }
 
@@ -196,6 +210,8 @@ static int cuda_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
         mf2 = aeg_quant_mf[qp % 6][2];
     void *args[9];
     int st;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
     dres = cuda_buf(o, 0, bytes);
     dlev = cuda_buf(o, 1, bytes);
@@ -226,6 +242,8 @@ static int cuda_iq_idct_batch(void *priv, const int16_t *level, int nblk,
         ls2 = aeg_dequant_ls[qp % 6][2];
     void *args[7];
     int st;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
     dlev = cuda_buf(o, 0, bytes);
     dres = cuda_buf(o, 1, bytes);
@@ -248,6 +266,8 @@ static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b
     CUdeviceptr da, db, dout;
     size_t tw = (size_t)w / 8, th = (size_t)h / 8, count = tw * th;
     size_t abytes = (size_t)sa * h, bbytes = (size_t)sb * h;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
     uint64_t *tmp;
     size_t i, acc = 0;
     int itw = (int)tw, ith = (int)th, icount = (int)count;
@@ -293,18 +313,25 @@ static int cuda_interp_plane(void *priv, const uint8_t *ref, int rstride,
     int pad = AEG_PAD;
     void *args[8];
     int st;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
     dref = cuda_buf(o, 0, rbytes);
     ddst = cuda_buf(o, 1, dbytes);
     if (!dref || !ddst)
         return AEG_EBACKEND;
-    p_cuMemcpyHtoD_v2(dref, ref, rbytes);
+    /* the kernel takes the whole padded allocations, see backend_opencl.c */
+    if (p_cuMemcpyHtoD_v2(dref, ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD,
+                          rbytes) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
     args[0] = &dref; args[1] = &rstride; args[2] = &w; args[3] = &h;
     args[4] = &pad;  args[5] = &which;   args[6] = &ddst; args[7] = &dstride;
     st = cuda_launch(o->k_intp, (int)count, args);
     if (st != AEG_OK)
         return st;
-    p_cuMemcpyDtoH_v2(dst, ddst, dbytes);
+    if (p_cuMemcpyDtoH_v2(dst - (ptrdiff_t)AEG_PAD * dstride - AEG_PAD, ddst,
+                          dbytes) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
     return AEG_OK;
 }
 
@@ -316,6 +343,8 @@ static int cuda_ref_upload(void *priv, const uint8_t *const planes[4],
     size_t rows = (size_t)h + 2 * AEG_PAD;
     size_t bytes = (size_t)pstride * rows;
     int k;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
     for (k = 0; k < 4; k++) {
         CUdeviceptr d = cuda_buf(o, 4 + k, bytes);
@@ -340,6 +369,8 @@ static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     size_t cbytes = (size_t)cstride * rows;
     int pad = AEG_PAD, k, st;
     void *args[13];
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
 
     if (!o->ref_valid || !count)
         return AEG_EBACKEND;
@@ -367,8 +398,9 @@ static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
 
 static void cuda_sync(void *priv)
 {
-    (void)priv;
-    p_cuCtxSynchronize();
+    cuda_ctx *o = (cuda_ctx *)priv;
+    if (cuda_bind(o) == AEG_OK)
+        p_cuCtxSynchronize();
 }
 
 static void cuda_destroy(void *priv)
@@ -377,9 +409,12 @@ static void cuda_destroy(void *priv)
     int i;
     if (!o)
         return;
+    if (o->ctx)
+        cuda_bind(o);
     for (i = 0; i < NBUF; i++)
         if (o->buf[i])
             p_cuMemFree_v2(o->buf[i]);
+    free(o->pos);
     if (o->ctx) {
         if (o->mod)
             p_cuModuleUnload(o->mod);
@@ -402,6 +437,15 @@ static int cuda_load(void **lib)
         NULL
     };
     int i;
+    /* AEG_CUDA_LIB: a library outside the loader's search path (a pip-installed
+     * runtime, a second driver) -- tried before the usual names */
+    const char *ev = getenv("AEG_CUDA_LIB");
+    if (ev && *ev) {
+        *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
+        if (*lib)
+            return AEG_OK;
+        aeg_log(1, "aeg: AEG_CUDA_LIB=%s: %s", ev, dlerror());
+    }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
         if (*lib)
@@ -413,10 +457,19 @@ static int cuda_load(void **lib)
 static int nvrtc_load(void **lib)
 {
     static const char *names[] = {
-        "libnvrtc.so", "libnvrtc.so.12", "libnvrtc.so.11",
+        "libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11",
         "/usr/local/cuda/lib64/libnvrtc.so", NULL
     };
     int i;
+    /* AEG_NVRTC_LIB: a library outside the loader's search path (a pip-installed
+     * runtime, a second driver) -- tried before the usual names */
+    const char *ev = getenv("AEG_NVRTC_LIB");
+    if (ev && *ev) {
+        *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
+        if (*lib)
+            return AEG_OK;
+        aeg_log(1, "aeg: AEG_NVRTC_LIB=%s: %s", ev, dlerror());
+    }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
         if (*lib)
@@ -425,19 +478,98 @@ static int nvrtc_load(void **lib)
     return AEG_EBACKEND;
 }
 
+/* The kernels the backend looks up in the module. */
+static const char *const aeg_cuda_kernels[] = {
+    "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
+    "satd_batch", NULL
+};
+
+/* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
+ * older NVRTC still loads. */
+typedef nvrtcResult (*fn_nvrtcGetNumSupportedArchs)(int *);
+typedef nvrtcResult (*fn_nvrtcGetSupportedArchs)(int *);
+static fn_nvrtcGetNumSupportedArchs p_nvrtcGetNumSupportedArchs;
+static fn_nvrtcGetSupportedArchs p_nvrtcGetSupportedArchs;
+
+/* The shared kernel source (behind the CUDA preamble) to PTX for virtual
+ * architecture compute_<cc>.  The PTX is malloc'ed into *ptx_out; on failure
+ * the compiler log goes to `log`. */
+static int cuda_compile_ptx(int cc, char **ptx_out, size_t *ptx_size,
+                            char *log, size_t logsz)
+{
+    nvrtcProgram prog = NULL;
+    size_t src_len = strlen(aeg_cuda_preamble) + strlen(aeg_kernel_src) + 1;
+    char arch[64], *src, *ptx;
+    const char *opts[1];
+    size_t ptx_sz = 0;
+    nvrtcResult nr;
+
+    if (log && logsz)
+        log[0] = '\0';
+    snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d", cc);
+    opts[0] = arch;
+    src = (char *)malloc(src_len);
+    if (!src)
+        return AEG_ENOMEM;
+    snprintf(src, src_len, "%s%s", aeg_cuda_preamble, aeg_kernel_src);
+    nr = p_nvrtcCreateProgram(&prog, src, "aeg_kernels.cu", 0, NULL, NULL);
+    if (nr == 0)
+        nr = p_nvrtcCompileProgram(prog, 1, opts);
+    if (nr != 0) {
+        size_t log_sz = 0;
+        if (log && logsz && prog &&
+            p_nvrtcGetProgramLogSize(prog, &log_sz) == 0 && log_sz > 1 &&
+            log_sz <= logsz)
+            p_nvrtcGetProgramLog(prog, log);
+        if (prog)
+            p_nvrtcDestroyProgram(&prog);
+        free(src);
+        return AEG_EBACKEND;
+    }
+    p_nvrtcGetPTXSize(prog, &ptx_sz);
+    ptx = (char *)malloc(ptx_sz + 1);
+    if (!ptx) {
+        p_nvrtcDestroyProgram(&prog);
+        free(src);
+        return AEG_ENOMEM;
+    }
+    p_nvrtcGetPTX(prog, ptx);
+    ptx[ptx_sz] = '\0';
+    p_nvrtcDestroyProgram(&prog);
+    free(src);
+    *ptx_out = ptx;
+    if (ptx_size)
+        *ptx_size = ptx_sz;
+    return AEG_OK;
+}
+
+/* The newest architecture NVRTC supports that is not newer than `cc` (0: none
+ * known).  A device newer than the NVRTC at hand still runs PTX built for an
+ * older virtual architecture -- the driver JIT-compiles it forward. */
+static int cuda_fallback_arch(int cc)
+{
+    int n = 0, i, best = 0, *list;
+    if (!p_nvrtcGetNumSupportedArchs || !p_nvrtcGetSupportedArchs ||
+        p_nvrtcGetNumSupportedArchs(&n) != 0 || n <= 0)
+        return 0;
+    list = (int *)malloc((size_t)n * sizeof(int));
+    if (!list)
+        return 0;
+    if (p_nvrtcGetSupportedArchs(list) == 0)
+        for (i = 0; i < n; i++)
+            if (list[i] <= cc && list[i] > best)
+                best = list[i];
+    free(list);
+    return best;
+}
+
 /* Compile the shared kernel source to PTX and load it as a module. */
 static int cuda_build_module(cuda_ctx *o)
 {
-    nvrtcProgram prog = NULL;
-    char *src = NULL;
-    size_t src_len = strlen(aeg_cuda_preamble) + strlen(aeg_kernel_src) + 1;
-    char arch[64];
-    const char *opts[1];
-    char *ptx = NULL;
-    size_t ptx_sz = 0;
-    int major = 5, minor = 0;
-    nvrtcResult nr;
+    char *ptx = NULL, log[2048];
+    int major = 5, minor = 0, cc, k, rc;
     CUresult cr;
+    CUfunction *fn[6];
 
     p_cuDeviceGetAttribute(&major,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -445,53 +577,98 @@ static int cuda_build_module(cuda_ctx *o)
     p_cuDeviceGetAttribute(&minor,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
                            o->device);
-    snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", major,
-             minor);
-    opts[0] = arch;
-
-    src = (char *)malloc(src_len);
-    if (!src)
-        return AEG_ENOMEM;
-    snprintf(src, src_len, "%s%s", aeg_cuda_preamble, aeg_kernel_src);
-
-    nr = p_nvrtcCreateProgram(&prog, src, "aeg_kernels.cu", 0, NULL, NULL);
-    if (nr == 0)
-        nr = p_nvrtcCompileProgram(prog, 1, opts);
-    if (nr != 0) {
-        char log[2048];
-        size_t log_sz = 0;
-        log[0] = '\0';
-        if (prog && p_nvrtcGetProgramLogSize(prog, &log_sz) == 0 &&
-            log_sz > 1 && log_sz < sizeof(log))
-            p_nvrtcGetProgramLog(prog, log);
-        aeg_log(1, "aeg: NVRTC build failed (%s): %s", arch, log);
-        if (prog)
-            p_nvrtcDestroyProgram(&prog);
-        free(src);
-        return AEG_EBACKEND;
+    cc = major * 10 + minor;
+    rc = cuda_compile_ptx(cc, &ptx, NULL, log, sizeof(log));
+    if (rc == AEG_EBACKEND) {
+        int fb = cuda_fallback_arch(cc);
+        if (fb && fb != cc) {
+            aeg_log(1, "aeg: NVRTC cannot target compute_%d, using compute_%d",
+                    cc, fb);
+            rc = cuda_compile_ptx(fb, &ptx, NULL, log, sizeof(log));
+        }
     }
-    p_nvrtcGetPTXSize(prog, &ptx_sz);
-    ptx = (char *)malloc(ptx_sz);
-    if (!ptx) {
-        p_nvrtcDestroyProgram(&prog);
-        free(src);
-        return AEG_ENOMEM;
+    if (rc != AEG_OK) {
+        aeg_log(1, "aeg: NVRTC build failed (compute_%d): %s", cc, log);
+        return rc;
     }
-    p_nvrtcGetPTX(prog, ptx);
-    p_nvrtcDestroyProgram(&prog);
-    free(src);
-
     cr = p_cuModuleLoadDataEx(&o->mod, ptx, 0, NULL, NULL);
     free(ptx);
     if (cr != CUDA_SUCCESS)
         return AEG_EBACKEND;
-    if (p_cuModuleGetFunction(&o->k_sad, o->mod, "sad_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_tq, o->mod, "tq_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_iq, o->mod, "iq_idct_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_sse, o->mod, "sse_batch") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_intp, o->mod, "interp_plane") != CUDA_SUCCESS ||
-        p_cuModuleGetFunction(&o->k_satd, o->mod, "satd_batch") != CUDA_SUCCESS)
-        return AEG_EBACKEND;
+    fn[0] = &o->k_sad; fn[1] = &o->k_tq; fn[2] = &o->k_iq;
+    fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
+    for (k = 0; aeg_cuda_kernels[k]; k++)
+        if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
+            CUDA_SUCCESS)
+            return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+static int nvrtc_bind(void *lib_nvrtc)
+{
+#define BIND_NVRTC(ret, name, args) \
+    if (!(*(void **)(&p_##name) = dlsym(lib_nvrtc, #name))) { \
+        aeg_log(2, "aeg: NVRTC is missing %s", #name); \
+        return AEG_EBACKEND; \
+    }
+    NVRTC_SYMS(BIND_NVRTC)
+#undef BIND_NVRTC
+    *(void **)(&p_nvrtcGetNumSupportedArchs) =
+        dlsym(lib_nvrtc, "nvrtcGetNumSupportedArchs");
+    *(void **)(&p_nvrtcGetSupportedArchs) =
+        dlsym(lib_nvrtc, "nvrtcGetSupportedArchs");
+    return AEG_OK;
+}
+
+/* Compile-only check of the device code, no GPU or driver needed: the exact
+ * source, preamble and options the backend builds with, for compute_<cc>
+ * (0: every architecture this NVRTC supports, newest first in `log` on
+ * failure).  Checks that every kernel the backend looks up is an entry point
+ * of the PTX.  AEG_EBACKEND when NVRTC cannot be loaded at all. */
+int aeg_cuda_compile_check(int cc, char *log, size_t logsz, size_t *ptx_size)
+{
+    static void *lib_nvrtc;
+    char *ptx = NULL;
+    int rc, k;
+
+    if (!lib_nvrtc) {
+        if (nvrtc_load(&lib_nvrtc) != AEG_OK)
+            return AEG_EBACKEND;
+        if (nvrtc_bind(lib_nvrtc) != AEG_OK) {
+            dlclose(lib_nvrtc);
+            lib_nvrtc = NULL;
+            return AEG_EBACKEND;
+        }
+    }
+    if (cc <= 0) {
+        int n = 0, *list, i;
+        if (!p_nvrtcGetNumSupportedArchs || p_nvrtcGetNumSupportedArchs(&n) ||
+            n <= 0)
+            return aeg_cuda_compile_check(52, log, logsz, ptx_size);
+        list = (int *)malloc((size_t)n * sizeof(int));
+        if (!list)
+            return AEG_ENOMEM;
+        p_nvrtcGetSupportedArchs(list);
+        rc = AEG_OK;
+        for (i = n - 1; i >= 0 && rc == AEG_OK; i--)
+            rc = aeg_cuda_compile_check(list[i], log, logsz, ptx_size);
+        free(list);
+        return rc;
+    }
+    rc = cuda_compile_ptx(cc, &ptx, ptx_size, log, logsz);
+    if (rc != AEG_OK)
+        return rc == AEG_EBACKEND ? AEG_EINVAL : rc;
+    for (k = 0; aeg_cuda_kernels[k]; k++) {
+        char want[64];
+        snprintf(want, sizeof(want), ".entry %s(", aeg_cuda_kernels[k]);
+        if (!strstr(ptx, want)) {
+            snprintf(log, logsz, "compute_%d: no entry point %s in the PTX",
+                     cc, aeg_cuda_kernels[k]);
+            free(ptx);
+            return AEG_EINVAL;
+        }
+    }
+    free(ptx);
     return AEG_OK;
 }
 
@@ -527,6 +704,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
         return AEG_EBACKEND;
     }
     NVRTC_SYMS(LOAD_NVRTC)
+    nvrtc_bind(lib_nvrtc);      /* the optional symbols */
 
     o = (cuda_ctx *)calloc(1, sizeof(*o));
     if (!o) {

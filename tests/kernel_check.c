@@ -100,8 +100,10 @@ static int g_pdstride;
 static void call_intp(int i)
 {
     (void)i;
-    interp_plane(g_pref, g_rstride, g_pw, g_ph, AEG_PAD, g_pwhich,
-                 g_pdst, g_pdstride);
+    /* the host passes the whole padded allocations (see the kernel) */
+    interp_plane(g_pref - (size_t)AEG_PAD * g_rstride - AEG_PAD, g_rstride,
+                 g_pw, g_ph, AEG_PAD, g_pwhich,
+                 g_pdst - (size_t)AEG_PAD * g_pdstride - AEG_PAD, g_pdstride);
 }
 
 /* ------------------------------------------------------------------ */

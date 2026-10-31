@@ -89,17 +89,28 @@ $(BUILD)/coef_check: tests/coef_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/kernel_check: tests/kernel_check.c $(BUILD)/kernels_gen.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) -I$(BUILD) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
+# The device backends' host side (transfers, layouts, threads) on a real
+# device against the CPU reference; skipped (and passing) without one.
+$(BUILD)/backend_check: tests/backend_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+# The CUDA kernels through NVRTC (no GPU needed); skipped without NVRTC.
+$(BUILD)/nvrtc_check: tests/nvrtc_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
 # `make test` runs the table consistency check, the CAVLC round-trip check and
 # the device-kernel cross-check (none of them need external dependencies), then
 # the end-to-end clip check (needs an ffmpeg binary; set FFMPEG=... ).
 test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
       $(BUILD)/cabac_check $(BUILD)/cabac_mb_check $(BUILD)/kernel_check \
-      $(BUILD)/coef_check
+      $(BUILD)/coef_check $(BUILD)/backend_check $(BUILD)/nvrtc_check
 	./$(BUILD)/syntax_check
 	./$(BUILD)/cavlc_check 2000
 	./$(BUILD)/cabac_check 200000 8
 	./$(BUILD)/cabac_mb_check 20000 1
 	./$(BUILD)/kernel_check
+	./$(BUILD)/backend_check
+	./$(BUILD)/nvrtc_check
 	./$(BUILD)/coef_check 200000
 	sh tests/run_tests.sh
 

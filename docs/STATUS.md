@@ -1,6 +1,6 @@
 # Status and engineering notes
 
-Date: 2026-10-26.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
+Date: 2026-11-01.  Branch: `arena/589d1e45-acceleratedencode-gpu`.
 
 ## Where the project stands
 
@@ -550,12 +550,17 @@ per candidate.
 
 State of the implementation (this is the provisional part):
 
-* **Verified here**: with the CPU reference ops behind the batch entry points,
-  the stream is byte-identical to the serial candidate loop -- the conformance
-  cases `rd_batch` and `rd_batch4`, the whole 84-case sweep run with
-  `AEG_RD_BATCH=1`, and six clip/preset/QP comparisons.  The arithmetic cannot
-  differ, because `luma_inter_finish()` is the one implementation both paths
-  use; only the order in which the kernels are called changes.
+* **Verified here**: the stream is byte-identical to the serial candidate loop
+  -- with the CPU reference ops behind the batch entry points *and* on a real
+  OpenCL device (PoCL): every preset on the five real clips at two QPs (50/50),
+  CAVLC (25/25), slice threads, the weighted-prediction fade clip, and the
+  conformance cases `rd_batch` / `rd_batch4`.  (This was true when the batch
+  was written and had silently stopped being true: the serial loop had since
+  grown the level selection, the CABAC price with chroma, and the candidate
+  refinement, and the batch decided by the CAVLC estimate without them --
+  4-10% more bits, found the first time it ran on a device.  The decide step
+  now *is* the serial loop with the luma coefficients taken from the batch;
+  see *GPU groundwork on a real OpenCL device*.)
 * **Not verifiable here**: whether two launches per macroblock actually beat
   thirty-two calls.  On the CPU the forced path costs ~10% of the transform
   stage (the prediction add, the clip and the SSE are scalar in the batched
@@ -581,13 +586,11 @@ AEG_RD_BATCH=1               # whole-macroblock batch, dispatcher ignored
 ```
 
 The flags are resolved at the top of every picture, not once at open time, so a
-`-s` override takes effect from the first `aeg_dispatch_update()` on.  What is
-*not* implemented is the dispatcher discovering the coefficient stages by
-itself: it only ever measures the path it already chose, so a stage that starts
-on the CPU records no device time and never flips.  Probing both paths for the
-first few pictures (running the loser's work and throwing it away) is the next
-dispatcher change, and it is what would make the placement automatic on
-hardware.
+`-s` override takes effect from the first `aeg_dispatch_update()` on.  Without
+an override the dispatcher now places the two stages by trial
+(`aeg_dispatch_coef_pick`): the first pictures of each kind alternate between
+the placements and the faster one per macroblock stays -- see *GPU groundwork
+on a real OpenCL device*.
 
 ## Verification
 
@@ -597,7 +600,8 @@ make -j2
 FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 76 clip cases
 ```
 
-`make test` runs seven things:
+`make test` runs nine things (8 and 9 skip, and pass, without a device or
+NVRTC; see *GPU groundwork on a real OpenCL device* for running them on one):
 
 1. `tests/syntax_check.c` — the two `coded_block_pattern` tables must be exact
    inverses (see bug 11; this is the check that would have caught it).
@@ -641,7 +645,17 @@ FFMPEG=/path/to/ffmpeg make test      # tables + cavlc + cabac + 76 clip cases
    show up at the amplitudes a quantiser normally produces.  Removing any of
    the three from the kernel makes this test fail; it is the check that would
    have caught bug 31 before the encoder ever ran on a device.
-7. `tests/run_tests.sh` — sixty-nine cases (QP 12/23/26/40, presets 0-4,
+7. `tests/backend_check.c` — the device backends' *host side* against the CPU
+   reference, on a real device: every operation through the guarded entry
+   points the encoder calls, on padded pictures allocated exactly as the
+   encoder allocates them, whole-picture candidate lists, vectors into the
+   padding, then two threads at once (lock-step reference registrations and
+   free-running coefficient batches).  106 checks.
+8. `tests/nvrtc_check.c` — the CUDA kernels compiled by NVRTC with the
+   backend's own preamble and options, for every architecture the NVRTC at
+   hand supports, and every kernel the backend looks up present in the PTX.
+   No GPU or driver needed, only `libnvrtc` (`AEG_NVRTC_LIB=`).
+9. `tests/run_tests.sh` — sixty-nine cases (QP 12/23/26/40, presets 0-4,
    deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8/8x16/P_8x8
    partitioning with all four `sub_mb_type` shapes, both the integer and the
    quarter-pel motion search, the forced whole-frame search seed *and* the
@@ -2108,13 +2122,12 @@ chroma-me 0.16, b-pyramid 0.46, ref 3 -> 1 0.70.  On cock alone: P only
    the largest remaining restructure and it cannot be measured here.  The
    per-macroblock form of it is implemented (*Rate-distortion batching
    (provisional)*); the picture-wide form would change the bitstream, so it is
-   a different encoder rather than an accelerator of this one.  The
-   dispatcher's
-   calibration has never run against real hardware in this environment (there
-   is no GPU here), so the crossover points are still the CPU-model ones; the
-   dispatcher also only ever measures the path it chose, so a stage is switched
-   by its forced override (`-s stage=backend`) or, on hardware, after both
-   paths have been probed.
+   a different encoder rather than an accelerator of this one.  Every
+   device path now runs end to end on a real OpenCL device (PoCL, a CPU
+   implementation) and is byte-identical to the CPU encoder; the dispatcher
+   places the coefficient stages by trial.  What only GPU hardware can answer
+   is whether that trial ever comes out for the device -- see *GPU groundwork
+   on a real OpenCL device*.
 4. Encoder features that need the profile to change: none left -- CABAC and the
    8x8 transform are both in (main profile and High profile respectively), and
    the encoder emits Main, High or Baseline depending on which tools a stream
@@ -2126,9 +2139,9 @@ chroma-me 0.16, b-pyramid 0.46, ref 3 -> 1 0.70.  On cock alone: P only
    tree is in at constant QP (*Macroblock tree*); making the rate controller
    and the buffer model aware of it beyond the mean offset is what is left
    for ABR/VBV.
-5. Threads beyond slices: a per-thread device context (so that slice threads
-   and GPU stages can run at the same time -- today a picture with any stage on
-   a device is coded by one thread), and frame-level threading (code picture
+5. Threads beyond slices: a per-thread device context (slice threads and
+   device stages do run together now, but their device calls are serialised by
+   the backend guard), and frame-level threading (code picture
    N+1's decision pass while picture N is being written), which needs the
    reconstruct-then-write split that the loop already has, plus one reference
    picture per thread.  Rate control is picture-level only (the macroblock
@@ -3798,3 +3811,103 @@ the tables, i.e. the stream could change with an unrelated edit.  BD-rate
 against the previous binary (five clips, global PSNR): preset 2 0.00 %, preset 3
 +0.04 %, preset 4 -0.03 % -- noise; the streams of presets 3-4 change, presets
 0-2 do not.
+
+## GPU groundwork on a real OpenCL device
+
+Every device path used to be checked in two ways only: the kernel *source*
+compiled as C (`tests/kernel_check.c`), and the batched paths run with the
+*CPU* implementations behind the batch entry points.  Neither runs the host
+side of a device backend -- what is transferred, from where, in which layout,
+what comes back and where it is written -- and neither runs two threads into
+one device context.  PoCL (a complete OpenCL implementation whose device is the
+host CPU) runs all of it here; `tools/pocl_env.sh` installs and sets it up
+without root.  The first run found five bugs, all now fixed; every one of them
+would have shown up on the first GPU as a crash or as a stream different from
+the CPU's.
+
+| # | bug | effect | fix |
+|---|---|---|---|
+| 1 | the RD batch's decide step had drifted from the serial candidate loop: no level selection on the batched levels, candidates ranked by the CAVLC estimate instead of the CABAC price with chroma, no candidate refinement, a different `jinter` | `AEG_RD_BATCH=1` (and the dispatcher's choice whenever a device owned the coefficient stages) wrote a *different* stream, 4-10% larger | the decide step is now the serial loop step for step, with only the luma coefficients taken from the batch: level selection on every candidate's batched levels between the two launches, then one inverse launch on the selected levels; each candidate's chroma prediction saved alongside its luma one (the batch had left the *last* candidate's in `pred_c`) |
+| 2 | one device context shared by slice threads with no locking (staging buffers, kernel arguments, a `static` scratch) | segfault on the first picture with `-t 2` and any device path | a guard around every device backend (`backend.c`) serialises the calls |
+| 3 | the registered reference (`ref_upload` then `satd_batch`) is device state that outlives a call; the CPU version kept it in a process-wide static | with two pictures in flight, one picture's search could read the other's reference -- a stream that depends on thread timing (CPU: `AEG_PARFULL=1` with frame threads) | the guard remembers each thread's registration and re-uploads it when another thread replaced it; the CPU registration is thread-local |
+| 4 | `sad_batch` on both devices transferred *one packed 16x16 block* and 48 reference rows, from an older one-block API; the encoder sends a whole picture's candidates with reference positions in the padding | out-of-bounds device reads: the whole-frame search was garbage and non-deterministic | the host transfers exactly the span the candidates read (`aeg_sad_span_rebase()`), positions rebased to it |
+| 5 | `interp_plane` transferred from the picture *origin* while its kernel reads and writes the padding around it, and read the result back over the end of the host buffer | device out-of-bounds reads, host heap corruption | the kernel takes the whole padded allocations (the convention `satd_batch` already used) |
+
+Also: a device call that fails now runs the CPU reference instead and keeps
+the device off (the encoder ignores the batch operations' return codes, which
+used to mean a failed call silently left garbage); the CUDA context is made
+current on the calling thread in every operation (a driver-API context is
+current only on its creating thread, so slice threads would have failed every
+call); the slice loop no longer drops to one thread when a stage is on a
+device; `-v 2` reports a stage as `gpu` when any of its work ran there
+(`stage_gpu_ns` / `stage_cpu_ns` are now the per-stage totals of device and host
+batch time, summed over the thread copies).
+
+**Tests added.**  `tests/backend_check.c` (106 checks, every operation and two
+threads, against the CPU reference; it is the one that fails on bugs 2-5 --
+the old backend corrupts its heap within the first checks) and
+`tests/nvrtc_check.c` (the CUDA kernels through NVRTC for every architecture it
+supports; a kernel line that is valid C but not C++ fails it).  Both are in
+`make test` and skip without a device / NVRTC.  `tools/gpu_validate.sh` was
+itself broken (the forced run passed its `-s` options as environment
+variables, the decimal stage times did not match its pattern, and the
+reconstruction check compared the coding-order dump with the display-order
+decode, so with B pictures every run "failed"); fixed, and it now also runs the
+whole-frame search on the CPU backend and requires the device's to be the
+same bytes, and forces `-s inter=` so the plane kernel is in an encode too.
+`tests/run_tests.sh` takes `BUILD=dir` and `AEG_TEST_BACKEND=opencl`.
+
+**State on the device (PoCL), all byte-identical to `-b cpu`:**
+
+* `tools/gpu_validate.sh` PASS on vtest and cockatoo, `-t 1` and `-t 2`: cpu,
+  auto, coefbatch, rdbatch, `-s tq= -s iq= -s inter=` the same stream; search
+  and all the same stream as the same search on the CPU backend; every
+  reconstruction equal to ffmpeg's decode.
+* `tests/run_tests.sh` with `BUILD=<OpenCL build> AEG_TEST_BACKEND=opencl`: all
+  conformance cases bit-exact, `seed_search`, `coef_batch(4)`, `rd_batch(4)`
+  through the device.
+* `-s inter=opencl` on vtest and the weighted fade clip, presets 1 and 3.
+* With the CPU backend nothing changed: `tools/real/same.sh` against the
+  previous commit 50/50 (presets 0-4, five clips, QP 24/32) plus 10/10 CAVLC,
+  frame threads 32/32, `make test` bit-exact.
+
+**Placement by trial.**  The dispatcher could not place the coefficient stages
+on its own: it only measured the path it had chosen, and the CPU form of the
+stages is not a batch with a per-call time at all -- sixteen SSE2 transforms
+inline in each candidate.  It now compares whole pictures instead
+(`aeg_dispatch_coef_pick` / `_done`): both placements code the same stream, so
+everything else a picture does is the same work, and the difference in time per
+macroblock is the placement's cost, host-side overhead of the batch included.
+The first pictures of each kind (P, B) alternate; the first picture on each side
+is not counted (kernel compilation at the first launch, buffer allocation);
+the faster side stays after three counted pictures each, or after one each when
+the two are a factor of two apart; the slower side is re-tried every 64
+pictures.  The motion search is never placed by timing -- its device form is a
+different search, so the stream would depend on the machine's speed -- only
+`-s est=` (or `AEG_SEED` / `AEG_PARFULL`) puts it on a device.  On PoCL the
+trial comes out at 0.15-0.45 ms per macroblock on the device against 0.02-0.06
+on the CPU (the launch overhead of a CPU OpenCL runtime, ~1 ms per call, two
+calls per macroblock), settles on the CPU after two device pictures per kind,
+and the stream is the CPU's byte for byte.  On PoCL that is the right answer;
+whether a GPU's launch cost ever makes it come out the other way is the one
+thing still to be measured on hardware, along with the per-call cost the
+batch's host side adds.
+
+**CUDA without a GPU.**  `pip install nvidia-cuda-nvrtc-cu12` gives NVRTC
+12.9, which compiles the kernels for every architecture it supports.  The
+backend now also falls back to the newest architecture NVRTC supports when the
+device's own is newer than the NVRTC at hand (the driver JIT-compiles PTX
+forward), instead of falling back to the CPU.  What remains unexercised is the
+driver half (`libcuda`: context, transfers, launches), which needs an NVIDIA
+driver.
+
+**Loader overrides.**  `AEG_OPENCL_LIB`, `AEG_CUDA_LIB` and `AEG_NVRTC_LIB`
+name the library to load before the usual sonames are tried.
+
+```sh
+. tools/pocl_env.sh                 # once per shell; installs into ~/.cache/aeg-pocl
+make OPENCL=1 && ./build/backend_check
+BE=opencl FFMPEG=ffmpeg tools/gpu_validate.sh clip.yuv W H FRAMES QP
+BUILD=./build AEG_TEST_BACKEND=opencl FFMPEG=ffmpeg sh tests/run_tests.sh
+AEG_NVRTC_LIB=.../nvidia/cuda_nvrtc/lib/libnvrtc.so.12 ./build/nvrtc_check   # CUDA=1 build
+```

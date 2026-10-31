@@ -10,16 +10,24 @@
 #
 # Set FFMPEG=/path/to/ffmpeg to use a specific build; without one the clip
 # checks are skipped (the table/CAVLC checks in `make test` still run).
+# Set BUILD=dir to test another build of the encoder (for example an OpenCL one
+# made with `make OPENCL=1 BUILD=dir`, against a device: see
+# tools/pocl_env.sh); it is not rebuilt here, and AEG_TEST_BACKEND=opencl
+# runs every case with `-b opencl` so the cases that force the batched paths
+# go through the device.
 set -e
-BUILD=build
+FULLBUILD=${BUILD:+1}
+BUILD=${BUILD:-./build}
 FF=${FFMPEG:-ffmpeg}
 TMP=${TMPDIR:-/tmp}/aegtest.$$
 mkdir -p "$TMP"
 FAIL=0
 
 echo "== build"
-make -s >/dev/null
-make -s "$BUILD/genyuv"
+if [ -z "$FULLBUILD" ]; then
+    make -s >/dev/null
+    make -s "$BUILD/genyuv"
+fi
 
 # compare BOTH files fully, over every frame
 cat > "$TMP/cmp.py" <<'PY'
@@ -123,9 +131,10 @@ PY
 run_bcase() {
     name=$1; w=$2; h=$3; n=$4; b=$5; mode=$6; shift 6
     "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
-    ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
+    $BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
         -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" \
-        --dump-order "$TMP/$name.order" "$@" \
+        --dump-order "$TMP/$name.order" \
+        ${AEG_TEST_BACKEND:+-b "$AEG_TEST_BACKEND"} "$@" \
         >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
@@ -157,8 +166,9 @@ run_case() {
     # frame by frame in *display* order, which is only the coding order when
     # the stream has no B pictures.  The B path has its own cases (run_bcase)
     # that rebuild the coding order before comparing.
-    ./$BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
-        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes 0 "$@" \
+    $BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
+        -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes 0 \
+        ${AEG_TEST_BACKEND:+-b "$AEG_TEST_BACKEND"} "$@" \
         >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
@@ -437,7 +447,7 @@ echo "== skip coding"
 # below that, so it fails only if the skip path breaks rather than when the
 # mode decision shifts.
 "$BUILD/genyuv" 320 192 8 "$TMP/still.yuv" 3 >/dev/null
-./$BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/still.yuv" -o "$TMP/still.264" \
+$BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/still.yuv" -o "$TMP/still.264" \
     -q 26 >"$TMP/still.log" 2>&1
 python3 -c '
 import re, sys
@@ -466,16 +476,16 @@ cat "$TMP/cutA.yuv" "$TMP/cutB.yuv" > "$TMP/cut.yuv"
 # when there are B pictures, see run_case), and the same clip once more with B
 # pictures for the IDR count: a cut still has to become an IDR when the group
 # structure puts B pictures around it.
-./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
     -o "$TMP/cut.264" -g 250 --bframes 0 --dump-recon "$TMP/cut.recon" \
     >"$TMP/cut.log" 2>&1 \
     || { echo "   cut clip: encode failed"; FAIL=1; }
-./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
     -o "$TMP/cutb.264" -g 250 --bframes 3 >"$TMP/cutb.log" 2>&1 \
     || { echo "   cut clip with B pictures: encode failed"; FAIL=1; }
-./$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
     -o "$TMP/nocut.264" -g 250 --bframes 0 >/dev/null 2>&1
-./$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
     -o "$TMP/nocutb.264" -g 250 --bframes 3 >/dev/null 2>&1
 if ! command -v "$FF" >/dev/null 2>&1; then
     echo "   scenecut: skipped (no ffmpeg)"
@@ -534,7 +544,7 @@ sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
 
 echo "== rate control"
 "$BUILD/genyuv" 320 192 40 "$TMP/abr.yuv" 0 >/dev/null
-./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/abr.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/abr.yuv" \
     -o "$TMP/abr.264" --bitrate 400 -v 0
 python3 -c '
 import os, sys
@@ -552,9 +562,9 @@ echo "== VBV / HRD"
 # saying so when even QP 51 cannot make it fit, because a model that can never
 # report an underflow is not a model.
 "$BUILD/genyuv" 320 192 40 "$TMP/vbv.yuv" 0 >/dev/null
-./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
     -o "$TMP/vbv_off.264" --bitrate 400 -v 0
-./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
     -o "$TMP/vbv_wide.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 120 \
     >"$TMP/vbv_wide.log" 2>&1
 if cmp -s "$TMP/vbv_off.264" "$TMP/vbv_wide.264"; then
@@ -563,10 +573,10 @@ else
     echo "   generous buffer (120 kbit): stream differs from the ABR stream  FAIL"
     FAIL=1
 fi
-./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
     -o "$TMP/vbv_tight.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 30 \
     >"$TMP/vbv_tight.log" 2>&1
-./$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
     -o "$TMP/vbv_alone.264" --vbv-maxrate 400 --vbv-bufsize 120 \
     >"$TMP/vbv_alone.log" 2>&1
 python3 - "$TMP" <<'PY2' || FAIL=1
@@ -621,10 +631,10 @@ echo "== two-pass rate control"
 # of the first pass is to *measure* that difference and spend accordingly.  The
 # rate controller stays on in pass 2, so the stream still lands on target; the
 # first pass only decides how the bits are shared out.
-./$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
     -o "$TMP/2p1.264" --pass 1 --stats "$TMP/2p.stats" >"$TMP/2p1.log" 2>&1 \
     || { echo "   pass 1 failed"; FAIL=1; }
-./$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
     -o "$TMP/2p2.264" --pass 2 --stats "$TMP/2p.stats" --bitrate 250 \
     --dump-recon "$TMP/2p.recon" >"$TMP/2p2.log" 2>&1 \
     || { echo "   pass 2 failed"; FAIL=1; }
@@ -632,7 +642,7 @@ echo "== two-pass rate control"
 # two-pass run is: --pass 1 measures one packet per picture in display order, so
 # a two-pass run cannot use B pictures at all (the CLI turns them off), and the
 # one-pass stream has to be P-only for the comparison to mean anything.
-./$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
     -o "$TMP/1p.264" --bitrate 250 --bframes 0 >"$TMP/1p.log" 2>&1 \
     || { echo "   one-pass control failed"; FAIL=1; }
 python3 - "$TMP/2p2.log" "$TMP/1p.log" <<'PY2' || FAIL=1
@@ -669,7 +679,7 @@ if command -v "$FF" >/dev/null 2>&1; then
 fi
 
 echo "== device enumeration"
-./$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
+$BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 
 rm -rf "$TMP"
 if [ "$FAIL" != 0 ]; then

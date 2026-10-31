@@ -37,10 +37,13 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > two cores at 320x192 QP 24, and 68 % of the CPU time is now the
 > transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
 > the motion search (80 %/19 % at preset 4), which is exactly what the GPU
-> backends exist for.  The GPU backends sit behind a measured dispatcher, and
-> the kernels are checked against the CPU reference by `tests/kernel_check.c`,
-> but nothing has run on real GPU hardware in this environment (there is no GPU
-> available).  See
+> backends exist for.  The GPU backends sit behind a measured dispatcher.  There
+> is no GPU in this environment, but every device path runs end to end on a
+> real OpenCL device (PoCL, a CPU implementation of OpenCL: `tools/pocl_env.sh`)
+> and writes the CPU encoder's stream byte for byte, and the CUDA kernels are
+> compiled by NVRTC for every architecture it supports (`tests/nvrtc_check.c`).
+> What still needs GPU hardware is the speed: whether the device side ever wins.
+> See *GPU groundwork on a real OpenCL device* in
 > [`docs/STATUS.md`](docs/STATUS.md).
 
 **Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
@@ -92,12 +95,16 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Entropy coding (CABAC by default, CAVLC with `--no-cabac`) | CPU | inherently serial: every bin depends on the arithmetic coder's state and on context states the previous macroblocks left behind |
 | Bitstream assembly / rate decisions | CPU | serial |
 
-The dispatcher is *measured*, not guessed: each stage is timed per frame in both
-places when `--bench` is used, and a stage only stays on the GPU when the
-measured time (including transfer and launch overhead) is lower than the CPU
-path, with 10% hysteresis to avoid oscillation.  `aeg_backend_calibrate()`
-measures a real kernel launch + transfer round trip so the model knows the
-fixed cost below which batching cannot pay off.
+The dispatcher is *measured*, not guessed.  The coefficient stages are placed
+by trial: the first pictures of each kind alternate between the CPU and the
+device, and since both placements write the same stream, the difference in a
+picture's time per macroblock is exactly the cost of the placement (transfers,
+launches and the batch's host work included); the faster side stays, with 10%
+hysteresis, and the slower one is re-tried every 64 pictures.  The motion
+search is never placed by timing, because its device form is a different
+search and the stream would then depend on the machine's speed; `-s est=`
+forces it.  `aeg_backend_calibrate()` measures a kernel launch + transfer
+round trip on its own.
 
 Quality goal: the encoder must be *decision equivalent* to a CPU implementation
 of the same algorithm — same transforms, same quantiser, same integer
@@ -218,9 +225,17 @@ preset.
   encodes with the CPU backend, with the dispatcher free, and with each batched
   device path forced on, then requires the coefficient paths to be the *same
   bytes* as the CPU stream and every stream's reconstruction to match an
-  independent decode.  Run it on the machine that has the GPU; on a CPU-only
-  machine everything passes trivially, because the batch entry points fall back
-  to the reference ops.
+  independent decode, and the device's whole-frame search to be the same bytes
+  as that search on the CPU backend.  No GPU at hand: `. tools/pocl_env.sh`
+  gives a real OpenCL device that runs on the CPU (installed with pip into
+  `~/.cache/aeg-pocl`, no root), and `make OPENCL=1` then runs every device
+  path for real.
+* `tests/backend_check.c` checks every device operation's host side
+  (transfers, layouts, two threads into one context) against the CPU reference
+  on whatever device loads, and `tests/nvrtc_check.c` compiles the CUDA kernels
+  with NVRTC for every architecture (`AEG_NVRTC_LIB=` pointing at a
+  `libnvrtc`, e.g. from `pip install nvidia-cuda-nvrtc-cu12`); both are in
+  `make test` and skip without a device / NVRTC.
 * `tests/run_tests.sh` encodes fifty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
@@ -255,6 +270,9 @@ src/backend_opencl.c OpenCL backend (dlopen, cached buffers, 6 kernels)
 src/backend_cuda.c  CUDA backend (driver API + NVRTC, both dlopen()ed)
 src/kernels.h       the shared kernel source string (OpenCL C / CUDA C)
 tests/kernel_check.c cross-checks every GPU kernel against the CPU reference
+tests/backend_check.c every device operation end to end on a real device
+tests/nvrtc_check.c the CUDA kernels through NVRTC (no GPU needed)
+tools/pocl_env.sh   a real OpenCL device without a GPU (PoCL), for the above
 cli/aegenc.c        command line front end
 tests/              synthetic clip generator, single-MB probe, test runner
 ```

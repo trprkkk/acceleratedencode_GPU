@@ -317,12 +317,14 @@ struct aeg_encoder {
      * and only then are the costs compared.  Four candidates x sixteen blocks
      * is the largest batch a macroblock can produce. */
     int rd_batch;
+    int coef_kind, coef_dev;    /* this picture's placement (resolve_coef_stages) */
     int coef_force, rd_force;   /* -1: ask the dispatcher, 0/1: forced */
     int16_t rd_res[16 * 16 * AEG_MB_CAND_MAX];
     int16_t rd_lev[16 * 16 * AEG_MB_CAND_MAX];
     int16_t rd_rec[16 * 16 * AEG_MB_CAND_MAX];
     int32_t rd_nz[16 * AEG_MB_CAND_MAX];
     uint8_t rd_pred[16 * 16 * AEG_MB_CAND_MAX];
+    uint8_t rd_predc[2 * 8 * 8 * AEG_MB_CAND_MAX];
     /* Whole-frame search seed: 2 ints per macroblock, integer pel.  Filled by
      * me_seed_frame() with the best of a fixed candidate grid, evaluated as one
      * batch through the backend (this is the stage the GPU actually runs). */
@@ -485,6 +487,20 @@ struct aeg_encoder {
 static int ft_alloc(struct aeg_encoder *e, int nw);
 static void ft_free(struct aeg_encoder *e);
 
+/* One measured call of a stage's batch operation: to the dispatcher (its
+ * moving averages decide the placement) and to the statistics, whose per-stage
+ * device / host totals say where the time actually went -- the copies a
+ * picture's slice threads and frame threads run in sum theirs into the
+ * encoder's. */
+static void stage_rec(struct aeg_encoder *e, int stage, int on_gpu, int64_t ns)
+{
+    aeg_dispatch_record(&e->d, stage, on_gpu, ns);
+    if (on_gpu)
+        e->st.stage_gpu_ns[stage] += ns;
+    else
+        e->st.stage_cpu_ns[stage] += ns;
+}
+
 /* Which of the two batched coefficient code paths to use for this picture.
  * Both need the device to own *both* coefficient stages: an inter candidate
  * cannot transform on one and reconstruct on the other without a round trip in
@@ -493,10 +509,18 @@ static void ft_free(struct aeg_encoder *e);
  * machine with no GPU. */
 static void resolve_coef_stages(struct aeg_encoder *e)
 {
+    const int kind = e->cur_is_b ? 2 : (e->cur_is_p ? 1 : 0);
     int want = e->d.ops.backend != AEG_BACKEND_CPU &&
-               e->d.use_gpu[AEG_STAGE_TRANSFORM] &&
-               e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] &&
-               e->d.ops.tq_batch && e->d.ops.iq_idct_batch;
+               e->d.ops.tq_batch && e->d.ops.iq_idct_batch &&
+               aeg_dispatch_coef_pick(&e->d, kind);
+    /* remembered for aeg_dispatch_coef_done() at the end of the picture, and
+     * mirrored into the stage decisions (the statistics report those) */
+    e->coef_kind = kind;
+    e->coef_dev = want;
+    if (e->d.have_gpu && e->d.forced[AEG_STAGE_TRANSFORM] < 0 &&
+        e->d.forced[AEG_STAGE_IQUANT_IDCT] < 0)
+        e->d.use_gpu[AEG_STAGE_TRANSFORM] =
+            e->d.use_gpu[AEG_STAGE_IQUANT_IDCT] = want;
     e->coef_batch = e->coef_force >= 0 ? e->coef_force : want;
     e->rd_batch = e->rd_force >= 0 ? e->rd_force : want;
     if (e->rd_batch)
@@ -1647,7 +1671,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         int64_t t0 = aeg_now_ns();
         e->d.ops.tq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
                           e->coef_lev, e->coef_nz);
-        aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM,
+        stage_rec(e, AEG_STAGE_TRANSFORM,
                             e->d.ops.backend != AEG_BACKEND_CPU,
                             aeg_now_ns() - t0);
         if (e->p.trellis > 0 && e->p.cabac) {
@@ -1660,7 +1684,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             t0 = aeg_now_ns();
             e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp,
                                    e->coef_rec);
-            aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+            stage_rec(e, AEG_STAGE_IQUANT_IDCT,
                                 e->d.ops.backend != AEG_BACKEND_CPU,
                                 aeg_now_ns() - t0);
             luma_inter_finish(e, mbx, mby, c, e->coef_lev, NULL,
@@ -1669,7 +1693,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         t0 = aeg_now_ns();
         e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
-        aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+        stage_rec(e, AEG_STAGE_IQUANT_IDCT,
                             e->d.ops.backend != AEG_BACKEND_CPU,
                             aeg_now_ns() - t0);
         luma_inter_finish(e, mbx, mby, c, e->coef_lev, e->coef_nz, e->coef_rec,
@@ -4152,7 +4176,7 @@ static void me_seed_frame(struct aeg_encoder *e)
 
     t0 = aeg_now_ns() - t0;
     e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
-    aeg_dispatch_record(&e->d, AEG_STAGE_MOTION_EST,
+    stage_rec(e, AEG_STAGE_MOTION_EST,
                         e->d.ops.backend != AEG_BACKEND_CPU, t0);
 }
 
@@ -5510,55 +5534,98 @@ static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
  * the CAVLC cost model needs their non-zero counts.  All three are serial in
  * raster order, so the batch has to stop at the macroblock boundary -- see
  * docs/STATUS.md, "Rate-distortion batching (provisional)". */
+static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
+                          const mbenc *t, int64_t est, int cmode, double lambda,
+                          int64_t bound);
+static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
+                        int qp, double lambda);
+
 static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
                                    mbenc *best, uint8_t *snap_l,
-                                   int64_t best_cost, double lambda, int qp)
+                                   int64_t best_cost, double lambda, int qp,
+                                   int cmode, int64_t *jinter)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     const int n = e->mb_ncand;
+    const int trel = e->p.trellis > 0 && e->p.cabac;
     int k;
     int64_t t0;
 
-    /* 1. every candidate's prediction, and its residual in the batch buffer */
+    /* 1. every candidate's prediction (luma and chroma: the chroma one is
+     *    what the decision prices the candidate's chroma against), and its
+     *    luma residual in the batch buffer */
     for (k = 0; k < n; k++) {
         mbenc c;
         cand_enc(e, k, qp, &c);
         inter_predict_typed(e, mbx, mby, &c);
         luma_inter_gather(e, src, e->pred_l, e->rd_res + 256 * k);
         memcpy(e->rd_pred + 256 * k, e->pred_l, 256);
+        memcpy(e->rd_predc + 128 * k, e->pred_c, 128);
     }
     /* 2. one launch each for the whole macroblock's candidates */
     t0 = aeg_now_ns();
     e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * n, qp, 0, e->rd_lev,
                       e->rd_nz);
-    aeg_dispatch_record(&e->d, AEG_STAGE_TRANSFORM,
+    stage_rec(e, AEG_STAGE_TRANSFORM,
                         e->d.ops.backend != AEG_BACKEND_CPU,
                         aeg_now_ns() - t0);
+    /* The level selection runs on the host between the two launches, on
+     * every candidate's levels exactly as code_luma_inter() runs it on one
+     * candidate's: it reads only the source, the candidate's prediction and
+     * its own levels (plus the neighbours, which no candidate changes), so
+     * running it for all of them first selects the same levels.  The
+     * reconstruction is then made from the selected levels. */
+    if (trel) {
+        for (k = 0; k < n; k++) {
+            mbenc c;
+            cand_enc(e, k, qp, &c);
+            memcpy(e->pred_l, e->rd_pred + 256 * k, 256);
+            if (use_t8(e, mbx, mby, &c))
+                continue;           /* coded by the 8x8 path below */
+            trellis_luma4(e, mbx, mby, &c, qp,
+                          (int16_t (*)[16])(e->rd_lev + 256 * k),
+                          inter_trellis_lambda(qp));
+        }
+    }
     t0 = aeg_now_ns();
     e->d.ops.iq_idct_batch(e->d.ops.priv, e->rd_lev, 16 * n, qp, e->rd_rec);
-    aeg_dispatch_record(&e->d, AEG_STAGE_IQUANT_IDCT,
+    stage_rec(e, AEG_STAGE_IQUANT_IDCT,
                         e->d.ops.backend != AEG_BACKEND_CPU,
                         aeg_now_ns() - t0);
-    /* 3. decide, in the same order and with the same tie-breaking the serial
-     *    loop uses (a later candidate has to be strictly cheaper) */
+    /* 3. decide: the serial candidate loop of code_mb() step for step -- the
+     *    same price (full_price() against the running best), the same
+     *    refinement of a candidate still in the running, the same strict
+     *    tie-breaking -- with only the luma coefficient work taken from the
+     *    batch.  Anything else and the two paths choose differently. */
     for (k = 0; k < n; k++) {
         mbenc t;
         int64_t cost;
         cand_enc(e, k, qp, &t);
-        /* The batch only produces 4x4 blocks: a candidate whose residual wants
-         * the 8x8 transform is coded through the serial path, which is what
-         * makes the two decisions agree. */
         memcpy(e->pred_l, e->rd_pred + 256 * k, 256);
+        memcpy(e->pred_c, e->rd_predc + 128 * k, 128);
+        /* The batch only produces 4x4 blocks: a candidate whose residual wants
+         * the 8x8 transform is coded through the serial path. */
         if (use_t8(e, mbx, mby, &t)) {
             code_luma_inter8(e, mbx, mby, &t);
         } else {
             luma_inter_finish(e, mbx, mby, &t, e->rd_lev + 256 * k,
-                              e->rd_nz + 16 * k, e->rd_rec + 256 * k,
-                              e->rd_pred + 256 * k);
+                              trel ? NULL : e->rd_nz + 16 * k,
+                              e->rd_rec + 256 * k, e->rd_pred + 256 * k);
         }
         t.bits += inter_hdr_bits(e, &t);
         cost = t.sse + (int64_t)(lambda * t.bits + 0.5);
         t.cost = cost;
+        cost = full_price(e, mbx, mby, &t, cost, cmode, lambda, best_cost);
+        if (e->p.cabac && e->p.refine_cand > 0 && e->p.refine_mv > 0 &&
+            cost <= best_cost) {
+            /* serial: a whole macroblock evaluation per neighbour vector */
+            refine_cand(e, mbx, mby, k, qp, lambda);
+            cost = rd_luma(e, mbx, mby, &t, qp, e->mb_cand[k].type, 0, lambda,
+                           k);
+            cost = full_price(e, mbx, mby, &t, cost, cmode, lambda, best_cost);
+        }
+        if (cost < *jinter)
+            *jinter = cost;
         if (cost < best_cost) {
             best_cost = cost;
             *best = t;
@@ -5983,15 +6050,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         if (e->rd_batch && e->mb_ncand > 0) {
             best_cost = rd_luma_inter_batch(e, mbx, mby, &best, snap_l, best_cost,
-                                            lambda, c->qp);
-            /* The batch ranks the inter candidates against each other with
-             * the estimate; the winner is then priced with the coder's own
-             * model, so that comparing it with the intra candidates is like
-             * for like. */
-            if (e->p.cabac && best_cost != INT64_MAX)
-                best_cost = full_price(e, mbx, mby, &best, best_cost, c->chroma_mode, lambda, INT64_MAX);
-            if (is_inter_type(best.type))
-                jinter = best_cost;
+                                            lambda, c->qp, c->chroma_mode,
+                                            &jinter);
         } else {
             for (i = 0; i < e->mb_ncand; i++) {
                 int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, e->mb_cand[i].type, 0,
@@ -8737,19 +8797,17 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
     return AEG_OK;
 }
 
-/* How many threads the slice loop may use.  A device context (one command
- * queue) is not safe to submit to from several threads, so as long as any stage
- * is dispatched to a non-CPU backend the slices stay serial; per-thread device
- * contexts are the follow-up that lifts that. */
+/* How many threads the slice loop may use.  A device stage does not limit it:
+ * the backend guard (backend.c) serialises the threads' calls into the one
+ * device context, so the other slices go on with their CPU work while one
+ * waits for the device.  (This used to drop to one thread whenever the
+ * dispatcher had a stage on a device -- and missed the forced batch paths,
+ * which then crashed the OpenCL backend from two threads.)  A per-thread
+ * device context would let the calls overlap as well. */
 static int slice_thread_count(const struct aeg_encoder *e)
 {
-    int k;
-
     if (e->n_threads <= 1 || e->n_slices <= 1)
         return 1;
-    for (k = 0; k < AEG_STAGE_COUNT; k++)
-        if (e->d.use_gpu[k] && e->d.ops.backend != AEG_BACKEND_CPU)
-            return 1;
     return e->n_threads;
 }
 
@@ -9524,7 +9582,7 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 umh_radii(e, ctx->umh, &ctx->umh_et);
             }
         }
-        aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,
+        stage_rec(e, AEG_STAGE_INTER_PRED,
                             e->d.use_gpu[AEG_STAGE_INTER_PRED] &&
                             e->d.ops.backend != AEG_BACKEND_CPU,
                             aeg_now_ns() - t0);
@@ -9822,10 +9880,11 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
             if (k == AEG_MB_I4x4 || k == AEG_MB_I8x8 || k == AEG_MB_I16x16 ||
                 k == AEG_MB_IPCM)
                 in += e->stat_type[k] - dbg_type0[k];
-        fprintf(stderr, "PIC %c poc %d qp %d bits %d skip %lld intra %lld ms %.1f\n",
+        fprintf(stderr, "PIC %c poc %d qp %d bits %d skip %lld intra %lld ms %.1f%s\n",
                 is_idr ? 'I' : (e->cur_is_b ? (e->cur_bref ? 'b' : 'B') : (e->cur_is_p ? 'P' : 'i')),
                 e->cur_poc, e->cur_qp, (int)(out_len * 8), (long long)sk,
-                (long long)in, (aeg_now_ns() - t_all) / 1e6);
+                (long long)in, (aeg_now_ns() - t_all) / 1e6,
+                e->coef_dev ? " coef-on-device" : "");
     }
     if (getenv("AEG_RCDBG"))
         fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f vbv %.0f\n",
@@ -9833,6 +9892,11 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 e->rc_bits_per_frame, e->rc_debt, e->vbv_full);
     vbv_update(e, (int)(out_len * 8));
     rc_update(e, (int)(out_len * 8), is_idr);
+    /* the placement trial of the coefficient stages measures whole pictures
+     * (see aeg_dispatch_coef_pick); a forced batch path is not a trial */
+    if (e->coef_force < 0 && e->rd_force < 0)
+        aeg_dispatch_coef_done(&e->d, e->coef_kind, e->coef_dev,
+                               aeg_now_ns() - t_all, e->mb_count);
     aeg_dispatch_update(&e->d);
     return AEG_OK;
 }
@@ -11558,9 +11622,9 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     for (i = 0; i < AEG_MB_TYPE_COUNT; i++)
         out->mb_types[i] = e->stat_type[i];
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
-        out->stage_use_gpu[i] = e->d.use_gpu[i];
-        out->stage_cpu_ns[i] = e->d.cpu_ns[i][1];
-        out->stage_gpu_ns[i] = e->d.gpu_ns[i][1];
+        /* on the device: the dispatcher has it there now, or some of its
+         * work ran there (a forced batch path, or an earlier placement) */
+        out->stage_use_gpu[i] = e->d.use_gpu[i] || e->st.stage_gpu_ns[i] > 0;
     }
     return AEG_OK;
 }

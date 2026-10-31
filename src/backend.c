@@ -19,6 +19,8 @@
  * from frame to frame without affecting the produced bitstream.
  */
 #include <math.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include "backend.h"
 
 /* ------------------------------------------------------------------ */
@@ -118,8 +120,10 @@ static int cpu_interp_plane(void *priv, const uint8_t *ref, int rstride,
 /* ------------------------------------------------------------------ */
 /* The reference picture and its planes are registered once per picture, like a
  * GPU would keep them in device memory; the CPU "registration" is the pointer
- * set itself.  One encoder drives one backend, so a single static is enough. */
-static struct {
+ * set itself.  It is per thread: with frame threads two pictures run their
+ * searches at the same time, each against its own reference, and the
+ * registration and the batches of one picture always run on one thread. */
+static __thread struct {
     const uint8_t *base[4];
     int            stride;
 } g_cpu_ref;
@@ -183,7 +187,232 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
 int aeg_be_opencl_create(aeg_be_ops *ops);
 int aeg_be_cuda_create(aeg_be_ops *ops);
 
+/* ------------------------------------------------------------------ */
+/* Device guard                                                        */
+/* ------------------------------------------------------------------ */
+/* Every device backend is wrapped in this before the encoder sees it, for
+ * three reasons the backends themselves do not handle:
+ *
+ *  1. One device context serves every thread.  Frame threads and slice
+ *     threads are copies of the encoder that share ops.priv, and a backend
+ *     keeps its staging buffers and kernel arguments in the context, so two
+ *     calls at once corrupt each other (on a real OpenCL device: a crash on the
+ *     first picture with -t 2).  The guard serialises the calls.
+ *  2. The registered reference is device state that outlives a call.  Picture
+ *     A registers its reference, picture B registers another one on its own
+ *     thread, then A's satd_batch() would read B's.  The guard remembers, per
+ *     thread, what that thread registered and re-uploads it before a batch
+ *     whenever another thread's registration replaced it.
+ *  3. A failing device call must not change the stream.  The encoder ignores
+ *     the return codes of the batch operations (they cannot fail on the CPU),
+ *     so the guard runs the CPU reference instead -- the same arithmetic, so
+ *     the same bytes -- and keeps the device off from then on. */
+typedef struct be_guard {
+    aeg_be_ops      dev;
+    aeg_be_ops      cpu;
+    pthread_mutex_t mu;
+    uint64_t        seq;        /* registrations so far                     */
+    uint64_t        dev_seq;    /* the one resident on the device           */
+    int             failed;     /* a device call failed: CPU from now on    */
+} be_guard;
+
+static __thread struct {
+    const be_guard *g;
+    uint64_t        seq;
+    const uint8_t  *planes[4];
+    int             stride, w, h;
+} g_tls_ref;
+
+/* lock, or return 0 when the device is off and the CPU op has to run */
+static int guard_enter(be_guard *g)
+{
+    pthread_mutex_lock(&g->mu);
+    if (g->failed) {
+        pthread_mutex_unlock(&g->mu);
+        return 0;
+    }
+    return 1;
+}
+
+/* unlock; a failure switches the device off for good */
+static int guard_leave(be_guard *g, int rc, const char *op)
+{
+    if (rc != AEG_OK && !g->failed) {
+        g->failed = 1;
+        aeg_log(1, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
+    }
+    pthread_mutex_unlock(&g->mu);
+    return rc == AEG_OK;
+}
+
+static int g_sad_batch(void *priv, const uint8_t *cur, int cstride,
+                       const uint8_t *ref, int rstride, int bw, int bh,
+                       const int16_t *mv, int count, int32_t *out)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.sad_batch(g->dev.priv, cur, cstride, ref, rstride,
+                                        bw, bh, mv, count, out), "sad_batch"))
+        return AEG_OK;
+    return g->cpu.sad_batch(g->cpu.priv, cur, cstride, ref, rstride, bw, bh,
+                            mv, count, out);
+}
+
+static int g_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
+                      int intra, int16_t *level, int32_t *nz)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.tq_batch(g->dev.priv, res, nblk, qp, intra, level,
+                                       nz), "tq_batch"))
+        return AEG_OK;
+    return g->cpu.tq_batch(g->cpu.priv, res, nblk, qp, intra, level, nz);
+}
+
+static int g_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
+                           int16_t *res)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.iq_idct_batch(g->dev.priv, level, nblk, qp, res),
+                    "iq_idct_batch"))
+        return AEG_OK;
+    return g->cpu.iq_idct_batch(g->cpu.priv, level, nblk, qp, res);
+}
+
+static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
+                          int h, int which, uint8_t *dst, int dstride)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.interp_plane(g->dev.priv, ref, rstride, w, h,
+                                           which, dst, dstride),
+                    "interp_plane"))
+        return AEG_OK;
+    return g->cpu.interp_plane(g->cpu.priv, ref, rstride, w, h, which, dst,
+                               dstride);
+}
+
+static int g_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
+                       int sb, int w, int h, uint64_t *out)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.sse_batch(g->dev.priv, a, sa, b, sb, w, h, out),
+                    "sse_batch"))
+        return AEG_OK;
+    return g->cpu.sse_batch(g->cpu.priv, a, sa, b, sb, w, h, out);
+}
+
+static int g_ref_upload(void *priv, const uint8_t *const planes[4], int pstride,
+                        int w, int h)
+{
+    be_guard *g = (be_guard *)priv;
+    int k;
+    /* the CPU registration too, so that a fallback has a reference */
+    g->cpu.ref_upload(g->cpu.priv, planes, pstride, w, h);
+    for (k = 0; k < 4; k++)
+        g_tls_ref.planes[k] = planes[k];
+    g_tls_ref.stride = pstride;
+    g_tls_ref.w = w;
+    g_tls_ref.h = h;
+    g_tls_ref.g = g;
+    g_tls_ref.seq = 0;
+    if (!guard_enter(g))
+        return AEG_OK;
+    k = g->dev.ref_upload(g->dev.priv, planes, pstride, w, h);
+    if (k == AEG_OK)
+        g->dev_seq = g_tls_ref.seq = ++g->seq;
+    guard_leave(g, k, "ref_upload");
+    return AEG_OK;
+}
+
+static int g_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+                        int bh, const int16_t *pos, int count, int32_t *out)
+{
+    be_guard *g = (be_guard *)priv;
+    if (g_tls_ref.g == g && guard_enter(g)) {
+        int rc = AEG_OK;
+        if (g_tls_ref.seq != g->dev_seq) {
+            /* another thread registered its reference since this one did */
+            rc = g->dev.ref_upload(g->dev.priv, g_tls_ref.planes,
+                                   g_tls_ref.stride, g_tls_ref.w, g_tls_ref.h);
+            if (rc == AEG_OK)
+                g->dev_seq = g_tls_ref.seq = ++g->seq;
+        }
+        if (rc == AEG_OK)
+            rc = g->dev.satd_batch(g->dev.priv, cur, cstride, bw, bh, pos, count,
+                                   out);
+        if (guard_leave(g, rc, "satd_batch"))
+            return AEG_OK;
+    }
+    return g->cpu.satd_batch(g->cpu.priv, cur, cstride, bw, bh, pos, count, out);
+}
+
+static void g_sync(void *priv)
+{
+    be_guard *g = (be_guard *)priv;
+    if (!guard_enter(g))
+        return;
+    if (g->dev.sync)
+        g->dev.sync(g->dev.priv);
+    pthread_mutex_unlock(&g->mu);
+}
+
+static void g_destroy(void *priv)
+{
+    be_guard *g = (be_guard *)priv;
+    if (!g)
+        return;
+    if (g->dev.destroy)
+        g->dev.destroy(g->dev.priv);
+    pthread_mutex_destroy(&g->mu);
+    free(g);
+}
+
+/* Wrap a freshly created device backend; an operation the device does not
+ * provide stays absent, exactly as before. */
+static int be_guard_wrap(aeg_be_ops *ops)
+{
+    be_guard *g = (be_guard *)calloc(1, sizeof(*g));
+    if (!g)
+        return AEG_ENOMEM;
+    g->dev = *ops;
+    aeg_be_cpu_ops(&g->cpu);
+    pthread_mutex_init(&g->mu, NULL);
+    ops->priv = g;
+    if (ops->sad_batch) ops->sad_batch = g_sad_batch;
+    if (ops->tq_batch) ops->tq_batch = g_tq_batch;
+    if (ops->iq_idct_batch) ops->iq_idct_batch = g_iq_idct_batch;
+    if (ops->interp_plane) ops->interp_plane = g_interp_plane;
+    if (ops->sse_batch) ops->sse_batch = g_sse_batch;
+    if (ops->ref_upload && ops->satd_batch) {
+        ops->ref_upload = g_ref_upload;
+        ops->satd_batch = g_satd_batch;
+    } else {
+        ops->ref_upload = NULL;
+        ops->satd_batch = NULL;
+    }
+    ops->sync = g_sync;
+    ops->destroy = g_destroy;
+    return AEG_OK;
+}
+
+static int be_create_raw(int which, aeg_be_ops *ops);
+
 int aeg_be_create(int which, aeg_be_ops *ops)
+{
+    int rc = be_create_raw(which, ops);
+    if (ops->backend != AEG_BACKEND_CPU && be_guard_wrap(ops) != AEG_OK) {
+        if (ops->destroy)
+            ops->destroy(ops->priv);
+        aeg_be_cpu_ops(ops);
+        return AEG_EBACKEND;
+    }
+    return rc;
+}
+
+static int be_create_raw(int which, aeg_be_ops *ops)
 {
     aeg_be_cpu_ops(ops);
     switch (which) {
@@ -275,6 +504,17 @@ void aeg_dispatch_update(aeg_dispatcher *d)
             d->use_gpu[i] = 0;
             continue;
         }
+        /* The device form of the motion search is a different search (the
+         * whole-frame rounds), so placing it by timing would make the stream
+         * depend on how fast the machine happened to be.  Only a -s override
+         * (or AEG_SEED / AEG_PARFULL) puts it on a device. */
+        if (i == AEG_STAGE_MOTION_EST) {
+            d->use_gpu[i] = 0;
+            continue;
+        }
+        /* the coefficient stages are placed by aeg_dispatch_coef_pick() */
+        if (i == AEG_STAGE_TRANSFORM || i == AEG_STAGE_IQUANT_IDCT)
+            continue;
         /* Only switch to the GPU when the measurement is unambiguous
          * (>= 10% faster) and the frame had enough work to amortise a
          * launch; this includes the launch cost in the comparison. */
@@ -287,6 +527,83 @@ void aeg_dispatch_update(aeg_dispatcher *d)
         }
         d->cpu_ns[i][0] = 0;
         d->gpu_ns[i][0] = 0;
+    }
+}
+
+/* Placing the coefficient stages.
+ *
+ * Timing the batch calls themselves cannot decide this one: the CPU form of
+ * the stages is not a batch at all but sixteen SSE2 transforms inline in each
+ * candidate's coding, with nothing to time per call, and the batched form adds
+ * host work of its own around the launches (the gather, the scalar
+ * reconstruction add).  What can be compared is the whole picture: both
+ * placements code exactly the same stream -- the batched paths are
+ * byte-identical to the serial one -- so every other part of the picture's
+ * work is the same, and the difference in its time per macroblock *is* the
+ * cost of the placement.  So the first pictures of each kind alternate between
+ * the two, and once both have been seen enough the faster one stays, with
+ * the slower one re-tried every AEG_COEF_RETRY pictures in case the balance
+ * moved (another process on the GPU, a resolution change).
+ *
+ * The first picture on each side is not counted: it pays one-off costs (the
+ * OpenCL runtime compiles a kernel at its first launch, the buffers are
+ * allocated) that would otherwise decide the comparison. */
+#define AEG_COEF_PROBE 3        /* counted pictures per placement and kind */
+#define AEG_COEF_RETRY 64
+
+int aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind)
+{
+    if (kind < 0 || kind > 2)
+        return 0;
+    if (d->forced[AEG_STAGE_TRANSFORM] >= 0 ||
+        d->forced[AEG_STAGE_IQUANT_IDCT] >= 0)
+        return d->use_gpu[AEG_STAGE_TRANSFORM] &&
+               d->use_gpu[AEG_STAGE_IQUANT_IDCT];
+    if (!d->have_gpu || kind == 0)
+        return 0;               /* an I picture has no inter candidates */
+    if (!d->coef_decided[kind])
+        return d->coef_n[kind][1] < d->coef_n[kind][0];
+    if (++d->coef_since[kind] >= AEG_COEF_RETRY) {
+        d->coef_since[kind] = 0;
+        return !d->coef_dev[kind];
+    }
+    return d->coef_dev[kind];
+}
+
+void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
+                            int mbs)
+{
+    int64_t per, *slot;
+    if (kind <= 0 || kind > 2 || mbs <= 0 || !d->have_gpu ||
+        d->forced[AEG_STAGE_TRANSFORM] >= 0 ||
+        d->forced[AEG_STAGE_IQUANT_IDCT] >= 0)
+        return;
+    dev = dev != 0;
+    per = ns / mbs;
+    slot = &d->coef_ns[kind][dev];
+    if (d->coef_n[kind][dev]++ == 0)
+        return;                 /* the warm-up picture, see above */
+    *slot = *slot ? (*slot * 3 + per) / 4 : per;
+    if (d->coef_n[kind][0] > 1 && d->coef_n[kind][1] > 1) {
+        int64_t c = d->coef_ns[kind][0], g = d->coef_ns[kind][1];
+        int was = d->coef_dev[kind], first = !d->coef_decided[kind];
+        /* settle after AEG_COEF_PROBE counted pictures a side -- or after the
+         * first one when the two are a factor of two apart, which no amount
+         * of content variation between neighbouring pictures explains */
+        if (first && g < 2 * c && c < 2 * g &&
+            (d->coef_n[kind][0] <= AEG_COEF_PROBE ||
+             d->coef_n[kind][1] <= AEG_COEF_PROBE))
+            return;
+        d->coef_decided[kind] = 1;
+        if (g * 100 < c * 90)
+            d->coef_dev[kind] = 1;
+        else if (c * 100 < g * 90)
+            d->coef_dev[kind] = 0;
+        if (d->coef_dev[kind] != was || first)
+            aeg_log(2, "aeg: coefficient stages of %c pictures on the %s "
+                    "(%.2f us/MB on the CPU, %.2f us/MB on the device)",
+                    kind == 1 ? 'P' : 'B', d->coef_dev[kind] ? "device" : "CPU",
+                    c / 1000.0, g / 1000.0);
     }
 }
 
@@ -395,5 +712,10 @@ int aeg_backend_query_cuda(aeg_device_info *out, int max)
 {
     (void)out; (void)max;
     return 0;
+}
+int aeg_cuda_compile_check(int cc, char *log, size_t logsz, size_t *ptx_size)
+{
+    (void)cc; (void)log; (void)logsz; (void)ptx_size;
+    return AEG_EBACKEND;
 }
 #endif

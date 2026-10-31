@@ -223,9 +223,12 @@ typedef struct aeg_stats {
     int64_t bytes;
     int64_t enc_ns;             /* total wall time inside encode calls    */
     int64_t stage_ns[AEG_STAGE_COUNT];   /* time spent per stage          */
+    /* time inside the stage's batch operations, on a device and on the host
+     * (only the batched paths are timed per call, so these are parts of
+     * stage_ns, not a split of it) */
     int64_t stage_gpu_ns[AEG_STAGE_COUNT];
     int64_t stage_cpu_ns[AEG_STAGE_COUNT];
-    int     stage_use_gpu[AEG_STAGE_COUNT];
+    int     stage_use_gpu[AEG_STAGE_COUNT]; /* any of its work on a device */
     double  psnr_y, psnr_u, psnr_v, psnr_avg; /* reconstructed vs source  */
     double  ssim_y;
     /* VBV/HRD accounting (zero when the model is off): the lowest buffer level

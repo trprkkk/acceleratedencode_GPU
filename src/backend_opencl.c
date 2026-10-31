@@ -97,6 +97,8 @@ typedef struct ocl_ctx {
     char vendor[48];
     uint64_t mem;
     int cus;
+    int16_t *pos;               /* sad_batch: the rebased positions */
+    size_t pos_cap;
 } ocl_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -124,39 +126,40 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
 {
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mcur, mref, mmv, mout;
-    size_t cur_sz = (size_t)bw * bh;
-    size_t ref_sz = (size_t)rstride * (bh + 32);
     size_t nthreads = (size_t)count;
+    aeg_sad_span sp;
     cl_int st = CL_SUCCESS;
 
-    mcur = ocl_buf(o, 0, cur_sz, CL_MEM_READ_ONLY);
-    mref = ocl_buf(o, 1, ref_sz, CL_MEM_READ_ONLY);
+    if (count <= 0)
+        return AEG_OK;
+    if (o->pos_cap < (size_t)count) {
+        free(o->pos);
+        o->pos_cap = (size_t)count;
+        o->pos = (int16_t *)malloc(o->pos_cap * 8);
+        if (!o->pos) {
+            o->pos_cap = 0;
+            return AEG_ENOMEM;
+        }
+    }
+    /* only the span the candidates read, see aeg_sad_span_rebase() */
+    aeg_sad_span_rebase(mv, count, bw, bh, cstride, rstride, o->pos, &sp);
+    mcur = ocl_buf(o, 0, sp.cbytes, CL_MEM_READ_ONLY);
+    mref = ocl_buf(o, 1, sp.rbytes, CL_MEM_READ_ONLY);
     mmv = ocl_buf(o, 2, (size_t)count * 8, CL_MEM_READ_ONLY);
     mout = ocl_buf(o, 3, (size_t)count * 4, CL_MEM_WRITE_ONLY);
     if (!mcur || !mref || !mmv || !mout)
         return AEG_EBACKEND;
-
-    /* pack the current block contiguously */
-    {
-        static uint8_t *tmp;
-        static size_t tmp_cap;
-        int y;
-        if (tmp_cap < cur_sz) {
-            free(tmp);
-            tmp_cap = cur_sz;
-            tmp = (uint8_t *)malloc(tmp_cap);
-            if (!tmp)
-                return AEG_ENOMEM;
-        }
-        for (y = 0; y < bh; y++)
-            memcpy(tmp + (size_t)y * bw, cur + (size_t)y * cstride, (size_t)bw);
-        p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cur_sz, tmp, 0, NULL, NULL);
-    }
-    p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, ref_sz, ref, 0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mmv, CL_TRUE, 0, (size_t)count * 8, mv, 0, NULL, NULL);
+    st |= p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, sp.cbytes,
+                                 cur + sp.coff, 0, NULL, NULL);
+    st |= p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, sp.rbytes,
+                                 ref + sp.roff, 0, NULL, NULL);
+    st |= p_clEnqueueWriteBuffer(o->queue, mmv, CL_TRUE, 0, (size_t)count * 8,
+                                 o->pos, 0, NULL, NULL);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
 
     p_clSetKernelArg(o->k_sad, 0, sizeof(cl_mem), &mcur);
-    p_clSetKernelArg(o->k_sad, 1, sizeof(int), &bw);
+    p_clSetKernelArg(o->k_sad, 1, sizeof(int), &cstride);
     p_clSetKernelArg(o->k_sad, 2, sizeof(cl_mem), &mref);
     p_clSetKernelArg(o->k_sad, 3, sizeof(int), &rstride);
     p_clSetKernelArg(o->k_sad, 4, sizeof(int), &bw);
@@ -168,8 +171,9 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
                                   0, NULL, NULL);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4, out,
-                          0, NULL, NULL);
+    if (p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4,
+                              out, 0, NULL, NULL) != CL_SUCCESS)
+        return AEG_EBACKEND;
     return AEG_OK;
 }
 
@@ -304,11 +308,17 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
     int pad = AEG_PAD;
     cl_int st;
 
+    /* `ref` and `dst` point at the picture origins; the kernel takes the
+     * whole padded allocations (rows * stride bytes from pad rows and pad
+     * columns before the origin), because its output covers the padding */
     mref = ocl_buf(o, 0, rbytes, CL_MEM_READ_ONLY);
     mdst = ocl_buf(o, 1, dbytes, CL_MEM_WRITE_ONLY);
     if (!mref || !mdst)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, rbytes, ref, 0, NULL, NULL);
+    if (p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, rbytes,
+                               ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD, 0,
+                               NULL, NULL) != CL_SUCCESS)
+        return AEG_EBACKEND;
     p_clSetKernelArg(o->k_intp, 0, sizeof(cl_mem), &mref);
     p_clSetKernelArg(o->k_intp, 1, sizeof(int), &rstride);
     p_clSetKernelArg(o->k_intp, 2, sizeof(int), &w);
@@ -321,7 +331,10 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
                                   0, NULL, NULL);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mdst, CL_TRUE, 0, dbytes, dst, 0, NULL, NULL);
+    if (p_clEnqueueReadBuffer(o->queue, mdst, CL_TRUE, 0, dbytes,
+                              dst - (ptrdiff_t)AEG_PAD * dstride - AEG_PAD, 0,
+                              NULL, NULL) != CL_SUCCESS)
+        return AEG_EBACKEND;
     return AEG_OK;
 }
 
@@ -413,6 +426,7 @@ static void ocl_destroy(void *priv)
     for (i = 0; i < NBUF; i++)
         if (o->buf[i])
             p_clReleaseMemObject(o->buf[i]);
+    free(o->pos);
     if (o->k_sad) p_clReleaseKernel(o->k_sad);
     if (o->k_tq) p_clReleaseKernel(o->k_tq);
     if (o->k_iq) p_clReleaseKernel(o->k_iq);
@@ -434,6 +448,15 @@ static int ocl_load(void **lib)
         "/usr/lib/x86_64-linux-gnu/libOpenCL.so.1", NULL
     };
     int i;
+    /* AEG_OPENCL_LIB: a library outside the loader's search path (a pip-installed
+     * runtime, a second driver) -- tried before the usual names */
+    const char *ev = getenv("AEG_OPENCL_LIB");
+    if (ev && *ev) {
+        *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
+        if (*lib)
+            return AEG_OK;
+        aeg_log(1, "aeg: AEG_OPENCL_LIB=%s: %s", ev, dlerror());
+    }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
         if (*lib)
