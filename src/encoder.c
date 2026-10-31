@@ -5923,8 +5923,15 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * the modes by SATD instead of SAD helped neither two nor one. */
     CM_T0();
     int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
-    if (n16 > ENV_INT("AEG_I16N", 2))
-        n16 = ENV_INT("AEG_I16N", 2);
+    {
+        /* one mode below preset 4 (re-measured once the Intra_16x16 AC
+         * level selection was off: +0.08 / +0.02 % at preset 3 for -4.9 /
+         * -2.0 %, +0.07 % at preset 2 for -4.4 %) */
+        const int nmax = ENV_INT("AEG_I16N", -1) > 0 ? ENV_INT("AEG_I16N", -1)
+                         : e->p.preset >= 4 ? 2 : 1;
+        if (n16 > nmax)
+            n16 = nmax;
+    }
     if (e->mb_inter_ok && ENV_INT("AEG_I16G", 0) > 0 &&
         e->mb_inter_sad * ENV_INT("AEG_I16G", 0) < e->mb_sad * 100)
         n16 = 1;

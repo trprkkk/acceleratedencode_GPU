@@ -2793,6 +2793,16 @@ back, cock 90 frames, QP 28, best of three:
 | preset 4, one thread | 7.53 s (12.0 fps) | 5.89 s (15.3 fps) |
 | preset 4, frame threads | 4.13 s (21.8 fps) | 3.24 s (27.8 fps) |
 
+**One Intra_16x16 mode below preset 4** (`AEG_I16N=2` restores two): with
+the Intra_16x16 AC level selection off, the second mode is worth less than it
+was; one mode measured +0.08 / +0.02 % at preset 3 (5 clips / validation
+set) for -4.9 / -2.0 % of the time, +0.07 % at preset 2 for -4.4 %, and +0.09 %
+on all-intra streams (`-g 1`, preset 3) for -4.3 %.  Preset 4 keeps two.
+With it, preset 3 has spent about +0.04 % of its budget net over the round.
+Also tried for preset 3 alone: the UMH early exit at 1500 (+0.06 / -0.01 %
+for -2.8 / 0 %), and skipping the coder's price of a candidate-refinement
+neighbour whose luma distortion already loses (exact, no measurable time).
+
 Also tried in this round and not taken (each against the then default,
 preset 3): the lambda-scaled gate on the second-reference 16x16 search (k =
 32: -0.01 % for -2.4 %, k = 64: +0.10 % for -1.1 % -- within the noise of the
