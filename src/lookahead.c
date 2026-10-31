@@ -26,6 +26,9 @@
  * decision rule in encoder.c (b_adapt_decide()) and its thresholds expect.
  */
 #include "h264.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -106,13 +109,10 @@ void aeg_lowres_build_rows(aeg_lowres *l, const uint8_t *src, int sstride,
 
 static int se_bits(int v)
 {
-    unsigned u = v > 0 ? 2u * (unsigned)v - 1u : 2u * (unsigned)(-v);
-    int n = 0;
+    /* codeNum + 1 has n significant bits; the code is 2n - 1 long */
+    unsigned u = (v > 0 ? 2u * (unsigned)v - 1u : 2u * (unsigned)(-v)) + 1u;
 
-    u++;
-    while (u >> n)
-        n++;
-    return 2 * n - 1;
+    return 2 * (32 - __builtin_clz(u)) - 1;
 }
 
 static int mv_cost(int mx, int my, int px, int py)
@@ -142,6 +142,32 @@ static void get_pred(const aeg_lowres *ref, int bx, int by, int hx, int hy,
     const uint8_t *p = ref->plane + (ptrdiff_t)(by + iy) * ref->stride + bx + ix;
     int s = ref->stride;
 
+#if defined(__SSE2__)
+    {
+        const __m128i z = _mm_setzero_si128(), two = _mm_set1_epi16(2);
+        for (y = 0; y < 8; y++, p += s) {
+            __m128i a = _mm_loadl_epi64((const __m128i *)p), v;
+            if (!fx && !fy) {
+                v = a;
+            } else if (!fy) {
+                v = _mm_avg_epu8(a, _mm_loadl_epi64((const __m128i *)(p + 1)));
+            } else if (!fx) {
+                v = _mm_avg_epu8(a, _mm_loadl_epi64((const __m128i *)(p + s)));
+            } else {
+                __m128i t = _mm_add_epi16(
+                    _mm_add_epi16(_mm_unpacklo_epi8(a, z),
+                                  _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(p + 1)), z)),
+                    _mm_add_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(p + s)), z),
+                                  _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(p + s + 1)), z)));
+                t = _mm_srli_epi16(_mm_add_epi16(t, two), 2);
+                v = _mm_packus_epi16(t, t);
+            }
+            _mm_storel_epi64((__m128i *)(out + 8 * y), v);
+        }
+        (void)x;
+        return;
+    }
+#endif
     for (y = 0; y < 8; y++, p += s)
         for (x = 0; x < 8; x++) {
             int v;
@@ -195,13 +221,28 @@ static int block_search(const aeg_lowres *cur, const aeg_lowres *ref,
         if (cx != bmx || cy != bmy)
             LA_TRY(cx, cy);
     }
-    for (it = 0; it < LA_RANGE; it++) {
-        int cx = bmx, cy = bmy;
+    /* After a move along hex[d], three of the new hexagon's points (hex[d+2]
+     * .. hex[d+4] around the new centre: two points of the old hexagon and the
+     * old centre) were measured already, and a point measured before cannot
+     * beat the best it has already lost to: only hex[d-1..d+1] are new. */
+    {
+        int d = -1;
+        for (it = 0; it < LA_RANGE; it++) {
+            int cx = bmx, cy = bmy, nd = -1;
 
-        for (i = 0; i < 6; i++)
-            LA_TRY(cx + hex[i][0], cy + hex[i][1]);
-        if (bmx == cx && bmy == cy)
-            break;
+            for (i = 0; i < 6; i++) {
+                int ox = bmx, oy = bmy, r = (i - d + 6) % 6;
+                /* in index order, as before, so that ties go the same way */
+                if (d >= 0 && r > 1 && r < 5)
+                    continue;
+                LA_TRY(cx + hex[i][0], cy + hex[i][1]);
+                if (bmx != ox || bmy != oy)
+                    nd = i;
+            }
+            if (bmx == cx && bmy == cy)
+                break;
+            d = nd;
+        }
     }
     {
         int cx = bmx, cy = bmy;

@@ -1069,20 +1069,14 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         if (e->p.trellis > 0 && e->p.cabac)
             trellis_i16_ac(e, mbx, mby, c, blk, src + by * e->stride[0] + bx,
                            e->stride[0], pr, qp, &dcv);
-        for (i = 0; i < 16; i++)
-            nz += c->level[blk][i] != 0;
+        {
+            int dummy;
+            nz = aeg_nz_last(c->level[blk], 16, &dummy);
+        }
         c->nz[blk] = (int8_t)nz;
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++)
-                r[y * e->stride[0] + x] = pr[y * 16 + x];
-        aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, r, e->stride[0], &dcv);
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int d = (int)r[y * e->stride[0] + x] -
-                        (int)src[(by + y) * e->stride[0] + bx + x];
-                c->sse += (int64_t)d * d;
-            }
+        aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, pr, 16, &dcv);
     }
+    c->sse += aeg_ssd(16, 16, dst, e->stride[0], src, e->stride[0]);
     /* CAVLC Intra_16x16 always codes all sixteen AC blocks; the luma part of
      * the coded block pattern comes from the macroblock type. */
     c->cbp = (c->cbp & 0x30) | 0x0f;
@@ -1153,7 +1147,7 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     uint8_t *dst = e->recp[0] + mby * 16 * e->stride[0] + mbx * 16;
-    int blk, i, x, y, luma_cbp = 0, qp = c->qp;
+    int blk, x, y, luma_cbp = 0, qp = c->qp;
 
     if (lev != &c->level[0][0])
         memcpy(c->level, lev, 16 * 16 * sizeof(int16_t));
@@ -1166,8 +1160,8 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         if (nz) {
             n = nz[blk];
         } else {
-            for (i = 0; i < 16; i++)
-                n += c->level[blk][i] != 0;
+            int dummy;
+            n = aeg_nz_last(c->level[blk], 16, &dummy);
         }
         c->nz[blk] = (int8_t)n;
         if (n)
@@ -1181,19 +1175,12 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                         (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
                 }
         } else {
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++)
-                    r[y * e->stride[0] + x] = pr[y * 16 + x];
-            aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, r,
-                               e->stride[0], NULL);
+            aeg_idct_add_block(r, e->stride[0], c->level[blk], qp, pr, 16,
+                               NULL);
         }
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int d = (int)r[y * e->stride[0] + x] -
-                        (int)src[(by + y) * e->stride[0] + bx + x];
-                c->sse += (int64_t)d * d;
-            }
     }
+    /* the sixteen blocks' SSE, summed as one */
+    c->sse += aeg_ssd(16, 16, dst, e->stride[0], src, e->stride[0]);
     c->cbp = (c->cbp & 0x30) | luma_cbp;
     if (!e->p.cabac) {                  /* CAVLC estimate, see above */
         int g, k;
@@ -1330,16 +1317,18 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
     int i, pass, nnz = 0, last = -1;
     int64_t bits, sse, cost, best_cost, orig_cost, best_sse, orig_bits, orig_sse;
 
+    {
+        /* most blocks are empty: say so before gathering the scan */
+        int dummy;
+        if (!aeg_nz_last(lev, nat, &dummy))
+            return 0;
+    }
     memcpy(cur, lev, natsz);
     for (i = 0; i < t->n; i++)
-        if (cur[t->scan[i]]) {
-            nnz++;
-            last = i;
-        }
+        scan[i] = cur[t->scan[i]];
+    nnz = aeg_nz_last(scan, t->n, &last);
     if (!nnz)
         return 0;
-    for (i = 0; i < t->n; i++)
-        scan[i] = cur[t->scan[i]];
     bits = cabac_block_price(sh, scan, t->n, t->cat, t->cbf_ctx);
     sse = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
     orig_cost = best_cost = cost = sse + trel_price(bits, lambda);
@@ -1650,7 +1639,7 @@ static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     uint8_t *dst = e->recp[0] + mby * 16 * s + mbx * 16;
     const int bx = (g & 1) * 8, by = (g >> 1) * 8;
     int16_t res[64], coef[64];
-    int i, x, y;
+    int x, y;
 
     for (y = 0; y < 8; y++)
         for (x = 0; x < 8; x++)
@@ -1662,18 +1651,14 @@ static void code_luma8_block(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         trellis_luma8(e, src + by * s + bx, s, pred, pred_stride, c->level8[g],
                       c->qp, intra ? trellis_intra_lambda(AEG_LAMBDA(c->qp))
                                    : AEG_LAMBDA(c->qp));
-    c->nz8[g] = 0;
-    for (i = 0; i < 64; i++)
-        c->nz8[g] |= c->level8[g][i] != 0;
+    {
+        int dummy;
+        c->nz8[g] = aeg_nz_last(c->level8[g], 64, &dummy) != 0;
+    }
 
     aeg_idct_8x8_add(dst + by * s + bx, s, c->level8[g], c->qp, pred,
                      pred_stride);
-    for (y = 0; y < 8; y++)
-        for (x = 0; x < 8; x++) {
-            int d = (int)dst[(by + y) * s + bx + x] -
-                    (int)src[(by + y) * s + bx + x];
-            c->sse += (int64_t)d * d;
-        }
+    c->sse += aeg_ssd(8, 8, dst + by * s + bx, s, src + by * s + bx, s);
 }
 
 /* Coded block pattern, contexts and CAVLC cost of the four 8x8 luma blocks.
@@ -1846,7 +1831,6 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         c->nz[AEG_BLK_CHROMA_DC + pl] = (int8_t)nz_dc;
         aeg_dequant_2x2_dc_out(dclev, dcout, qpc);
         for (blk = 0; blk < 4; blk++) {
-            uint8_t tmp[8 * 8];
             const uint8_t *pr = pred + bxy[blk][1] * 8 + bxy[blk][0];
             int32_t dcv = dcout[blk];
             int nz = 0;
@@ -1872,25 +1856,24 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                              e->stride[1], pr, 8, qpc,
                              inter ? lam : trellis_intra_lambda(lam), 2, 1);
             }
-            for (i = 0; i < 16; i++)
-                nz += c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk][i] != 0;
+            {
+                int dummy;
+                nz = aeg_nz_last(c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
+                                 16, &dummy);
+            }
             c->nz[AEG_BLK_CHROMA_CB + pl * 4 + blk] = (int8_t)nz;
             if (nz)
                 c->cbp |= 0x20;
 
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++)
-                    tmp[y * 8 + x] = pr[y * 8 + x];
-            aeg_idct_add_block(tmp, 8, c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
-                               qpc, tmp, 8, &dcv);
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++) {
-                    int v = tmp[y * 8 + x];
-                    int s = src[(bxy[blk][1] + y) * e->stride[1] + bxy[blk][0] + x];
-                    int d = v - s;
-                    c->sse += (int64_t)d * d;
-                    base[(bxy[blk][1] + y) * e->stride[1] + bxy[blk][0] + x] = (uint8_t)v;
-                }
+            {
+                uint8_t *o = base + bxy[blk][1] * e->stride[1] + bxy[blk][0];
+                aeg_idct_add_block(o, e->stride[1],
+                                   c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
+                                   qpc, pr, 8, &dcv);
+                c->sse += aeg_ssd(4, 4, o, e->stride[1],
+                                  src + bxy[blk][1] * e->stride[1] + bxy[blk][0],
+                                  e->stride[1]);
+            }
         }
         if (nz_dc) {
             c->cbp |= (pl == 0) ? 0x10 : 0x10;
@@ -4047,6 +4030,29 @@ static int bidir_on(const struct aeg_encoder *e)
     return v >= 0 ? v : e->p.preset >= 3;
 }
 
+/* The prediction of one partition from list `list` at a quarter-pel
+ * vector, stored with stride geo[2] (b_part_satd_bi()'s, exactly). */
+static void b_part_pred(struct aeg_encoder *e, int mbx, int mby,
+                        const int geo[4], int mvx, int mvy, int list,
+                        uint8_t *buf)
+{
+    const uint8_t *ref = list ? e->ref2p[0] : e->refp[0];
+    const aeg_mc_ctx *mc = list ? &e->mc1 : &e->mc;
+    const uint8_t *r = ref + (mby * 16 + geo[1] + (mvy >> 2)) * e->stride[0] +
+                       mbx * 16 + geo[0] + (mvx >> 2);
+    if (mc->ready)
+        aeg_mc_luma_p(buf, geo[2], mc, r, geo[2], geo[3], mvx & 3, mvy & 3);
+    else
+        aeg_mc_luma(buf, geo[2], r, e->stride[0], geo[2], geo[3],
+                    mvx & 3, mvy & 3);
+}
+
+/* Joint refinement of a bi-predicted pair: each list's vector in turn walks
+ * its eight quarter-pel neighbours with the other list held, by the SATD of
+ * the averaged prediction plus both mvds.  The held list's prediction and
+ * mvd bits do not change while the other walks, so both are kept instead of
+ * being recomputed per neighbour (the same costs, in the same order, as
+ * b_part_satd_bi() per candidate). */
 static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
                              const int geo[4], const int pmv[2][2],
                              int mv[2][2])
@@ -4056,33 +4062,43 @@ static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
     };
     const int range4 = (e->p.search_range ? e->p.search_range : 16) * 4;
     const int lam = e->me_lambda;
+    const uint8_t *src = e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                         mbx * 16 + geo[0];
+    uint8_t store[3][16 * 16];
+    uint8_t *pred[2] = { store[0], store[1] }, *tmp = store[2];
+    int bits[2];
     int best, it, moved = 1;
 
-    best = b_part_satd_bi(e, mbx, mby, geo, mv[0][0], mv[0][1], mv[1][0],
-                          mv[1][1]) +
-           lam * (aeg_mvd_bits(mv[0][0] - pmv[0][0], mv[0][1] - pmv[0][1]) +
-                  aeg_mvd_bits(mv[1][0] - pmv[1][0], mv[1][1] - pmv[1][1]));
+    b_part_pred(e, mbx, mby, geo, mv[0][0], mv[0][1], 0, pred[0]);
+    b_part_pred(e, mbx, mby, geo, mv[1][0], mv[1][1], 1, pred[1]);
+    bits[0] = aeg_mvd_bits(mv[0][0] - pmv[0][0], mv[0][1] - pmv[0][1]);
+    bits[1] = aeg_mvd_bits(mv[1][0] - pmv[1][0], mv[1][1] - pmv[1][1]);
+    best = aeg_satd_avg(geo[2], geo[3], src, e->stride[0], pred[0], pred[1],
+                        geo[2]) +
+           lam * (bits[0] + bits[1]);
     for (it = 0; it < 4 && moved; it++) {
         int l;
         moved = 0;
         for (l = 1; l >= 0; l--) {
             int k, bx = mv[l][0], by = mv[l][1];
             for (k = 0; k < 8; k++) {
-                int t[2][2] = { { mv[0][0], mv[0][1] }, { mv[1][0], mv[1][1] } };
-                int c;
-                t[l][0] = bx + offs[k][0];
-                t[l][1] = by + offs[k][1];
-                if (t[l][0] < -range4 || t[l][0] > range4 ||
-                    t[l][1] < -range4 || t[l][1] > range4)
+                int tx = bx + offs[k][0], ty = by + offs[k][1], c, tb;
+                if (tx < -range4 || tx > range4 || ty < -range4 || ty > range4)
                     continue;
-                c = b_part_satd_bi(e, mbx, mby, geo, t[0][0], t[0][1],
-                                   t[1][0], t[1][1]) +
-                    lam * (aeg_mvd_bits(t[0][0] - pmv[0][0], t[0][1] - pmv[0][1]) +
-                           aeg_mvd_bits(t[1][0] - pmv[1][0], t[1][1] - pmv[1][1]));
+                b_part_pred(e, mbx, mby, geo, tx, ty, l, tmp);
+                tb = aeg_mvd_bits(tx - pmv[l][0], ty - pmv[l][1]);
+                c = aeg_satd_avg(geo[2], geo[3], src, e->stride[0],
+                                 l ? pred[0] : tmp, l ? tmp : pred[1],
+                                 geo[2]) +
+                    lam * (l ? bits[0] + tb : tb + bits[1]);
                 if (c < best) {
+                    uint8_t *sw = pred[l];
                     best = c;
-                    mv[l][0] = t[l][0];
-                    mv[l][1] = t[l][1];
+                    mv[l][0] = tx;
+                    mv[l][1] = ty;
+                    bits[l] = tb;
+                    pred[l] = tmp;
+                    tmp = sw;
                     moved = 1;
                 }
             }
@@ -4972,18 +4988,16 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                 trel_descent(&e->cab_shadow, &tr, t->level[rb], sb, s, pred, 4,
                              t->qp, trellis_intra_lambda(lambda), 2, 1);
             }
-            for (k = 0; k < 16; k++)
-                nz += t->level[rb][k] != 0;
+            {
+                int dummy;
+                nz = aeg_nz_last(t->level[rb], 16, &dummy);
+            }
             t->nz[rb] = (int8_t)nz;
             if (nz)
                 t->cbp |= 1 << ((rb >> 3) * 2 + ((rb & 3) >> 1));
         }
         aeg_idct_add_block(db, s, t->level[rb], t->qp, pred, 4, NULL);
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int d = (int)db[y * s + x] - (int)sb[y * s + x];
-                t->sse += (int64_t)d * d;
-            }
+        t->sse += aeg_ssd(4, 4, db, s, sb, s);
     }
 
     t->bits += mode_bits;

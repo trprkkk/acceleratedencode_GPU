@@ -41,4 +41,16 @@ for k in range(30):
 np.concatenate(out).tofile(real + '/fade.yuv')
 PY
 echo "--clip $REAL/cock.yuv 640x352 --clip $REAL/vtest.yuv 384x288 --clip $REAL/mega.yuv 352x256 --clip $REAL/short.yuv 320x240 --clip $REAL/tree.yuv 320x240" > "$REAL/clips.txt"
+# The validation set ($REAL2, default /tmp/real2): six other 30-picture
+# segments of the same sources, for checking that a decision-changing speed-up
+# did not just get lucky on clips.txt (tools/real/pab.sh CL=$REAL2/clips.txt).
+REAL2=${REAL2:-/tmp/real2}; mkdir -p "$REAL2"
+cv2() { "$FF" -v error -y -i "$DL/src/$1" -vf "select=gte(n\,$3)$4" -vsync 0 -frames:v 30 -pix_fmt yuv420p -f rawvideo "$REAL2/$2.yuv"; }
+cv2 cockatoo.mp4 cock   60  ",scale=640:352"
+cv2 vtest.avi    vtest  60  ",scale=384:288"
+cv2 Megamind.avi mega   60  ",scale=360:264,crop=352:256"
+cv2 tree.avi     tree   30  ""
+cv2 vtest.avi    vtest2 400 ",scale=384:288"
+cv2 Megamind.avi mega2  200 ",scale=360:264,crop=352:256"
+echo "--clip $REAL2/cock.yuv 640x352 --clip $REAL2/vtest.yuv 384x288 --clip $REAL2/mega.yuv 352x256 --clip $REAL2/tree.yuv 320x240 --clip $REAL2/vtest2.yuv 384x288 --clip $REAL2/mega2.yuv 352x256" > "$REAL2/clips.txt"
 echo "FFMPEG=$FF"

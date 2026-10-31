@@ -212,4 +212,30 @@ int64_t aeg_cabac_coef_price(const aeg_cabac *c, int cat, int n, int pos,
 int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
                                  int n, int cat, int cbf_ctx);
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+/* The number of non-zero values of v[0..n-1] and the index of the last one
+ * (-1 when there is none): the loop every block price and level search
+ * starts with, eight values per compare. */
+static inline int aeg_nz_last(const int16_t *v, int n, int *last)
+{
+    int i = 0, cnt = 0, l = -1;
+#if defined(__SSE2__)
+    const __m128i z = _mm_setzero_si128();
+    for (; i + 8 <= n; i += 8) {
+        unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi16(
+                         _mm_loadu_si128((const __m128i *)(v + i)), z)) ^ 0xffffu;
+        if (m) {
+            cnt += __builtin_popcount(m) >> 1;
+            l = i + ((31 - __builtin_clz(m)) >> 1);
+        }
+    }
+#endif
+    for (; i < n; i++)
+        if (v[i]) { cnt++; l = i; }
+    *last = l;
+    return cnt;
+}
+
 #endif

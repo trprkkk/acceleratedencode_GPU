@@ -589,8 +589,7 @@ int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
     int i, last = -1, count = 0;
     uint32_t c = 0;
 
-    for (i = 0; i < n; i++)
-        if (coef[i]) { last = i; count++; }
+    count = aeg_nz_last(coef, n, &last);
     if (cbf_ctx >= 0) {
         c += BIN_COST(state[cbf_ctx], count != 0);
         if (!count)
@@ -741,10 +740,9 @@ int aeg_cabac_residual(aeg_cabac *cb, const int16_t *coef, int n, int cat,
                        int cbf_ctx)
 {
     const struct cab_cat_ctx *k = &cab_cat[cat];
-    int i, last = -1, count = 0;
+    int i, last = -1, count;
 
-    for (i = 0; i < n; i++)
-        if (coef[i]) { last = i; count++; }
+    count = aeg_nz_last(coef, n, &last);
     if (cb->cost)
         return residual_cost(cb, coef, n, k, cbf_ctx, last, count);
     if (cbf_ctx >= 0) {
