@@ -6,3 +6,5 @@ build/
 *.yuv
 *.mp4
 __pycache__/
+.ci/
+build-*/

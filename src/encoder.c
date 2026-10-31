@@ -1473,12 +1473,14 @@ static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
                         aeg_idct8_cache_init(&c8, cur, qp);
                     cache_ready = 1;
                 }
-                if (t->side == 8)
+                if (t->side == 8) {
                     sse2 = aeg_idct8_cache_ssd(&c8, pos, newlev, pred,
                                                pred_stride, src, stride);
-                cur[pos] = (int16_t)newlev;
-                if (t->side != 8)
+                    cur[pos] = (int16_t)newlev;
+                } else {
+                    cur[pos] = (int16_t)newlev;
                     sse2 = trel_sse(t, src, stride, pred, pred_stride, cur, qp);
+                }
                 c = sse2 + trel_price(bits + dbits, lambda);
                 if (c >= cost) {
                     cur[pos] = oldlev;

@@ -1,0 +1,189 @@
+# Every push: the CPU encoder's conformance suite, and every device path on a
+# real OpenCL device (PoCL, an OpenCL implementation that runs on the CPU), and
+# the CUDA kernels through NVRTC.  No GPU is needed for any of it; what these
+# jobs prove is that the device paths are *correct* -- byte-identical to the
+# CPU encoder -- not that they are fast.  See docs/STATUS.md, "GPU groundwork
+# on a real OpenCL device".
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # the same ffmpeg build the conformance cases were written against
+  FFMPEG: ${{ github.workspace }}/.ci/ext/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2
+  AEG_POCL_DIR: ${{ github.workspace }}/.ci/pocl
+
+jobs:
+  cpu:
+    name: CPU build, make test, frame threads
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # a Python that pip may install into (the runner's system Python is
+      # "externally managed", PEP 668); only the tools come from pip --
+      # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: .ci/ext
+          key: ffmpeg-imageio-v7.0.2
+      - name: ffmpeg 7.0.2
+        run: |
+          [ -x "$FFMPEG" ] || python3 -m pip install -q --target .ci/ext imageio-ffmpeg
+          "$FFMPEG" -version | head -n 1
+      - name: build
+        run: make -j"$(nproc)"
+      - name: make test
+        run: make test
+      - name: frame threads write the serial stream
+        run: |
+          make -s build/genyuv
+          ./build/genyuv 320 192 40 /tmp/ft.yuv 1
+          for p in 1 3 4; do
+            ./build/aegenc -w 320 -h 192 -n 40 -q 26 -p $p -i /tmp/ft.yuv \
+                -o /tmp/s.264 --frame-threads 1 -v 0
+            ./build/aegenc -w 320 -h 192 -n 40 -q 26 -p $p -i /tmp/ft.yuv \
+                -o /tmp/f.264 --frame-threads 4 -v 0
+            cmp /tmp/s.264 /tmp/f.264
+            echo "preset $p: frame threads identical"
+          done
+
+  opencl-pocl:
+    name: OpenCL backend on PoCL
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # a Python that pip may install into (the runner's system Python is
+      # "externally managed", PEP 668); only the tools come from pip --
+      # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci/ext
+            .ci/pocl
+          key: ffmpeg-imageio-v7.0.2-pocl-v1
+      - name: ffmpeg 7.0.2
+        run: |
+          [ -x "$FFMPEG" ] || python3 -m pip install -q --target .ci/ext imageio-ffmpeg
+      - name: build (OPENCL=1)
+        run: |
+          make -j"$(nproc)" OPENCL=1
+          make -s OPENCL=1 build/backend_check build/genyuv
+      - name: device present
+        run: |
+          . tools/pocl_env.sh
+          ./build/aegenc --list-devices | tee /tmp/devices
+          grep -q opencl /tmp/devices
+      - name: backend_check (every device operation, two threads)
+        run: |
+          . tools/pocl_env.sh
+          ./build/backend_check opencl | tee /tmp/bc
+          grep -q "checks agree" /tmp/bc
+      - name: conformance suite through the device
+        run: |
+          . tools/pocl_env.sh
+          BUILD=./build AEG_TEST_BACKEND=opencl sh tests/run_tests.sh
+      - name: gpu_validate (device paths byte-identical to the CPU)
+        run: |
+          . tools/pocl_env.sh
+          ./build/genyuv 320 192 16 /tmp/v.yuv 1
+          BE=opencl tools/gpu_validate.sh /tmp/v.yuv 320 192 16 26 -p 3 -t 1
+          BE=opencl tools/gpu_validate.sh /tmp/v.yuv 320 192 16 26 -p 2 -t 2
+
+  cuda-nvrtc:
+    name: CUDA kernels through NVRTC
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # a Python that pip may install into (the runner's system Python is
+      # "externally managed", PEP 668); only the tools come from pip --
+      # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: .ci/nvrtc
+          key: nvrtc-cu12-v1
+      - name: NVRTC (pip, no toolkit, no driver)
+        run: |
+          [ -d .ci/nvrtc/nvidia ] ||
+            python3 -m pip install -q --target .ci/nvrtc nvidia-cuda-nvrtc-cu12
+      - name: build (CUDA=1 OPENCL=1)
+        run: |
+          make -j"$(nproc)" CUDA=1 OPENCL=1
+          make -s CUDA=1 OPENCL=1 build/nvrtc_check
+      - name: nvrtc_check (every supported architecture)
+        run: |
+          AEG_NVRTC_LIB=$(ls .ci/nvrtc/nvidia/cuda_nvrtc/lib/libnvrtc.so.* | head -n 1) \
+            ./build/nvrtc_check | tee /tmp/nv
+          grep -q "kernels compile" /tmp/nv
+
+  sanitizers:
+    name: ASan + UBSan (CPU and the OpenCL host side)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # a Python that pip may install into (the runner's system Python is
+      # "externally managed", PEP 668); only the tools come from pip --
+      # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci/ext
+            .ci/pocl
+          key: ffmpeg-imageio-v7.0.2-pocl-v1
+      - name: ffmpeg 7.0.2
+        run: |
+          [ -x "$FFMPEG" ] || python3 -m pip install -q --target .ci/ext imageio-ffmpeg
+      - name: build with sanitizers
+        env:
+          # from the environment, not the make command line: the Makefile
+          # appends its include paths to CFLAGS, which a command-line CFLAGS
+          # would override
+          CFLAGS: -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment,shift -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+        run: |
+          make -j"$(nproc)" OPENCL=1 BUILD=build-san
+          make -s OPENCL=1 BUILD=build-san build-san/backend_check \
+            build-san/kernel_check build-san/coef_check build-san/genyuv
+      - name: unit checks
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          ./build-san/kernel_check
+          ./build-san/coef_check 20000
+      - name: backend_check on PoCL (host transfers stay inside the buffers)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          . tools/pocl_env.sh
+          ./build-san/backend_check opencl
+      - name: encodes (CPU and device paths, B pictures, slice and frame threads)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          . tools/pocl_env.sh
+          ./build-san/genyuv 176 144 12 /tmp/s.yuv 1
+          B=./build-san/aegenc
+          A="-w 176 -h 144 -n 12 -q 26 -i /tmp/s.yuv -v 0"
+          for p in 0 2 4; do
+            $B $A -p $p -b cpu -o /tmp/c.264
+            $B $A -p $p -b cpu -t 2 -o /tmp/t.264
+            $B $A -p $p -b cpu --frame-threads 3 -o /tmp/f.264
+            AEG_RD_BATCH=1 $B $A -p $p -b opencl -t 2 -o /tmp/o.264
+            AEG_SEED=1 AEG_PARFULL=1 $B $A -p $p -b opencl -s inter=opencl -o /tmp/s.264
+            cmp /tmp/t.264 /tmp/o.264 || { echo "rd batch differs at preset $p" >&2; exit 1; }
+            cmp /tmp/c.264 /tmp/f.264 || { echo "frame threads differ at preset $p" >&2; exit 1; }
+          done
