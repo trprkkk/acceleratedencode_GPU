@@ -488,6 +488,9 @@ typedef struct aeg_mc_ctx {
      * blocks, for the other blocks with a 16-sample side, and for the
      * smaller ones; 0 = hexagon walk only. */
     int            umh[4];
+    /* Skip the multi-hexagon stage when the best predictor is the predicted
+     * MV and its SAD + MV cost is below umh_et / 256 per sample; 0 = never. */
+    int            umh_et;
 } aeg_mc_ctx;
 
 void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride);

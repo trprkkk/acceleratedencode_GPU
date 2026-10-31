@@ -126,6 +126,7 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     mc->ready = 0;
     mc->chroma = 0;
     mc->umh[0] = mc->umh[1] = mc->umh[2] = mc->umh[3] = 0;
+    mc->umh_et = 0;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
                                 (size_t)AEG_PAD * stride + AEG_PAD
@@ -971,6 +972,13 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
     }
     {
         int ur = me_umh_radius(mc, bw, bh);
+        /* x264-style early exit: when the best of the predictors is the
+         * (rounded) predicted MV itself and already cheap, the
+         * multi-hexagon stage is skipped and only the hexagon walk runs. */
+        if (ur > 0 && mc->umh_et > 0 && best_cost * 256 < mc->umh_et * bw * bh &&
+            ((bx == pred_x >> 2 && by == pred_y >> 2) ||
+             (bx == (pred_x + 2) >> 2 && by == (pred_y + 2) >> 2)))
+            ur = 0;
         if (ur > 0)
             umh_search(ref, rstride, cur, cstride, bw, bh, range, ur, &rt,
                        &bx, &by, &best_cost);

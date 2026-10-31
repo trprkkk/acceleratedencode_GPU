@@ -2700,6 +2700,26 @@ streams (`-g 1`, preset 3, -15 %).  The other two switches of the same kind
 stay: chroma level selection off is +2.2 %, the bi-predictive refinement of
 B partitions off +0.14 % for -4 %.
 
+**Early exit before the multi-hexagon stage** (x264's UMH has the same kind
+of exit; `AEG_UMHET=0` turns it off, `AEG_UMHET=n` sets the threshold): when the
+best integer predictor is the predicted MV itself and its SAD + MV cost is
+below n/256 per sample, only the hexagon walk runs.  n = 1000 below preset 4,
+500 at preset 4:
+
+| preset | threshold | 5 clips | validation set | time |
+|---|---|---|---|---|
+| 1 | 1000 | +0.01 % | | -4.6 % |
+| 2 | 1000 | +0.07 % | | -4.2 % |
+| 3 | 1000 | +0.01 % | +0.11 % | -6.6 % / -6.1 % |
+| 3 | 500 | +0.06 % | +0.05 % | -5.4 % / -3.7 % |
+| 4 | 1000 | +0.08 % | +0.06 % | -7.6 % / -8.6 % |
+| 4 | 500 | +0.03 % | +0.07 % | -6.1 % / -6.2 % |
+
+Without the predictor condition the exit costs more (threshold 1000, preset
+3: +0.09 % on the 5 clips).  `AEG_UMHET=0` writes the previous default's
+stream at every preset; decoder-exact at presets 3 and 4, frame threads
+identical 32/32.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,

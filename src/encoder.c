@@ -9173,7 +9173,7 @@ done:
  * segments of the same sources, for -8.5 % of the time (none below 8x8 at all
  * +0.05 % for -7 %, radius 8 on both +0.01 % for -4 %).
  * AEG_UMH / AEG_UMHP / AEG_UMH8 / AEG_UMHS override the four radii. */
-static void umh_radii(const struct aeg_encoder *e, int r[4])
+static void umh_radii(const struct aeg_encoder *e, int r[4], int *et)
 {
     static const char *const names[4] = { "AEG_UMH", "AEG_UMHP", "AEG_UMH8",
                                           "AEG_UMHS" };
@@ -9187,6 +9187,15 @@ static void umh_radii(const struct aeg_encoder *e, int r[4])
         const char *ev = getenv(names[k]);
         if (ev)
             r[k] = atoi(ev);
+    }
+    /* UMH early exit (mc.c): threshold 1000 per 16x16 below preset 4 measured
+     * +0.01 / +0.11 % (two clip sets) for -6.6 / -6.1 % of the time at p3;
+     * at p4 500 measured +0.03 / +0.07 % for -6.1 / -6.2 %. */
+    *et = pr >= 4 ? 500 : 1000;
+    {
+        const char *ev = getenv("AEG_UMHET");
+        if (ev)
+            *et = atoi(ev);
     }
 }
 
@@ -9466,7 +9475,7 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 ctx->cur_c[0] = e->srcp[1];
                 ctx->cur_c[1] = e->srcp[2];
                 ctx->cstride = e->stride[1];
-                umh_radii(e, ctx->umh);
+                umh_radii(e, ctx->umh, &ctx->umh_et);
             }
         }
         aeg_dispatch_record(&e->d, AEG_STAGE_INTER_PRED,
