@@ -2608,6 +2608,61 @@ on two cores needs consecutive P pictures to overlap (row-wavefront frame
 threads with a fixed vertical vector limit).  That is what *Frame threads*
 above now does, exactly -- the search range already is the limit.
 
+## Exact work, third round: nothing measured twice
+
+Byte-identical to 40c1301 throughout (`tools/real/same.sh` presets 1/3/4 at
+QP 24/34, 30/30; presets 0/2; CAVLC; `-g 1`; ABR + AQ; frame threads; `make
+test`).  The kernels are mostly SIMD already, so this round removes work whose
+result is already known:
+
+* **Empty blocks and counts:** `aeg_nz_last()` (count and last index, eight
+  values per compare, a SWAR bit count since baseline x86-64 has no popcnt) in
+  the CABAC pricer and writer and in the trellis, which returns before
+  gathering the scan when a block is empty; one SSD per reconstructed
+  macroblock instead of one per block.
+* **Lookahead:** Exp-Golomb length by leading-zero count, SSE2 half-pel
+  averaging, and a hexagon walk that measures only the three new positions
+  after a move (in the listed order, so ties still go the same way).
+* **Motion search without revisits.**  A position measured earlier in the
+  search lost to the best at the time, and the best only falls, so it can
+  never be strictly cheaper later: the hexagon/square rounds skip what the
+  previous round measured (a hexagon that moved by one step shares three
+  points with the last one, and the first square shares four with the last
+  hexagon), the sub-pel rounds skip their previous round's 3x3, the start
+  candidates are de-duplicated and measured four at a time, and the hexagon
+  walk takes the start's cost from the caller instead of measuring it again.
+  (A per-search stamp table over all stages removed more SADs and was no
+  faster -- the four-way SAD only gains when a group of four goes.)
+* **Trellis converges early:** a trial depends only on the current state, so
+  once a whole sweep's worth of trials has gone by without a move, the second
+  sweep would repeat the first one's rejections and is skipped (-2.5 %).
+* **Intra mode decision:** two modes that predict the same samples share one
+  evaluation (only the mode bits differ); the trellis pass over the best two
+  modes starts from the levels, SSE and price the plain pass already measured;
+  and the winner's selected levels are coded as they are instead of being
+  quantised and selected again (-8 % together).
+* **Chroma memo:** a macroblock's chroma depends only on its prediction, the
+  QP and intra/inter while `code_mb()` decides, so the result (levels, flags,
+  SSE, reconstruction) is kept per macroblock and replayed -- every intra
+  candidate under the chroma-aware comparison, the winner's final chroma pass
+  (-2.6 % at preset 4).  The same memo for the luma of inter candidates hit
+  13 % of them and saved nothing measurable, so it is not in.
+
+cock 90 frames, QP 28, this two-core sandbox, the two builds run back to back:
+
+| | 40c1301 | now |
+|---|---|---|
+| preset 3, one thread | 11.1 s (8.1 fps) | 8.9 s (10.1 fps) |
+| preset 3, frame threads | 6.2 s (14.6 fps) | 5.1 s (17.7 fps) |
+| preset 4, one thread | 12.6 s (7.2 fps) | 9.9 s (9.1 fps) |
+| preset 4, frame threads | 6.9 s (13.0 fps) | 5.4 s (16.7 fps) |
+
+The profile is flat now (preset 3, one thread: the four-way SAD 6 %, the
+macroblock search's own code 5 %, quarter-pel SATD 5 %, MC 5 %, the 4x4
+inverse transform 4 %, the CABAC pricer 4 %, nothing else above 3 %); what is
+left is mostly decisions, which is the early-termination stage (each gated at
++0.1 % BD-rate).
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
