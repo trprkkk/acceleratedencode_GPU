@@ -176,7 +176,10 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           . tools/pocl_env.sh
-          ./build-san/aegenc --list-devices | grep -q opencl
+          # (to a file first: "| grep -q" exits at the first match, and under
+          # pipefail the writer's SIGPIPE would fail the step at random)
+          ./build-san/aegenc --list-devices > /tmp/devices
+          grep -q opencl /tmp/devices
           ./build-san/backend_check opencl | tee /tmp/bc
           grep -q "checks agree" /tmp/bc
       - name: encodes (CPU and device paths, B pictures, slice and frame threads)
