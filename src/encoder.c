@@ -5457,6 +5457,9 @@ static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
     f = *t;
     dc = rd_chroma(e, mbx, mby, &f, is_inter_type(t->type),
                    is_inter_type(t->type) ? t->chroma_mode : cmode, lambda);
+    /* the same bound with the chroma distortion added */
+    if (e->p.cabac && f.sse >= bound)
+        return f.sse;
     return rd_price(e, mbx, mby, &f, est + dc, lambda);
 }
 
@@ -5547,6 +5550,67 @@ static int i16_satd(struct aeg_encoder *e, int mbx, int mby)
                             mby > e->top_row && mbx > 0, e->mb_modes[0]);
     return aeg_satd(16, 16, buf, 16, src, e->stride[0]);
 }
+/* How many of the eight quarter-pel neighbours the rate-distortion vector
+ * refinement re-codes the macroblock with (0 = the plain walks: the four of
+ * the cross at --refine-mv 1, all eight at 3).  --refine-mv 2 takes the four
+ * (three at preset 3) whose prediction SATD plus the mvd's bits is the
+ * lowest, in that order,
+ * around the vector the search returned: a SATD and an interpolation are a
+ * small fraction of one candidate's coding and pricing.  Measured at preset 4
+ * on the five real clips plus six other 30-picture segments of the same
+ * sources (ours against ours, global PSNR): +0.05 to +0.09 % for -9 % of the
+ * time against all eight, where the fixed cross (--refine-mv 1) is +0.17 %;
+ * all eight re-ordered and not walked is +0.01 %.  At preset 3 three of
+ * them against the cross: -0.11 % / -0.02 % for -2 to -3 % of the time.
+ * AEG_MVREFK=K overrides the count (1..8). */
+static int mvref_k(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_MVREFK");
+        v = ev ? atoi(ev) : -1;
+    }
+    if (v >= 0)
+        return v;
+    return e->p.refine_mv == 2 ? (e->p.preset >= 4 ? 4 : 3) : 0;
+}
+
+static inline int mvref_se_bits(int v)
+{
+    unsigned m = (unsigned)(v < 0 ? -v : v) * 2u;
+    return m ? 2 * (31 - __builtin_clz(m)) + 1 : 1;
+}
+
+/* Order the eight neighbours of partition `geo` (vector mv on list/ref
+ * `ref`; for a bi-predicted B partition `omv` is the other list's vector,
+ * `bi` 1 when the refined list is list 0 and 2 when it is list 1). */
+static void mvref_order(struct aeg_encoder *e, int mbx, int mby,
+                        const int geo[4], const int16_t mv[2],
+                        const int16_t pmv[2], int ref, int bi,
+                        const int16_t omv[2], double lambda, int ord[8])
+{
+    static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+    static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+    const int lm = (int)(sqrt(lambda) + 0.5);
+    int c[8], j, i;
+
+    for (j = 0; j < 8; j++) {
+        int nx = mv[0] + dx[j], ny = mv[1] + dy[j], d;
+        if (bi == 1)
+            d = b_part_satd_bi(e, mbx, mby, geo, nx, ny, omv[0], omv[1]);
+        else if (bi == 2)
+            d = b_part_satd_bi(e, mbx, mby, geo, omv[0], omv[1], nx, ny);
+        else
+            d = part_satd_ref(e, mbx, mby, geo, nx, ny, ref);
+        c[j] = d + lm * (mvref_se_bits(nx - pmv[0]) + mvref_se_bits(ny - pmv[1]));
+        ord[j] = j;
+    }
+    for (j = 1; j < 8; j++)
+        for (i = j; i > 0 && c[ord[i]] < c[ord[i - 1]]; i--) {
+            int t = ord[i]; ord[i] = ord[i - 1]; ord[i - 1] = t;
+        }
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     /* Both snapshots are written by the first candidate that is evaluated, and
@@ -5735,7 +5799,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
         static const int cross[4] = { 1, 3, 4, 6 };
         const int cheap = e->p.refine_mv < 2;
-        const int nn = cheap ? 4 : 8;
+        const int K = cheap ? 0 : mvref_k(e);
+        const int nn = K > 0 ? (K < 8 ? K : 8) : cheap ? 4 : 8;
         const int npart = mb_part_count(&best);
         mbcand save = e->mb_cand[0];
         int p, b, j;
@@ -5746,9 +5811,17 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
          * which is more than the rest of the macroblock costs.) */
         for (p = 0; p < npart; p++) {
             int geo[4], b0;
+            int ord[8];
+            int16_t bmv[2];
             mb_part_geom(&best, p, geo, &b0);
+            bmv[0] = best.mv[b0][0];
+            bmv[1] = best.mv[b0][1];
+            if (K > 0)
+                mvref_order(e, mbx, mby, geo, bmv, best.pmv[b0],
+                            e->cur_l0_active > 1 ? best.ref[b0] & 1 : 0, 0,
+                            NULL, lambda, ord);
             for (j = 0; j < nn; j++) {
-                int k = cheap ? cross[j] : j;
+                int k = K > 0 ? ord[j] : cheap ? cross[j] : j;
                 int64_t cost;
                 e->mb_cand[0] = save;
                 e->mb_cand[0].type = best.type;
@@ -5769,8 +5842,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                     if (bx < geo[0] || bx >= geo[0] + geo[2] ||
                         by < geo[1] || by >= geo[1] + geo[3])
                         continue;
-                    e->mb_cand[0].mv[b][0] = best.mv[b][0] + dx[k];
-                    e->mb_cand[0].mv[b][1] = best.mv[b][1] + dy[k];
+                    e->mb_cand[0].mv[b][0] = (K > 0 ? bmv[0] : best.mv[b][0]) + dx[k];
+                    e->mb_cand[0].mv[b][1] = (K > 0 ? bmv[1] : best.mv[b][1]) + dy[k];
                 }
                 cost = rd_luma(e, mbx, mby, &t, c->qp, best.type, 0, lambda, 0);
                 cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
@@ -5815,7 +5888,8 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
         static const int cross[4] = { 1, 3, 4, 6 };
         const int cheap = e->p.refine_mv < 2;
-        const int nn = cheap ? 4 : 8;
+        const int K = cheap ? 0 : mvref_k(e);
+        const int nn = K > 0 ? (K < 8 ? K : 8) : cheap ? 4 : 8;
         const int npart = mb_part_count(&best);
         mbcand save = e->mb_cand[0];
         const int mb_qp = c->qp;
@@ -5825,10 +5899,20 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             int geo[4], b0;
             mb_part_geom(&best, p, geo, &b0);
             for (l = 0; l < 2; l++) {
-                if (!(mb_part_lists(&best, p) & (1 << l)))
+                int ord[8], lists = mb_part_lists(&best, p);
+                int16_t bmv[2], omv[2];
+                if (!(lists & (1 << l)))
                     continue;
+                bmv[0] = l ? best.mv1[b0][0] : best.mv[b0][0];
+                bmv[1] = l ? best.mv1[b0][1] : best.mv[b0][1];
+                omv[0] = l ? best.mv[b0][0] : best.mv1[b0][0];
+                omv[1] = l ? best.mv[b0][1] : best.mv1[b0][1];
+                if (K > 0)
+                    mvref_order(e, mbx, mby, geo, bmv,
+                                l ? best.pmv1[b0] : best.pmv[b0], l,
+                                lists == 3 ? 1 + l : 0, omv, lambda, ord);
                 for (j = 0; j < nn; j++) {
-                    int k = cheap ? cross[j] : j;
+                    int k = K > 0 ? ord[j] : cheap ? cross[j] : j;
                     int64_t cost;
                     e->mb_cand[0] = save;
                     e->mb_cand[0].type = best.type;
@@ -5853,11 +5937,11 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                             by < geo[1] || by >= geo[1] + geo[3])
                             continue;
                         if (l == 0) {
-                            e->mb_cand[0].mv[b][0] = best.mv[b][0] + dx[k];
-                            e->mb_cand[0].mv[b][1] = best.mv[b][1] + dy[k];
+                            e->mb_cand[0].mv[b][0] = (K > 0 ? bmv[0] : best.mv[b][0]) + dx[k];
+                            e->mb_cand[0].mv[b][1] = (K > 0 ? bmv[1] : best.mv[b][1]) + dy[k];
                         } else {
-                            e->mb_cand[0].mv1[b][0] = best.mv1[b][0] + dx[k];
-                            e->mb_cand[0].mv1[b][1] = best.mv1[b][1] + dy[k];
+                            e->mb_cand[0].mv1[b][0] = (K > 0 ? bmv[0] : best.mv1[b][0]) + dx[k];
+                            e->mb_cand[0].mv1[b][1] = (K > 0 ? bmv[1] : best.mv1[b][1]) + dy[k];
                         }
                     }
                     cand_enc(e, 0, c->qp, &retry);
@@ -8847,19 +8931,25 @@ done:
 }
 
 /* The multi-hexagon stage of the motion search (umh_search, mc.c), per
- * block class: 16x16 / 16x8 and 8x16 / 8x8 and smaller.  Measured (ours
+ * block class: 16x16 / 16x8 and 8x16 / 8x8 / smaller than 8x8.  Measured (ours
  * against ours, global PSNR): 16x16 only -0.14% for +1.6% time; with the
- * 16x8/8x16 searches -0.47% for +8%; every block -0.53% for +26%.
- * AEG_UMH / AEG_UMHP / AEG_UMH8 override the three radii. */
-static void umh_radii(const struct aeg_encoder *e, int r[3])
+ * 16x8/8x16 searches -0.47% for +8%; every block -0.53% for +26%.  At preset
+ * 4, against radius 16 on every block: the 8x8 search at radius 8 and none
+ * below 8x8 measured +0.00 % on the five real clips and -0.03 % on six other
+ * segments of the same sources, for -8.5 % of the time (none below 8x8 at all
+ * +0.05 % for -7 %, radius 8 on both +0.01 % for -4 %).
+ * AEG_UMH / AEG_UMHP / AEG_UMH8 / AEG_UMHS override the four radii. */
+static void umh_radii(const struct aeg_encoder *e, int r[4])
 {
-    static const char *const names[3] = { "AEG_UMH", "AEG_UMHP", "AEG_UMH8" };
+    static const char *const names[4] = { "AEG_UMH", "AEG_UMHP", "AEG_UMH8",
+                                          "AEG_UMHS" };
     int pr = e->p.preset, k;
 
     r[0] = pr >= 1 ? 16 : 0;
     r[1] = pr >= 3 ? 16 : 0;
-    r[2] = pr >= 4 ? 16 : 0;
-    for (k = 0; k < 3; k++) {
+    r[2] = pr >= 4 ? 8 : 0;
+    r[3] = 0;
+    for (k = 0; k < 4; k++) {
         const char *ev = getenv(names[k]);
         if (ev)
             r[k] = atoi(ev);
@@ -10041,7 +10131,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * candidate per neighbour, so it scales with the preset like the search
      * range does: the two slow presets are where the quality is wanted. */
     if (pp->refine_mv < 0)
-        pp->refine_mv = pp->preset >= 4 ? 2 : (pp->preset >= 3 ? 1 : 0);
+        pp->refine_mv = pp->preset >= 3 ? 2 : 0;
     /* Refining every candidate is a large amount of work (one macroblock
      * evaluation per neighbour per candidate) for a change that measured
      * between 0.3 and 0.6 points, a worse exchange rate than the level

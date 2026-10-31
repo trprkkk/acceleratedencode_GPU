@@ -2508,6 +2508,54 @@ Tried and rejected in the same round:
 thread; `an.py` prints self, inclusive, `--callers=` and `--children=`
 tables), and `tools/real/spd.sh` times two binaries with alternating runs.
 
+## Less motion work at presets 3 and 4
+
+Preset 4 adds four things to preset 3, and each was measured against the
+current preset 4 (ours against ours, `ABBD_GLOBAL=1`, five real clips, one
+thread): the UMH stage on blocks below 16x8 (+0.18 % without it, -10 % time),
+all eight neighbours in the vector refinement instead of the cross (+0.17 %,
+-9 %), the chroma-aware candidate comparison (+0.72 %, -10 %), range 48
+instead of 32 (+0.12 %, no time) and a longer lookahead (nothing either way).
+None can simply go, so two of them were made cheaper instead:
+
+* **The refinement ranks before it codes.**  Re-coding the macroblock with a
+  neighbouring vector is a full candidate (residual, trellis, chroma, CABAC
+  price); a quarter-pel SATD of the partition plus the mvd's bits is a small
+  fraction of one.  `--refine-mv 2` now SATD-ranks all eight neighbours around
+  the searched vector and re-codes the best K, in that order: K = 4 at preset 4,
+  3 at preset 3 (which used the plain cross, now `--refine-mv 1`; the old
+  eight-neighbour walk is `--refine-mv 3`; `AEG_MVREFK` overrides K).  Preset
+  4: +0.09 % for -9 % time on the five clips, +0.05 % on six other 30-picture
+  segments of the same sources (cock, vtest and mega from picture 60, tree
+  from 30, vtest from 400, mega from 200); the fixed cross was +0.17 %; all
+  eight ranked, not walked, +0.01 %.  Preset 3, against the cross: -0.11 % and
+  -0.02 % for -2 to -3 % time (K = 2 is +0.02 % for -4.6 %).
+* **The UMH stage per block class** (`umh_radii`): 8x8 blocks at radius 8 and
+  none for 8x4, 4x8 and 4x4 (a fourth class, `AEG_UMHS`).  +0.00 % / -0.03 %
+  on the two clip sets for -8.5 % time; no UMH below 8x8 at all is +0.05 % for
+  -7 %, radius 8 on both +0.01 % for -4 %.  (Radius 8 for 16x8/8x16 at preset
+  3: -0.03 % for -2 %, but +0.11 % at preset 4 -- not taken.)
+
+Together at preset 4: -0.04 % / +0.07 % on the two sets for -18 % / -16 %
+time.  Against x264 medium psy=0 at constant QP (`BD_GLOBAL=1
+tools/real/bdx.sh "" psy=0 N`): preset 3 -0.01 / -11.30 / -6.17 / -8.98 /
++2.37, mean **-4.82 %**; preset 4 -1.78 / -11.74 / -8.05 / -9.24 / +2.11,
+mean **-5.74 %** (cock, vtest, mega, short, tree).
+
+Exact, alongside: the UMH stage's vector costs four positions at a time (the
+Exp-Golomb length is the float exponent of 2|d| | 1, so SSE2 without a
+leading-zero count; it was a third of `umh_search`'s own time), a two- or
+three-position remainder of a SAD list goes through the four-way SAD, and a
+candidate whose luma plus chroma distortion already reaches the best price is
+not priced by the coder.  -3 % at preset 4, byte-identical (`same.sh` presets
+1/3/4, 30/30).
+
+cock 90 frames, frame threads, this (noisy: +-10 % between runs) sandbox:
+preset 4 9.97 -> **7.73 s** (mean of 4; best 9.50 -> 7.23 s, ~12 fps), preset
+3 unchanged within the noise (6.4-6.7 s; serial -2 %).  Decoder-exact
+(`exact.sh` presets 3/4, `--refine-mv 3`, P-only, the fade clip), frame
+threads identical to serial (`ftcmp.sh` 48/48 on cock, short and fade).
+
 ## Exact kernel work (second round)
 
 Byte-identical again (`tools/real/same.sh` against 32e961c, presets 1/3/4,
@@ -2611,8 +2659,10 @@ pel away can have a marginally worse prediction and a much cheaper bitstream
 the winning P16x16 macroblock with each neighbour of its vector in quarter-pel
 steps and keep whichever the coder's own price prefers -- `SSD + lambda * bits`
 with `bits` from the shadow coder, so the mvd, the residual and the
-macroblock's own syntax are all in the comparison.  Preset 3 tries the four
-axial neighbours, preset 4 all eight; `--refine-mv 0|1|2` overrides it, and
+macroblock's own syntax are all in the comparison.  Preset 3 tried the four
+axial neighbours, preset 4 all eight (both now rank the eight by SATD and
+re-code the best three or four -- *Less motion work at presets 3 and 4*);
+`--refine-mv 0|1|2|3` overrides it, and
 preset 2 and below do not refine at all.  B pictures refine both lists of every
 partition the same way (*The same refinement in a B picture* below).
 

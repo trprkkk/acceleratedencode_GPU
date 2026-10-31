@@ -124,7 +124,7 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     mc->base[0] = NULL;
     mc->ready = 0;
     mc->chroma = 0;
-    mc->umh[0] = mc->umh[1] = mc->umh[2] = 0;
+    mc->umh[0] = mc->umh[1] = mc->umh[2] = mc->umh[3] = 0;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
                                 (size_t)AEG_PAD * stride + AEG_PAD
@@ -501,6 +501,20 @@ static void me_sad_list(const uint8_t *ref, int rstride, const uint8_t *cur,
             b[k] = ref + pts[i + k][1] * rstride + pts[i + k][0];
         aeg_sad_x4(bw, bh, cur, cstride, b, rstride, out + i);
     }
+    if (n - i >= 2) {
+        /* two or three left: one more four-way call (the last position
+         * repeated) is cheaper than two or three single ones */
+        const uint8_t *b[4];
+        int k, o[4];
+        for (k = 0; k < 4; k++) {
+            int q = i + k < n ? i + k : n - 1;
+            b[k] = ref + pts[q][1] * rstride + pts[q][0];
+        }
+        aeg_sad_x4(bw, bh, cur, cstride, b, rstride, o);
+        for (k = 0; i + k < n; k++)
+            out[i + k] = o[k];
+        return;
+    }
     for (; i < n; i++)
         out[i] = me_sad(ref, rstride, cur, cstride, bw, bh, pts[i][0], pts[i][1]);
 }
@@ -570,6 +584,54 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
     return best;
 }
 
+/* best/bx/by of the n positions pts[] with SADs sads[]: each position's cost
+ * is its SAD plus me_mv_cost(), and a position replaces the best only when it
+ * is strictly cheaper, in the listed order.  The rate term four positions at a
+ * time: the bits of an Exp-Golomb component are 2*floor(log2(2|d| | 1)) + 1,
+ * and floor(log2) of a small integer is the exponent of its float. */
+static void me_pick(const me_rate *rt, const int (*pts)[2], const int *sads,
+                    int n, int *best, int *bx, int *by)
+{
+    int k = 0, b = *best, x = *bx, y = *by;
+#if defined(__SSE2__)
+    if (rt->lambda > 0 && rt->lambda < 32768) {
+        const __m128i px = _mm_set1_epi32(rt->px), py = _mm_set1_epi32(rt->py);
+        const __m128i one = _mm_set1_epi32(1), lam = _mm_set1_epi32(rt->lambda);
+        const __m128i e127 = _mm_set1_epi32(127 * 2 - 1);
+        for (; k + 4 <= n; k += 4) {
+            __m128 lo = _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)pts[k]));
+            __m128 hi = _mm_castsi128_ps(_mm_loadu_si128((const __m128i *)pts[k + 2]));
+            __m128i vx = _mm_castps_si128(_mm_shuffle_ps(lo, hi, _MM_SHUFFLE(2, 0, 2, 0)));
+            __m128i vy = _mm_castps_si128(_mm_shuffle_ps(lo, hi, _MM_SHUFFLE(3, 1, 3, 1)));
+            __m128i dx = _mm_sub_epi32(_mm_slli_epi32(vx, 2), px);
+            __m128i dy = _mm_sub_epi32(_mm_slli_epi32(vy, 2), py);
+            __m128i sx = _mm_srai_epi32(dx, 31), sy = _mm_srai_epi32(dy, 31);
+            __m128i ex, ey, bits, c;
+            int cc[4], j;
+            dx = _mm_sub_epi32(_mm_xor_si128(dx, sx), sx);
+            dy = _mm_sub_epi32(_mm_xor_si128(dy, sy), sy);
+            dx = _mm_or_si128(_mm_slli_epi32(dx, 1), one);
+            dy = _mm_or_si128(_mm_slli_epi32(dy, 1), one);
+            ex = _mm_srli_epi32(_mm_castps_si128(_mm_cvtepi32_ps(dx)), 23);
+            ey = _mm_srli_epi32(_mm_castps_si128(_mm_cvtepi32_ps(dy)), 23);
+            /* (2(ex-127)+1) + (2(ey-127)+1) */
+            bits = _mm_sub_epi32(_mm_slli_epi32(_mm_add_epi32(ex, ey), 1),
+                                 _mm_slli_epi32(e127, 1));
+            c = _mm_add_epi32(_mm_loadu_si128((const __m128i *)(sads + k)),
+                              _mm_madd_epi16(bits, lam));
+            _mm_storeu_si128((__m128i *)cc, c);
+            for (j = 0; j < 4; j++)
+                if (cc[j] < b) { b = cc[j]; x = pts[k + j][0]; y = pts[k + j][1]; }
+        }
+    }
+#endif
+    for (; k < n; k++) {
+        int c = sads[k] + me_mv_cost(rt, pts[k][0] * 4, pts[k][1] * 4);
+        if (c < b) { b = c; x = pts[k][0]; y = pts[k][1]; }
+    }
+    *best = b; *bx = x; *by = y;
+}
+
 /* x264's uneven multi-hexagon search, simplified: from the best start, a
  * cross of every other sample out to +-r horizontally and +-r/2 vertically,
  * a 5x5 square, and 16-point hexagons at radii 4, 8, .. r; each stage keeps
@@ -603,10 +665,8 @@ static void umh_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         int k_;                                                              \
         me_sad_list(ref, rstride, cur, cstride, bw, bh,                      \
                     (const int (*)[2])pts, np, sads);                        \
-        for (k_ = 0; k_ < np; k_++) {                                        \
-            int c_ = sads[k_] + me_mv_cost(rt, pts[k_][0] * 4, pts[k_][1] * 4); \
-            if (c_ < best) { best = c_; bx = pts[k_][0]; by = pts[k_][1]; }  \
-        }                                                                    \
+        me_pick(rt, (const int (*)[2])pts, sads, np, &best, &bx, &by);       \
+        (void)k_;                                                            \
         np = 0;                                                              \
     } while (0)
     for (i = 1; i <= r; i += 2) {
@@ -643,7 +703,9 @@ static int me_umh_radius(const aeg_mc_ctx *mc, int bw, int bh)
         return 0;
     if (bw == 16 && bh == 16)
         return mc->umh[0];
-    return bw >= 16 || bh >= 16 ? mc->umh[1] : mc->umh[2];
+    if (bw >= 16 || bh >= 16)
+        return mc->umh[1];
+    return bw == 8 && bh == 8 ? mc->umh[2] : mc->umh[3];
 }
 
 static int me_try_pmv(void)

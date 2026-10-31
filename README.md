@@ -132,9 +132,10 @@ more than one CPU unless `-t 1`; the stream is byte-identical to the serial
 one; constant QP, one slice), `-p 0..4` is the speed/quality
 preset (it scales the search range, the subpel refinement and, from 3 up, the
 rate-distortion refinement of the winning motion vector and the level
-selection), `--refine-mv 0|1|2`
+selection), `--refine-mv 0|1|2|3`
 controls that last one on its own (0 off, 1 the four axial quarter-pel
-neighbours, 2 all eight; 1.2-4.2 points of BD-rate against x264 medium for
+neighbours, 2 the three or four of all eight with the lowest SATD -- the
+preset 3/4 default --, 3 all eight; 1.2-4.2 points of BD-rate against x264 medium for
 30-45 % more time, and from preset 3 up it also refines each partition of a
 16x8 / 8x16 winner and both lists of every B-picture partition (worth 0.4-0.9
 points there, see `docs/STATUS.md`), `--refine-cand 0|1`
