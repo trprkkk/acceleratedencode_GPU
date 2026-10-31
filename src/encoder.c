@@ -1369,11 +1369,18 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
             cost = orig_cost;
         }
     }
-    for (pass = 0; pass < passes; pass++) {
-        for (i = 0; i < t->n; i++) {
+    /* A trial depends only on the state (levels, cost, bits, last), so once
+     * a whole sweep's worth of trials has gone by without a move, the state is
+     * the one every following trial already saw and rejected: the descent has
+     * converged and the remaining sweeps would change nothing. */
+    int idle = 0;
+    for (pass = 0; pass < passes && idle < 2 * t->n; pass++) {
+        for (i = 0; i < t->n && idle < 2 * t->n; i++) {
             int pos = t->scan[i], step;
-            if (!cur[pos])
+            if (!cur[pos]) {
+                idle += 2;
                 continue;
+            }
             for (step = -1; step <= 1; step += 2) {
                 const int16_t oldlev = cur[pos];
                 int newlev = (int)oldlev + step;
@@ -1386,6 +1393,7 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
                         j--;
                     last2 = j;
                 }
+                idle++;
                 dbits = trel_dbits(sh, t, cur, i, newlev, last);
                 /* the distortion is never negative, so a move whose bits
                  * alone already cost what the current levels do cannot be
@@ -1415,6 +1423,7 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
                     sse = sse2;
                     bits += dbits;
                     last = last2;
+                    idle = 0;
                     if (c < best_cost) {
                         best_cost = c;
                         best_sse = sse2;

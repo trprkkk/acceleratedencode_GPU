@@ -15,6 +15,7 @@
  */
 #include "h264.h"
 #include <stdlib.h>
+#include <string.h>
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -543,15 +544,24 @@ static inline int me_mv_cost(const me_rate *r, int qx, int qy)
     return r->lambda * (me_se_bits(qx - r->px) + me_se_bits(qy - r->py));
 }
 
+/* `cost` is the cost (SAD + rate) of the start, already measured */
 static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
                       int cstride, int bw, int bh, int range,
-                      const me_rate *rt, int *mvx, int *mvy, int *dist)
+                      const me_rate *rt, int cost, int *mvx, int *mvy, int *dist)
 {
     int cx = *mvx, cy = *mvy;
-    int bd = me_sad(ref, rstride, cur, cstride, bw, bh, cx, cy);
-    int best = bd + me_mv_cost(rt, cx * 4, cy * 4);
+    int best = cost;
+    int bd = best - me_mv_cost(rt, cx * 4, cy * 4);
     int step, i, improved = 1;
 
+    /* The positions the previous round measured (and its centre): one of
+     * them cannot beat the best it already lost to, and a hexagon or square
+     * that moved by one step overlaps the last one by three to five points
+     * (the first square round by four of the last hexagon's six), so they
+     * are not measured again -- the same walk, fewer SADs. */
+    int vis[9][2], nvis = 1;
+    vis[0][0] = cx;
+    vis[0][1] = cy;
     for (step = 0; step < 2 && improved; step++) {
         const int8_t *dx = step ? sq_dx : hex_dx;
         const int8_t *dy = step ? sq_dy : hex_dy;
@@ -559,16 +569,29 @@ static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
         improved = 1;
         while (improved) {
             int bx = cx, by = cy, bc = best, bdd = bd;
-            int pts[8][2], sads[8], np = 0;
+            int pts[8][2], sads[8], np = 0, k;
             improved = 0;
             for (i = 1; i < n; i++) {
                 int nx = cx + dx[i], ny = cy + dy[i];
                 if (nx < -range || nx > range || ny < -range || ny > range)
                     continue;
+                for (k = 0; k < nvis; k++)
+                    if (vis[k][0] == nx && vis[k][1] == ny)
+                        break;
+                if (k < nvis)
+                    continue;
                 pts[np][0] = nx;
                 pts[np][1] = ny;
                 np++;
             }
+            /* this round's positions, for the next */
+            for (k = 0; k < np; k++) {
+                vis[k][0] = pts[k][0];
+                vis[k][1] = pts[k][1];
+            }
+            vis[np][0] = cx;
+            vis[np][1] = cy;
+            nvis = np + 1;
             me_sad_list(ref, rstride, cur, cstride, bw, bh,
                         (const int (*)[2])pts, np, sads);
             for (i = 0; i < np; i++) {
@@ -799,14 +822,23 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
     for (pass = 0; pass < 2; pass++) {
         int step = pass ? 1 : 2;
         int improved = 1, iters = 0;
+        int pcx = 0, pcy = 0, pstep = 0;
         while (improved && iters++ < AEG_SUBPEL_ITERS) {
+            int pvx = pcx, pvy = pcy, pst = pstep;
             improved = 0;
+            /* the next round skips what this one measures (hex_search()) */
+            pcx = cx; pcy = cy; pstep = step;
             for (i = 1; i < 9; i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;
                 int ix = nx >> 2, iy = ny >> 2, cost, d;
                 if (ix < -range || ix > range || iy < -range || iy > range)
                     continue;
                 if (nx < -range * 4 || nx > range * 4 || ny < -range * 4 || ny > range * 4)
+                    continue;
+                /* measured by the previous round of this pass: its centre
+                 * and the eight around it */
+                if (pst == step && abs(nx - pvx) <= step && abs(ny - pvy) <= step &&
+                    (nx - pvx) % step == 0 && (ny - pvy) % step == 0)
                     continue;
                 if (mc && mc->ready && mc->stride == rstride &&
                     !(((ny & 3) << 2 | (nx & 3)) & 5)) {
@@ -901,15 +933,24 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
             cand[n][1] = (extra[i][1] + 2) >> 2;
             n++;
         }
+        int pts[4 + 16][2], sads[4 + 16], np = 0, k;
         for (i = 0; i < n; i++) {
-            int c;
             if (cand[i][0] < -range || cand[i][0] > range ||
                 cand[i][1] < -range || cand[i][1] > range)
                 continue;
-            c = me_sad(ref, rstride, cur, cstride, bw, bh, cand[i][0], cand[i][1]) +
-                me_mv_cost(&rt, cand[i][0] * 4, cand[i][1] * 4);
-            if (c < best_cost) { best_cost = c; bx = cand[i][0]; by = cand[i][1]; }
+            for (k = 0; k < np; k++)
+                if (pts[k][0] == cand[i][0] && pts[k][1] == cand[i][1])
+                    break;
+            if (k < np)
+                continue;
+            pts[np][0] = cand[i][0];
+            pts[np][1] = cand[i][1];
+            np++;
         }
+        /* measured four at a time, compared in the listed order */
+        me_sad_list(ref, rstride, cur, cstride, bw, bh,
+                    (const int (*)[2])pts, np, sads);
+        me_pick(&rt, (const int (*)[2])pts, sads, np, &best_cost, &bx, &by);
     }
     {
         static _Atomic int fr = -1;
@@ -934,8 +975,8 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
             umh_search(ref, rstride, cur, cstride, bw, bh, range, ur, &rt,
                        &bx, &by, &best_cost);
     }
-    hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, &bx, &by,
-               &best_sad);
+    hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, best_cost,
+               &bx, &by, &best_sad);
 
     if (subme <= 0) {
         *mvx = bx * 4; *mvy = by * 4; *sad_out = best_sad;
