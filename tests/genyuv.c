@@ -56,7 +56,7 @@ int main(int argc, char **argv)
                 if (v < 16) v = 16;
                 if (v > 235) v = 235;
                 if (mode == 6) {
-                    unsigned hsh = (unsigned)(cx * 73856093) ^ (unsigned)(cy * 19349663);
+                    unsigned hsh = ((unsigned)cx * 73856093u) ^ ((unsigned)cy * 19349663u);
                     hsh ^= hsh >> 13;
                     hsh *= 0x5bd1e995u;
                     v += (int)((hsh >> 24) & 63) - 32;

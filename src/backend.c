@@ -94,8 +94,8 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
             ac |= l[i];
         if (!ac) {
             int16_t d0 = (int16_t)((int16_t)((int32_t)l[0] *
-                                             aeg_dequant_ls[qp % 6][0]
-                                             << (qp / 6)) + 32);
+                                             aeg_dequant_ls[qp % 6][0] *
+                                             (1 << (qp / 6))) + 32);
             int16_t v = (int16_t)(d0 >> 6);
             for (i = 0; i < 16; i++)
                 r[i] = v;

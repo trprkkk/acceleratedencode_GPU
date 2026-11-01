@@ -4410,3 +4410,63 @@ Tests: ABR within 10 %; a generous buffer leaves the stream byte-identical
 options alone imply ABR; two-pass with B pictures within 6 % of CRF 26's rate
 and 0.3 dB of its PSNR, P-only within 6 %, both bit-exact against the decoder
 (coding order with B pictures); the stats file's header and types.
+
+## Robustness: extreme and hostile inputs
+
+`tools/robust_sweep.sh <aegenc>` runs the rate control at the edges (1 kb/s
+to 100 Mb/s, CRF 0 and 51, QP ranges pinned to one value, 1 kbit buffers,
+one-picture streams, 2x2 and 16x16 pictures, slices, frame threads, CAVLC,
+all-intra) and the second pass on damaged and mismatched statistics, on a
+sanitizer build, and requires no sanitizer report, no stream the decoder
+complains about, and a refused input to exit 1 or 2 with a reason.  What it
+found (`194df06`):
+
+* **All-intra ABR did not control the rate.**  An intra picture takes the
+  anchors' recent average QP, and with `--bframes 0 -g 1` there are no
+  anchors: the QP stayed where it started.  vtest at 2500 kb/s coded
+  15932 kb/s (short: 11264).  An intra picture right after an intra picture
+  is now rate-controlled like an anchor, its intra estimate standing in for
+  the complexity (x264's rule: accum_p only when the last non-B picture was
+  not intra): 2583 and 2580 kb/s, the QP settling within ten pictures.
+* **Short GOPs** (not all-intra) still overshoot in the first seconds: the
+  intra pictures follow the anchors' slowly decaying average, as in x264, and
+  only the overflow correction makes the P pictures pay for them.  180
+  frames, preset 3: `-g 1` (with B pictures: P pictures between the IDRs)
+  vtest +10 %, cock +10 %, short +13 %; `-g 5` +13 / +7 / +10 %; `-g 15`
+  +10 / +6 / +7 %.  Two passes are the answer there.
+* **Two-pass statistics** were trusted.  A second pass with another
+  B-picture setting followed a plan made for other picture types (+27 % with
+  B pictures measured and none coded); `-g 1` in pass 2 coded intra pictures
+  from a plan for P pictures (+100 %); QP 999 in the file coded +85 %; all
+  bits 0 coded +72 %; one line with display index 99999999 asked for a 3 GB
+  table; coding 10 of 40 measured pictures shared the target out over 40
+  (+26 %).  Now: the plan covers a picture only if pass 2 codes it as the
+  same kind (intra, P, B), the rest fall back to the one-pass controller
+  (`-g 1`: +27 %, the short-GOP figure); pass 1 writes `aeg-stats 2
+  bframes=N` (the resolved value, `aeg_stats.bframes`) and pass 2 refuses
+  another setting, as x264 does; `aeg_encoder_set_pass1()` refuses a type or
+  QP out of range and statistics without bits; the CLI refuses an index more
+  than 65536 past the pictures before it and plans only the pictures `-n`
+  lets it code (+3 %); the reason is printed.
+* **`--qpmax 0`** was silently QP 51: 0 is the library's "unset" (a zeroed
+  `aeg_params` must not pin every macroblock to QP 0).  The CLI refuses it.
+* **Undefined behaviour**, harmless on x86 but undefined: 32-bit loads and
+  stores through `int *` at unaligned pixel addresses in the SSE2 chroma
+  motion compensation and inverse transform (now `memcpy`, the same `movd`),
+  and left shifts of negative dequantised coefficients (now multiplications).
+  CI had excluded both checks (`-fno-sanitize=alignment,shift`).  With the
+  exclusion gone, the conformance suite under full UBSan found the rest: the
+  same shift in the CPU reference of the coefficient batch, in the scalar
+  forward transform and in the device kernels' source (`t3 << 1`, `ls <<
+  sh`); and a signed overflow in `mb_variance()` (AQ), where `256 * sum2`
+  passes 2^31 for a bright block -- the result was right only because the
+  wrap cancels in the subtraction; now 64-bit.  Output unchanged (12
+  configurations with and without AQ, and the device paths by
+  `gpu_validate.sh`).  CI now builds with every UBSan check, non-recoverable,
+  and runs the sweep.
+
+CQP and CRF output is unchanged (14 configurations, two clips, presets 0-4,
+CAVLC); ABR on the five long clips is unchanged.  Tests: all-intra ABR
+within 10 %, four refused statistics files, a pass 2 coding 30 of 60
+measured pictures within 10 %, `--qpmax 0` and `--qpmin 40 --qpmax 30`
+refused.

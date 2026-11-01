@@ -7839,8 +7839,10 @@ static int mb_variance(const struct aeg_encoder *e, int mbx, int mby)
             sum += v;
             sum2 += v * v;
         }
-    /* 256 * var, exact in integers; the caller only needs the logarithm */
-    return (sum2 * 256 - sum * sum) / 256;
+    /* 256 * var, exact in integers; the caller only needs the logarithm
+     * (in 64 bits: 256 * sum2 passes 2^31 for a bright block, though the
+     * difference always fits) */
+    return (int)(((int64_t)sum2 * 256 - (int64_t)sum * sum) / 256);
 }
 
 /* Adaptive quantisation (x264's "variance AQ"): flat macroblocks -- sky,

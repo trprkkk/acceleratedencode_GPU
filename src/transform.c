@@ -80,8 +80,8 @@ static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *
     int t3_ = (d0) - (d3);                                           \
     (s0) = t0_ + t1_;                                                \
     (s2) = t0_ - t1_;                                                \
-    (s1) = (t3_ << 1) + t2_;                                         \
-    (s3) = t3_ - (t2_ << 1);                                         \
+    (s1) = t3_ * 2 + t2_;                                            \
+    (s3) = t3_ - t2_ * 2;                                            \
 } while (0)
 
 #if defined(__SSE2__)

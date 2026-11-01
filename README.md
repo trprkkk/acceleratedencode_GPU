@@ -204,11 +204,14 @@ preset.
   (rate factor from the bits spent, overflow correction, a QP step limit), with
   the macroblock tree.  Over 180 frames of five real clips it lands within
   -4 %..+6 % of the target at 0.03-0.48 dB below the CRF curve.  A stream of a
-  second or two cannot absorb the first intra picture -- use two passes there.
+  second or two cannot absorb the first intra picture, and short GOPs (`-g 1`
+  to `-g 15` with B pictures) land 6-13 % over in six seconds -- use two
+  passes there.  All-intra (`--bframes 0 -g 1`) lands within 3 %.
 * `--pass 1` / `--pass 2 --bitrate <kbps>` (`--stats <file>`): two-pass, B
   pictures included.  Pass 1 measures every picture; pass 2 plans every
   picture's QP from that (x264's `init_pass2`) and lands within 1 % of the
-  target and 0.15 dB of the CRF curve on the same clips.
+  target and 0.15 dB of the CRF curve on the same clips.  Pass 2 has to use
+  pass 1's B-picture setting (it refuses another, and damaged statistics).
 * `--vbv-maxrate <kbps> --vbv-bufsize <kbit>`: a buffer model on
   ABR or CRF (capped CRF), with x264's per-type size predictor; a picture that
   would still underflow is coded again, coarser.  A stream that fits its buffer

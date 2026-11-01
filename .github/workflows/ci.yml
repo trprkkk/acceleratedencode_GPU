@@ -174,7 +174,7 @@ jobs:
           # from the environment, not the make command line: the Makefile
           # appends its include paths to CFLAGS, which a command-line CFLAGS
           # would override
-          CFLAGS: -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment,shift -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          CFLAGS: -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
           LDFLAGS: -fsanitize=address,undefined
         run: |
           make -j"$(nproc)" OPENCL=1 BUILD=build-san
@@ -209,3 +209,8 @@ jobs:
             cmp /tmp/t.264 /tmp/o.264 || { echo "rd batch differs at preset $p" >&2; exit 1; }
             cmp /tmp/c.264 /tmp/f.264 || { echo "frame threads differ at preset $p" >&2; exit 1; }
           done
+      - name: rate control and two-pass statistics at the edges
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          sh tools/robust_sweep.sh ./build-san/aegenc /tmp/sweep

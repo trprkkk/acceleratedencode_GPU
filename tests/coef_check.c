@@ -63,7 +63,7 @@ static void fdct_ref(const int16_t *res, int stride, int16_t out[16])
         const int a_ = (d0) + (d3), b_ = (d1) + (d2);                \
         const int c_ = (d1) - (d2), e_ = (d0) - (d3);                \
         (s0) = a_ + b_; (s2) = a_ - b_;                              \
-        (s1) = (e_ << 1) + c_; (s3) = e_ - (c_ << 1);                \
+        (s1) = e_ * 2 + c_; (s3) = e_ - c_ * 2;                  \
     } while (0)
     for (i = 0; i < 4; i++)
         DCT1(res[i * stride + 0], res[i * stride + 1], res[i * stride + 2],
@@ -86,7 +86,7 @@ static void idct_ref_res(const int16_t *level, int qp, int32_t res[16])
         for (x = 0; x < 4; x++) {
             const int cls = (x & 1) + (y & 1);
             const int v = level[x * 4 + y];
-            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] << sh);
+            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] * (1 << sh));
         }
     d[0] += 1 << 5;
     for (i = 0; i < 4; i++) {
@@ -123,7 +123,7 @@ static void idct_ref(uint8_t *dst, int stride, const int16_t *level, int qp,
             const int v = level[x * 4 + y];
             if (v && (x | y))
                 ac = 1;
-            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] << sh);
+            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] * (1 << sh));
         }
     if (pred && !ac) {
         const int v = (d[0] + 32) >> 6;
