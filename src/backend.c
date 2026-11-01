@@ -564,6 +564,8 @@ void aeg_be_lane(const aeg_be_ops *ops, int k, aeg_be_ops *out)
         }
         if (l)
             aeg_log(2, "aeg: device lane %d: %s", k, c.desc);
+        else if (l0->dev.clone)
+            aeg_log(2, "aeg: device lane %d is lane 0 (%s)", k, aeg_last_error());
         g->lane[k] = l ? l : l0;
     }
     l = g->lane[k];

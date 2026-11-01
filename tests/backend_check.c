@@ -466,8 +466,17 @@ static void check_threads(int w, int h, int lanes)
         /* both device backends can clone: the lanes are instances of their
          * own (a clone that fails maps the lane to lane 0, correct but
          * serialised -- this would catch it) */
-        check(wk[0].ops.priv != dev.priv && wk[1].ops.priv != dev.priv &&
-              wk[0].ops.priv != wk[1].ops.priv, "lanes are separate instances");
+        if (wk[0].ops.priv == dev.priv && wk[1].ops.priv == dev.priv &&
+            strstr(aeg_last_error(), "PoCL")) {
+            /* a runtime known to break with several queues: the backend
+             * declined, both threads above ran on lane 0, serialised */
+            printf("   backend_check: lanes share lane 0 here (%s)\n",
+                   aeg_last_error());
+        } else {
+            check(wk[0].ops.priv != dev.priv && wk[1].ops.priv != dev.priv &&
+                      wk[0].ops.priv != wk[1].ops.priv,
+                  "lanes are separate instances");
+        }
         aeg_be_lane(&wk[1].ops, 1, &again);
         check(again.priv == wk[0].ops.priv, "a lane asked for twice is one lane");
         aeg_be_lane(&wk[1].ops, 0, &again);

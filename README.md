@@ -81,7 +81,9 @@ frame thread and slice thread (OpenCL: own queue, kernels and buffers on a
 shared context and program; CUDA: own buffers on a shared context and
 module), so frame threads now run with a device backend and the threads'
 device calls overlap instead of queueing (-24 to -43 % on the batch paths
-with three frame threads).  Details under *GPU groundwork without hardware,
+with three frame threads; on PoCL 4.x-6.x, whose runtime aborts when
+several queues launch at once, the lanes fall back to one shared instance).
+Details under *GPU groundwork without hardware,
 continued* in `docs/STATUS.md`.
 
 ## Why this design

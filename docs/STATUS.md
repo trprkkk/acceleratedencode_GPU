@@ -4172,7 +4172,8 @@ guard now has up to 16 *lanes*, each its own instance behind its own lock:
   of its own: frame-thread worker k uses lane 1 + k * (slice threads), the
   slice threads of a picture add their index; the encoder itself is lane 0.
   `AEG_LANES=0` puts every thread on lane 0 (the measurement below, and a way
-  out should a driver mishandle several queues).
+  out should a driver mishandle several queues; PoCL 4.x-6.x does, and gets
+  that automatically -- see below).
 * The copies of the encoder the threads run on carry a copy of the
   dispatcher.  Their measurements (stage timings, the coefficient-placement
   trials) used to be lost with the copy -- a frame thread's picture time never
@@ -4219,6 +4220,26 @@ best of three, every stream identical:
 On PoCL the "device" is the same two cores and every launch costs about a
 millisecond of latency, so this mostly measures launches overlapping instead
 of queueing; what a GPU gains depends on its queue count and launch cost.
+
+*A driver that mishandles several queues: PoCL 4.x-6.x.*  CI went red with
+the lanes, in its one job that runs the conformance suite through the device
+(Ubuntu 24.04's PoCL 5.0), and only in its two slice-thread cases: the
+encoder aborted inside PoCL, `pocl_release_dlhandle_cache: Assertion
+'found->ref_count > 0' failed`.  Two queues launching the same kernel at the
+same moment break PoCL's cache of compiled work-group functions; PoCL fixed
+it in c9ac4c0c3 ("fix dlhandle cache": a multithreaded program running the
+same kernel with different sizes aborts) and 69d0ae9ac (its locking), both
+first released in 7.0.  The sandbox's PoCL 3.0 does not have the cache bug,
+which is why nothing here failed.  The OpenCL backend now reads the device's
+version: on PoCL 4.x-6.x `clone()` declines with the reason as the last
+error, every lane is lane 0, and the device calls are serialised as before
+the lanes -- the same stream, without the overlap.  `AEG_POCL_LANES=1`
+clones on any PoCL (to try a fixed build), `=0` declines on any PoCL (the
+fallback, testable here: the conformance suite through the device is
+bit-exact both ways, and `backend_check` reports the shared lane instead of
+failing "separate instances" -- any other collapse still fails).  The suite
+now prints a failed encode's exit status and log tail, which is what found
+this: the job's log itself is not reachable from the sandbox.
 
 **Intra_16x16 and chroma in the batch (`tq_dc_batch`, `iq_dc_batch`).**  The
 coefficient batch covered the sixteen luma blocks of inter candidates; the

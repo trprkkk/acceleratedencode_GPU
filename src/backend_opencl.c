@@ -41,6 +41,8 @@ typedef intptr_t cl_context_properties;
 #define CL_DEVICE_TYPE_GPU (1 << 2)
 #define CL_DEVICE_NAME 0x102B
 #define CL_DEVICE_VENDOR 0x102C
+#define CL_DRIVER_VERSION 0x102D
+#define CL_DEVICE_VERSION 0x102F
 #define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
 #define CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
 #define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
@@ -101,7 +103,34 @@ typedef struct ocl_ctx {
     int cus;
     int16_t *pos;               /* sad_batch: the rebased positions */
     size_t pos_cap;
+    int no_clone;               /* the runtime cannot take several queues */
 } ocl_ctx;
+
+/* PoCL 4.x-6.x abort when two command queues launch the same kernel at the
+ * same time: pocl_release_dlhandle_cache() asserts on its reference count
+ * (the cache of compiled work-group functions was not safe across threads;
+ * fixed by PoCL c9ac4c0c3 / 69d0ae9ac, both first released in 7.0).  Seen
+ * on Ubuntu 24.04's PoCL 5.0 with two slice threads.  PoCL 3.0 does not
+ * have it (the lane tests run on it).  On those versions clone() declines,
+ * so every device lane is lane 0 -- serialised, as before the lanes, and the
+ * same stream.  AEG_POCL_LANES=1 clones on any PoCL (to test a fixed
+ * build), AEG_POCL_LANES=0 declines on any PoCL (to test the fallback). */
+static int ocl_pocl_unsafe_queues(cl_device_id dev)
+{
+    char ver[128] = "", drv[64] = "";
+    const char *ev = getenv("AEG_POCL_LANES");
+    int major = 0;
+    if (ev && *ev && atoi(ev) != 0)
+        return 0;
+    p_clGetDeviceInfo(dev, CL_DEVICE_VERSION, sizeof(ver) - 1, ver, NULL);
+    if (!strstr(ver, "PoCL"))
+        return 0;
+    if (ev && *ev)
+        return 1;
+    p_clGetDeviceInfo(dev, CL_DRIVER_VERSION, sizeof(drv) - 1, drv, NULL);
+    major = atoi(drv);
+    return major >= 4 && major < 7;
+}
 
 /* ------------------------------------------------------------------ */
 /* Buffer cache                                                        */
@@ -674,8 +703,16 @@ static int ocl_clone(void *priv, aeg_be_ops *out)
     ocl_ctx *o = (ocl_ctx *)calloc(1, sizeof(*o));
     cl_int st;
 
+    if (src->no_clone) {
+        free(o);
+        aeg_set_last_error("PoCL 4.x-6.x cannot launch from several queues "
+                           "at once (fixed in PoCL 7.0): device lanes share "
+                           "one instance");
+        return AEG_EBACKEND;
+    }
     if (!o)
         return AEG_ENOMEM;
+    o->no_clone = 0;
     o->platform = src->platform;
     o->device = src->device;
     o->is_gpu = src->is_gpu;
@@ -740,6 +777,7 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         p_clGetDeviceInfo(o->device, CL_DEVICE_TYPE, sizeof(t), &t, NULL);
         o->is_gpu = (t & CL_DEVICE_TYPE_GPU) != 0;
     }
+    o->no_clone = ocl_pocl_unsafe_queues(o->device);
 
     o->ctx = p_clCreateContext(NULL, 1, &o->device, NULL, NULL, &st);
     if (!o->ctx || st != CL_SUCCESS) {
