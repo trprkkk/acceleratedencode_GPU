@@ -97,7 +97,7 @@ typedef struct cuda_ctx {
     CUdevice device;
     CUcontext ctx;
     CUmodule mod;
-    CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq;
+    CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq, k_tqdc, k_iqdc;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -300,6 +300,79 @@ static int cuda_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     if (p_cuMemcpyDtoH_v2(level, dlev, bytes) != CUDA_SUCCESS ||
         (nz && p_cuMemcpyDtoH_v2(nz, dnz, (size_t)nblk * 4) != CUDA_SUCCESS) ||
         p_cuMemcpyDtoH_v2(rec, drec, bytes) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+static int cuda_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
+                            int intra, int16_t *level, int32_t *nz,
+                            int32_t *dc)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    CUdeviceptr dres, dlev, dnz, ddc;
+    size_t bytes = (size_t)nblk * 16 * 2;
+    int qbits = 15 + qp / 6;
+    int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+    int mf0 = aeg_quant_mf[qp % 6][0], mf1 = aeg_quant_mf[qp % 6][1],
+        mf2 = aeg_quant_mf[qp % 6][2];
+    void *args[10];
+    int st;
+    if (nblk <= 0)
+        return AEG_OK;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+
+    dres = cuda_buf(o, 0, bytes);
+    dlev = cuda_buf(o, 1, bytes);
+    dnz = cuda_buf(o, 2, (size_t)nblk * 4);
+    ddc = cuda_buf(o, 3, (size_t)nblk * 4);
+    if (!dres || !dlev || !dnz || !ddc)
+        return AEG_EBACKEND;
+    if (p_cuMemcpyHtoD_v2(dres, res, bytes) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    args[0] = &dres; args[1] = &nblk; args[2] = &qbits; args[3] = &f;
+    args[4] = &mf0;  args[5] = &mf1;  args[6] = &mf2;
+    args[7] = &dlev; args[8] = &dnz;  args[9] = &ddc;
+    st = cuda_launch(o->k_tqdc, nblk, args);
+    if (st != AEG_OK)
+        return st;
+    if (p_cuMemcpyDtoH_v2(level, dlev, bytes) != CUDA_SUCCESS ||
+        (nz && p_cuMemcpyDtoH_v2(nz, dnz, (size_t)nblk * 4) != CUDA_SUCCESS) ||
+        p_cuMemcpyDtoH_v2(dc, ddc, (size_t)nblk * 4) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+static int cuda_iq_dc_batch(void *priv, const int16_t *level,
+                            const int32_t *dc, int nblk, int qp, int16_t *res)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    CUdeviceptr dlev, ddc, dres;
+    size_t bytes = (size_t)nblk * 16 * 2;
+    int sh = qp / 6;
+    int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
+        ls2 = aeg_dequant_ls[qp % 6][2];
+    void *args[8];
+    int st;
+    if (nblk <= 0)
+        return AEG_OK;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+
+    dlev = cuda_buf(o, 0, bytes);
+    ddc = cuda_buf(o, 1, (size_t)nblk * 4);
+    dres = cuda_buf(o, 2, bytes);
+    if (!dlev || !ddc || !dres)
+        return AEG_EBACKEND;
+    if (p_cuMemcpyHtoD_v2(dlev, level, bytes) != CUDA_SUCCESS ||
+        p_cuMemcpyHtoD_v2(ddc, dc, (size_t)nblk * 4) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    args[0] = &dlev; args[1] = &ddc; args[2] = &nblk; args[3] = &sh;
+    args[4] = &ls0;  args[5] = &ls1; args[6] = &ls2;  args[7] = &dres;
+    st = cuda_launch(o->k_iqdc, nblk, args);
+    if (st != AEG_OK)
+        return st;
+    if (p_cuMemcpyDtoH_v2(res, dres, bytes) != CUDA_SUCCESS)
         return AEG_EBACKEND;
     return AEG_OK;
 }
@@ -530,7 +603,7 @@ static int nvrtc_load(void **lib)
 /* The kernels the backend looks up in the module. */
 static const char *const aeg_cuda_kernels[] = {
     "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
-    "satd_batch", "tq_iq_batch", NULL
+    "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch", NULL
 };
 
 /* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
@@ -618,7 +691,7 @@ static int cuda_build_module(cuda_ctx *o)
     char *ptx = NULL, log[2048];
     int major = 5, minor = 0, cc, k, rc;
     CUresult cr;
-    CUfunction *fn[8];
+    CUfunction *fn[10];
 
     p_cuDeviceGetAttribute(&major,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -646,7 +719,7 @@ static int cuda_build_module(cuda_ctx *o)
         return AEG_EBACKEND;
     fn[0] = &o->k_sad; fn[1] = &o->k_tq; fn[2] = &o->k_iq;
     fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
-    fn[6] = &o->k_tqiq;
+    fn[6] = &o->k_tqiq; fn[7] = &o->k_tqdc; fn[8] = &o->k_iqdc;
     for (k = 0; aeg_cuda_kernels[k]; k++)
         if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
             CUDA_SUCCESS)
@@ -746,6 +819,8 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     o->k_intp = src->k_intp;
     o->k_satd = src->k_satd;
     o->k_tqiq = src->k_tqiq;
+    o->k_tqdc = src->k_tqdc;
+    o->k_iqdc = src->k_iqdc;
     o->cus = src->cus;
     o->mem = src->mem;
     memcpy(o->name, src->name, sizeof(o->name));
@@ -756,6 +831,8 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     out->tq_batch = cuda_tq_batch;
     out->iq_idct_batch = cuda_iq_idct_batch;
     out->tq_iq_batch = cuda_tq_iq_batch;
+    out->tq_dc_batch = cuda_tq_dc_batch;
+    out->iq_dc_batch = cuda_iq_dc_batch;
     out->sse_batch = cuda_sse_batch;
     out->interp_plane = cuda_interp_plane;
     out->ref_upload = cuda_ref_upload;
@@ -839,6 +916,8 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     ops->tq_batch = cuda_tq_batch;
     ops->iq_idct_batch = cuda_iq_idct_batch;
     ops->tq_iq_batch = cuda_tq_iq_batch;
+    ops->tq_dc_batch = cuda_tq_dc_batch;
+    ops->iq_dc_batch = cuda_iq_dc_batch;
     ops->sse_batch = cuda_sse_batch;
     ops->interp_plane = cuda_interp_plane;
     ops->ref_upload = cuda_ref_upload;

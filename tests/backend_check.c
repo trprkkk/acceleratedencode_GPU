@@ -138,6 +138,29 @@ static void check_coef(void)
                               !memcmp(r0, r1, (size_t)n * 32),
                           "tq_iq_batch");
                 }
+                /* the DC-split pair (Intra_16x16, chroma) */
+                check(dev.tq_dc_batch && dev.iq_dc_batch,
+                      "tq_dc_batch / iq_dc_batch (present)");
+                if (dev.tq_dc_batch && dev.iq_dc_batch) {
+                    int32_t *d0 = (int32_t *)malloc((size_t)n * 4);
+                    int32_t *d1 = (int32_t *)malloc((size_t)n * 4);
+                    memset(l1, 0x55, (size_t)n * 32);
+                    memset(z1, 0x55, (size_t)n * 4);
+                    memset(d1, 0x55, (size_t)n * 4);
+                    cpu.tq_dc_batch(cpu.priv, res, n, qps[qi], intra, l0, z0, d0);
+                    dev.tq_dc_batch(dev.priv, res, n, qps[qi], intra, l1, z1, d1);
+                    check(!memcmp(l0, l1, (size_t)n * 32) &&
+                              !memcmp(z0, z1, (size_t)n * 4) &&
+                              !memcmp(d0, d1, (size_t)n * 4),
+                          "tq_dc_batch");
+                    for (i = 0; i < n; i++)
+                        d0[i] = rnd(4) ? rnd(8001) - 4000 : rnd(80001) - 40000;
+                    memset(r1, 0x55, (size_t)n * 32);
+                    cpu.iq_dc_batch(cpu.priv, l0, d0, n, qps[qi], r0);
+                    dev.iq_dc_batch(dev.priv, l0, d0, n, qps[qi], r1);
+                    check(!memcmp(r0, r1, (size_t)n * 32), "iq_dc_batch");
+                    free(d0); free(d1);
+                }
                 free(res); free(l0); free(l1); free(r0); free(r1);
                 free(z0); free(z1);
             }

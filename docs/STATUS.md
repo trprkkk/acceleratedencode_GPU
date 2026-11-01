@@ -504,11 +504,11 @@ in `tests/run_tests.sh`.  On the CPU the forced path is ~20% slower in the
 transform stage (scalar add/clip/SSE instead of the SSE2 `aeg_idct_add_block`,
 plus the gather); on a device it is two launches instead of thirty-two calls.
 
-Two things deliberately stay per block:
-
-* Intra_16x16, because its DC coefficient is replaced by the 4x4 Hadamard of
-  the sixteen DCs, and the batch API has no per-block override;
-* chroma, for the same reason (the 2x2 chroma DC Hadamard).
+Two things first stayed per block, because their DC coefficients go through
+a Hadamard of their own and the batch API had no per-block override:
+Intra_16x16 (the 4x4 Hadamard of the sixteen DCs) and chroma (the 2x2 one).
+Both are batched now with a DC-split pair of operations (`tq_dc_batch`,
+`iq_dc_batch`; see *GPU groundwork without hardware, continued*).
 
 ## Rate-distortion batching (provisional)
 
@@ -4217,3 +4217,46 @@ best of three, every stream identical:
 On PoCL the "device" is the same two cores and every launch costs about a
 millisecond of latency, so this mostly measures launches overlapping instead
 of queueing; what a GPU gains depends on its queue count and launch cost.
+
+**Intra_16x16 and chroma in the batch (`tq_dc_batch`, `iq_dc_batch`).**  The
+coefficient batch covered the sixteen luma blocks of inter candidates; the
+chroma of every macroblock and the luma of Intra_16x16 candidates stayed per
+block, because their block DCs leave the 4x4 transform for a Hadamard of
+their own (2x2 for chroma, 4x4 for Intra_16x16), and the inverse takes the
+dequantised Hadamard output as each block's DC.  A pair of operations splits
+the DC off:
+
+* `tq_dc_batch()`: the forward transform and quantisation of every block,
+  with the block's transform DC handed out (on the device the sum of its
+  residual, the same number) and its DC level forced to zero -- what the
+  per-block code did with `coef[0] = 0`;
+* the Hadamard, its quantisation and dequantisation stay on the host: four or
+  sixteen values, sequential, nothing to launch;
+* `iq_dc_batch()`: the inverse of every block with its dequantised DC given
+  (the kernel helper `aeg_iq4` takes the DC override that
+  `aeg_idct_add_block()`'s `dc` argument is, int16 truncation included).
+
+So chroma is two calls per macroblock for both planes (eight blocks) instead
+of sixteen block calls, and an Intra_16x16 candidate two calls instead of 32.
+They run wherever the coefficient batch does (the dispatcher's trial, or
+`AEG_COEF_BATCH` / `AEG_RD_BATCH`), and not where level selection runs between
+the halves (trellis with CABAC: the chroma and Intra_16x16 AC selection is
+sequential per block); `AEG_DCBATCH=0` keeps the per-block path.  The
+dispatcher's coefficient trial times whole pictures, so these launches are in
+the comparison it makes.
+
+Checks: `kernel_check` runs both kernels (as C) at every QP, intra and inter,
+full-range and sparse residuals, with given DCs past the int16 range, against
+the CPU ops, and the CPU op's residual plus prediction against
+`aeg_idct_add_block()` with the same DC (9 kernels); `backend_check` the
+device ops against the CPU ones (312 checks on PoCL); `nvrtc_check` requires
+the two entry points.  The CPU batch modes equal the serial encoder on vtest,
+cock and mega at presets 0-2, all-intra (`-g 1`), CAVLC at presets 1, 3 and 4,
+and preset 2 without trellis (48/48); on PoCL an all-intra encode writes the
+same stream with and without the pair and as the CPU build;
+`gpu_validate.sh` PASS at `-p 1` and `-p 2` with frame threads and on cock
+`-p 2 -g 4 -t 2`; ASan + UBSan clean on the batch paths with frame threads
+on both backends; the conformance suite bit-exact.  On PoCL the pair makes an
+all-intra encode slower (1.46 s -> 4.49 s for 6 pictures: three times the
+launches at a millisecond each), as every batch path is there; whether a GPU
+wins is the dispatcher's trial to find out.

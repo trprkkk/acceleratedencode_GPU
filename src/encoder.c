@@ -1083,6 +1083,39 @@ static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                            int blk, const uint8_t *src, int stride,
                            const uint8_t *pred, int qp, const int32_t *dcv);
 
+static void luma_inter_gather(const struct aeg_encoder *e, const uint8_t *src,
+                              const uint8_t *pred, int16_t *res);
+
+/* Intra_16x16 and chroma in the coefficient batch: the blocks' forward
+ * halves in one tq_dc_batch() call, the DC Hadamard (sixteen or four values)
+ * on the host, the inverses in one iq_dc_batch() -- the same arithmetic as the
+ * per-block path, so the same stream.  Only where the batch is in use (the
+ * dispatcher placed the coefficient stages on the device, or AEG_COEF_BATCH /
+ * AEG_RD_BATCH) and no level selection runs between the halves (`sel`):
+ * that one is sequential per block.  AEG_DCBATCH=0 keeps the per-block path. */
+static int dc_batch_on(const struct aeg_encoder *e, int sel)
+{
+    static _Atomic int env = -2;
+    if (env == -2) {
+        const char *ev = getenv("AEG_DCBATCH");
+        env = ev ? atoi(ev) != 0 : 1;
+    }
+    return env && e->coef_batch && e->d.ops.tq_dc_batch &&
+           e->d.ops.iq_dc_batch && !sel;
+}
+
+/* a 4x4 block's prediction plus residual, clipped: aeg_idct_add_block()'s
+ * last step, for a residual that came out of a batch */
+static void add_res4(uint8_t *dst, int stride, const uint8_t *pred,
+                     int pstride, const int16_t *res)
+{
+    int x, y;
+    for (y = 0; y < 4; y++)
+        for (x = 0; x < 4; x++)
+            dst[y * stride + x] = (uint8_t)clip255(pred[y * pstride + x] +
+                                                   res[y * 4 + x]);
+}
+
 static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
@@ -1092,8 +1125,24 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     int32_t dchad[16];
     int blk, i, x, y, nz_dc = 0;
     int qp = c->qp;
+    /* batched (see dc_batch_on): the sixteen blocks' forward halves in one
+     * call, the DC Hadamard on the host, the inverses in another */
+    const int batch = dc_batch_on(e, e->p.trellis > 0 && e->p.cabac);
+    int16_t bres[16 * 16], brec[16 * 16];
+    int32_t bdc[16];
 
-    for (blk = 0; blk < 16; blk++) {
+    if (batch) {
+        int64_t t0 = aeg_now_ns();
+        int32_t bnz[16];
+        luma_inter_gather(e, src, pred, bres);
+        e->d.ops.tq_dc_batch(e->d.ops.priv, bres, 16, qp, 1, &c->level[0][0],
+                             bnz, bdc);
+        stage_rec(e, AEG_STAGE_TRANSFORM, e->d.ops.backend != AEG_BACKEND_CPU,
+                  aeg_now_ns() - t0);
+        for (blk = 0; blk < 16; blk++)
+            dc[blk] = (int16_t)bdc[blk];
+    }
+    for (blk = 0; blk < 16 && !batch; blk++) {
         int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
         int16_t res[16], coef[16];
         for (y = 0; y < 4; y++)
@@ -1114,7 +1163,20 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     aeg_dequant_4x4_dc_out(dcled, dchad, qp);
     aeg_dc_block_unpermute(dchad);   /* decoder slot order -> raster order */
 
-    for (blk = 0; blk < 16; blk++) {
+    if (batch) {
+        int64_t t0 = aeg_now_ns();
+        e->d.ops.iq_dc_batch(e->d.ops.priv, &c->level[0][0], dchad, 16, qp,
+                             brec);
+        stage_rec(e, AEG_STAGE_IQUANT_IDCT, e->d.ops.backend != AEG_BACKEND_CPU,
+                  aeg_now_ns() - t0);
+        for (blk = 0; blk < 16; blk++) {
+            int bx = (blk & 3) * 4, by = (blk >> 2) * 4, dummy;
+            c->nz[blk] = (int8_t)aeg_nz_last(c->level[blk], 16, &dummy);
+            add_res4(dst + by * e->stride[0] + bx, e->stride[0],
+                     pred + by * 16 + bx, 16, brec + 16 * blk);
+        }
+    }
+    for (blk = 0; blk < 16 && !batch; blk++) {
         int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
         uint8_t *r = dst + by * e->stride[0] + bx;
         const uint8_t *pr = pred + by * 16 + bx;
@@ -2028,6 +2090,83 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     }
 }
 
+/* code_chroma_run() through the coefficient batch (dc_batch_on): both
+ * planes' eight blocks forward in one call, each plane's 2x2 DC on the host,
+ * the eight inverses in one call; then per block exactly what the per-block
+ * path does after its inverse.  No level selection runs here. */
+static void code_chroma_batch(struct aeg_encoder *e, int mbx, int mby,
+                              mbenc *c, int qpc)
+{
+    static const int bxy[4][2] = { {0, 0}, {4, 0}, {0, 4}, {4, 4} };
+    const int cs = e->stride[1];
+    int16_t res[8 * 16], rec[8 * 16];
+    int32_t dc[8], dcout[8], nzb[8];
+    int16_t *lev = &c->level[AEG_BLK_CHROMA_CB][0];
+    int pl, blk, i, x, y;
+    int64_t t0;
+
+    for (pl = 0; pl < 2; pl++) {
+        const uint8_t *src = e->srcp[1 + pl] + mby * 8 * cs + mbx * 8;
+        const uint8_t *pred = e->pred_c[pl];
+        for (blk = 0; blk < 4; blk++) {
+            int16_t *r = res + 16 * (pl * 4 + blk);
+            for (y = 0; y < 4; y++)
+                for (x = 0; x < 4; x++)
+                    r[y * 4 + x] =
+                        (int16_t)((int)src[(bxy[blk][1] + y) * cs + bxy[blk][0] + x] -
+                                  (int)pred[(bxy[blk][1] + y) * 8 + bxy[blk][0] + x]);
+        }
+    }
+    t0 = aeg_now_ns();
+    e->d.ops.tq_dc_batch(e->d.ops.priv, res, 8, qpc, 1, lev, nzb, dc);
+    stage_rec(e, AEG_STAGE_TRANSFORM, e->d.ops.backend != AEG_BACKEND_CPU,
+              aeg_now_ns() - t0);
+    for (pl = 0; pl < 2; pl++) {
+        int16_t d4[4], had[4], dclev[4];
+        int nz_dc = 0;
+        for (blk = 0; blk < 4; blk++)
+            d4[blk] = (int16_t)dc[pl * 4 + blk];
+        aeg_transform_dc2x2_fwd(d4, had);
+        aeg_quant_2x2_dc(had, dclev, qpc, 1);
+        for (i = 0; i < 4; i++)
+            nz_dc += dclev[i] != 0;
+        memcpy(c->level[AEG_BLK_CHROMA_DC + pl], dclev, sizeof(dclev));
+        c->nz[AEG_BLK_CHROMA_DC + pl] = (int8_t)nz_dc;
+        aeg_dequant_2x2_dc_out(dclev, dcout + 4 * pl, qpc);
+    }
+    t0 = aeg_now_ns();
+    e->d.ops.iq_dc_batch(e->d.ops.priv, lev, dcout, 8, qpc, rec);
+    stage_rec(e, AEG_STAGE_IQUANT_IDCT, e->d.ops.backend != AEG_BACKEND_CPU,
+              aeg_now_ns() - t0);
+    for (pl = 0; pl < 2; pl++) {
+        uint8_t *base = e->recp[1 + pl] + mby * 8 * cs + mbx * 8;
+        const uint8_t *src = e->srcp[1 + pl] + mby * 8 * cs + mbx * 8;
+        for (blk = 0; blk < 4; blk++) {
+            const int b = AEG_BLK_CHROMA_CB + pl * 4 + blk;
+            uint8_t *o = base + bxy[blk][1] * cs + bxy[blk][0];
+            int dummy, nz = aeg_nz_last(c->level[b], 16, &dummy);
+            c->nz[b] = (int8_t)nz;
+            if (nz)
+                c->cbp |= 0x20;
+            add_res4(o, cs, e->pred_c[pl] + bxy[blk][1] * 8 + bxy[blk][0], 8,
+                     rec + 16 * (pl * 4 + blk));
+            c->sse += aeg_ssd(4, 4, o, cs, src + bxy[blk][1] * cs + bxy[blk][0],
+                              cs);
+        }
+        if (c->nz[AEG_BLK_CHROMA_DC + pl]) {
+            c->cbp |= 0x10;
+            if (!e->p.cabac)            /* CAVLC estimate */
+                c->bits += aeg_cavlc_block_cost(c->level[AEG_BLK_CHROMA_DC + pl],
+                                                0, 2);
+        }
+        for (blk = 0; blk < 4 && !e->p.cabac; blk++)
+            if (c->nz[AEG_BLK_CHROMA_CB + pl * 4 + blk])
+                c->bits += aeg_cavlc_block_cost(
+                    c->level[AEG_BLK_CHROMA_CB + pl * 4 + blk],
+                    chroma_nc(e, mbx, mby, c, pl, blk), 3);
+    }
+}
+
 /* code_chroma() itself; pred_c already holds the prediction of both planes */
 static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                             int inter)
@@ -2037,6 +2176,10 @@ static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     int pl, blk, i, x, y;
 
     c->cbp &= 0x0f;
+    if (dc_batch_on(e, e->p.trellis > 0 && e->p.cabac && trellis_chroma_on())) {
+        code_chroma_batch(e, mbx, mby, c, qpc);
+        return;
+    }
     for (pl = 0; pl < 2; pl++) {
         uint8_t *base = e->recp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8;
         const uint8_t *src = e->srcp[1 + pl] + mby * 8 * e->stride[1] + mbx * 8;

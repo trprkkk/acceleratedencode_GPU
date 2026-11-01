@@ -45,6 +45,18 @@ typedef struct aeg_be_ops {
     int (*tq_iq_batch)(void *priv, const int16_t *res, int nblk, int qp,
                        int intra, int16_t *level, int32_t *nz, int16_t *rec);
 
+    /* The DC-split pair for Intra_16x16 and chroma, whose block DCs go
+     * through a Hadamard of their own (on the host: four or sixteen values).
+     * tq_dc_batch(): tq_batch() with each block's transform DC written to
+     * `dc` (the coefficient before quantisation) and its level forced to 0,
+     * `nz` counting the AC levels.  iq_dc_batch(): iq_idct_batch() with the
+     * dequantised DC of block b replaced by dc[b] (as aeg_idct_add_block()'s
+     * dc argument).  Optional, both or neither. */
+    int (*tq_dc_batch)(void *priv, const int16_t *res, int nblk, int qp,
+                       int intra, int16_t *level, int32_t *nz, int32_t *dc);
+    int (*iq_dc_batch)(void *priv, const int16_t *level, const int32_t *dc,
+                       int nblk, int qp, int16_t *res);
+
     /* One fractional-pel plane of a reference picture (H.264 8.4.2.2.1),
      * `which` 1 = horizontal, 2 = vertical, 3 = both.  `ref` points at picture
      * (0,0) in a padded buffer (AEG_PAD samples of edge replication on every

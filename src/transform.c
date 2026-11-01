@@ -772,6 +772,12 @@ void aeg_idct_residual(const int16_t *level, int qp, int16_t *res)
     idct_core(level, qp, NULL, res);
 }
 
+void aeg_idct_residual_dc(const int16_t *level, int qp, int32_t dc,
+                          int16_t *res)
+{
+    idct_core(level, qp, &dc, res);
+}
+
 static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
                             int qp, const uint8_t *pred, int pred_stride,
                             const int32_t *dc_in)

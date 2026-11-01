@@ -88,6 +88,24 @@ static void call_tqiq(int i)
 }
 
 /* ------------------------------------------------------------------ */
+/* tq_dc_batch / iq_dc_batch: the DC-split pair (Intra_16x16, chroma)  */
+/* ------------------------------------------------------------------ */
+static int *g_dc;
+
+static void call_tqdc(int i)
+{
+    (void)i;
+    tq_dc_batch(g_res, g_nblk, g_qbits, g_f, g_mf0, g_mf1, g_mf2, g_level, g_nz,
+                g_dc);
+}
+
+static void call_iqdc(int i)
+{
+    (void)i;
+    iq_dc_batch(g_qlevel, g_dc, g_nblk, g_sh, g_ls0, g_ls1, g_ls2, g_iqres);
+}
+
+/* ------------------------------------------------------------------ */
 /* sad_batch                                                           */
 /* ------------------------------------------------------------------ */
 static const uchar *g_cur, *g_ref;
@@ -298,6 +316,81 @@ int main(void)
             }
             free(res); free(rl); free(rr); free(cl); free(cr); free(rn);
             free(cn); free(g_level); free(g_tqrec); free(g_nz);
+        }
+    }
+
+    /* ---- the DC-split pair against the CPU ops (the per-block steps of
+     *      code_luma_i16 / code_chroma_run), at every QP; the given DCs
+     *      reach past the int16 range, where the scalar path truncates --- */
+    for (qp = 0; qp <= 51; qp++) {
+        for (intra = 0; intra <= 1; intra++) {
+            int16_t *res, *rl, *rr, *lev;
+            int32_t *rn, *rd, *dcin;
+            int i, bad = 0, sparse = qp & 1;
+
+            g_nblk = 1 + rnd(32);
+            res = (int16_t *)malloc((size_t)g_nblk * 32);
+            rl = (int16_t *)malloc((size_t)g_nblk * 32);
+            rr = (int16_t *)malloc((size_t)g_nblk * 32);
+            lev = (int16_t *)malloc((size_t)g_nblk * 32);
+            rn = (int32_t *)malloc((size_t)g_nblk * 4);
+            rd = (int32_t *)malloc((size_t)g_nblk * 4);
+            dcin = (int32_t *)malloc((size_t)g_nblk * 4);
+            g_level = (int16_t *)malloc((size_t)g_nblk * 32);
+            g_iqres = (int16_t *)malloc((size_t)g_nblk * 32);
+            g_nz = (int *)malloc((size_t)g_nblk * 4);
+            g_dc = (int *)malloc((size_t)g_nblk * 4);
+            for (i = 0; i < g_nblk * 16; i++)
+                res[i] = (int16_t)(sparse ? (rnd(4) ? rnd(5) - 2 : rnd(511) - 255)
+                                          : rnd(511) - 255);
+            g_res = res;
+            g_qbits = 15 + qp / 6;
+            g_f = aeg_quant_bias(g_qbits, intra ? 3 : 6);
+            g_mf0 = aeg_quant_mf[qp % 6][0];
+            g_mf1 = aeg_quant_mf[qp % 6][1];
+            g_mf2 = aeg_quant_mf[qp % 6][2];
+            g_sh = qp / 6;
+            g_ls0 = aeg_dequant_ls[qp % 6][0];
+            g_ls1 = aeg_dequant_ls[qp % 6][1];
+            g_ls2 = aeg_dequant_ls[qp % 6][2];
+            run_items(g_nblk, call_tqdc);
+            cpu.tq_dc_batch(cpu.priv, res, g_nblk, qp, intra, rl, rn, rd);
+            for (i = 0; i < g_nblk * 16; i++)
+                bad += g_level[i] != rl[i];
+            for (i = 0; i < g_nblk; i++)
+                bad += (g_nz[i] != rn[i]) + (g_dc[i] != rd[i]) +
+                       (rl[16 * i] != 0);
+            /* the inverse on those levels with DCs of every size */
+            for (i = 0; i < g_nblk; i++)
+                dcin[i] = g_dc[i] = rnd(4) ? rnd(8001) - 4000
+                                           : rnd(80001) - 40000;
+            memcpy(lev, rl, (size_t)g_nblk * 32);
+            g_qlevel = lev;
+            run_items(g_nblk, call_iqdc);
+            cpu.iq_dc_batch(cpu.priv, lev, dcin, g_nblk, qp, rr);
+            for (i = 0; i < g_nblk * 16; i++)
+                bad += g_iqres[i] != rr[i];
+            for (i = 0; i < g_nblk; i++) {
+                /* and the CPU op against the scalar path's own call */
+                uint8_t pred[16], o1[16], o2[16];
+                int k;
+                for (k = 0; k < 16; k++)
+                    pred[k] = (uint8_t)rnd(256);
+                memcpy(o1, pred, 16);
+                aeg_idct_add_block(o1, 4, lev + 16 * i, qp, pred, 4, &dcin[i]);
+                for (k = 0; k < 16; k++) {
+                    int v = pred[k] + rr[16 * i + k];
+                    o2[k] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+                bad += memcmp(o1, o2, 16) != 0;
+            }
+            if (bad) {
+                printf("   kernel_check: tq_dc/iq_dc qp %d intra %d: %d "
+                       "mismatches\n", qp, intra, bad);
+                fail = 1;
+            }
+            free(res); free(rl); free(rr); free(lev); free(rn); free(rd);
+            free(dcin); free(g_level); free(g_iqres); free(g_nz); free(g_dc);
         }
     }
 
@@ -518,6 +611,6 @@ int main(void)
     }
 
     if (!fail)
-        printf("   kernel_check: 7 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 9 kernels agree with the CPU reference\n");
     return fail;
 }

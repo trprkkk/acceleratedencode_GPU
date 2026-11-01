@@ -391,6 +391,9 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
  * dequantised coefficients, the DC rounding before the first pass and the
  * truncating shift in the second one. */
 void aeg_idct_residual(const int16_t *level, int qp, int16_t *res);
+/* the same with the dequantised DC given (Intra_16x16, chroma) */
+void aeg_idct_residual_dc(const int16_t *level, int qp, int32_t dc,
+                          int16_t *res);
 void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
                    int pred_stride, const int16_t *res, int w, int h);
 /* dst = clip(pred + rec) for a 16x16 luma block whose residual is sixteen

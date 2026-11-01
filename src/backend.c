@@ -116,6 +116,38 @@ static int cpu_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     return cpu_iq_idct_batch(priv, level, nblk, qp, rec);
 }
 
+/* the DC-split pair: exactly the per-block steps of code_luma_i16() and
+ * code_chroma_run() */
+static int cpu_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
+                           int intra, int16_t *level, int32_t *nz, int32_t *dc)
+{
+    int b;
+    (void)priv;
+    for (b = 0; b < nblk; b++) {
+        int16_t coef[16];
+        int i, n = 0;
+        aeg_transform_4x4(res + 16 * b, 4, coef);
+        dc[b] = coef[0];
+        coef[0] = 0;
+        aeg_quant_4x4(coef, level + 16 * b, qp, intra);
+        for (i = 0; i < 16; i++)
+            n += level[16 * b + i] != 0;
+        if (nz)
+            nz[b] = n;
+    }
+    return AEG_OK;
+}
+
+static int cpu_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
+                           int nblk, int qp, int16_t *res)
+{
+    int b;
+    (void)priv;
+    for (b = 0; b < nblk; b++)
+        aeg_idct_residual_dc(level + 16 * b, qp, dc[b], res + 16 * b);
+    return AEG_OK;
+}
+
 static int cpu_sse_batch(void *priv, const uint8_t *a, int sa,
                          const uint8_t *b, int sb, int w, int h,
                          uint64_t *out)
@@ -208,6 +240,8 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->tq_batch = cpu_tq_batch;
     ops->iq_idct_batch = cpu_iq_idct_batch;
     ops->tq_iq_batch = cpu_tq_iq_batch;
+    ops->tq_dc_batch = cpu_tq_dc_batch;
+    ops->iq_dc_batch = cpu_iq_dc_batch;
     ops->sse_batch = cpu_sse_batch;
     ops->interp_plane = cpu_interp_plane;
     ops->ref_upload = cpu_ref_upload;
@@ -352,6 +386,29 @@ static int g_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
         return AEG_OK;
     return l->g->cpu.tq_iq_batch(l->g->cpu.priv, res, nblk, qp, intra, level,
                                  nz, rec);
+}
+
+static int g_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
+                         int intra, int16_t *level, int32_t *nz, int32_t *dc)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.tq_dc_batch(l->dev.priv, res, nblk, qp, intra,
+                                          level, nz, dc), "tq_dc_batch"))
+        return AEG_OK;
+    return l->g->cpu.tq_dc_batch(l->g->cpu.priv, res, nblk, qp, intra, level,
+                                 nz, dc);
+}
+
+static int g_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
+                         int nblk, int qp, int16_t *res)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.iq_dc_batch(l->dev.priv, level, dc, nblk, qp, res),
+                    "iq_dc_batch"))
+        return AEG_OK;
+    return l->g->cpu.iq_dc_batch(l->g->cpu.priv, level, dc, nblk, qp, res);
 }
 
 static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
@@ -540,6 +597,13 @@ static int be_guard_wrap(aeg_be_ops *ops)
     if (ops->tq_batch) ops->tq_batch = g_tq_batch;
     if (ops->iq_idct_batch) ops->iq_idct_batch = g_iq_idct_batch;
     if (ops->tq_iq_batch) ops->tq_iq_batch = g_tq_iq_batch;
+    if (ops->tq_dc_batch && ops->iq_dc_batch) {
+        ops->tq_dc_batch = g_tq_dc_batch;
+        ops->iq_dc_batch = g_iq_dc_batch;
+    } else {
+        ops->tq_dc_batch = NULL;
+        ops->iq_dc_batch = NULL;
+    }
     if (ops->interp_plane) ops->interp_plane = g_interp_plane;
     if (ops->sse_batch) ops->sse_batch = g_sse_batch;
     if (ops->ref_upload && ops->satd_batch) {

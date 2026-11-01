@@ -93,7 +93,7 @@ static void usage(void)
 "  --frame-threads <n> code n pictures at once, each following its\n"
 "                   references row by row (same stream as serial);\n"
 "                   1 = off, 0 = auto (CPUs + 1, max 8, unless -t 1;\n"
-"                   B pictures, constant QP, one slice, CPU backend)\n"
+"                   B pictures, constant QP, one slice)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8  16=its 8x4/4x8/4x4 sub-partitions\n"
 "                   (default 15; P_8x8 is skipped by preset 0, and so\n"
