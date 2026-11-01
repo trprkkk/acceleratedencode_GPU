@@ -91,22 +91,30 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
 /* Pick the smallest level that satisfies the frame size, frame rate and
  * bit rate of the stream (Table A-1). */
 static int pick_level(int mb_w, int mb_h, int fps_num, int fps_den,
-                      int bitrate_kbps)
+                      int bitrate_kbps, int interlaced)
 {
-    /* [level_idc][MaxFS][MaxMBPS][MaxBR(kbit/s)] for Baseline/Main/High   */
-    static const struct { int idc, fs, mbs, br; } tab[] = {
-        { 10,  99,   1485,    64 }, { 11,  396,   3000,   192 },
-        { 12,  396,   6000,   384 }, { 13,  396,  11880,   768 },
-        { 20,  396,  11880,  2000 }, { 21,  792,  19800,  4000 },
-        { 22, 1620,  40500,  4000 }, { 30, 1620,  40500, 10000 },
-        { 31, 3600, 108000, 14000 }, { 40, 5120, 216000, 20000 },
-        { 41, 8192, 245760, 20000 }, { 42, 8704, 522240, 50000 },
-        { 50, 22080, 589824, 135000 }, { 51, 36864, 983040, 240000 },
+    /* [level_idc][MaxFS][MaxMBPS][MaxBR(kbit/s)] for Baseline/Main/High, and
+     * whether the level requires frame_mbs_only_flag = 1 (Table A-4: only
+     * levels 2.1 to 4.1 allow an interlaced stream) */
+    static const struct { int idc, fs, mbs, br, frame_only; } tab[] = {
+        { 10,  99,   1485,    64, 1 }, { 11,  396,   3000,   192, 1 },
+        { 12,  396,   6000,   384, 1 }, { 13,  396,  11880,   768, 1 },
+        { 20,  396,  11880,  2000, 1 }, { 21,  792,  19800,  4000, 0 },
+        { 22, 1620,  20250,  4000, 0 }, { 30, 1620,  40500, 10000, 0 },
+        { 31, 3600, 108000, 14000, 0 }, { 32, 5120, 216000, 20000, 0 },
+        { 40, 8192, 245760, 20000, 0 }, { 41, 8192, 245760, 50000, 0 },
+        { 42, 8704, 522240, 50000, 1 }, { 50, 22080, 589824, 135000, 1 },
+        { 51, 36864, 983040, 240000, 1 },
     };
     int fs = mb_w * mb_h;
     int64_t mbs = (int64_t)fs * fps_num / fps_den;
     int br = bitrate_kbps > 0 ? bitrate_kbps : 20000;
     size_t i;
+    if (interlaced)     /* the smallest that fits and allows it, if any */
+        for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
+            if (!tab[i].frame_only && fs <= tab[i].fs && mbs <= tab[i].mbs &&
+                br <= tab[i].br)
+                return tab[i].idc;
     for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
         if (fs <= tab[i].fs && mbs <= tab[i].mbs && br <= tab[i].br)
             return tab[i].idc;
@@ -183,8 +191,22 @@ size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s)
     }
     if (s->pt) {
         aeg_bw_init(&pb, pl, sizeof(pl), 0);
-        aeg_bw_put(&pb, 24, s->cpb_delay);     /* cpb_removal_delay       */
-        aeg_bw_put(&pb, 24, s->dpb_delay);     /* dpb_output_delay        */
+        if (s->pt_delays) {
+            aeg_bw_put(&pb, 24, s->cpb_delay); /* cpb_removal_delay       */
+            aeg_bw_put(&pb, 24, s->dpb_delay); /* dpb_output_delay        */
+        }
+        if (s->pt_struct) {
+            /* Table D-1: NumClockTS 1 for a frame or a field, 2 for the
+             * two fields of a frame (3 = top-bottom, 4 = bottom-top), 3
+             * with a repeated field; no clock timestamps are sent */
+            static const unsigned char nclock[9] = { 1, 1, 1, 2, 2, 3, 3, 2, 3 };
+            int ps = s->pt_struct - 1, i;
+            aeg_bw_put(&pb, 4, (uint32_t)ps);  /* pic_struct              */
+            for (i = 0; i < nclock[ps]; i++)
+                aeg_bw_put(&pb, 1, 0);         /* clock_timestamp_flag    */
+        }
+        if (pb.bits)                           /* payload byte alignment  */
+            aeg_bw_align_one(&pb);
         sei_message(&bw, 1, pl, pb.len);
     }
     if (s->info) {
@@ -269,7 +291,7 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
         aeg_bw_put(bw, 1, 0);        /* nal_hrd_parameters_present_flag     */
         aeg_bw_put(bw, 1, 0);        /* vcl_hrd_parameters_present_flag     */
     }
-    aeg_bw_put(bw, 1, 0);            /* pic_struct_present_flag             */
+    aeg_bw_put(bw, 1, p->interlaced ? 1 : 0); /* pic_struct_present_flag   */
     aeg_bw_put(bw, 1, 1);            /* bitstream_restriction_flag          */
     aeg_bw_put(bw, 1, 1);            /* motion_vectors_over_pic_boundaries  */
     aeg_bw_ue(bw, 0);                /* max_bytes_per_pic_denom             */
@@ -289,20 +311,25 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
 {
     aeg_bitwriter bw;
     int coded_w = mb_w * 16, coded_h = mb_h * 16;
+    /* frame_mbs_only_flag 0: the height is counted in field macroblock rows
+     * (pairs of frame rows) and cropped in units of 4 rows (CropUnitY) */
+    const int fmo = !p->interlaced;
     int crop_r = (coded_w - p->width) / 2;
-    int crop_b = (coded_h - p->height) / 2;
+    int crop_b = (coded_h - p->height) / (fmo ? 2 : 4);
 
     if (level_idc <= 0)
         level_idc = pick_level(mb_w, mb_h, p->fps_num, p->fps_den,
                                p->vbv_maxrate_kbps > p->bitrate_kbps
-                                   ? p->vbv_maxrate_kbps : p->bitrate_kbps);
+                                   ? p->vbv_maxrate_kbps : p->bitrate_kbps,
+                               p->interlaced);
 
     /* High profile as soon as the 8x8 transform is on -- it is the profile that
      * introduced transform_size_8x8_flag.  CABAC without it is Main profile;
      * only a stream with neither tool is Baseline (the rest of the syntax stays
      * inside the Baseline tool set, so no further constraints apply). */
     const int high = p->transform_8x8 != 0;
-    const int main = !high && p->cabac;
+    /* Baseline does not allow an interlaced stream; Main does (CAVLC too) */
+    const int main = !high && (p->cabac || p->interlaced);
 
     aeg_bw_init(&bw, rbsp, cap, 0);
     aeg_bw_put(&bw, 8, high ? 100 : (main ? 77 : 66)); /* profile_idc         */
@@ -337,8 +364,10 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     aeg_bw_ue(&bw, (uint32_t)nrefs);
     aeg_bw_put(&bw, 1, 0);               /* gaps_in_frame_num_value_allowed */
     aeg_bw_ue(&bw, (uint32_t)(mb_w - 1));
-    aeg_bw_ue(&bw, (uint32_t)(mb_h - 1));
-    aeg_bw_put(&bw, 1, 1);               /* frame_mbs_only_flag             */
+    aeg_bw_ue(&bw, (uint32_t)(fmo ? mb_h - 1 : mb_h / 2 - 1));
+    aeg_bw_put(&bw, 1, (uint32_t)fmo);   /* frame_mbs_only_flag             */
+    if (!fmo)
+        aeg_bw_put(&bw, 1, 0);           /* mb_adaptive_frame_field_flag    */
     aeg_bw_put(&bw, 1, 1);               /* direct_8x8_inference_flag       */
     if (crop_r || crop_b) {
         aeg_bw_put(&bw, 1, 1);           /* frame_cropping_flag             */
@@ -426,7 +455,9 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type);
     aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
-    aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
+    aeg_bw_put(bw, frame_num_bits & 0xff, (uint32_t)frame_num);
+    if (frame_num_bits & AEG_SH_FIELD)
+        aeg_bw_put(bw, 1, 0);         /* field_pic_flag: a frame            */
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     if (slice_type % 5 == 0) {        /* P slice                            */
@@ -478,7 +509,9 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type_in);
     aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
-    aeg_bw_put(bw, frame_num_bits, (uint32_t)frame_num);
+    aeg_bw_put(bw, frame_num_bits & 0xff, (uint32_t)frame_num);
+    if (frame_num_bits & AEG_SH_FIELD)
+        aeg_bw_put(bw, 1, 0);         /* field_pic_flag: a frame            */
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);

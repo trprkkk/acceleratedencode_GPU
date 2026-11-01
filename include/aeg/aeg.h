@@ -143,6 +143,15 @@ typedef struct aeg_params {
      * ask for (defaults 0 / 51; qp_max 0 means 51, unset).  chroma_qp_offset: chroma_qp_index_offset,
      * -12..12 (negative = finer chroma). */
     int aud;
+    /* Interlaced material: 0 = progressive (the default), 1 = top field
+     * first, 2 = bottom field first.  The pictures are still coded as frames
+     * (no field or MBAFF coding); the stream says it is interlaced
+     * (frame_mbs_only_flag 0) and in which order the fields are displayed
+     * (pic_struct in a picture timing SEI on every picture), so a player
+     * deinterlaces it correctly -- what x264 --fake-interlaced does for
+     * Blu-ray, with the field order of --tff/--bff.  The height must be a
+     * multiple of 4; the levels that allow it are 2.1 to 4.1. */
+    int interlaced;
     int level_idc;
     int qp_min, qp_max;
     int chroma_qp_offset;
@@ -335,6 +344,40 @@ typedef struct aeg_stats {
 typedef struct aeg_encoder aeg_encoder;
 
 /* ------------------------------------------------------------------ */
+/* Input pictures in other formats                                     */
+/* ------------------------------------------------------------------ */
+/* The layouts aeg_encoder_encode_image() accepts.  The planes are given in
+ * memory order: plane[0] is always Y; I420 has U then V, YV12 V then U; NV12
+ * has one plane of interleaved U,V pairs (NV21: V,U); I400 is luma only. */
+typedef enum aeg_csp {
+    AEG_CSP_I420 = 0,   /* 4:2:0 planar Y, U, V                          */
+    AEG_CSP_YV12 = 1,   /* 4:2:0 planar Y, V, U                          */
+    AEG_CSP_NV12 = 2,   /* 4:2:0 Y + interleaved UV (P010/P016: depth 16) */
+    AEG_CSP_NV21 = 3,   /* 4:2:0 Y + interleaved VU                      */
+    AEG_CSP_I422 = 4,   /* 4:2:2 planar Y, U, V                          */
+    AEG_CSP_YV16 = 5,   /* 4:2:2 planar Y, V, U                          */
+    AEG_CSP_NV16 = 6,   /* 4:2:2 Y + interleaved UV                      */
+    AEG_CSP_I444 = 7,   /* 4:4:4 planar Y, U, V                          */
+    AEG_CSP_YV24 = 8,   /* 4:4:4 planar Y, V, U                          */
+    AEG_CSP_I400 = 9    /* luma only (grey); chroma is coded as 128      */
+} aeg_csp;
+
+/* A picture of the encoder's width x height in any aeg_csp, 8 to 16 bits per
+ * sample.  depth 8: one byte per sample; depth 9..16: one uint16_t per
+ * sample in the machine's byte order, holding a value 0..2^depth - 1 (larger
+ * values are clipped).  stride[] is in bytes.  How it becomes 8-bit 4:2:0:
+ * samples are scaled to 16 bits, the chroma is resampled to 4:2:0 in that
+ * precision for MPEG-2/H.264 chroma siting (per field when params.interlaced
+ * is set), and every plane is dithered to 8 bits by error diffusion, exactly
+ * as x264's 8-bit build does with high bit depth input. */
+typedef struct aeg_image {
+    int csp;                  /* aeg_csp                                 */
+    int depth;                /* bits per sample, 8..16                  */
+    const void *plane[3];
+    int stride[3];            /* bytes per row                           */
+} aeg_image;
+
+/* ------------------------------------------------------------------ */
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 /* Thread safety: one encoder must not be used by two threads at once, but
@@ -360,6 +403,12 @@ AEG_API int  aeg_encoder_encode_planes(aeg_encoder *enc,
                                        const uint8_t *const plane[3],
                                        const int stride[3], int64_t pts,
                                        aeg_packet *pkt);
+/* Any other input format: the picture is converted to the 8-bit 4:2:0 the
+ * encoder codes (see aeg_image), then coded as by aeg_encoder_encode_planes().
+ * 8-bit I420/YV12 is passed through untouched, so the bytes are the same as
+ * from the calls above. */
+AEG_API int  aeg_encoder_encode_image(aeg_encoder *enc, const aeg_image *img,
+                                      int64_t pts, aeg_packet *pkt);
 /* After the last picture: call until it returns AEG_EOF; each AEG_OK hands
  * back one more packet. */
 AEG_API int  aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt);

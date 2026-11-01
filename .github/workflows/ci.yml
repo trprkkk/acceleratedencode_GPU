@@ -194,13 +194,14 @@ jobs:
           make -j"$(nproc)" OPENCL=1 BUILD=build-san
           make -s OPENCL=1 BUILD=build-san build-san/backend_check \
             build-san/kernel_check build-san/coef_check build-san/genyuv \
-            build-san/api_check
+            build-san/api_check build-san/input_check
       - name: unit checks
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           ./build-san/kernel_check
           ./build-san/coef_check 20000
+          ./build-san/input_check
       - name: public API (leak detection on)
         env:
           ASAN_OPTIONS: detect_leaks=1

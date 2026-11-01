@@ -143,6 +143,9 @@ struct aeg_encoder {
     int64_t *dts_q;
     int     dts_cap, dts_head, dts_n;
     double  dts_dur;
+    /* aeg_encoder_encode_image(): the converted picture (8-bit 4:2:0) */
+    aeg_input_cvt cvt;
+    uint8_t *cvt_pic;
     /* AEG_LATIME: time in the scheduler, waiting for and inside the frame
      * thread workers (per encoder: encoders may run in parallel threads) */
     int64_t sched_ns, ft_wait_ns, ft_worker_ns;
@@ -9107,7 +9110,9 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
         aeg_write_slice_header_poc(&bw,
                                    slice == AEG_SLICE_B ? 6 : (slice ? 5 : 7),
                                    e->frame_num & ((1 << e->frame_num_bits) - 1),
-                                   e->frame_num_bits, is_idr, e->idr_pic_id,
+                                   e->frame_num_bits |
+                                       (e->p.interlaced ? AEG_SH_FIELD : 0),
+                                   is_idr, e->idr_pic_id,
                                    e->cur_poc & (max_lsb - 1), e->poc_lsb_bits,
                                    e->cur_is_ref,
                                    e->p.cabac ? e->cabac_init_idc : -1,
@@ -9119,7 +9124,9 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
-                               e->frame_num_bits, is_idr, e->idr_pic_id,
+                               e->frame_num_bits |
+                                   (e->p.interlaced ? AEG_SH_FIELD : 0),
+                               is_idr, e->idr_pic_id,
                                e->p.cabac ? e->cabac_init_idc : -1,
                                e->cur_qp - 26, e->p.deblock_alpha,
                                e->p.deblock_beta,
@@ -10185,9 +10192,11 @@ recode:
         out_len += e->hdr_len;
     }
     /* SEI, before the slices: the HRD's buffering period (IDR) and picture
-     * timing (every picture), and the info text on the first picture.  A
-     * frame lasts two clock ticks (time_scale = 2 * fps_num). */
-    if (e->hrd_on || (e->p.info_sei && e->frame_count == 0)) {
+     * timing (every picture; also for the field order of an interlaced
+     * stream), and the info text on the first picture.  A frame lasts two
+     * clock ticks (time_scale = 2 * fps_num). */
+    if (e->hrd_on || e->p.interlaced ||
+        (e->p.info_sei && e->frame_count == 0)) {
         aeg_sei s;
         uint8_t sei[1200];
         size_t sn;
@@ -10212,8 +10221,13 @@ recode:
             } else {
                 s.cpb_delay = (uint32_t)(2 * (c - e->hrd_bp_c));
             }
-            s.pt = 1;
+            s.pt = s.pt_delays = 1;
             s.dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
+        }
+        if (e->p.interlaced) {
+            /* pic_struct 3 = top field, bottom field; 4 = the reverse */
+            s.pt = 1;
+            s.pt_struct = 1 + (e->p.interlaced == 1 ? 3 : 4);
         }
         if (e->p.info_sei && e->frame_count == 0)
             s.info = e->info;
@@ -10635,6 +10649,10 @@ static int write_param_sets(struct aeg_encoder *e)
     if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
         return AEG_ERROR;
     e->level_out = sps[2];   /* profile_idc, constraint flags, level_idc */
+    if (e->p.interlaced && (e->level_out < 21 || e->level_out > 41))
+        aeg_log(AEG_LOG_WARNING, "aeg: level %d.%d does not allow an "
+                "interlaced stream (only 2.1 to 4.1 do)", e->level_out / 10,
+                e->level_out % 10);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 7, sps, sl, 1);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
     if (e->p.weightp) {
@@ -11265,6 +11283,13 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->chroma_qp_offset < -12) pp->chroma_qp_offset = -12;
     if (pp->chroma_qp_offset > 12) pp->chroma_qp_offset = 12;
     if (pp->level_idc < 0 || pp->level_idc > 62) pp->level_idc = 0;
+    if (pp->interlaced < 0 || pp->interlaced > 2) pp->interlaced = 0;
+    /* frame_mbs_only_flag 0 crops in units of 4 rows (as x264 refuses) */
+    if (pp->interlaced && (pp->height & 3)) {
+        aeg_set_last_error("interlaced: the height must be a multiple of 4");
+        aeg_free(e);
+        return NULL;
+    }
     if (pp->deblock_alpha < -6) pp->deblock_alpha = -6;
     if (pp->deblock_alpha > 6) pp->deblock_alpha = 6;
     if (pp->deblock_beta < -6) pp->deblock_beta = -6;
@@ -11459,7 +11484,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     pp->width = e->vw;
     pp->height = e->vh;
     e->w = (e->vw + 15) & ~15;
-    e->h = (e->vh + 15) & ~15;
+    /* interlaced: the SPS counts the height in pairs of macroblock rows */
+    e->h = pp->interlaced ? (e->vh + 31) & ~31 : (e->vh + 15) & ~15;
     e->cw = (e->w + 1) / 2;
     e->ch = (e->h + 1) / 2;
     e->mb_w = e->w / 16;
@@ -11816,6 +11842,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  e->p.partitions, e->p.cabac, e->p.transform_8x8,
                  e->p.deblock, e->p.deblock_alpha, e->p.deblock_beta,
                  e->n_slices, crf_txt);
+        if (e->p.interlaced) {
+            size_t n = strlen(e->info);
+            snprintf(e->info + n, sizeof(e->info) - n, " interlaced=%s",
+                     e->p.interlaced == 1 ? "tff" : "bff");
+        }
     }
     if (write_param_sets(e) != AEG_OK) {
         aeg_set_last_error("parameter sets do not fit");
@@ -12691,6 +12722,60 @@ int aeg_encoder_encode_planes(aeg_encoder *enc, const uint8_t *const plane[3],
     return encode_src(e, &in, pts, pkt);
 }
 
+int aeg_encoder_encode_image(aeg_encoder *enc, const aeg_image *img,
+                             int64_t pts, aeg_packet *pkt)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    aeg_src in;
+    int i, rc;
+
+    if (!e || !img || !pkt) {
+        aeg_set_last_error("aeg_encoder_encode_image: NULL argument");
+        return AEG_EINVAL;
+    }
+    if ((rc = aeg_image_check(img, e->vw, e->vh)) != AEG_OK)
+        return rc;
+    if (img->depth == 8 &&
+        (img->csp == AEG_CSP_I420 || img->csp == AEG_CSP_YV12)) {
+        /* the encoder's own format: no conversion */
+        int u = img->csp == AEG_CSP_YV12 ? 2 : 1;
+        in.plane[0] = (const uint8_t *)img->plane[0];
+        in.plane[1] = (const uint8_t *)img->plane[u];
+        in.plane[2] = (const uint8_t *)img->plane[3 - u];
+        in.stride[0] = img->stride[0];
+        in.stride[1] = img->stride[u];
+        in.stride[2] = img->stride[3 - u];
+        return encode_src(e, &in, pts, pkt);
+    }
+    if (!e->cvt_pic) {
+        e->cvt_pic = (uint8_t *)malloc((size_t)e->vw * e->vh +
+                                       2 * (size_t)e->vcw * e->vch);
+        if (!e->cvt_pic) {
+            aeg_set_last_error("out of memory");
+            return AEG_ENOMEM;
+        }
+    }
+    {
+        uint8_t *dst[3];
+        int st[3];
+        dst[0] = e->cvt_pic;
+        dst[1] = dst[0] + (size_t)e->vw * e->vh;
+        dst[2] = dst[1] + (size_t)e->vcw * e->vch;
+        st[0] = e->vw;
+        st[1] = st[2] = e->vcw;
+        if (aeg_input_convert(&e->cvt, img, e->vw, e->vh, e->p.interlaced,
+                              dst, st) != AEG_OK) {
+            aeg_set_last_error("out of memory");
+            return AEG_ENOMEM;
+        }
+        for (i = 0; i < 3; i++) {
+            in.plane[i] = dst[i];
+            in.stride[i] = st[i];
+        }
+    }
+    return encode_src(e, &in, pts, pkt);
+}
+
 int aeg_encoder_headers(aeg_encoder *enc, aeg_packet *pkt)
 {
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
@@ -13118,6 +13203,8 @@ void aeg_encoder_close(aeg_encoder *enc)
                 e->ft_worker_ns / 1e6, e->fsync ? (long long)e->fsync->restarts : 0LL);
     ft_free(e);
     free(e->dts_q);
+    aeg_input_cvt_free(&e->cvt);
+    free(e->cvt_pic);
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);
     aeg_mc_ctx_free(&e->mc1);

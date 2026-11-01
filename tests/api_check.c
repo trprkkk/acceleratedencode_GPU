@@ -33,7 +33,7 @@ static int failures;
 
 /* An odd chroma height and a width that is not a whole number of macroblocks:
  * the crop path, with planes of their own widths. */
-enum { W = 200, H = 118, CW = (W + 1) / 2, CH = (H + 1) / 2, NF = 14 };
+enum { W = 200, H = 116, CW = (W + 1) / 2, CH = (H + 1) / 2, NF = 14 };
 
 static uint8_t *clip;   /* NF packed I420 frames */
 
@@ -79,8 +79,91 @@ static void put(buf *b, const uint8_t *d, size_t n)
     b->n += n;
 }
 
+/* The clip's frame t with flat chroma (value flat_chroma(t)) -- what a 4:4:4,
+ * 4:2:2 or grey picture with the same flat chroma converts to exactly. */
+static int flat_value = -1;      /* -1: 100 + 3t; else this value */
+static int flat_chroma(int t)
+{
+    return flat_value >= 0 ? flat_value : 100 + 3 * t;
+}
+static void flat_frame(uint8_t *dst, const uint8_t *f, int t)
+{
+    memcpy(dst, f, (size_t)W * H);
+    memset(dst + W * H, flat_chroma(t), 2 * (size_t)CW * CH);
+}
+
+enum {
+    IMG_NONE, IMG_NV12, IMG_NV21, IMG_YV12, IMG_I420_10, IMG_I420_16,
+    IMG_I444_FLAT, IMG_I422_FLAT, IMG_NV16_FLAT, IMG_I400, IMG_I444_16_FLAT
+};
+
+/* Lay frame f (packed I420) out as image mode m in scratch (padded rows
+ * of junk the encoder must not read). */
+static void fill_image(int m, const uint8_t *f, int t, uint8_t *scratch,
+                       aeg_image *im)
+{
+    const uint8_t *Y = f, *U = f + W * H, *V = U + CW * CH;
+    int x, y, i;
+    int hi = m == IMG_I420_10 || m == IMG_I420_16 || m == IMG_I444_16_FLAT;
+    int bps = hi ? 2 : 1, sh = m == IMG_I420_10 ? 2 : 8;
+    int cw = CW, ch = CH, il = 1, np = 3;
+    memset(im, 0, sizeof(*im));
+    im->depth = m == IMG_I420_10 ? 10 : hi ? 16 : 8;
+    switch (m) {
+    case IMG_NV12: im->csp = AEG_CSP_NV12; il = 2; np = 2; break;
+    case IMG_NV21: im->csp = AEG_CSP_NV21; il = 2; np = 2; break;
+    case IMG_YV12: im->csp = AEG_CSP_YV12; break;
+    case IMG_I420_10: case IMG_I420_16: im->csp = AEG_CSP_I420; break;
+    case IMG_I444_FLAT: case IMG_I444_16_FLAT:
+        im->csp = AEG_CSP_I444; cw = W; ch = H; break;
+    case IMG_I422_FLAT: im->csp = AEG_CSP_I422; ch = H; break;
+    case IMG_NV16_FLAT: im->csp = AEG_CSP_NV16; ch = H; il = 2; np = 2; break;
+    case IMG_I400: im->csp = AEG_CSP_I400; np = 1; break;
+    }
+    im->stride[0] = W * bps + 6;
+    for (i = 1; i < np; i++)
+        im->stride[i] = cw * il * bps + 10;
+    memset(scratch, 0xA7, (size_t)im->stride[0] * H + 2 * (size_t)(W * 2 * bps + 10) * H);
+    im->plane[0] = scratch;
+    for (i = 1; i < np; i++)
+        im->plane[i] = (const uint8_t *)im->plane[i - 1] +
+                       (size_t)im->stride[i - 1] * (i == 1 ? H : ch);
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            uint8_t *d = (uint8_t *)im->plane[0] + (size_t)y * im->stride[0];
+            if (hi)
+                ((uint16_t *)d)[x] = (uint16_t)(Y[y * W + x] << sh);
+            else
+                d[x] = Y[y * W + x];
+        }
+    for (y = 0; y < ch && np > 1; y++)
+        for (x = 0; x < cw; x++) {
+            int fl = m >= IMG_I444_FLAT;
+            int u = fl ? flat_chroma(t) : U[y * CW + x];
+            int v = fl ? flat_chroma(t) : V[y * CW + x];
+            if (il == 2) {
+                uint8_t *d = (uint8_t *)im->plane[1] + (size_t)y * im->stride[1];
+                d[2 * x] = (uint8_t)(m == IMG_NV21 ? v : u);
+                d[2 * x + 1] = (uint8_t)(m == IMG_NV21 ? u : v);
+            } else {
+                int pu = m == IMG_YV12 ? 2 : 1;
+                uint8_t *du = (uint8_t *)im->plane[pu] + (size_t)y * im->stride[pu];
+                uint8_t *dv = (uint8_t *)im->plane[3 - pu] + (size_t)y * im->stride[3 - pu];
+                if (hi) {
+                    ((uint16_t *)du)[x] = (uint16_t)(u << sh);
+                    ((uint16_t *)dv)[x] = (uint16_t)(v << sh);
+                } else {
+                    du[x] = (uint8_t)u;
+                    dv[x] = (uint8_t)v;
+                }
+            }
+        }
+}
+
 typedef struct run {
     aeg_params p;
+    int image;           /* feed aeg_image in this IMG_* layout */
+    int flat;            /* encode the flat-chroma frames (packed I420) */
     int planes;          /* feed strided planes instead of packed frames */
     int64_t pts_step;
     buf out;
@@ -96,6 +179,7 @@ static void encode_clip(run *r)
     size_t fb = frame_bytes();
     int t, rc, y, s0 = W + 37, s1 = CW + 11;
     uint8_t *pl[3] = { NULL, NULL, NULL };
+    uint8_t *scratch = NULL, *ff = NULL;
 
     r->n = 0;
     r->rc = 0;
@@ -108,10 +192,23 @@ static void encode_clip(run *r)
         pl[1] = (uint8_t *)malloc((size_t)s1 * CH);
         pl[2] = (uint8_t *)malloc((size_t)s1 * CH);
     }
+    if (r->image)
+        scratch = (uint8_t *)malloc((size_t)(W * 2 + 6) * H +
+                                    2 * (size_t)(W * 4 + 10) * H);
+    if (r->flat)
+        ff = (uint8_t *)malloc(fb);
     for (t = 0; t < NF; t++) {
         const uint8_t *f = clip + fb * t;
         int64_t pts = 1000 + t * r->pts_step;
-        if (r->planes) {
+        if (r->flat) {
+            flat_frame(ff, f, t);
+            f = ff;
+        }
+        if (r->image) {
+            aeg_image im;
+            fill_image(r->image, f, t, scratch, &im);
+            rc = aeg_encoder_encode_image(enc, &im, pts, &pkt);
+        } else if (r->planes) {
             const uint8_t *cp[3];
             int st[3] = { s0, s1, s1 };
             /* fill the padding with junk the encoder must not read */
@@ -149,6 +246,98 @@ static void encode_clip(run *r)
     free(pl[0]);
     free(pl[1]);
     free(pl[2]);
+    free(scratch);
+    free(ff);
+}
+
+static void base_params(aeg_params *p, int preset);
+
+/* Every input layout that converts exactly must give the bytes of the same
+ * picture given as I420; and the conversion's argument checks. */
+static void check_images(void)
+{
+    static const struct { int mode, flat, fv; const char *name; } cases[] = {
+        { IMG_NV12, 0, -1, "NV12" }, { IMG_NV21, 0, -1, "NV21" },
+        { IMG_YV12, 0, -1, "YV12" }, { IMG_I420_10, 0, -1, "I420 10-bit" },
+        { IMG_I420_16, 0, -1, "I420 16-bit" },
+        { IMG_I444_FLAT, 1, -1, "I444 flat chroma" },
+        { IMG_I422_FLAT, 1, -1, "I422 flat chroma" },
+        { IMG_NV16_FLAT, 1, -1, "NV16 flat chroma" },
+        { IMG_I444_16_FLAT, 1, -1, "I444 16-bit flat chroma" },
+        { IMG_I400, 1, 128, "I400" },
+    };
+    int i, inter;
+    for (inter = 0; inter <= 1; inter++)
+        for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+            run a, b;
+            memset(&a, 0, sizeof(a));
+            memset(&b, 0, sizeof(b));
+            flat_value = cases[i].fv;
+            base_params(&a.p, 2);
+            a.p.interlaced = inter ? 2 : 0;
+            a.pts_step = b.pts_step = 1;
+            b.p = a.p;
+            a.flat = cases[i].flat;
+            b.image = cases[i].mode;
+            encode_clip(&a);
+            encode_clip(&b);
+            CHECK(a.rc == 0 && b.rc == 0, "%s: rc %d %d (%s)", cases[i].name,
+                  a.rc, b.rc, aeg_last_error());
+            CHECK(a.out.n > 0 && a.out.n == b.out.n &&
+                  !memcmp(a.out.d, b.out.d, a.out.n),
+                  "%s%s: %zu bytes, I420 %zu: not the same stream",
+                  cases[i].name, inter ? " (interlaced)" : "", b.out.n,
+                  a.out.n);
+            free(a.out.d);
+            free(b.out.d);
+        }
+    flat_value = -1;
+    {
+        aeg_params p;
+        aeg_encoder *e;
+        aeg_packet pkt;
+        aeg_image im;
+        uint8_t *scratch = (uint8_t *)malloc((size_t)(W * 2 + 6) * H +
+                                             2 * (size_t)(W * 4 + 10) * H + 2);
+        base_params(&p, 1);
+        e = aeg_encoder_open(&p);
+        CHECK(e != NULL, "open: %s", aeg_last_error());
+        if (e) {
+            fill_image(IMG_I420_10, clip, 0, scratch, &im);
+            im.csp = 42;
+            CHECK(aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_EINVAL &&
+                  strstr(aeg_last_error(), "colour"), "bad csp: '%s'",
+                  aeg_last_error());
+            im.csp = AEG_CSP_I420;
+            im.depth = 17;
+            CHECK(aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_EINVAL,
+                  "depth 17 accepted");
+            im.depth = 10;
+            im.stride[1] = CW;      /* bytes: half a 16-bit row */
+            CHECK(aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_EINVAL &&
+                  strstr(aeg_last_error(), "stride"), "short stride: '%s'",
+                  aeg_last_error());
+            im.stride[1] = 2 * CW + 10;
+            im.plane[0] = scratch + 1;
+            CHECK(aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_EINVAL,
+                  "unaligned 16-bit plane accepted");
+            im.plane[0] = NULL;
+            CHECK(aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_EINVAL,
+                  "NULL plane accepted");
+            CHECK(aeg_encoder_encode_image(e, NULL, 0, &pkt) == AEG_EINVAL,
+                  "NULL image accepted");
+            aeg_encoder_close(e);
+        }
+        free(scratch);
+        /* interlaced needs a height that is a multiple of 4 */
+        base_params(&p, 1);
+        p.height = 118;
+        p.interlaced = 1;
+        e = aeg_encoder_open(&p);
+        CHECK(e == NULL && strstr(aeg_last_error(), "multiple of 4"),
+              "interlaced height 118 accepted ('%s')", aeg_last_error());
+        aeg_encoder_close(e);
+    }
 }
 
 static void base_params(aeg_params *p, int preset)
@@ -481,6 +670,7 @@ int main(void)
     check_planes_and_dts(3, AEG_RC_CQP, 0);
     check_planes_and_dts(0, AEG_RC_CRF, 0);
     check_planes_and_dts(2, AEG_RC_CRF, 1);
+    check_images();
     check_threads();
     aeg_set_log_level(old);
     free(clip);

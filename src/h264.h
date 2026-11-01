@@ -291,7 +291,9 @@ typedef struct aeg_sei {
     int bp;                     /* buffering_period (D.1.1)               */
     uint32_t bp_delay, bp_offset; /* initial_cpb_removal_delay(_offset), 90 kHz */
     int pt;                     /* pic_timing (D.1.2)                     */
+    int pt_delays;              /* ... with the HRD's cpb/dpb delays      */
     uint32_t cpb_delay, dpb_delay; /* in clock ticks (two per frame)      */
+    int pt_struct;              /* ... with pic_struct = pt_struct - 1 (0 = none) */
     const char *info;           /* user_data_unregistered text, or NULL   */
 } aeg_sei;
 size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s);
@@ -320,7 +322,10 @@ typedef struct aeg_pwt {
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8,
                      int cabac, int weighted_pred);
-/* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header. */
+/* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header.
+ * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an
+ * interlaced stream coded as frames), so the header carries field_pic_flag. */
+#define AEG_SH_FIELD 0x100
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int cabac_init_idc, int slice_qp_delta,
@@ -606,6 +611,32 @@ typedef struct aeg_me_ctx aeg_me_ctx;
 #define AEG_MAX(a,b) ((a) > (b) ? (a) : (b))
 #define AEG_CLIP3(lo,hi,v) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 #define AEG_ALIGN(x,a) (((x) + ((a)-1)) & ~((size_t)(a)-1))
+
+/* Input conversion (input.c): any aeg_image to the encoder's 8-bit 4:2:0. */
+typedef struct aeg_csp_info_t {
+    int planes;           /* 1..3                                         */
+    int xs, ys;           /* chroma subsampling shifts (4:2:0: 1, 1)      */
+    int u, v;             /* plane index of U and V (planar layouts)      */
+    int interleave;       /* 2: U and V share plane 1 (NV12/NV21/NV16)    */
+    int swap_uv;          /* NV21: V first                                */
+    int grey;             /* I400                                         */
+} aeg_csp_info_t;
+typedef struct aeg_input_cvt {
+    uint16_t *a, *b, *t;  /* 16-bit stages, w * h samples each            */
+    int16_t *err;         /* the dither's error row                       */
+    size_t cap;
+} aeg_input_cvt;
+int  aeg_csp_info(int csp, aeg_csp_info_t *ci);
+int  aeg_image_check(const aeg_image *img, int w, int h);
+int  aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
+                       int interlaced, uint8_t *dst[3], const int dst_stride[3]);
+void aeg_input_cvt_free(aeg_input_cvt *c);
+void aeg_dither_plane(uint8_t *dst, int dst_stride, const uint16_t *src,
+                      int src_stride, int width, int height, int depth,
+                      int16_t *errors);
+void aeg_chroma_to420(uint16_t *dst, int dst_stride, const uint16_t *src,
+                      int src_stride, int sw, int sh, int cw, int ch,
+                      int interlaced, uint16_t *tmp);
 
 void aeg_log(int level, const char *fmt, ...);
 extern int aeg_log_level;

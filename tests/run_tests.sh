@@ -128,10 +128,15 @@ print("   %-22s bit-exact (%d frames, %d B, coding order, max abs diff 0)"
 PY
 
 # run_bcase <name> <w> <h> <frames> <bframes> <genyuv mode> <extra aegenc args...>
+# (with IN_FILE set, that file is the input instead of a generated clip)
 run_bcase() {
     name=$1; w=$2; h=$3; n=$4; b=$5; mode=$6; shift 6
-    "$BUILD/genyuv" "$w" "$h" "$n" "$TMP/$name.yuv" "$mode" >/dev/null
-    $BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
+    src=$IN_FILE
+    if [ -z "$src" ]; then
+        src="$TMP/$name.yuv"
+        "$BUILD/genyuv" "$w" "$h" "$n" "$src" "$mode" >/dev/null
+    fi
+    $BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$src" \
         -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" \
         --dump-order "$TMP/$name.order" \
         ${AEG_TEST_BACKEND:+-b "$AEG_TEST_BACKEND"} "$@" \
@@ -874,6 +879,8 @@ for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
             "-w 96 -h 64 --fps 0" "-w 96 -h 64 --sar 4" "-w 96 -h 64 --direct x" \
             "-w 96 -h 64 --colorprim nope" "-w 64 -h 64 --demuxer y4m" \
             "-w 96 -h 64 --qpmax 0" "-w 96 -h 64 --qpmin 40 --qpmax 30" \
+            "-w 96 -h 64 --input-csp foo" "-w 96 -h 64 --input-depth 17" \
+            "--input-depth 10" "--demuxer raw -w 96 -h 62 --tff" \
             "--nonsense"; do
     # shellcheck disable=SC2086
     rc=0
@@ -883,7 +890,60 @@ for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
         echo "   '$args' was accepted (exit $rc)  FAIL"; bad=1
     fi
 done
-if [ $bad = 0 ]; then echo "   15 malformed command lines refused"; else FAIL=1; fi
+if [ $bad = 0 ]; then echo "   19 malformed command lines refused"; else FAIL=1; fi
+
+echo "== input formats and interlace"
+# Other layouts and depths, made by ffmpeg from a generated clip, are
+# converted to 8-bit 4:2:0 and must still decode bit-exactly; interlaced
+# streams must decode bit-exactly and carry their field order (ffmpeg's
+# showinfo: i:T top first, i:B bottom first) on every picture; a YUV4MPEG2
+# header with a C tag and It must give the stream its raw equivalent gives.
+IN_FILE=
+if command -v "$FF" >/dev/null 2>&1; then
+    "$BUILD/genyuv" 176 144 12 "$TMP/if.yuv" 4 >/dev/null
+    for spec in yuv422p10le:i422:10 yuv444p:i444:8 nv12:nv12:8 \
+                yuv420p12le:i420:12 gray16le:i400:16 nv21:nv21:8; do
+        pf=${spec%%:*}; rest=${spec#*:}; csp=${rest%%:*}; dep=${rest#*:}
+        "$FF" -v error -y -f rawvideo -s 176x144 -pix_fmt yuv420p \
+            -i "$TMP/if.yuv" -pix_fmt "$pf" -f rawvideo "$TMP/if_$csp.raw"
+        IN_FILE="$TMP/if_$csp.raw"
+        run_bcase "in_${csp}_$dep" 176 144 12 2 4 -q 24 -p 2 \
+            --input-csp "$csp" --input-depth "$dep"
+        IN_FILE=
+    done
+    run_bcase tff      176 144 12 2 4 -q 24 -p 3 --tff
+    run_bcase bff      176 144 12 3 1 -q 26 -p 2 --bff --slices 2 --b-adapt 0 \
+        --b-pyramid 0
+    run_case  bff_cavlc 176 144 8 4 -q 26 -p 2 --bff --no-cabac --no-8x8dct
+    run_bcase tff_hrd  176 144 16 2 4 -p 2 --tff --bitrate 300 \
+        --vbv-maxrate 300 --vbv-bufsize 600 --nal-hrd
+    for fo in tff:T bff:B tff_hrd:T; do
+        nm=${fo%%:*}; want=${fo#*:}
+        got=$("$FF" -i "$TMP/$nm.264" -vf showinfo -f null - 2>&1 |
+              grep -o 'i:[A-Z?]' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
+        nfr=$("$FF" -i "$TMP/$nm.264" -vf showinfo -f null - 2>&1 |
+              grep -c "i:$want" || true)
+        if [ "$nfr" -ge 12 ] && ! echo "$got" | grep -q 'i:[^'"$want"']'; then
+            echo "   $nm: every picture i:$want"
+        else
+            echo "   $nm: field order '$got'  FAIL"; FAIL=1
+        fi
+    done
+    "$FF" -v error -y -f rawvideo -s 176x144 -pix_fmt yuv420p -i "$TMP/if.yuv" \
+        -vf setfield=tff -pix_fmt yuv422p10le -strict -1 "$TMP/if.y4m"
+    rc=0
+    $BUILD/aegenc -i "$TMP/if.y4m" -o "$TMP/if1.264" -v 0 || rc=$?
+    $BUILD/aegenc -i "$TMP/if_i422.raw" -w 176 -h 144 --fps 25 --tff \
+        --input-csp i422 --input-depth 10 -o "$TMP/if2.264" -v 0 || rc=$?
+    if [ $rc = 0 ] && head -1 "$TMP/if.y4m" | grep -q 'It.*C422p10' &&
+       cmp -s "$TMP/if1.264" "$TMP/if2.264"; then
+        echo "   y4m 'It C422p10' = raw --input-csp i422 --input-depth 10 --tff"
+    else
+        echo "   y4m C422p10/It: streams differ (rc $rc)  FAIL"; FAIL=1
+    fi
+else
+    echo "   skipped (no ffmpeg)"
+fi
 
 echo "== device enumeration"
 $BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'

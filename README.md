@@ -238,6 +238,22 @@ as whole macroblocks, cropped in the SPS); `--fps 30000/1001`, `--sar W:H`,
 `--info-sei` (the options in a user-data SEI), `-g`, `--scenecut`.  A missing,
 malformed or out-of-range value is refused with exit status 2.
 
+Other input formats are converted to the 8-bit 4:2:0 that is coded, the way
+x264's 8-bit build does: `--input-csp i420|yv12|nv12|nv21|i422|yv16|nv16|
+i444|yv24|i400` and `--input-depth 8..16` for raw input (above 8 bits, two
+bytes per sample, little-endian: `yuv422p10le` and the like), or a `.y4m`
+header's `C` tag (`420p10`, `422`, `444p12`, `mono16`, ...).  The chroma is
+resampled to 4:2:0 in 16-bit precision (per field for interlaced material),
+then every plane is dithered to 8 bits with x264's error diffusion.  8-bit
+I420 goes through untouched.
+
+`--tff` / `--bff` (or a `.y4m` header's `It` / `Ib`) mark the stream as
+interlaced with that field order: the pictures are still coded as frames
+(what x264 calls `--fake-interlaced`), and the SPS (`frame_mbs_only_flag 0`)
+and a picture-timing SEI on every picture (`pic_struct` 3 or 4) tell a
+decoder or player to treat them as two fields.  The height must be a
+multiple of 4.
+
 ## Using the library
 
 `include/aeg/aeg.h` is the whole interface; `examples/encode.c` is a complete
@@ -260,6 +276,9 @@ aeg_encoder_headers(e, &pkt);                  /* SPS/PPS for avcC */
 int rc = aeg_encoder_encode(e, i420, size, pts, &pkt);
 /* ... or three planes with their own strides (same bytes out) */
 rc = aeg_encoder_encode_planes(e, plane, stride, pts, &pkt);
+/* ... or anything else: NV12, 4:2:2, 10-bit, grey ... (converted) */
+aeg_image img = { AEG_CSP_I422, 10, { y, u, v }, { ys, us, vs } };
+rc = aeg_encoder_encode_image(e, &img, pts, &pkt);
 if (rc == AEG_OK) write(pkt.data, pkt.size);   /* AEG_EAGAIN: no packet yet */
 while (aeg_encoder_flush(e, &pkt) == AEG_OK) write(pkt.data, pkt.size);
 aeg_encoder_close(e);

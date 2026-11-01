@@ -4512,7 +4512,7 @@ wrong with the interface as it stood:
   as with x264.
 * **Packaging**: only a static archive and no install rule.  Now `make
   shared` (position-independent, `-fvisibility=hidden`, only the `AEG_API`
-  symbols exported -- 26 of them), `make install` / `uninstall` with `PREFIX`,
+  symbols exported -- 26 of them; 27 with `aeg_encoder_encode_image()`), `make install` / `uninstall` with `PREFIX`,
   `DESTDIR`, `LIBDIR`, `INCLUDEDIR`, `BINDIR`, an `aeg.pc`, and a run-time
   `aeg_version()`.  The soname is `libaeg.so.0`: `aeg_params` and
   `aeg_packet` are plain structs the caller allocates, so a field added in a
@@ -4529,3 +4529,91 @@ with the system's pkg-config).  CQP, CRF and ABR output byte-identical to the
 previous commit: 13 configurations (presets 2-4, no B, CRF, CRF+AQ, ABR, VBV,
 HRD, CAVLC, slices, slice threads, short GOP), the CPU and OpenCL conformance
 suites.
+
+## Input formats and interlace signalling
+
+The encoder codes 8-bit 4:2:0 progressive pictures.  What was missing was
+everything a real source hands over that is not exactly that: decoders and
+capture cards give NV12, professional material is 4:2:2 or 10-bit, a YUV4MPEG2
+pipe from ffmpeg says `C420p10` or `C422`, and broadcast material is
+interlaced.  x264's 8-bit build accepts all of them by converting on input;
+this does the same, in the library (`aeg_encoder_encode_image()`, `aeg_image`,
+`src/input.c`) so an application gets it too, and in the CLI.
+
+* **Layouts**: I420, YV12, NV12, NV21 (4:2:0); I422, YV16, NV16 (4:2:2);
+  I444, YV24 (4:4:4); I400 (grey, chroma coded as 128).  Each 8 to 16 bits
+  per sample; above 8, one native-endian `uint16_t` per sample holding
+  0..2^depth-1 (P010/P016 are NV12 with depth 16).
+* **Depth**: every sample goes to 16 bits (`s << (16 - depth)`, x264's input
+  scaling) and is dithered back to 8 bits with x264's Sierra-2-4A error
+  diffusion (`filters/video/depth.c`).  `tests/input_check.c` compares it bit
+  for bit with a transcription of x264's loop on random planes of odd sizes,
+  and checks its two properties: a plane that was scaled up from 8 bits comes
+  back unchanged (so `yuv420p10le` made from an 8-bit source codes to the
+  same bytes as the source), and a flat level between two codes keeps its
+  mean (100.25 → mean 100.2500).
+* **Chroma**: resampled to 4:2:0 in the 16-bit stage, for H.264's default
+  chroma siting (`chroma_loc_type` 0): horizontally (1 2 1)/4 on the even
+  columns, vertically (1 3 3 1)/8 between two rows; for interlaced material
+  the vertical filter runs within each field, (3 1)/4 for the top field and
+  (1 3)/4 for the bottom one, where the 4:2:0 chroma lines of the two fields
+  sit -- a progressive filter would blend the fields and smear colour on
+  motion.  `input_check` checks every output sample against the taps written
+  out with explicit edge clamping (sizes 1x1 to 65x34) and that a 4:2:2
+  source with different chroma in its two fields keeps them apart when
+  interlaced and blends them when not.
+* **Exact paths**: 8-bit I420 and YV12 go straight to the encoder (no copy),
+  NV12/NV21 are only deinterleaved, the luma of any 8-bit picture is copied.
+  `tests/api_check.c` encodes the same picture in every layout that must
+  convert exactly (NV12, NV21, YV12, 10- and 16-bit scaled up, 4:4:4 / 4:2:2
+  / NV16 / 16-bit 4:4:4 with flat chroma, grey against chroma 128), with
+  junk in the row padding, progressive and interlaced, and requires the very
+  bytes of the I420 encode.
+* **Cost** (one 1920x1080 picture, one core): 10-bit 4:2:0 9.9 ms, 10-bit
+  4:2:2 10.3 ms, 10-bit 4:4:4 14.6 ms, 8-bit 4:2:2 4.5 ms, NV12 0.5 ms.  The
+  dither is serial by nature (each sample's error feeds the next); against
+  the encode of the same picture this is a few per cent.
+* **CLI**: `--input-csp`, `--input-depth` for raw input; YUV4MPEG2 `C` tags
+  `420jpeg/420paldv/420mpeg2/420`, `422`, `444`, `mono`, with `p9`..`p16`
+  (`mono9`..`mono16`); `444alpha` is refused.  The 4:2:0 siting variants are
+  read as they are, as x264 does.  A header that contradicts
+  `--input-csp`/`--input-depth` is an error.
+
+**Interlace**: `--tff` / `--bff` (`params.interlaced` 1 / 2), or a `.y4m`
+header's `It` / `Ib` (`Im`, mixed, is warned about and coded as progressive).
+The pictures are coded as frames -- no field pictures (PAFF) and no
+field macroblock pairs (MBAFF) -- and signalled as interlaced, what x264
+calls `--fake-interlaced`:
+
+* SPS `frame_mbs_only_flag` 0 with `mb_adaptive_frame_field_flag` 0, the
+  height in macroblock-row pairs (the coded height is rounded up to 32, the
+  crop counts in units of 4 rows, so the height must be a multiple of 4 --
+  x264's rule), every slice header `field_pic_flag` 0; a stream with neither
+  CABAC nor the 8x8 transform says Main instead of Baseline (Baseline forbids
+  `frame_mbs_only_flag` 0).
+* VUI `pic_struct_present_flag` 1 and a picture-timing SEI on every picture
+  with `pic_struct` 3 (top field, bottom field) or 4 (bottom, top), with the
+  HRD delays when `--nal-hrd` is on.  x264 writes `pic_struct` only in
+  MBAFF mode or with `--pic-struct`, and sets the bottom field's picture
+  order count one above or below the top's; frames coded as frames carry no
+  bottom-field offset here, so `pic_struct` is what tells the decoder the
+  field order.
+* Levels 2.1 to 4.1 are the only ones that allow `frame_mbs_only_flag` 0;
+  the automatic level picks the lowest of them that fits, and a forced level
+  outside that range is warned about.
+
+ffmpeg reports `i:T` / `i:B` on every picture (`showinfo`), and the streams
+decode bit-exactly with B pictures, slices, CAVLC and HRD
+(`tests/run_tests.sh`, *input formats and interlace*).
+
+**Level table fix** (found while adding the interlace column): level 2.2 had
+MaxMBPS 40500 instead of 20250, level 3.2 was missing, and its limits were
+filed under 4.0, 4.0's under 4.1, so 4.1's 50 Mb/s did not exist.  The first
+error *understated* the level: a 640x352 stream at 30 fps (26400 macroblocks
+per second) claimed level 2.2, whose limit is 20250, where 3.0 is needed.
+The others overstated it (a stream that fits 3.2 claimed 4.0).  The table is
+the standard's Table A-1 now; only the `level_idc` byte of the SPS changes,
+and a CQP/CRF stream with no rate given, which is sized for 20 Mb/s, now
+claims 3.2 instead of 4.0.  Every other byte of 8-bit 4:2:0 progressive
+output is unchanged: 14 configurations compared with the level forced to the
+same value, and the conformance suites.

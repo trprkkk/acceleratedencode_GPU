@@ -28,6 +28,12 @@ static void usage(void)
 "  -i <file>        input: raw I420, or YUV4MPEG2 (recognised by its\n"
 "                   header, also on stdin; default: stdin)\n"
 "  --demuxer <fmt>  auto (default) | raw | y4m\n"
+"  --input-csp <c>  raw input layout: i420 (default) yv12 nv12 nv21 i422\n"
+"                   yv16 nv16 i444 yv24 i400; a .y4m header's C tag sets it\n"
+"  --input-depth <n> raw input bits per sample, 8 (default) .. 16; above 8\n"
+"                   two bytes per sample, little-endian (yuv420p10le etc.)\n"
+"                   Anything but 8-bit 4:2:0 is converted: chroma resampled\n"
+"                   to 4:2:0, then dithered to 8 bits (as x264's 8-bit build)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
 "  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
@@ -66,6 +72,9 @@ static void usage(void)
 "                   (defaults 0 / 51)\n"
 "  --chroma-qp-offset <n>  chroma QP relative to luma, -12..12 (default 0)\n"
 "  --aud            an access unit delimiter before every picture\n"
+"  --tff, --bff     interlaced material, top / bottom field first: coded as\n"
+"                   frames, signalled as interlaced with that field order\n"
+"                   (x264 --fake-interlaced; height a multiple of 4)\n"
 "  --level <l>      force the level (4.1, 41; default: the smallest that\n"
 "                   fits)\n"
 "  --seek <n>       skip the first n input frames\n"
@@ -216,7 +225,126 @@ typedef struct {
     int npeek, ppeek;
     /* from a .y4m header (0 = not given) */
     int w, h, fps_num, fps_den, sar_w, sar_h, fullrange;
+    int interlaced;             /* It = 1 (top first), Ib = 2 */
+    int csp, depth;             /* from the C tag (-1 = not given)        */
 } input_t;
+
+/* ------------------------------------------------------------------ */
+/* Input layouts: planes, their sizes, and the frame as an aeg_image   */
+/* ------------------------------------------------------------------ */
+static const struct { const char *name; int csp, xs, ys, planes, il; } csps[] = {
+    { "i420", AEG_CSP_I420, 1, 1, 3, 1 }, { "yv12", AEG_CSP_YV12, 1, 1, 3, 1 },
+    { "nv12", AEG_CSP_NV12, 1, 1, 2, 2 }, { "nv21", AEG_CSP_NV21, 1, 1, 2, 2 },
+    { "i422", AEG_CSP_I422, 1, 0, 3, 1 }, { "yv16", AEG_CSP_YV16, 1, 0, 3, 1 },
+    { "nv16", AEG_CSP_NV16, 1, 0, 2, 2 }, { "i444", AEG_CSP_I444, 0, 0, 3, 1 },
+    { "yv24", AEG_CSP_YV24, 0, 0, 3, 1 }, { "i400", AEG_CSP_I400, 0, 0, 1, 1 },
+};
+
+static void le16_to_native(uint8_t *b, size_t n);
+
+/* hand one frame of the input to the encoder */
+static int encode_frame(aeg_encoder *e, uint8_t *frame, size_t fsize,
+                        const aeg_image *layout, const size_t off[3],
+                        int64_t pts, aeg_packet *pkt)
+{
+    aeg_image im = *layout;
+    int i;
+    if (im.depth > 8)
+        le16_to_native(frame, fsize);
+    for (i = 0; i < 3; i++)
+        im.plane[i] = im.stride[i] ? frame + off[i] : NULL;
+    return aeg_encoder_encode_image(e, &im, pts, pkt);
+}
+
+static int csp_index(int csp)
+{
+    int i;
+    for (i = 0; i < (int)(sizeof(csps) / sizeof(csps[0])); i++)
+        if (csps[i].csp == csp)
+            return i;
+    return 0;
+}
+
+/* lay out one raw frame of w x h: plane offsets, strides, total bytes */
+static size_t frame_layout(int csp, int depth, int w, int h, aeg_image *img,
+                           size_t off[3])
+{
+    int k = csp_index(csp), i, bps = depth > 8 ? 2 : 1;
+    size_t total = 0;
+    memset(img, 0, sizeof(*img));
+    img->csp = csp;
+    img->depth = depth;
+    for (i = 0; i < csps[k].planes; i++) {
+        int pw = i ? (w + csps[k].xs) >> csps[k].xs : w;
+        int ph = i ? (h + csps[k].ys) >> csps[k].ys : h;
+        img->stride[i] = pw * bps * (i ? csps[k].il : 1);
+        off[i] = total;
+        total += (size_t)img->stride[i] * ph;
+    }
+    return total;
+}
+
+/* YUV4MPEG2 colour space tag: 420jpeg, 420paldv, 420mpeg2, 420 (all 4:2:0;
+ * the siting variants are not resampled, as with x264), 422, 444, mono,
+ * each optionally with p9..p16 (mono: 9..16) for the bits per sample */
+static int y4m_csp(const char *c, int *csp, int *depth)
+{
+    const char *rest;
+    *depth = 8;
+    if (!strncmp(c, "420", 3)) {
+        *csp = AEG_CSP_I420;
+        rest = c + 3;
+        if (!strcmp(rest, "jpeg") || !strcmp(rest, "paldv") ||
+            !strcmp(rest, "mpeg2"))
+            return 0;
+    } else if (!strncmp(c, "422", 3)) {
+        *csp = AEG_CSP_I422;
+        rest = c + 3;
+    } else if (!strncmp(c, "444", 3)) {
+        *csp = AEG_CSP_I444;
+        rest = c + 3;
+        if (!strcmp(rest, "alpha"))
+            return -1;
+    } else if (!strncmp(c, "mono", 4)) {
+        *csp = AEG_CSP_I400;
+        rest = c + 4;
+        if (*rest && *rest != 'p') {        /* mono16, mono10, ... */
+            char *end;
+            long d = strtol(rest, &end, 10);
+            if (*end || d < 9 || d > 16)
+                return -1;
+            *depth = (int)d;
+            return 0;
+        }
+    } else
+        return -1;
+    if (!*rest)
+        return 0;
+    if (*rest == 'p') {
+        char *end;
+        long d = strtol(rest + 1, &end, 10);
+        if (*end || d < 9 || d > 16)
+            return -1;
+        *depth = (int)d;
+        return 0;
+    }
+    return -1;
+}
+
+/* the 16-bit samples of a file are little-endian; aeg_image wants them in
+ * the machine's order */
+static void le16_to_native(uint8_t *b, size_t n)
+{
+    const uint16_t one = 1;
+    size_t i;
+    if (*(const uint8_t *)&one)
+        return;
+    for (i = 0; i + 1 < n; i += 2) {
+        uint8_t t = b[i];
+        b[i] = b[i + 1];
+        b[i + 1] = t;
+    }
+}
 
 static size_t in_read(input_t *in, void *buf, size_t n)
 {
@@ -252,6 +380,7 @@ static int in_open(input_t *in, FILE *f, int force)
     char line[1024], *tok, *save = NULL;
     memset(in, 0, sizeof(*in));
     in->f = f;
+    in->csp = in->depth = -1;
     in->npeek = (int)fread(in->peek, 1, 9, f);
     if (force == 1 || in->npeek < 9 || memcmp(in->peek, "YUV4MPEG2", 9)) {
         if (force == 2) {
@@ -280,16 +409,20 @@ static int in_open(input_t *in, FILE *f, int force)
                 in->sar_w = in->sar_h = 0;
             break;
         case 'I':
-            if (tok[1] != 'p' && tok[1] != '?')
-                fprintf(stderr, "warning: interlaced YUV4MPEG2 input (I%c) is "
-                                "coded as progressive frames\n", tok[1]);
+            if (tok[1] == 't')
+                in->interlaced = 1;
+            else if (tok[1] == 'b')
+                in->interlaced = 2;
+            else if (tok[1] != 'p' && tok[1] != '?')
+                fprintf(stderr, "warning: YUV4MPEG2 field order 'I%c' (mixed) "
+                                "is signalled as progressive; --tff/--bff "
+                                "override it\n", tok[1]);
             break;
         case 'C':
-            if (strncmp(tok + 1, "420", 3) ||
-                (tok[4] && strcmp(tok + 4, "jpeg") && strcmp(tok + 4, "paldv") &&
-                 strcmp(tok + 4, "mpeg2"))) {
-                fprintf(stderr, "error: YUV4MPEG2 colour space '%s': only 8-bit "
-                                "4:2:0 is supported\n", tok + 1);
+            if (y4m_csp(tok + 1, &in->csp, &in->depth) < 0) {
+                fprintf(stderr, "error: YUV4MPEG2 colour space '%s' is not "
+                                "supported (420, 422, 444, mono, with p9..p16)\n",
+                        tok + 1);
                 return -1;
             }
             break;
@@ -457,7 +590,10 @@ int main(int argc, char **argv)
     FILE *in = stdin, *out = stdout;
     int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
     int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
-    int fullrange = 0, demux = 0, seek = 0;
+    int fullrange = 0, demux = 0, seek = 0, interlaced = -1;
+    int in_csp = -1, in_depth = -1;
+    aeg_image layout;
+    size_t poff[3];
     double crf = -1.0;
     double fps;
     input_t inp;
@@ -508,6 +644,22 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--fullrange")) fullrange = 1;
         else if (!strcmp(a, "--nal-hrd")) p.nal_hrd = 1;
         else if (!strcmp(a, "--aud")) p.aud = 1;
+        else if (!strcmp(a, "--input-csp")) {
+            const char *v = next_arg(argc, argv, &i);
+            int k;
+            for (k = 0; k < (int)(sizeof(csps) / sizeof(csps[0])); k++)
+                if (!strcmp(v, csps[k].name))
+                    in_csp = csps[k].csp;
+            if (in_csp < 0) {
+                fprintf(stderr, "error: --input-csp %s: i420 yv12 nv12 nv21 "
+                                "i422 yv16 nv16 i444 yv24 i400\n", v);
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "--input-depth"))
+            in_depth = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--tff")) interlaced = 1;
+        else if (!strcmp(a, "--bff")) interlaced = 2;
         else if (!strcmp(a, "--qpmin")) p.qp_min = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--qpmax")) p.qp_max = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--chroma-qp-offset"))
@@ -703,6 +855,7 @@ int main(int argc, char **argv)
         if (iqp > -1000) bad |= range_bad("--iqp", iqp, -51, 51);
         if (trellis >= 0) bad |= range_bad("--trellis", trellis, 0, 1);
         if (partitions >= 0) bad |= range_bad("--partitions", partitions, 0, 31);
+        if (in_depth >= 0) bad |= range_bad("--input-depth", in_depth, 8, 16);
         if (bad)
             return 2;
     }
@@ -725,7 +878,19 @@ int main(int argc, char **argv)
             sar_w = inp.sar_w, sar_h = inp.sar_h;
         if (inp.fullrange)
             fullrange = 1;
+        if (inp.csp >= 0) {
+            if ((in_csp >= 0 && in_csp != inp.csp) ||
+                (in_depth >= 0 && in_depth != inp.depth)) {
+                fprintf(stderr, "error: --input-csp/--input-depth contradict "
+                                "the YUV4MPEG2 header's colour space\n");
+                return 2;
+            }
+            in_csp = inp.csp;
+            in_depth = inp.depth;
+        }
     }
+    if (in_csp < 0) in_csp = AEG_CSP_I420;
+    if (in_depth < 0) in_depth = 8;
     fps = (double)fps_num / (double)fps_den;
     if (!width || !height) {
         fprintf(stderr, "error: -w and -h are required (or a .y4m input)\n");
@@ -736,6 +901,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "error: %dx%d: the frame size must be even, 2..16384 "
                         "(4:2:0 is cropped in units of two samples)\n",
                 width, height);
+        return 2;
+    }
+    if ((interlaced > 0 || (interlaced < 0 && inp.interlaced)) && (height & 3)) {
+        fprintf(stderr, "error: %dx%d: an interlaced stream needs a height "
+                        "that is a multiple of 4\n", width, height);
         return 2;
     }
     if (outpath) {
@@ -843,6 +1013,7 @@ int main(int argc, char **argv)
     p.sar_w = sar_w;
     p.sar_h = sar_h;
     p.fullrange = fullrange;
+    p.interlaced = interlaced >= 0 ? interlaced : inp.interlaced;
     p.gop_size = gop;
     p.bitrate_kbps = bitrate;
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
@@ -880,8 +1051,13 @@ int main(int argc, char **argv)
                                                              : verbose + 1)
                               : AEG_LOG_ERROR);
 
-    fsize = (size_t)width * height * 3 / 2;
+    fsize = frame_layout(in_csp, in_depth, width, height, &layout, poff);
     frame = (uint8_t *)malloc(fsize);
+    if (verbose && (in_csp != AEG_CSP_I420 || in_depth != 8))
+        fprintf(stderr, "input: %s, %d bit -> 4:2:0, 8 bit%s\n",
+                csps[csp_index(in_csp)].name, in_depth,
+                in_depth > 8 || csps[csp_index(in_csp)].ys == 0 ||
+                csps[csp_index(in_csp)].xs == 0 ? " (dithered)" : "");
     if (!frame) { fprintf(stderr, "out of memory\n"); return 1; }
 
     if (bench) {
@@ -911,7 +1087,7 @@ int main(int argc, char **argv)
                     break;
                 if (in_frame(&inp, frame, fsize) != 1)
                     break;
-                r = aeg_encoder_encode(e, frame, fsize, pts++, &pkt);
+                r = encode_frame(e, frame, fsize, &layout, poff, pts++, &pkt);
                 n++;
                 if (r == AEG_EAGAIN)
                     continue;
@@ -990,7 +1166,7 @@ int main(int argc, char **argv)
             aeg_packet pkt;
             int r;
 
-            r = aeg_encoder_encode(enc, frame, fsize, pts++, &pkt);
+            r = encode_frame(enc, frame, fsize, &layout, poff, pts++, &pkt);
             if (r == AEG_EAGAIN) {
                 /* The picture went into the lookahead (B pictures): it will come
                  * out when the group it belongs to is complete. */

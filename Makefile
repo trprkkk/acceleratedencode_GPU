@@ -47,7 +47,7 @@ INSTALL    ?= install
 
 SRC := src/tables.c src/transform.c src/intra.c src/mc.c src/deblock.c \
        src/bitstream.c src/cavlc.c src/cabac.c src/util.c src/backend.c \
-       src/lookahead.c src/encoder.c
+       src/lookahead.c src/input.c src/encoder.c
 OBJ := $(patsubst %,$(BUILD)/%.o,$(basename $(notdir $(SRC))))
 
 ifeq ($(OPENCL),1)
@@ -180,6 +180,11 @@ $(BUILD)/nvrtc_check: tests/nvrtc_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/api_check: tests/api_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
+# The input conversion (dither, chroma resampling, layouts) against
+# references written in the test.
+$(BUILD)/input_check: tests/input_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
 # Install into a scratch DESTDIR, then build and run the example against it
 # through pkg-config, shared and static, and check the exported symbols.
 install-check: $(BIN) $(LIB) $(SHLIB) $(BUILD)/genyuv
@@ -191,8 +196,9 @@ install-check: $(BIN) $(LIB) $(SHLIB) $(BUILD)/genyuv
 test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
       $(BUILD)/cabac_check $(BUILD)/cabac_mb_check $(BUILD)/kernel_check \
       $(BUILD)/coef_check $(BUILD)/backend_check $(BUILD)/nvrtc_check \
-      $(BUILD)/api_check
+      $(BUILD)/api_check $(BUILD)/input_check
 	./$(BUILD)/api_check
+	./$(BUILD)/input_check
 	./$(BUILD)/syntax_check
 	./$(BUILD)/cavlc_check 2000
 	./$(BUILD)/cabac_check 200000 8
