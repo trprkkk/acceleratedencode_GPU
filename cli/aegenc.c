@@ -48,8 +48,9 @@ static void usage(void)
 "  -g <int>         GOP size, 0 = only the first frame is IDR (default 250)\n"
 "  --scenecut <pct> insert an IDR when a scene change is detected (0 = off,\n"
 "                   default 120: inter prediction 20%% worse than intra)\n"
-"  --pass <1|2>     two-pass rate control: pass 1 measures each picture, pass 2\n"
-"                   spends the bits where they buy the most (needs --bitrate)\n"
+"  --pass <1|2>     two-pass rate control: pass 1 codes the clip (best with the\n"
+"                   same --bitrate) and measures every picture, B pictures\n"
+"                   included; pass 2 shares --bitrate out by that measurement\n"
 "  --stats <file>   statistics file for --pass (default: <output>.stats)\n"
 "  --qcomp <pct>    complexity-to-bits exponent of --crf and of pass 2, in\n"
 "                   percent (default 60: bits ~ complexity^0.6)\n"
@@ -383,46 +384,33 @@ typedef struct {
     aeg_stats st;
 } run_result;
 
-/* Two-pass rate control, second pass: turn the first pass's measurement of every
- * picture into that picture's QP bias.
- *
- * Pass 1 codes the stream at a fixed QP, so the bits it spends on a picture are
- * a measurement of how hard that picture is.  Scaling them to the target
- * (`bits_i` proportional to `bits_i`) would be exactly a constant QP shift --
- * the whole point of two passes is to spend *unevenly*.  The allocation is
- * therefore bits proportional to `complexity^qcomp` with qcomp < 1 (x264's
- * default 0.6): the hard pictures get a little less than proportional and the
- * easy ones a little more, which is the right direction because distortion per
- * bit falls faster in flat, well-predicted areas than in busy ones.
- *
- * The controller keeps the *rate*; this only says how the bits are shared out.
- * With `t_i ~ b_i^alpha` normalised to the same total, the QP of picture i
- * relative to a constant-QP stream is
- *
- *     QP_i - QP = 6 * (1 - alpha) * (log2 b_i - mean_j log2 b_j)
- *
- * so the bias is mean-zero over the stream and depends only on how unusual a
- * picture is, not on the target bitrate.  It is rounded to whole QP steps and
- * clipped to +-12. */
-static void pass2_bias(const int64_t *bits, int n, int qcomp, int *bias_out)
+/* Pass 1's measurement of the picture with display index d (the packets come
+ * out in coding order). */
+static int pass1_put(aeg_pass1_frame **f, int *n, int *cap, int64_t d,
+                     int type, double qp, double qp_base, int64_t bits)
 {
-    double mean = 0.0, keep = 6.0 * (1.0 - qcomp / 100.0);
-    int i;
-
-    if (n <= 0)
-        return;
-    for (i = 0; i < n; i++)
-        mean += log2((double)(bits[i] > 0 ? bits[i] : 1));
-    mean /= n;
-    for (i = 0; i < n; i++) {
-        double l = log2((double)(bits[i] > 0 ? bits[i] : 1));
-        double b = keep * (l - mean);
-        int bi = (int)(b > 0 ? b + 0.5 : b - 0.5);
-
-        if (bi < -12) bi = -12;
-        if (bi > 12) bi = 12;
-        bias_out[i] = bi;
+    if (d < 0 || d > 100000000)
+        return 0;
+    if (d >= *cap) {
+        int ncap = *cap ? *cap : 256, k;
+        aeg_pass1_frame *nf;
+        while (ncap <= d)
+            ncap *= 2;
+        nf = realloc(*f, (size_t)ncap * sizeof(**f));
+        if (!nf)
+            return -1;
+        *f = nf;
+        for (k = *cap; k < ncap; k++)
+            nf[k].type = 1, nf[k].qp = nf[k].qp_base = 0.0, nf[k].bits = -1;
+        *cap = ncap;
     }
+    (*f)[d].type = type >= 0 && type <= 3 ? type : 1;
+    (*f)[d].qp = qp;
+    (*f)[d].qp_base = qp_base;
+    (*f)[d].bits = bits;
+    if (d + 1 > *n)
+        *n = (int)d + 1;
+    return 0;
 }
 
 /* Write one packet to the stream and, if a reconstruction dump was asked for,
@@ -480,8 +468,8 @@ int main(int argc, char **argv)
     int mbtree = -1, rclookahead = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
-    int64_t *pass1_bits = NULL;
-    int pass1_n = 0;
+    aeg_pass1_frame *pass1 = NULL;
+    int pass1_n = 0, pass1_cap = 0;
     char stats_path[4096];
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
     const char *orderpath = NULL;
@@ -752,23 +740,13 @@ int main(int argc, char **argv)
         if (!out) { perror(outpath); return 1; }
     }
 
-    /* Two-pass looks at one packet per picture, in display order.  With B
-     * pictures the packets come out in coding order and the QP bias goes to
-     * whichever picture is coded next rather than to the one just submitted,
-     * so the measurement of picture i would end up on a different picture.
-     * Asking for B pictures *explicitly* in a two-pass run is therefore an
-     * error; leaving them at their default just turns them off for the run. */
+    /* Two-pass keys its measurement by display index (the packet's pts): with
+     * B pictures the packets come out in coding order. */
     if (crf >= 0.0 && (bitrate > 0 || pass)) {
         fprintf(stderr, "error: --crf cannot be combined with %s\n",
                 bitrate > 0 ? "--bitrate" : "--pass");
         return 2;
     }
-    if (pass && bframes > 0) {
-        fprintf(stderr, "error: --pass and --bframes cannot be combined yet\n");
-        return 1;
-    }
-    if (pass)
-        p.bframes = 0;
     if (pass) {
         if (!stats_path[0]) {
             if (!outpath) {
@@ -782,29 +760,57 @@ int main(int argc, char **argv)
             return 1;
         }
         if (pass == 2) {
+            /* "aeg-stats 2" then "display type qp qp_base bits" per picture
+             * (type I, P, B or b for a reference B; qp the macroblocks'
+             * average, qp_base the picture's QP before their offsets);
+             * a file of bare numbers is the first format, one bit count per
+             * picture in display order without B pictures */
             FILE *sf = fopen(stats_path, "r");
-            int cap = 0;
+            char line[256];
+            int v2 = 0, k = 0;
 
             if (!sf) {
                 fprintf(stderr, "cannot read statistics file %s\n", stats_path);
                 return 1;
             }
-            while (!feof(sf)) {
-                long long b;
-                if (fscanf(sf, "%lld", &b) != 1)
-                    break;
-                if (pass1_n == cap) {
-                    int ncap = cap ? cap * 2 : 256;
-                    int64_t *nb = realloc(pass1_bits, (size_t)ncap * sizeof(*nb));
-                    if (!nb) { fprintf(stderr, "out of memory\n"); return 1; }
-                    pass1_bits = nb;
-                    cap = ncap;
+            while (fgets(line, sizeof(line), sf)) {
+                long long d, b;
+                double q, qb;
+                int ty;
+                char t;
+
+                if (!strncmp(line, "aeg-stats 2", 11)) {
+                    v2 = 1;
+                    continue;
                 }
-                pass1_bits[pass1_n++] = b;
+                if (v2) {
+                    if (sscanf(line, "%lld %c %lf %lf %lld", &d, &t, &q, &qb,
+                               &b) != 5 ||
+                        !strchr("IPBb", t) || t == 0 || b < 0 || d < 0) {
+                        fprintf(stderr, "%s: bad line: %s", stats_path, line);
+                        fclose(sf);
+                        free(pass1);
+                        return 1;
+                    }
+                    ty = t == 'I' ? 0 : t == 'B' ? 2 : t == 'b' ? 3 : 1;
+                } else {
+                    if (sscanf(line, "%lld", &b) != 1)
+                        break;
+                    d = k++;
+                    q = qb = qp;
+                    ty = 1;
+                }
+                if (pass1_put(&pass1, &pass1_n, &pass1_cap, d, ty, q, qb, b) < 0) {
+                    fprintf(stderr, "out of memory\n");
+                    fclose(sf);
+                    free(pass1);
+                    return 1;
+                }
             }
             fclose(sf);
             if (pass1_n <= 0) {
                 fprintf(stderr, "no statistics in %s\n", stats_path);
+                free(pass1);
                 return 1;
             }
             if (max_frames && pass1_n < max_frames)
@@ -829,10 +835,6 @@ int main(int argc, char **argv)
         p.rc_mode = AEG_RC_CRF;
         p.crf = crf;
     }
-    /* In pass 2 the rate controller stays on -- it is what keeps the stream on
-     * target -- and the first pass's measurement arrives per picture as a QP
-     * bias (aeg_encoder_set_qp_offset), so the two never fight: the controller
-     * owns the level, the bias owns the distribution. */
     p.backend = backend;
     p.verbose = verbose;
     if (range) p.search_range = range;
@@ -931,29 +933,26 @@ int main(int argc, char **argv)
     if (!enc) {
         fprintf(stderr, "aeg_encoder_open failed: %s\n", aeg_last_error());
         free(frame);
+        free(pass1);
         return 1;
     }
 
     {
         int64_t t0 = aeg_now_ns();
         int n = 0;
-        int *bias_of_frame = NULL;
 
-        if (pass == 2) {
-            bias_of_frame = malloc((size_t)pass1_n * sizeof(*bias_of_frame));
-            if (!bias_of_frame) {
-                fprintf(stderr, "out of memory\n");
-                aeg_encoder_close(enc);
-                return 1;
-            }
-            pass2_bias(pass1_bits, pass1_n, qcomp, bias_of_frame);
+        /* the second pass plans every picture from the first's measurement */
+        if (pass == 2 && aeg_encoder_set_pass1(enc, pass1, pass1_n) != AEG_OK) {
+            fprintf(stderr, "cannot use the statistics in %s\n", stats_path);
+            aeg_encoder_close(enc);
+            free(frame);
+            free(pass1);
+            return 1;
         }
         while (in_frame(&inp, frame, fsize) == 1) {
             aeg_packet pkt;
             int r;
 
-            if (pass == 2)
-                aeg_encoder_set_qp_offset(enc, n < pass1_n ? bias_of_frame[n] : 0);
             r = aeg_encoder_encode(enc, frame, fsize, pts++, &pkt);
             if (r == AEG_EAGAIN) {
                 /* The picture went into the lookahead (B pictures): it will come
@@ -970,22 +969,12 @@ int main(int argc, char **argv)
             }
             write_packet(out, dumppath, enc, &pkt, &dump_first,
                          width, height);
-            if (pass == 1) {
-                static int cap = 0;
-
-                if (n == cap) {
-                    int ncap = cap ? cap * 2 : 256;
-                    int64_t *nb = realloc(pass1_bits, (size_t)ncap * sizeof(*nb));
-                    if (!nb) {
-                        fprintf(stderr, "out of memory\n");
-                        ret = 1;
-                        break;
-                    }
-                    pass1_bits = nb;
-                    cap = ncap;
-                }
-                pass1_bits[n] = (int64_t)pkt.size * 8;   /* bits, not bytes */
-                pass1_n = n + 1;
+            if (pass == 1 &&
+                pass1_put(&pass1, &pass1_n, &pass1_cap, pkt.pts, pkt.type,
+                          pkt.qp_avg, pkt.qp_base, (int64_t)pkt.size * 8) < 0) {
+                fprintf(stderr, "out of memory\n");
+                ret = 1;
+                break;
             }
             n++;
             if (max_frames && n >= max_frames)
@@ -1006,6 +995,13 @@ int main(int argc, char **argv)
             }
             write_packet(out, dumppath, enc, &pkt, &dump_first,
                          width, height);
+            if (pass == 1 &&
+                pass1_put(&pass1, &pass1_n, &pass1_cap, pkt.pts, pkt.type,
+                          pkt.qp_avg, pkt.qp_base, (int64_t)pkt.size * 8) < 0) {
+                fprintf(stderr, "out of memory\n");
+                ret = 1;
+                break;
+            }
         }
         if (pass == 1) {
             FILE *sf = fopen(stats_path, "w");
@@ -1015,15 +1011,20 @@ int main(int argc, char **argv)
                 ret = 1;
             } else {
                 int k;
+                fprintf(sf, "aeg-stats 2\n");
                 for (k = 0; k < pass1_n; k++)
-                    fprintf(sf, "%lld\n", (long long)pass1_bits[k]);
+                    if (pass1[k].bits >= 0)
+                        fprintf(sf, "%d %c %.3f %.3f %lld\n", k,
+                                "IPBb"[pass1[k].type], pass1[k].qp,
+                                pass1[k].qp_base, (long long)pass1[k].bits);
                 fclose(sf);
                 if (verbose)
                     printf("pass 1: measured %d pictures -> %s\n", pass1_n,
                            stats_path);
             }
         }
-        free(bias_of_frame);
+        free(pass1);
+        pass1 = NULL;
         if (verbose) {
             double secs = (aeg_now_ns() - t0) / 1e9;
             aeg_encoder_stats(enc, &st);

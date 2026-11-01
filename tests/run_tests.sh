@@ -560,15 +560,18 @@ echo "== rate"
 sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
 
 echo "== rate control"
-"$BUILD/genyuv" 320 192 40 "$TMP/abr.yuv" 0 >/dev/null
-$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/abr.yuv" \
-    -o "$TMP/abr.264" --bitrate 400 -v 0
+# Four seconds of two half-frame pans (genyuv 1): the whole-frame pan (mode 0)
+# is predicted so well that its pictures barely change size with the QP, which
+# no controller that models size against QP can land a target on.
+"$BUILD/genyuv" 320 192 120 "$TMP/abr.yuv" 1 >/dev/null
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/abr.yuv" \
+    -o "$TMP/abr.264" --bitrate 300 -v 0
 python3 -c '
 import os, sys
 size = os.path.getsize(sys.argv[1])
-kbps = size * 8 * 30 / 40 / 1000.0
-ok = abs(kbps - 400) <= 40
-print("   ABR target 400 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
+kbps = size * 8 * 30 / 120 / 1000.0
+ok = abs(kbps - 300) <= 30
+print("   ABR target 300 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
 sys.exit(0 if ok else 1)
 ' "$TMP/abr.264" || FAIL=1
 
@@ -577,24 +580,25 @@ echo "== VBV / HRD"
 # alone (the bytes must be exactly what the same ABR configuration without a
 # buffer produces), and raise the QP when a picture would not fit -- including
 # saying so when even QP 51 cannot make it fit, because a model that can never
-# report an underflow is not a model.
-"$BUILD/genyuv" 320 192 40 "$TMP/vbv.yuv" 0 >/dev/null
-$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
-    -o "$TMP/vbv_off.264" --bitrate 400 -v 0
-$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
-    -o "$TMP/vbv_wide.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 120 \
+# report an underflow is not a model.  (The buffer turns the macroblock tree
+# off, so the stream without one is coded without it too.)
+"$BUILD/genyuv" 320 192 120 "$TMP/vbv.yuv" 1 >/dev/null
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_off.264" --bitrate 300 --mbtree 0 -v 0
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_wide.264" --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 240 \
     >"$TMP/vbv_wide.log" 2>&1
 if cmp -s "$TMP/vbv_off.264" "$TMP/vbv_wide.264"; then
-    echo "   generous buffer (120 kbit): stream unchanged"
+    echo "   generous buffer (240 kbit): stream unchanged"
 else
-    echo "   generous buffer (120 kbit): stream differs from the ABR stream  FAIL"
+    echo "   generous buffer (240 kbit): stream differs from the ABR stream  FAIL"
     FAIL=1
 fi
-$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
-    -o "$TMP/vbv_tight.264" --bitrate 400 --vbv-maxrate 400 --vbv-bufsize 30 \
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_tight.264" --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 30 \
     >"$TMP/vbv_tight.log" 2>&1
-$BUILD/aegenc -w 320 -h 192 -n 40 -q 24 -i "$TMP/vbv.yuv" \
-    -o "$TMP/vbv_alone.264" --vbv-maxrate 400 --vbv-bufsize 120 \
+$BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
+    -o "$TMP/vbv_alone.264" --vbv-maxrate 300 --vbv-bufsize 240 \
     >"$TMP/vbv_alone.log" 2>&1
 python3 - "$TMP" <<'PY2' || FAIL=1
 import re, sys, os
@@ -631,9 +635,9 @@ else:
 
 # --vbv-maxrate/--vbv-bufsize alone must imply ABR (a buffer model without a
 # rate target cannot squeeze anything), and the rate must still land.
-kbps = os.path.getsize(os.path.join(tmp, 'vbv_alone.264')) * 8 * 30 / 40 / 1000.0
-if abs(kbps - 400) > 40:
-    print("   --vbv-* alone: %.1f kb/s, wanted 400  FAIL" % kbps)
+kbps = os.path.getsize(os.path.join(tmp, 'vbv_alone.264')) * 8 * 30 / 120 / 1000.0
+if abs(kbps - 300) > 30:
+    print("   --vbv-* alone: %.1f kb/s, wanted 300  FAIL" % kbps)
     ok = False
 print("   generous buffer: low water %.1f kbit, 0 clamps" % wide[0]
       if ok and wide else "   VBV check failed")
@@ -681,6 +685,10 @@ run_bcase crf_tree   176 144 16 3 0 -p 3 --crf 24
 run_bcase crf_cplx   176 144 16 3 4 -p 1 --crf 23.5 --mbtree 0
 run_case  crf_nob    176 144 12 4 -p 2 --crf 26.3 --bframes 0
 run_bcase crf_vbv    320 192 30 3 6 -p 3 --crf 12 --vbv-maxrate 300 --vbv-bufsize 150 --nal-hrd
+if command -v "$FF" >/dev/null 2>&1; then
+    python3 "$(dirname "$0")/../tools/hrd_check.py" "$FF" "$TMP/crf_vbv.264" \
+        "$TMP/crf_vbv.order" || FAIL=1
+fi
 if grep -q " 0 underflow(s)" "$TMP/crf_vbv.log"; then
     echo "   capped CRF: no underflow"
 else
@@ -711,51 +719,74 @@ echo "== two-pass rate control"
 # Two-pass on a clip whose two halves have very different complexity: the point
 # of the first pass is to *measure* that difference and spend accordingly.  The
 # rate controller stays on in pass 2, so the stream still lands on target; the
-# first pass only decides how the bits are shared out.
-$BUILD/aegenc -w 320 -h 192 -n 60 -q 26 -i "$TMP/cut.yuv" \
-    -o "$TMP/2p1.264" --pass 1 --stats "$TMP/2p.stats" >"$TMP/2p1.log" 2>&1 \
-    || { echo "   pass 1 failed"; FAIL=1; }
-$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
-    -o "$TMP/2p2.264" --pass 2 --stats "$TMP/2p.stats" --bitrate 250 \
-    --dump-recon "$TMP/2p.recon" >"$TMP/2p2.log" 2>&1 \
-    || { echo "   pass 2 failed"; FAIL=1; }
-# The reference for "two-pass beats one-pass" has to be coded the same way the
-# two-pass run is: --pass 1 measures one packet per picture in display order, so
-# a two-pass run cannot use B pictures at all (the CLI turns them off), and the
-# one-pass stream has to be P-only for the comparison to mean anything.
-$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" \
-    -o "$TMP/1p.264" --bitrate 250 --bframes 0 >"$TMP/1p.log" 2>&1 \
-    || { echo "   one-pass control failed"; FAIL=1; }
-python3 - "$TMP/2p2.log" "$TMP/1p.log" <<'PY2' || FAIL=1
-import re, sys
+# first pass only decides how the bits are shared out.  What two-pass promises
+# is constant quality at a rate chosen in advance: at the rate CRF 26 happened
+# to take, it has to land within 6% and, with B pictures (the measurement keyed
+# by display index while the packets come in coding order), come within 0.3 dB
+# of it.  P-only it only has to land: without B pictures there is no tree, and
+# CRF's complexity blur, which carries over the cut here, gives the new IDR and
+# the pictures predicted from it a head start that is luck more than design.
+for v in b p; do
+    if [ $v = b ]; then o=""; else o="--bframes 0"; fi
+    $BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" $o --crf 26 \
+        -o "$TMP/crf$v.264" >"$TMP/crf$v.log" 2>&1 \
+        || { echo "   CRF control ($v) failed"; FAIL=1; }
+    r=$(sed -n 's/^bitrate \([0-9]*\).*/\1/p' "$TMP/crf$v.log")
+    echo "${r:-0}" > "$TMP/crf$v.rate"
+    $BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" $o --bitrate "${r:-1}" \
+        -o "$TMP/2p1$v.264" --pass 1 --stats "$TMP/2p$v.stats" >"$TMP/2p1$v.log" 2>&1 \
+        || { echo "   pass 1 ($v) failed"; FAIL=1; }
+    $BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" $o --bitrate "${r:-1}" \
+        -o "$TMP/2p2$v.264" --pass 2 --stats "$TMP/2p$v.stats" \
+        --dump-recon "$TMP/2p$v.recon" --dump-order "$TMP/2p$v.order" \
+        >"$TMP/2p2$v.log" 2>&1 || { echo "   pass 2 ($v) failed"; FAIL=1; }
+done
+python3 - "$TMP" <<'PY2' || FAIL=1
+import re, sys, os
+tmp = sys.argv[1]
 
-def measure(path):
-    t = open(path).read()
+def measure(name):
+    t = open(os.path.join(tmp, name)).read()
     m = re.search(r'bitrate ([0-9.]+) kb/s at \d+ fps, PSNR ([0-9.]+) dB', t)
     return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
 
-two, one = measure(sys.argv[1]), measure(sys.argv[2])
 ok = True
-if abs(two[0] - 250) > 15:
-    print("   two-pass rate %.1f kb/s, target 250  FAIL" % two[0])
-    ok = False
-if two[1] <= one[1]:
-    print("   two-pass %.2f dB did not beat one-pass %.2f dB  FAIL"
-          % (two[1], one[1]))
-    ok = False
-print("   1-pass %5.1f kb/s %.2f dB  ->  2-pass %5.1f kb/s %.2f dB"
-      % (one[0], one[1], two[0], two[1]))
+for v, what in (('b', 'B pictures'), ('p', 'P only')):
+    lines = open(os.path.join(tmp, '2p%s.stats' % v)).read().split('\n')
+    types = [l.split()[1] for l in lines[1:] if l.strip()]
+    if lines[0] != 'aeg-stats 2' or len(types) != 60:
+        print("   %s: stats file has %d pictures, header %r  FAIL"
+              % (what, len(types), lines[0]))
+        ok = False
+    if (v == 'b') != any(t in 'Bb' for t in types):
+        print("   %s: stats types %s  FAIL" % (what, ''.join(types)))
+        ok = False
+    two, crf = measure('2p2%s.log' % v), measure('crf%s.log' % v)
+    want = int(open(os.path.join(tmp, 'crf%s.rate' % v)).read())
+    if want <= 0 or abs(two[0] - want) > 0.06 * want:
+        print("   %s: two-pass rate %.1f kb/s, target %d  FAIL" % (what, two[0], want))
+        ok = False
+    if v == 'b' and two[1] < crf[1] - 0.3:
+        print("   %s: two-pass %.2f dB, CRF %.2f dB at that rate  FAIL"
+              % (what, two[1], crf[1]))
+        ok = False
+    print("   %-10s CRF 26 %5.1f kb/s %.2f dB  ->  2-pass %5.1f kb/s %.2f dB"
+          % (what, crf[0], crf[1], two[0], two[1]))
 sys.exit(0 if ok else 1)
 PY2
 if command -v "$FF" >/dev/null 2>&1; then
-    "$FF" -v error -y -i "$TMP/2p2.264" -f rawvideo -pix_fmt yuv420p \
-        "$TMP/2p.dec" 2>"$TMP/2p.decerr"
-    if [ -s "$TMP/2p.decerr" ]; then
-        echo "   two-pass: decoder reported problems:"
-        sed 's/^/     /' "$TMP/2p.decerr" | head -3
-        FAIL=1
-    fi
-    python3 "$TMP/cmp.py" "$TMP/2p.recon" "$TMP/2p.dec" 320 192 60 two_pass \
+    for v in b p; do
+        "$FF" -v error -y -i "$TMP/2p2$v.264" -f rawvideo -pix_fmt yuv420p \
+            "$TMP/2p$v.dec" 2>"$TMP/2p$v.decerr"
+        if [ -s "$TMP/2p$v.decerr" ]; then
+            echo "   two-pass ($v): decoder reported problems:"
+            sed 's/^/     /' "$TMP/2p$v.decerr" | head -3
+            FAIL=1
+        fi
+    done
+    python3 "$TMP/cmp_b.py" "$TMP/2pb.recon" "$TMP/2pb.dec" 320 192 60 3 \
+        two_pass_b 0 "$TMP/2pb.order" 0 || FAIL=1
+    python3 "$TMP/cmp.py" "$TMP/2pp.recon" "$TMP/2pp.dec" 320 192 60 two_pass_p \
         || FAIL=1
 fi
 

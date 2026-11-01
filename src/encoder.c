@@ -450,18 +450,10 @@ struct aeg_encoder {
      * a picture without changing the picture's average QP. */
     int8_t *mb_dqp;
 
-    /* ABR rate control (`AEG_RC_ABR`): a fractional QP that is nudged after
-     * every picture so that the running bit count tracks the target. */
-    double rc_qp;
-    double rc_bits_per_frame;
-    double rc_spent;        /* bits used so far, all pictures               */
-    double rc_debt;         /* budget - spent (positive = under budget)     */
-    double rc_target_sum;   /* the budget so far, all pictures               */
-    double rc_b_ratio;      /* measured B-picture cost relative to an anchor */
-    int    rc_anchor_bits;  /* the last anchor's size, for the ratio above   */
-    int    rc_frames;       /* pictures coded so far, for the budget        */
+    /* a bitrate target (`AEG_RC_ABR`; the controller is abr_on's, below) */
     int    rc_active;
     int    rc_qp_offset;    /* user bias on the per-picture QP (two-pass)     */
+    int    in_qpoff[AEG_RING]; /* ... as it was when the picture came in    */
 
     /* CRF (`AEG_RC_CRF`, x264's constant rate factor): an anchor's QP follows
      * qscale = blurred_complexity^(1 - qcomp) / crf_rf, the complexity being
@@ -480,6 +472,29 @@ struct aeg_encoder {
     int64_t *crf_cplx;        /* per ring slot (-1 = none)                  */
     aeg_lowres crf_low[2];    /* without B pictures: this and the last input */
     int64_t crf_last;         /* the last estimate (no-B path)              */
+    /* ABR, x264's one-pass form, on the model above (crf_on is set as well):
+     * the rate factor is no longer a constant but what the stream so far
+     * says it should have been -- the bits wanted for the pictures coded
+     * over the sum of each picture's bits * qscale / rceq -- and a bounded
+     * correction pulls the total back towards the target. */
+    int     abr_on;
+    double  abr_bpf;          /* bits per picture                          */
+    double  abr_fps;
+    double  abr_cplxr;        /* sum of bits * qscale / rceq (+ the guess) */
+    double  abr_wanted;       /* sum of abr_bpf (+ one for the guess)      */
+    double  abr_total;        /* bits spent                                */
+    int     abr_frames;       /* pictures coded                            */
+    double  abr_rceq;         /* this picture's complexity term            */
+    double  abr_last_rceq;    /* the last anchor's, for the B pictures     */
+    double  abr_last_pqs;     /* the last P picture's qscale (step limit)  */
+    double  abr_qm;           /* this picture's model QP                   */
+    int     abr_qpre;         /* cur_qp before the VBV / qp range clamps   */
+    /* Two-pass: the QP planned for each picture (display order) from the
+     * first pass's statistics, the bits that plan expects, and how far the
+     * pictures coded so far are from it. */
+    double *plan_q, *plan_bits;
+    int     plan_n;
+    double  plan_total, plan_exp_sum;
 
     /* VBV/HRD (H.264 Annex C): the receiver's buffer is modelled picture by
      * picture.  `vbv_full` is what the model says is in the buffer when the
@@ -8050,7 +8065,7 @@ static void vbv_clamp_qp(struct aeg_encoder *e)
     /* The B picture's QP already carries the B offset, so the prediction has to
      * start from the QP the encoder will actually quantise with. */
     avail = vbv_available(e);
-    if (e->crf_on) {
+    if (e->crf_on && !e->abr_on) {
         /* Capped CRF has no rate target pulling the level back, so a run of
          * pictures that each fit could still drain the buffer until one the
          * prediction underestimates no longer does.  A picture may therefore
@@ -8164,124 +8179,195 @@ static void vbv_update(struct aeg_encoder *e, int bits)
         e->vbv_min_full = level;
 }
 
-/* One step of the ABR controller (H.264 Annex; a one-pass, picture-level
- * controller).
- *
- * The target is a *long-term* average, so the error is driven to zero instead
- * of merely being reduced: every picture's bits are accumulated, the difference
- * between the budget for the pictures coded so far and the bits actually spent
- * (`rc_debt`) is spread over the next `RC_WINDOW` pictures, and the QP follows
- * the logarithm of (actual / wanted) -- the log is the right variable because
- * the rate grows roughly exponentially with QP.  A keyframe is many times the
- * size of a P picture; the debt term absorbs it over the following window
- * rather than giving keyframes a target of their own, which is what keeps the
- * average on track for short streams too. */
-#define RC_WINDOW 6.0
-#define RC_GAIN   1.2
-#define RC_DEBT_MAX 3.0
-
 /* The QP below which the B-picture offset is faded out (see the B picture's QP
  * in aeg_encoder_encode): at QP 12 and above it is applied in full. */
 #define B_QP_FADE 12
 
-/* How much of a frame's budget each picture is expected to take.
- *
- * Every picture cannot take the same share when they are coded with different
- * quantisers on purpose: a B picture sits b_qp_offset coarser than the anchors
- * around it, so it spends a fraction of what an anchor does, and a controller
- * that asked it for a whole frame's worth would keep lowering the QP trying to
- * reach a target the picture type cannot spend -- the stream then lands well
- * under the requested bitrate (14% at 400 kb/s before this was accounted for)
- * while the anchors get finer than they should.  The weights are normalised so
- * that one group -- one anchor and bframes B pictures -- is worth exactly the
- * pictures it contains.
- *
- * The fraction itself is *measured* rather than derived from the QP offset: the
- * offset only bounds what a B picture may spend, and with three B pictures per
- * group the anchors have to make up a share that no closed form gets right (the
- * offset model leaves the stream 11% short at 400 kb/s where the measured
- * ratio lands on it). */
-static double rc_weight(const struct aeg_encoder *e, int is_b)
-{
-    double wb, wa, g;
+static double qp2qs(double q) { return 0.85 * pow(2.0, (q - 12.0) / 6.0); }
+static double qs2qp(double s) { return 12.0 + 6.0 * log2(s / 0.85); }
 
-    if (e->p.bframes <= 0)
-        return 1.0;
-    g = (double)(e->p.bframes + 1);
-    wb = e->rc_b_ratio;             /* measured: B bits / anchor bits      */
-    wa = 1.0 + (g - 1.0) * wb;      /* one group's bits / an anchor's      */
-    return (is_b ? wb : 1.0) * g / wa;
+/* x264's qpstep 4: how far an anchor's qscale may move from the last one */
+#define ABR_LSTEP 1.5874010519681994
+/* the first keyframe's share of the budget, in pictures (see abr_intra_q) */
+#define ABR_I_PICS 12.0
+/* below this intra estimate per macroblock the first picture is flat */
+#define ABR_FLAT 100
+/* a P picture under 1/ABR_HELD of the blurred complexity is held */
+#define ABR_HELD 16.0
+
+/* Two-pass: the planned qscale of picture poc, pulled towards the plan's
+ * total by how far the pictures coded so far are from what it expected
+ * (x264's second pass).  The pull is weak at the start and grows towards the
+ * end of the stream, where there is no time left to make up a difference
+ * gradually. */
+static int plan_has(const struct aeg_encoder *e, int poc)
+{
+    return poc >= 0 && poc < e->plan_n && e->plan_q[poc] >= 0.0;
 }
 
-static void rc_update(struct aeg_encoder *e, int bits, int is_idr)
+static double plan_qs(const struct aeg_encoder *e, int poc)
 {
-    double bpf = e->rc_bits_per_frame;
-    double per, want, ratio, adj;
+    double qs = qp2qs(e->plan_q[poc]);
+    double buf = 2.0 * e->abr_bpf * e->abr_fps, diff, pos, sc, k;
 
-    if (!e->rc_active || bpf <= 0.0)
-        return;
-    e->rc_frames++;
-    e->rc_spent += (double)bits;
+    pos = e->plan_total > 0.0 ? e->plan_exp_sum / e->plan_total : 1.0;
+    sc = sqrt((pos < 1.0 ? 1.0 - pos : 0.0) * e->plan_n);
+    buf *= 0.5 * (sc > 0.5 ? sc : 0.5);
+    diff = e->abr_total - e->plan_exp_sum;
+    k = (buf - diff) / buf;
+    if (k < 0.5) k = 0.5;
+    if (k > 2.0) k = 2.0;
+    qs /= k;
+    if (e->abr_frames >= e->abr_fps && e->plan_exp_sum >= 1.0) {
+        double w = 100.0 * e->abr_frames / e->plan_n;
+        if (w > 1.0) w = 1.0;
+        qs *= pow(e->abr_total / e->plan_exp_sum, w);
+    }
+    return qs;
+}
+
+/* The QP of a P picture under ABR (x264's rate_estimate_qscale, one pass):
+ * the qscale that the bits wanted so far over the complexity spent so far
+ * says this picture's complexity deserves, scaled up or down by how far the
+ * total is from the target (by at most 2x, the tolerance growing with the
+ * square root of the time coded), and kept within qpstep of the last P
+ * picture -- one step further in the direction the total needs. */
+static double abr_anchor_q(struct aeg_encoder *e, int64_t c, int poc)
+{
+    double rceq, qs, overflow = 1.0, lmin, lmax;
+
+    if (c >= 0 && e->crf_qc > 0.0 && e->crf_cnt > 0.0 &&
+        (double)c * ABR_HELD < e->crf_sum / e->crf_cnt && !plan_has(e, poc)) {
+        /* A held picture (a repeat, or next to nothing moving): whatever
+         * QP it gets it costs little more than its skip run, so a finer one
+         * only re-codes the same picture again -- 20..37 kbit a picture on
+         * the tree clip, where the falling blur took the QP from 23 to 17.
+         * It keeps the last P picture's qscale, as x264's second pass does
+         * for a P picture without texture, and leaves the blur alone. */
+        e->abr_rceq = e->abr_last_rceq;
+        return qs2qp(e->abr_last_pqs);
+    }
+    if (e->crf_qc <= 0.0) {
+        rceq = 1.0;                       /* the tree owns the distribution */
+    } else if (c >= 0) {
+        e->crf_sum = e->crf_sum * 0.5 + (double)c;
+        e->crf_cnt = e->crf_cnt * 0.5 + 1.0;
+        rceq = pow(e->crf_sum / e->crf_cnt, e->crf_qc);
+    } else {
+        rceq = e->abr_last_rceq;
+    }
+    if (!(rceq >= 1.0))
+        rceq = 1.0;
+    e->abr_rceq = e->abr_last_rceq = rceq;
+    qs = rceq * e->abr_cplxr / e->abr_wanted;
+    if (e->abr_frames > 0) {
+        double t = e->abr_frames / e->abr_fps;
+        double want = e->abr_frames * e->abr_bpf;
+        double buf = 2.0 * e->abr_bpf * e->abr_fps * (t > 1.0 ? sqrt(t) : 1.0);
+
+        overflow = 1.0 + (e->abr_total - want) / buf;
+        if (overflow < 0.5) overflow = 0.5;
+        if (overflow > 2.0) overflow = 2.0;
+        qs *= overflow;
+    }
+    lmin = e->abr_last_pqs / ABR_LSTEP;
+    lmax = e->abr_last_pqs * ABR_LSTEP;
+    if (overflow > 1.1 && e->abr_frames > 3)
+        lmax *= ABR_LSTEP;
+    else if (overflow < 0.9)
+        lmin /= ABR_LSTEP;
+    /* Far off the target the step limit only delays what the rate factor
+     * already knows: under camera noise the estimates miss what the first
+     * P pictures cost, and climbing out four steps an anchor cost a 40
+     * frame stream 60% of its budget.  It is lifted in the direction the
+     * total needs. */
+    if (overflow > 1.5)
+        lmax = 1e30;
+    else if (overflow < 0.67)
+        lmin = 0.0;
+    if (qs < lmin) qs = lmin;
+    if (qs > lmax) qs = lmax;
+    if (plan_has(e, poc))
+        qs = plan_qs(e, poc);
+    e->abr_last_pqs = qs;
+    return qs2qp(qs);
+}
+
+/* An intra picture under ABR: the anchors' recent average (the caller's q)
+ * or the plan's; its own intra estimate is what its bits are measured
+ * against afterwards. */
+static double abr_intra_q(struct aeg_encoder *e, double q, int poc)
+{
+    int64_t c = -1;
+
     if (e->p.bframes > 0) {
-        /* keep the weight the two paths above agree on up to date */
-        if (e->cur_is_b && e->rc_anchor_bits > 0) {
-            double r = (double)bits / (double)e->rc_anchor_bits;
-
-            if (r < 0.02) r = 0.02;
-            if (r > 1.00) r = 1.00;
-            e->rc_b_ratio = 0.75 * e->rc_b_ratio + 0.25 * r;
-        } else if (!e->cur_is_b) {
-            e->rc_anchor_bits = bits;
-        }
+        const int *ic = la_intra(e, poc);
+        int i;
+        if (ic)
+            for (c = 0, i = 0; i < e->mb_count; i++)
+                c += ic[i];
+    } else {
+        c = e->cur_satd;
     }
-    per = rc_weight(e, e->cur_is_b) * bpf;
-    e->rc_target_sum += per;
-    e->rc_debt = e->rc_target_sum - e->rc_spent;
-    /* One picture can be many times the target -- a keyframe, or any picture
-     * after a scene cut -- and letting that single picture's overshoot follow
-     * the controller for the next `RC_WINDOW` pictures is what turns one
-     * expensive frame into thirty bad ones.  The debt is therefore clamped to
-     * RC_DEBT_MAX pictures' worth: the overshoot is still repaid, just over a
-     * window long enough that the quality does not collapse (the alternative,
-     * a 20% target floor, lets the QP run away while the debt is large). */
-    if (e->rc_debt >  RC_DEBT_MAX * per) e->rc_debt =  RC_DEBT_MAX * per;
-    if (e->rc_debt < -RC_DEBT_MAX * per) e->rc_debt = -RC_DEBT_MAX * per;
-    want = per + e->rc_debt / RC_WINDOW;
-    if (want < 0.2 * per)          /* never ask for the impossible */
-        want = 0.2 * per;
-    if (e->vbv_active) {
-        /* ask for a picture the buffer can actually take, with a little room
-         * left over so that the clamp in vbv_clamp_qp() is the exception */
-        double room = vbv_available(e) * 0.8;
-
-        if (want > room)
-            want = room;
-        if (want < 1.0)
-            want = 1.0;
+    e->abr_rceq = e->crf_qc <= 0.0 ? 1.0
+                : c > 0 ? pow((double)c, e->crf_qc) : e->abr_last_rceq;
+    if (!(e->abr_rceq >= 1.0))
+        e->abr_rceq = 1.0;
+    if (plan_has(e, poc)) {
+        q = qs2qp(plan_qs(e, poc));
+    } else if (e->abr_frames == 0 && c > ABR_FLAT * e->mb_count) {
+        /* The first picture has no history to go by, and a fixed start QP
+         * is right for one bitrate only: at a low rate the first keyframe
+         * alone can take most of a short stream's budget.  It is given the
+         * QP at which its intra estimate predicts ABR_I_PICS pictures'
+         * worth of bits instead (bits * qscale / estimate is about 1 at the
+         * QPs that matter, docs/STATUS.md), and the P pictures and the rate
+         * factor's guess start from there.  A flat picture (a fade from
+         * black: 19 per macroblock where real content measured 500..1300)
+         * says nothing about what follows and keeps the fixed start. */
+        double k = ABR_I_PICS;
+        double base = (double)e->mb_count * (e->p.bframes > 0 ? 120.0 : 80.0);
+        q = qs2qp((double)c / (k * e->abr_bpf)) + e->p.i_qp_offset;
+        if (q < 0.0) q = 0.0;
+        if (q > 51.0) q = 51.0;
+        e->crf_pqp = q * e->crf_pnorm;
+        e->abr_last_pqs = qp2qs(q);
+        e->abr_cplxr = e->abr_bpf * qp2qs(q) /
+                       (e->crf_qc > 0.0 ? pow(base, e->crf_qc) : 1.0);
     }
-    ratio = (double)(bits + 1) / want;
-    adj = RC_GAIN * (ratio > 0.0 ? log2(ratio) : 0.0);
+    return q;
+}
+
+/* After each picture: what it says about the rate factor.  Its bits are
+ * normalised to the model QP it was given -- the B and intra offsets left out,
+ * a VBV or qp range clamp kept in -- and to its complexity term. */
+static void rc_update(struct aeg_encoder *e, int bits)
+{
+    double qn;
+
+    if (!e->abr_on)
+        return;
+    qn = e->abr_qm + (double)(e->cur_qp - e->abr_qpre);
     {
-        /* Normally at most 1.5 QP per picture, so that a scene cut cannot make
-         * the quality collapse.  That cap is also what decides how long the
-         * stream takes to reach its target, and the whole group's error is
-         * repaid through the anchor alone: with three B pictures per group the
-         * equilibrium QP can be ten or more below where the controller starts
-         * (a B picture spends a fraction of a frame's budget, so the anchors
-         * have to be that much better to fill the rate), and 1.5 QP per picture
-         * then needs far more pictures than a short stream has.  A picture's
-         * worth of debt therefore buys a bigger step -- still bounded, and the
-         * debt clamp keeps it from running away. */
-        double cap = 1.5 + fabs(e->rc_debt) / per;
-
-        if (cap > 4.0) cap = 4.0;
-        if (adj >  cap) adj =  cap;
-        if (adj < -cap) adj = -cap;
+        double t = (double)bits * qp2qs(qn) / e->abr_rceq;
+        /* The stream's first picture leaves the rate factor where it was:
+         * it is sized from an estimate before there is any evidence, its
+         * term is several anchors' worth while it would be wanted only one
+         * picture's budget, and counted in it drags the first seconds
+         * coarse (tree: -0.75 dB against CRF counted in, -0.42 left out).
+         * Its bits still count through the overflow correction.  Later
+         * intra pictures (scene cuts, GOP) count like any other: left out,
+         * pictures held five frames with an IDR every 25 overspent 53%. */
+        if (e->cur_is_intra && e->abr_frames == 0)
+            e->abr_wanted += t * e->abr_wanted / e->abr_cplxr;
+        else
+            e->abr_wanted += e->abr_bpf;
+        e->abr_cplxr += t;
     }
-    e->rc_qp += adj;
-    if (e->rc_qp > 51.0) e->rc_qp = 51.0;
-    if (e->rc_qp < 0.0)  e->rc_qp = 0.0;
-    (void)is_idr;
+    e->abr_total += (double)bits;
+    e->abr_frames++;
+    e->plan_exp_sum += plan_has(e, e->cur_poc) ? e->plan_bits[e->cur_poc]
+                                               : (double)bits;
 }
 
 /* Scene-cut detection.
@@ -9803,13 +9889,18 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         double q;
         if (is_idr || slice == AEG_SLICE_I) {
             q = e->crf_pqp / e->crf_pnorm;
+            if (e->abr_on)
+                q = abr_intra_q(e, q, poc);
         } else if (e->cur_is_b) {
             q = e->crf_anchor_q;
+            e->abr_rceq = e->abr_last_rceq;
         } else {
             int64_t c = e->crf_qc <= 0.0 ? -1
                       : e->p.bframes > 0 ? e->crf_cplx[poc % in_slots(e)]
                       : e->crf_last;
-            if (c >= 0) {
+            if (e->abr_on) {
+                q = abr_anchor_q(e, c, poc);
+            } else if (c >= 0) {
                 double qs;
                 e->crf_sum = e->crf_sum * 0.5 + (double)c;
                 e->crf_cnt = e->crf_cnt * 0.5 + 1.0;
@@ -9825,25 +9916,19 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         }
         if (!e->cur_is_b)
             e->crf_anchor_q = q;
+        e->abr_qm = q;
         e->cur_qp = (int)floor(q);
         e->crf_frac = q - e->cur_qp;
         if (e->cur_qp >= 51) e->cur_qp = 51, e->crf_frac = 0.0;
     }
-    if (e->rc_active) {
-        e->cur_qp = (int)(e->rc_qp + 0.5);
-        /* a keyframe carries the whole picture on its own, so it gets a
-         * slightly finer quantiser than the inter pictures that follow */
-        if (is_idr)
-            e->cur_qp -= 2;
-        if (e->cur_qp < 0)  e->cur_qp = 0;
-        if (e->cur_qp > 51) e->cur_qp = 51;
-    }
-    else if ((is_idr || slice == AEG_SLICE_I) && e->p.i_qp_offset > 0) {
+    if ((is_idr || slice == AEG_SLICE_I) && e->p.i_qp_offset > 0) {
         e->cur_qp -= e->p.i_qp_offset;
         if (e->cur_qp < 0)  e->cur_qp = 0;
     }
-    if (e->rc_qp_offset) {
-        e->cur_qp += e->rc_qp_offset;
+    {
+        int qoff = e->p.bframes > 0 ? e->in_qpoff[poc % in_slots(e)]
+                                    : e->rc_qp_offset;
+        e->cur_qp += qoff;
         if (e->cur_qp < 0)  e->cur_qp = 0;
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
@@ -9883,6 +9968,7 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
     e->cur_is_intra = is_idr || slice == AEG_SLICE_I;
     if (e->p.bframes > 0)
         e->cur_satd = e->vbv_satd ? e->vbv_satd[poc % in_slots(e)] : -1;
+    e->abr_qpre = e->cur_qp;
     if (e->vbv_active)
         vbv_clamp_qp(e);
     if (e->cur_qp < e->p.qp_min) e->cur_qp = e->p.qp_min;
@@ -10336,6 +10422,16 @@ recode:
         pkt->pts = pts;
         pkt->keyframe = is_idr;
         pkt->qp = e->cur_qp;
+        pkt->type = is_idr || slice == AEG_SLICE_I ? 0
+                  : e->cur_is_b ? (e->cur_bref ? 3 : 2) : 1;
+        {
+            int64_t t = 0;
+            int i;
+            for (i = 0; i < e->mb_count; i++)
+                t += mb_qp_of(e, i % e->mb_w, i / e->mb_w);
+            pkt->qp_avg = (double)t / e->mb_count;
+            pkt->qp_base = e->cur_qp + e->crf_frac;
+        }
     }
 
     e->st.bytes += (int64_t)out_len;
@@ -10410,11 +10506,14 @@ recode:
                 e->coef_dev ? " coef-on-device" : "");
     }
     if (getenv("AEG_RCDBG"))
-        fprintf(stderr, "RC F%d qp %d bits %d target %.0f debt %.0f vbv %.0f\n",
-                e->frame_count, e->cur_qp, (int)(out_len * 8),
-                e->rc_bits_per_frame, e->rc_debt, e->vbv_full);
+        fprintf(stderr, "RC F%d poc %d qp %d (model %.2f) bits %d total %.0f "
+                "wanted %.0f rf %.4g vbv %.0f exp %.0f\n",
+                e->frame_count, e->cur_poc, e->cur_qp, e->abr_qm,
+                (int)(out_len * 8), e->abr_total,
+                e->abr_frames * e->abr_bpf, e->abr_wanted / e->abr_cplxr,
+                e->vbv_full, plan_has(e, e->cur_poc) ? e->plan_bits[e->cur_poc] : -1.0);
     vbv_update(e, (int)(out_len * 8));
-    rc_update(e, (int)(out_len * 8), is_idr);
+    rc_update(e, (int)(out_len * 8));
     /* the placement trial of the coefficient stages measures whole pictures
      * (see aeg_dispatch_coef_pick); a forced batch path is not a trial */
     if (e->coef_force < 0 && e->rd_force < 0)
@@ -10512,6 +10611,7 @@ static void push_input(struct aeg_encoder *e, const uint8_t *yuv420p,
         aeg_lowres_build(&e->in_low[slot], e->in_plane[slot][0], e->stride[0],
                          e->w, e->h);
     e->in_pts[slot] = pts;
+    e->in_qpoff[slot] = e->rc_qp_offset;
     e->in_count++;
 }
 
@@ -11213,12 +11313,14 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     pp->b_pyramid = pp->b_pyramid ? 1 : 0;
     /* The macroblock tree needs the lookahead ring, which only exists with B
      * pictures (without them every picture is coded as it arrives). */
-    /* On by default at constant QP only: the rate controller and the buffer
-     * model predict a picture's size from its QP and know nothing of the
-     * offsets beyond their mean (asked for explicitly, they get that). */
+    /* On by default except with a buffer model, which predicts a picture's
+     * size from its QP and knows nothing of the offsets beyond their mean
+     * (asked for explicitly, it gets that).  ABR keeps it, as x264 does: on
+     * six-second clips the tree took the one-pass stream from -0.13..-2.70
+     * dB against CRF to -0.02..-0.81, and the two-pass one to within 0.15
+     * dB of CRF (docs/STATUS.md). */
     if (pp->mbtree < 0)
-        pp->mbtree = pp->preset >= 1 && pp->bitrate_kbps <= 0 &&
-                     pp->vbv_maxrate_kbps <= 0;
+        pp->mbtree = pp->preset >= 1 && pp->vbv_maxrate_kbps <= 0;
     if (pp->bframes <= 0)
         pp->mbtree = 0;
     pp->mbtree = pp->mbtree ? 1 : 0;
@@ -11238,11 +11340,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * ABR on, with the maximum rate as the target when no bitrate was given.
      * CRF is the exception: there the buffer is a cap on the constant-quality
      * stream ("capped CRF"), the QP rising only where the buffer runs low. */
+    if (pp->qcomp < 0) pp->qcomp = 0;
+    if (pp->qcomp > 100) pp->qcomp = 100;
     if (pp->rc_mode == AEG_RC_CRF) {
         if (!(pp->crf >= 0.0)) pp->crf = 0.0;      /* also catches NaN */
         if (pp->crf > 51.0) pp->crf = 51.0;
-        if (pp->qcomp < 0) pp->qcomp = 0;
-        if (pp->qcomp > 100) pp->qcomp = 100;
         pp->bitrate_kbps = 0;
         if (pp->vbv_maxrate_kbps <= 0 || pp->vbv_bufsize_kbits <= 0)
             pp->vbv_maxrate_kbps = pp->vbv_bufsize_kbits = 0;
@@ -11266,17 +11368,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     else {
         double fps = (double)pp->fps_num / (double)pp->fps_den;
         e->rc_active = 1;
-        e->rc_qp = (double)pp->qp;
-        e->rc_bits_per_frame = (double)pp->bitrate_kbps * 1000.0 / fps;
-        e->rc_spent = 0.0;
-        e->rc_debt = 0.0;
-        e->rc_target_sum = 0.0;
-        e->rc_anchor_bits = 0;
-        /* the starting guess is the QP offset's own prediction */
-        e->rc_b_ratio = pow(0.5, (double)pp->b_qp_offset / 6.0);
-        e->rc_frames = 0;
+        e->crf_on = 1;              /* the model; see abr_on */
+        e->abr_on = 1;
+        e->abr_fps = fps;
+        e->abr_bpf = (double)pp->bitrate_kbps * 1000.0 / fps;
         aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
-                pp->bitrate_kbps, e->rc_bits_per_frame, fps, pp->qp);
+                pp->bitrate_kbps, e->abr_bpf, fps, pp->qp);
     }
     if (pp->vbv_maxrate_kbps > 0 && (e->rc_active || e->crf_on)) {
         double fps = (double)pp->fps_num / (double)pp->fps_den;
@@ -11514,8 +11611,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
 
         e->crf_qc = e->la_depth ? 0.0 : 1.0 - e->p.qcomp / 100.0;
         e->crf_tree_off = e->la_depth ? 2.7 * mbt_strength() + 2.25 : 1.0;
-        q0 = e->p.crf + e->crf_tree_off;
+        q0 = e->abr_on ? (double)e->p.qp : e->p.crf + e->crf_tree_off;
         e->crf_rf = pow(base, e->crf_qc) / (0.85 * pow(2.0, (q0 - 12.0) / 6.0));
+        if (e->abr_on) {
+            /* the start: the rate factor that would code a picture of
+             * base_cplx at the start QP, worth one picture of evidence */
+            e->abr_wanted = e->abr_bpf;
+            e->abr_cplxr = e->abr_bpf / e->crf_rf;
+            e->abr_last_pqs = qp2qs(q0);
+            e->abr_last_rceq = e->crf_qc > 0.0 ? pow(base, e->crf_qc) : 1.0;
+            e->abr_rceq = e->abr_last_rceq;
+        }
         e->crf_pnorm = 0.01;
         e->crf_pqp = q0 * e->crf_pnorm;
         e->crf_anchor_q = q0;
@@ -11531,8 +11637,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                 return NULL;
             }
         }
-        aeg_log(1, "aeg: CRF %.2f, qcomp %.2f%s", e->p.crf, e->p.qcomp / 100.0,
-                e->la_depth ? " (with the macroblock tree)" : "");
+        if (!e->abr_on)
+            aeg_log(1, "aeg: CRF %.2f, qcomp %.2f%s", e->p.crf,
+                    e->p.qcomp / 100.0,
+                    e->la_depth ? " (with the macroblock tree)" : "");
     }
     e->job_nb_last = e->job_nb_prev = -1;
     e->cur_satd = -1;
@@ -11628,7 +11736,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         /* what shaped the stream -- not how it was computed (threads,
          * backend), so a threaded encode writes the same bytes */
         char crf_txt[48] = "";
-        if (e->crf_on)
+        if (e->abr_on)
+            snprintf(crf_txt, sizeof(crf_txt), " qcomp=%.2f",
+                     e->p.qcomp / 100.0);
+        else if (e->crf_on)
             snprintf(crf_txt, sizeof(crf_txt), " crf=%.2f qcomp=%.2f",
                      e->p.crf, e->p.qcomp / 100.0);
         snprintf(e->info, sizeof(e->info),
@@ -11721,8 +11832,8 @@ struct ft_entry {
     uint8_t *buf;
     size_t   cap, size;
     int64_t  pts;
-    int      keyframe, qp;
-    double   psnr;
+    int      keyframe, qp, type;
+    double   psnr, qp_avg, qp_base;
     int      pending;           /* in a worker, not joined yet */
     uint8_t *rec_mem;
     int     *mbqp;
@@ -12007,6 +12118,9 @@ static int ft_fill(struct aeg_encoder *e, struct ft_entry *q,
     q->pts = pkt->pts;
     q->keyframe = pkt->keyframe;
     q->qp = pkt->qp;
+    q->type = pkt->type;
+    q->qp_avg = pkt->qp_avg;
+    q->qp_base = pkt->qp_base;
     q->psnr = psnr;
     memcpy(q->rec_mem, rec_mem, pic_bytes(e));
     for (i = 0; i < e->mb_count; i++)
@@ -12334,6 +12448,9 @@ static int ft_run(struct aeg_encoder *e, aeg_packet *pkt, int flushing)
         pkt->pts = q->pts;
         pkt->keyframe = q->keyframe;
         pkt->qp = q->qp;
+        pkt->type = q->type;
+        pkt->qp_avg = q->qp_avg;
+        pkt->qp_base = q->qp_base;
     }
     e->st.psnr_avg = q->psnr;
     e->ft_ret = e->ftq_head;
@@ -12384,7 +12501,7 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
                                   NULL, NULL, e->la_scratch)
                 : -1;
             e->cur_satd = e->crf_last;
-            if (e->vbv_active && e->crf_last < 0) {
+            if ((e->vbv_active || e->abr_on) && e->crf_last < 0) {
                 int i;
                 aeg_lowres_intra(cur, e->la_scratch);
                 for (e->cur_satd = 0, i = 0; i < e->mb_count; i++)
@@ -12513,6 +12630,220 @@ int aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3], int stride[3],
     return AEG_OK;
 }
 
+/* The QP a picture of the given type is coded at when its model QP is base:
+ * the offsets the prologue of aeg_encoder_encode applies, without the VBV. */
+static double plan_type_qp(const struct aeg_encoder *e, double base, int type)
+{
+    double q = base;
+
+    if (type == 0 && e->p.i_qp_offset > 0)
+        q -= e->p.i_qp_offset;
+    if ((type == 2 || type == 3) && e->p.b_qp_offset) {
+        int off = e->p.b_qp_offset, cur = (int)floor(q);
+        if (type == 3)
+            off = off * bref_qp_num() / 2;
+        if (cur < 0) cur = 0;
+        if (cur < B_QP_FADE)
+            off = off * cur / B_QP_FADE;
+        q += off;
+    }
+    if (q < e->p.qp_min) q = e->p.qp_min;
+    if (q > e->p.qp_max) q = e->p.qp_max;
+    return q;
+}
+
+/* The base (model) QP of every picture for rate factor rf, and the bits the
+ * plan expects in total.  P pictures follow their blurred complexity; an
+ * intra picture takes the level of the P pictures after it (the ones that
+ * predict from it -- x264's ip factor is then the I offset) and a B picture
+ * the level of the anchor after it, which is the one coded just before it. */
+static double plan_eval(const struct aeg_encoder *e, const aeg_pass1_frame *f,
+                        int n, const double *blur, const unsigned char *held,
+                        double rf, double *base, double *bits)
+{
+    double qc = e->crf_qc, total = 0.0;
+    int i, j;
+
+    for (i = 0; i < n; i++) {
+        base[i] = -1.0;
+        if (f[i].bits >= 0 && f[i].type == 1 && !held[i]) {
+            double qs = (qc > 0.0 ? pow(blur[i], qc) : 1.0) / rf;
+            base[i] = qs2qp(qs);
+            if (base[i] < 0.0) base[i] = 0.0;
+            if (base[i] > 51.0) base[i] = 51.0;
+        }
+    }
+    /* a held P picture keeps the level of the P picture before it */
+    for (i = 0; i < n; i++) {
+        if (f[i].bits < 0 || f[i].type != 1 || !held[i])
+            continue;
+        for (j = i - 1; j >= 0 && !(f[j].type == 1 && base[j] >= 0.0); j--)
+            ;
+        if (j < 0)
+            for (j = i + 1; j < n && !(f[j].type == 1 && base[j] >= 0.0 &&
+                                       !held[j]); j++)
+                ;
+        base[i] = j >= 0 && j < n ? base[j] : qs2qp(1.0 / rf);
+    }
+    for (i = 0; i < n; i++) {
+        double sum = 0.0;
+        int cnt = 0;
+        if (f[i].bits < 0 || f[i].type != 0)
+            continue;
+        for (j = i + 1; j < n && cnt < 3 && f[j].type != 0; j++)
+            if (base[j] >= 0.0 && f[j].type == 1)
+                sum += base[j], cnt++;
+        for (j = i - 1; j >= 0 && cnt == 0; j--)
+            if (base[j] >= 0.0 && f[j].type == 1)
+                sum += base[j], cnt++;
+        if (cnt) {
+            base[i] = sum / cnt;
+        } else {                       /* nothing but intra pictures */
+            double qs = (qc > 0.0 ? pow(blur[i], qc) : 1.0) / rf;
+            base[i] = qs2qp(qs);
+            if (base[i] < 0.0) base[i] = 0.0;
+            if (base[i] > 51.0) base[i] = 51.0;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (f[i].bits < 0 || (f[i].type != 2 && f[i].type != 3))
+            continue;
+        for (j = i + 1; j < n && !(f[j].bits >= 0 && f[j].type <= 1); j++)
+            ;
+        if (j >= n)
+            for (j = i - 1; j >= 0 && !(f[j].bits >= 0 && f[j].type <= 1); j--)
+                ;
+        base[i] = j >= 0 && j < n ? base[j] : qs2qp(1.0 / rf);
+    }
+    for (i = 0; i < n; i++) {
+        double q1, q2;
+        if (f[i].bits < 0) {
+            bits[i] = -1.0;
+            continue;
+        }
+        q1 = f[i].qp < 0.0 ? 0.0 : f[i].qp > 51.0 ? 51.0 : f[i].qp;
+        q2 = plan_type_qp(e, base[i], f[i].type);
+        /* with the tree the picture is coded at its QP plus the tree's
+         * mean offset, which the first pass's tree measured */
+        if (e->la_depth)
+            q2 += f[i].qp - f[i].qp_base;
+        bits[i] = f[i].type == 1 && held[i] && q2 >= q1
+                ? (double)f[i].bits     /* a skip run does not scale */
+                : (double)f[i].bits * qp2qs(q1) / qp2qs(q2);
+        total += bits[i];
+    }
+    return total;
+}
+
+int aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    double *cplx, *blur, *base, *bits, target, lo, hi, total = 0.0, qsum = 0.0;
+    unsigned char *held;
+    int i, j, it, pass, cnt = 0;
+
+    if (!e || !f || n <= 0 || !e->abr_on || e->frame_count > 0)
+        return AEG_EINVAL;
+    cplx = (double *)aeg_alloc((size_t)n * 4 * sizeof(double));
+    if (!cplx)
+        return AEG_ENOMEM;
+    blur = cplx + n;
+    base = blur + n;
+    bits = base + n;
+    for (i = 0; i < n; i++) {
+        double q = f[i].qp < 0.0 ? 0.0 : f[i].qp > 51.0 ? 51.0 : f[i].qp;
+        cplx[i] = f[i].bits >= 0
+                ? (double)(f[i].bits > 0 ? f[i].bits : 1) * qp2qs(q) : -1.0;
+        if (f[i].bits >= 0)
+            cnt++;
+    }
+    /* Complexity blurred over the neighbouring P pictures (a Gaussian of
+     * x264's width, in pictures), stopping at an intra picture: what comes
+     * after a cut has nothing to do with what came before it.  Twice: the
+     * first blur finds the held pictures (see ABR_HELD), which the second
+     * leaves out -- their bits say how little changed, not how hard the
+     * pictures around them are. */
+    held = (unsigned char *)aeg_alloc((size_t)n);
+    if (!held) {
+        aeg_free(cplx);
+        return AEG_ENOMEM;
+    }
+    memset(held, 0, (size_t)n);
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < n; i++) {
+            double ws = 1.0, cs = cplx[i];
+            int dir;
+            if (f[i].bits < 0 || f[i].type != 1) {
+                if (!pass)
+                    blur[i] = cplx[i];
+                continue;
+            }
+            if (pass && held[i])
+                ws = cs = 0.0;
+            for (dir = -1; dir <= 1; dir += 2)
+                for (j = i + dir; j >= 0 && j < n && abs(j - i) <= 40;
+                     j += dir) {
+                    double w;
+                    if (f[j].bits < 0 || f[j].type == 2 || f[j].type == 3 ||
+                        (pass && held[j]))
+                        continue;
+                    if (f[j].type == 0)
+                        break;
+                    w = exp(-(double)(j - i) * (j - i) / 200.0);
+                    ws += w;
+                    cs += w * cplx[j];
+                }
+            if (!pass)
+                held[i] = cplx[i] * ABR_HELD < cs / ws;
+            else
+                blur[i] = ws > 0.0 ? cs / ws : cplx[i];
+        }
+    }
+    /* the rate factor whose plan meets the target, by bisection on its log
+     * (the expected total grows with it) */
+    target = e->abr_bpf * cnt;
+    lo = log(1e-9);
+    hi = log(1e9);
+    for (it = 0; it < 80; it++) {
+        double mid = 0.5 * (lo + hi);
+        if (plan_eval(e, f, n, blur, held, exp(mid), base, bits) > target)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    plan_eval(e, f, n, blur, held, exp(0.5 * (lo + hi)), base, bits);
+    aeg_free(held);
+    aeg_free(e->plan_q);
+    aeg_free(e->plan_bits);
+    e->plan_q = (double *)aeg_alloc((size_t)n * sizeof(double));
+    e->plan_bits = (double *)aeg_alloc((size_t)n * sizeof(double));
+    if (!e->plan_q || !e->plan_bits) {
+        aeg_free(e->plan_q);
+        aeg_free(e->plan_bits);
+        e->plan_q = e->plan_bits = NULL;
+        e->plan_n = 0;
+        aeg_free(cplx);
+        return AEG_ENOMEM;   /* held is freed above */
+    }
+    for (i = 0; i < n; i++) {
+        e->plan_q[i] = f[i].bits >= 0 ? base[i] : -1.0;
+        e->plan_bits[i] = bits[i];
+        if (f[i].bits >= 0) {
+            total += bits[i];
+            qsum += plan_type_qp(e, base[i], f[i].type);
+        }
+    }
+    e->plan_n = n;
+    e->plan_total = total;
+    e->plan_exp_sum = 0.0;
+    aeg_log(1, "aeg: two-pass plan: %d pictures, %.1f kb/s expected "
+               "(target %d), average QP %.2f", cnt,
+            cnt ? total * e->abr_fps / cnt / 1000.0 : 0.0,
+            e->p.bitrate_kbps, cnt ? qsum / cnt : 0.0);
+    aeg_free(cplx);
+    return AEG_OK;
+}
+
 int aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset)
 {
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
@@ -12567,6 +12898,8 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->par_cost);
     aeg_free(e->mb_dqp);
     aeg_free(e->crf_cplx);
+    aeg_free(e->plan_q);
+    aeg_free(e->plan_bits);
     aeg_free(e->vbv_satd);
     aeg_lowres_free(&e->crf_low[0]);
     aeg_lowres_free(&e->crf_low[1]);

@@ -251,7 +251,18 @@ typedef struct aeg_packet {
     int64_t  pts;
     int      keyframe;
     int      qp;
+    int      type;     /* 0 = I, 1 = P, 2 = B, 3 = B used as a reference */
+    double   qp_avg;   /* the macroblocks' average QP (adaptive offsets in) */
+    double   qp_base;  /* the picture's QP before the macroblock offsets   */
 } aeg_packet;
+
+/* Two-pass rate control: what the first pass measured for one picture. */
+typedef struct aeg_pass1_frame {
+    int     type;      /* aeg_packet.type */
+    double  qp;        /* aeg_packet.qp_avg */
+    double  qp_base;   /* aeg_packet.qp_base */
+    int64_t bits;      /* the picture's size in bits; < 0 = not measured */
+} aeg_pass1_frame;
 
 typedef struct aeg_stats {
     int64_t frames;
@@ -302,11 +313,24 @@ int  aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out);
 int  aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3],
                        int stride[3], int mb_qp[]);
 int  aeg_encoder_set_qp(aeg_encoder *enc, int qp);
-/* Bias the QP of the pictures that follow, in QP steps (positive = coarser).
- * The two-pass mode uses it to redistribute a fixed budget: the rate controller
- * keeps the stream on target, the bias moves bits from the pictures that are
- * easy to the ones that are hard.  It is cleared by aeg_encoder_open(). */
+/* Bias the QP of the pictures submitted from now on, in QP steps (positive =
+ * coarser).  The bias belongs to the picture it was set for: with B pictures a
+ * picture is coded later than it is submitted, and it is coded with the bias
+ * that was in force when it was submitted.  The two-pass mode uses it to
+ * redistribute a fixed budget: the rate controller keeps the stream on target,
+ * the bias moves bits from the pictures that are easy to the ones that are
+ * hard.  It is cleared by aeg_encoder_open(). */
 int  aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset);
+/* Second pass of a two-pass encode (ABR only, before the first picture): f[d]
+ * is the first pass's measurement of the picture with display index d.  The
+ * encoder plans every picture's QP from it -- x264's second pass: each
+ * picture's complexity (bits * qscale), blurred over its neighbours and raised
+ * to 1 - qcomp, scaled so that the predicted total meets the bitrate -- and
+ * then follows the plan, pulled back towards it as far as the bits actually
+ * spent differ from what it expected.  Pictures past n fall back to the
+ * one-pass controller.  Returns AEG_OK, or AEG_EINVAL without a bitrate
+ * target or once encoding has started. */
+int  aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n);
 void aeg_encoder_close(aeg_encoder *enc);
 const char *aeg_last_error(void);
 
