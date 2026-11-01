@@ -2966,6 +2966,55 @@ search (`AEG_CHROMAME=1`, -0.20 %), the inter chroma level selection at 0.75x
 / 1.3x lambda (-0.03 / +0.15 %), the Intra_8x8 level selection at 0.75x /
 0.65x lambda in P and B pictures (-0.04 / +0.03 %).
 
+## Quality and speed round after CI (b-adapt 2, lookahead fields)
+
+**tree, once more.**  The macroblock tree gives tree's I picture 3.9 QP more
+than its refresh P pictures (x264 1.5), but nothing at picture level tells
+tree's repeated pictures from vtest's static background or cock's busy P
+pictures: tree strength 1.0 / 1.6 (`AEG_MBTS`) +1.03 / +3.40 against +2.04,
+traded against vtest; per-picture flat offsets (the tree's mean only) -5.19
+% mean; half the per-macroblock spread -5.28; `--iqp 1 / 2` -5.10 / -5.33
+(all against -5.37); a "new information" share of each refresh picture
+(0.24-0.40 on tree) overlaps cock's P pictures (0.23-0.61).  Left alone.
+P-only at QP 16-25 tree is +1.30 (the others -0.6 to -6.0): at QP 20 our
+refresh P pictures cost ~7% more than x264's at equal PSNR with the same
+macroblock type counts (261 coded against ~281, no intra) -- the
+P/B-coding gap described under "Why 3-B groups lose on short", no knob
+(inter trellis lambda 0.5x / 1.33x -0.44 / +0.57 % on a 7-picture cut,
+`--no-8x8dct`, `--partitions 1`, `--refine-mv 3`, `--range 32`, preset 4:
+within +-0.4 %) moves it.  The validation tree segment was the bigger loss
+(+9.90 %), and that was the group decision: see "B-picture decision" above
+-- b-adapt 2 is now the default at presets 3-4.
+
+A third reference was not added: x264's own ref 3 -> 1 costs it only +0.22 %
+mean (table above) and ref 2 -> 3 is -0.18 % at QP 16-25.
+
+**Lookahead fields computed once (exact).**  The search of one lowres
+picture against one reference depends on the pair only (a block's
+candidates and predictor are its neighbours' vectors in the same field),
+yet the group decision priced it inside every (p0, p1, b) estimate and the
+macroblock tree searched it again: on cock 663 searches for 427 distinct
+pairs and 471 intra estimates for 87 pictures.  `la_field()` / `la_intra()`
+keep the vectors and costs per ring slot (8 references each, entries of
+pictures that left the ring reused first) and `aeg_lowres_cost_fields()` /
+`aeg_lowres_mbcosts_fields()` assemble the estimates; only the bi-predicted
+cost depends on the (p0, p1) pair.  Byte-identical on 70 cases (7 clips x
+presets 1-4, b-adapt 1/2, `--mbtree 0`, frame threads, ABR, `-g 12
+--rc-lookahead 8`).  cock 90 frames, QP 28, best of three: preset 3 7126 ->
+6663 ms (-6.5 %), preset 4 8243 -> 7751 ms (-6.0 %) on one thread; preset 3
+with frame threads 3792 -> 3520 ms (-7.2 %, 25.6 fps).
+
+With frame threads the main thread (prologue: lookahead, tree, scheduling)
+is now 6.3 % of all samples (95 of 1512), almost all of it the lowres
+search; it runs beside the workers, so it bounds throughput only near 16x
+one core.  The kernels left in the per-macroblock profile (SATD, SAD x4,
+MC, quantisation, IDCT, the CABAC pricing) are all SSE2/AVX2 already and
+none is above 6.5 % self time, so more exact SIMD work buys little.  The
+wavefront lets a P picture's row r start once its reference has rows
+r + 2-3 (range + 4 + 15 samples), and with three B pictures per group the B
+pictures are independent once their anchors are done, so 4-8 workers have
+work; scaling itself cannot be measured on this two-core sandbox.
+
 ## The skip candidate
 
 `P_Skip` is the cheapest macroblock the standard has: one context-coded flag,
