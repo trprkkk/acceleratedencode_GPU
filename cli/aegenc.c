@@ -62,7 +62,7 @@ static void usage(void)
 "  --no-cabac       code the macroblock layer with CAVLC instead of CABAC\n"
 "  --no-deblock     disable the in-loop deblocking filter\n"
 "  --deblock <a:b>  deblocking strength offsets, -6..6 each (default 0:0)\n"
-"  --qpmin <n>, --qpmax <n>  no macroblock below / above this QP\n"
+"  --qpmin <n>, --qpmax <n>  no macroblock below / above this QP (max 1..51)\n"
 "                   (defaults 0 / 51)\n"
 "  --chroma-qp-offset <n>  chroma QP relative to luma, -12..12 (default 0)\n"
 "  --aud            an access unit delimiter before every picture\n"
@@ -469,7 +469,7 @@ int main(int argc, char **argv)
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
     aeg_pass1_frame *pass1 = NULL;
-    int pass1_n = 0, pass1_cap = 0;
+    int pass1_n = 0, pass1_cap = 0, pass1_bframes = -1;
     char stats_path[4096];
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
     const char *orderpath = NULL;
@@ -674,7 +674,10 @@ int main(int argc, char **argv)
         bad |= range_bad("--vbv-bufsize", p.vbv_bufsize_kbits, 0, 2000000);
         bad |= range_bad("-v", verbose, 0, 3);
         bad |= range_bad("--qpmin", p.qp_min, 0, 51);
-        bad |= range_bad("--qpmax", p.qp_max, 0, 51);
+        /* qp_max 0 is the library's "unset" (a zeroed aeg_params must not pin
+         * every macroblock to QP 0), so a range ending at 0 cannot be asked
+         * for; refusing it beats silently coding up to QP 51 */
+        bad |= range_bad("--qpmax", p.qp_max, 1, 51);
         bad |= range_bad("--chroma-qp-offset", p.chroma_qp_offset, -12, 12);
         bad |= range_bad("--deblock alpha", p.deblock_alpha, -6, 6);
         bad |= range_bad("--deblock beta", p.deblock_beta, -6, 6);
@@ -780,13 +783,20 @@ int main(int argc, char **argv)
                 char t;
 
                 if (!strncmp(line, "aeg-stats 2", 11)) {
+                    const char *kb = strstr(line, "bframes=");
                     v2 = 1;
+                    if (kb)
+                        pass1_bframes = atoi(kb + 8);
                     continue;
                 }
                 if (v2) {
+                    /* the pictures are numbered from 0 in display order: an
+                     * index far past the ones before it is damage, and the
+                     * table is allocated up to it */
                     if (sscanf(line, "%lld %c %lf %lf %lld", &d, &t, &q, &qb,
                                &b) != 5 ||
-                        !strchr("IPBb", t) || t == 0 || b < 0 || d < 0) {
+                        !strchr("IPBb", t) || t == 0 || b < 0 || d < 0 ||
+                        d > (long long)pass1_n + 65536) {
                         fprintf(stderr, "%s: bad line: %s", stats_path, line);
                         fclose(sf);
                         free(pass1);
@@ -808,13 +818,20 @@ int main(int argc, char **argv)
                 }
             }
             fclose(sf);
+            if (!v2)
+                pass1_bframes = 0;   /* the first format is P-only */
             if (pass1_n <= 0) {
                 fprintf(stderr, "no statistics in %s\n", stats_path);
                 free(pass1);
                 return 1;
             }
+            /* the plan is for the pictures this pass codes: with fewer (-n)
+             * it would share the target out over pictures that never come
+             * (+26% coding 10 of 40) */
             if (max_frames && pass1_n < max_frames)
                 max_frames = pass1_n;
+            else if (max_frames && max_frames < pass1_n)
+                pass1_n = max_frames;
         }
     }
 
@@ -941,9 +958,25 @@ int main(int argc, char **argv)
         int64_t t0 = aeg_now_ns();
         int n = 0;
 
+        /* the second pass has to code the picture types the first measured
+         * (x264 refuses other B-picture settings too) */
+        if (pass == 2 && pass1_bframes >= 0) {
+            aeg_stats bs;
+            aeg_encoder_stats(enc, &bs);
+            if (bs.bframes != pass1_bframes) {
+                fprintf(stderr, "%s was measured with %d B pictures per group, "
+                        "this pass codes %d: use the same options as pass 1\n",
+                        stats_path, pass1_bframes, bs.bframes);
+                aeg_encoder_close(enc);
+                free(frame);
+                free(pass1);
+                return 1;
+            }
+        }
         /* the second pass plans every picture from the first's measurement */
         if (pass == 2 && aeg_encoder_set_pass1(enc, pass1, pass1_n) != AEG_OK) {
-            fprintf(stderr, "cannot use the statistics in %s\n", stats_path);
+            fprintf(stderr, "cannot use the statistics in %s: %s\n", stats_path,
+                    aeg_last_error());
             aeg_encoder_close(enc);
             free(frame);
             free(pass1);
@@ -1011,7 +1044,9 @@ int main(int argc, char **argv)
                 ret = 1;
             } else {
                 int k;
-                fprintf(sf, "aeg-stats 2\n");
+                aeg_stats bs;
+                aeg_encoder_stats(enc, &bs);
+                fprintf(sf, "aeg-stats 2 bframes=%d\n", bs.bframes);
                 for (k = 0; k < pass1_n; k++)
                     if (pass1[k].bits >= 0)
                         fprintf(sf, "%d %c %.3f %.3f %lld\n", k,

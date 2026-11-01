@@ -575,6 +575,19 @@ print("   ABR target 300 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
 sys.exit(0 if ok else 1)
 ' "$TMP/abr.264" || FAIL=1
 
+# All-intra (no B pictures, an IDR every picture): no anchors to take an
+# intra QP from, so each intra picture is rate-controlled like an anchor
+# (before, the QP never moved: 6.4x the target).
+$BUILD/aegenc -w 320 -h 192 -n 120 -i "$TMP/abr.yuv" -o "$TMP/abr_i.264" \
+    --bitrate 1500 --bframes 0 -g 1 -v 0
+python3 -c '
+import os, sys
+kbps = os.path.getsize(sys.argv[1]) * 8 * 30 / 120 / 1000.0
+ok = abs(kbps - 1500) <= 150
+print("   all-intra ABR 1500 kb/s -> %.1f kb/s%s" % (kbps, "" if ok else "  FAIL"))
+sys.exit(0 if ok else 1)
+' "$TMP/abr_i.264" || FAIL=1
+
 echo "== VBV / HRD"
 # The buffer model has to do two things: leave a stream that fits its channel
 # alone (the bytes must be exactly what the same ABR configuration without a
@@ -754,7 +767,7 @@ ok = True
 for v, what in (('b', 'B pictures'), ('p', 'P only')):
     lines = open(os.path.join(tmp, '2p%s.stats' % v)).read().split('\n')
     types = [l.split()[1] for l in lines[1:] if l.strip()]
-    if lines[0] != 'aeg-stats 2' or len(types) != 60:
+    if not lines[0].startswith('aeg-stats 2 bframes=') or len(types) != 60:
         print("   %s: stats file has %d pictures, header %r  FAIL"
               % (what, len(types), lines[0]))
         ok = False
@@ -788,6 +801,40 @@ if command -v "$FF" >/dev/null 2>&1; then
         two_pass_b 0 "$TMP/2pb.order" 0 || FAIL=1
     python3 "$TMP/cmp.py" "$TMP/2pp.recon" "$TMP/2pp.dec" 320 192 60 two_pass_p \
         || FAIL=1
+fi
+
+# Statistics a second pass must refuse (exit 1, with a reason), and one it
+# must cut down: B pictures measured, none coded; a QP no encoder writes; an
+# index far past the pictures before it (the table is allocated up to it);
+# nothing measured.  Coding 30 of the 60 measured pictures plans for those 30.
+awk 'NR==1{print;next}{$3=99;print}' "$TMP/2pb.stats" > "$TMP/bad_qp.stats"
+awk 'NR==1{print;next}{$5=0;print}' "$TMP/2pb.stats" > "$TMP/bad_zero.stats"
+{ head -3 "$TMP/2pb.stats"; echo "99999999 P 20 20 1000"; } > "$TMP/bad_far.stats"
+bad=0
+for c in "2pb.stats --bframes 0" "bad_qp.stats" "bad_zero.stats" "bad_far.stats"; do
+    set -- $c
+    rc=0
+    $BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/cut.yuv" -o "$TMP/2px.264" \
+        --pass 2 --stats "$TMP/$1" --bitrate 100 $2 $3 -v 0 2>"$TMP/2px.err" || rc=$?
+    if [ $rc -ne 1 ] || [ ! -s "$TMP/2px.err" ]; then
+        echo "   pass 2 with $c: exit $rc  FAIL"; bad=1
+    fi
+done
+r=$(cat "$TMP/crfb.rate")
+$BUILD/aegenc -w 320 -h 192 -n 30 -i "$TMP/cut.yuv" -o "$TMP/2pn.264" --pass 2 \
+    --stats "$TMP/2pb.stats" --bitrate "$r" >"$TMP/2pn.log" 2>&1 || bad=1
+python3 - "$TMP/2pn.log" "$r" <<'PY2' || bad=1
+import re, sys
+m = re.search(r'bitrate ([0-9.]+) kb/s', open(sys.argv[1]).read())
+kbps, want = (float(m.group(1)) if m else 0.0), float(sys.argv[2])
+if abs(kbps - want) > 0.1 * want:
+    print("   pass 2 coding 30 of 60 pictures: %.1f kb/s for %d  FAIL" % (kbps, want))
+    sys.exit(1)
+PY2
+if [ $bad = 0 ]; then
+    echo "   damaged or mismatched statistics refused; a shorter pass 2 lands"
+else
+    FAIL=1
 fi
 
 echo "== input and options"
@@ -826,6 +873,7 @@ for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
             "-w 96 -h 64 --bframes 4" "-w 96 -h 64 --ref 3" "-w 96 -h 64 -p 5" \
             "-w 96 -h 64 --fps 0" "-w 96 -h 64 --sar 4" "-w 96 -h 64 --direct x" \
             "-w 96 -h 64 --colorprim nope" "-w 64 -h 64 --demuxer y4m" \
+            "-w 96 -h 64 --qpmax 0" "-w 96 -h 64 --qpmin 40 --qpmax 30" \
             "--nonsense"; do
     # shellcheck disable=SC2086
     rc=0
@@ -835,7 +883,7 @@ for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
         echo "   '$args' was accepted (exit $rc)  FAIL"; bad=1
     fi
 done
-if [ $bad = 0 ]; then echo "   13 malformed command lines refused"; else FAIL=1; fi
+if [ $bad = 0 ]; then echo "   15 malformed command lines refused"; else FAIL=1; fi
 
 echo "== device enumeration"
 $BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'

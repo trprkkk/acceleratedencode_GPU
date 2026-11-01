@@ -15,6 +15,12 @@
  */
 #include "h264.h"
 #include <pthread.h>
+#include <string.h>
+
+/* 32-bit loads and stores at any alignment (one movd; a cast to int * is
+ * undefined behaviour on an unaligned pixel address) */
+static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
+static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
 
 /* The distortion metrics are the innermost loop of the motion search -- a
  * 320x192 picture at preset 2 runs ~480 block comparisons per macroblock, so a
@@ -374,7 +380,7 @@ void aeg_dequant_4x4(const int16_t *level, int32_t *coef, int qp)
         for (x = 0; x < 4; x++) {
             int cls = (x & 1) + (y & 1);
             coef[y * 4 + x] = (int32_t)level[x * 4 + y] *
-                              aeg_dequant_ls[qp % 6][cls] << sh;
+                              aeg_dequant_ls[qp % 6][cls] * (1 << sh);
         }
 }
 
@@ -575,7 +581,7 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
      * reference decoder sees. */
 #define IDCT_ROW8(p, off) \
     _mm_unpacklo_epi16( \
-        _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)((p) + (off))), zero), zero)
+        _mm_unpacklo_epi8(_mm_cvtsi32_si128(ld32((p) + (off))), zero), zero)
     /* DC-only blocks (very common: a macroblock that predicts well leaves one
      * coefficient per block) skip the transform entirely, as in the scalar
      * loop -- there the fast path is worth more than the transform is. */
@@ -591,8 +597,8 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
          */
         if (pred && _mm_movemask_epi8(_mm_cmpeq_epi16(ac, zero)) == 0xFFFF) {
             const int dc = dc_in ? (int16_t)*dc_in :
-                           (int16_t)(((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
-                                      ls0) << sh);
+                           (int16_t)((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
+                                     ls0 * (1 << sh));
             const int add = (dc + (1 << 5)) >> 6;
             const __m128i bias = _mm_set1_epi32(add);
             __m128i p0 = bias, p1 = bias, p2 = bias, p3 = bias;
@@ -603,10 +609,10 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
                 p3 = _mm_add_epi32(bias, IDCT_ROW8(pred, 3 * pred_stride));
             }
             v = _mm_packus_epi16(_mm_packs_epi32(p0, p1), _mm_packs_epi32(p2, p3));
-            *(int *)(dst) = _mm_cvtsi128_si32(v);
-            *(int *)(dst + stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 4));
-            *(int *)(dst + 2 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 8));
-            *(int *)(dst + 3 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 12));
+            st32(dst, _mm_cvtsi128_si32(v));
+            st32(dst + stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 4)));
+            st32(dst + 2 * stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 8)));
+            st32(dst + 3 * stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 12)));
             return 1;
         }
     }
@@ -652,10 +658,10 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
 #undef IDCT_ROW8
     /* saturating packs do exactly the scalar's clip to [0, 255] */
     v = _mm_packus_epi16(_mm_packs_epi32(a0, a1), _mm_packs_epi32(a2, a3));
-    *(int *)(dst) = _mm_cvtsi128_si32(v);
-    *(int *)(dst + stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 4));
-    *(int *)(dst + 2 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 8));
-    *(int *)(dst + 3 * stride) = _mm_cvtsi128_si32(_mm_srli_si128(v, 12));
+    st32(dst, _mm_cvtsi128_si32(v));
+    st32(dst + stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 4)));
+    st32(dst + 2 * stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 8)));
+    st32(dst + 3 * stride, _mm_cvtsi128_si32(_mm_srli_si128(v, 12)));
     return 1;
 }
 #endif
@@ -708,7 +714,7 @@ static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
         for (x = 0; x < 4; x++) {
             int cls = (x & 1) + (y & 1);
             int v = level[x * 4 + y];   /* level[] is in decoder order */
-            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] << sh);
+            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] * (1 << sh));
         }
     if (dc_in)
         d[0] = (int16_t)*dc_in;
@@ -798,7 +804,7 @@ static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
         /* DC only: every pixel gets (dc + 32) >> 6 */
         int dc = dc_in ? (int16_t)*dc_in
                        : (int16_t)((int32_t)level[0] *
-                                   aeg_dequant_ls[qp % 6][0] << sh);
+                                   aeg_dequant_ls[qp % 6][0] * (1 << sh));
         int v = (dc + 32) >> 6;
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++) {
@@ -839,9 +845,9 @@ int64_t aeg_idct_add_ssd4(const int16_t *level, int qp, const uint8_t *pred,
     {
         const __m128i z = _mm_setzero_si128();
         __m128i va = _mm_loadu_si128((const __m128i *)r);
-        __m128i vb = _mm_setr_epi32(*(const int *)src, *(const int *)(src + stride),
-                                    *(const int *)(src + 2 * stride),
-                                    *(const int *)(src + 3 * stride));
+        __m128i vb = _mm_setr_epi32(ld32(src), ld32(src + stride),
+                                    ld32(src + 2 * stride),
+                                    ld32(src + 3 * stride));
         __m128i d0 = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
         __m128i d1 = _mm_sub_epi16(_mm_unpackhi_epi8(va, z), _mm_unpackhi_epi8(vb, z));
         __m128i acc = _mm_add_epi32(_mm_madd_epi16(d0, d0), _mm_madd_epi16(d1, d1));
@@ -876,12 +882,12 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
             const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
             __m128i va, vb, d0, d1;
             if (w == 4) {
-                va = _mm_setr_epi32(*(const int *)pa, *(const int *)(pa + sa),
-                                    *(const int *)(pa + 2 * sa),
-                                    *(const int *)(pa + 3 * sa));
-                vb = _mm_setr_epi32(*(const int *)pb, *(const int *)(pb + sb),
-                                    *(const int *)(pb + 2 * sb),
-                                    *(const int *)(pb + 3 * sb));
+                va = _mm_setr_epi32(ld32(pa), ld32(pa + sa),
+                                    ld32(pa + 2 * sa),
+                                    ld32(pa + 3 * sa));
+                vb = _mm_setr_epi32(ld32(pb), ld32(pb + sb),
+                                    ld32(pb + 2 * sb),
+                                    ld32(pb + 3 * sb));
             } else {
                 va = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)pa),
                                         _mm_loadl_epi64((const __m128i *)(pa + sa)));
@@ -906,8 +912,8 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
             va = _mm_loadl_epi64((const __m128i *)(a + (size_t)y * sa));
             vb = _mm_loadl_epi64((const __m128i *)(b + (size_t)y * sb));
         } else {
-            va = _mm_cvtsi32_si128(*(const int *)(a + (size_t)y * sa));
-            vb = _mm_cvtsi32_si128(*(const int *)(b + (size_t)y * sb));
+            va = _mm_cvtsi32_si128(ld32(a + (size_t)y * sa));
+            vb = _mm_cvtsi32_si128(ld32(b + (size_t)y * sb));
         }
         d = _mm_sub_epi16(_mm_unpacklo_epi8(va, z), _mm_unpacklo_epi8(vb, z));
         acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
@@ -1657,8 +1663,8 @@ static inline int sad_row(__m128i *acc, const uint8_t *a, const uint8_t *b, int 
         va = _mm_loadl_epi64((const __m128i *)a);
         vb = _mm_loadl_epi64((const __m128i *)b);
     } else if (w == 4) {
-        va = _mm_cvtsi32_si128(*(const int *)a);
-        vb = _mm_cvtsi32_si128(*(const int *)b);
+        va = _mm_cvtsi32_si128(ld32(a));
+        vb = _mm_cvtsi32_si128(ld32(b));
     } else {
         return 0;
     }
@@ -1810,8 +1816,8 @@ void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4
 static inline __m128i satd_row(const uint8_t *a, const uint8_t *b)
 {
     const __m128i zero = _mm_setzero_si128();
-    __m128i va = _mm_cvtsi32_si128(*(const int *)a);
-    __m128i vb = _mm_cvtsi32_si128(*(const int *)b);
+    __m128i va = _mm_cvtsi32_si128(ld32(a));
+    __m128i vb = _mm_cvtsi32_si128(ld32(b));
     return _mm_sub_epi16(_mm_unpacklo_epi8(va, zero), _mm_unpacklo_epi8(vb, zero));
 }
 

@@ -19,6 +19,11 @@
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
+
+/* 32-bit loads and stores at any alignment (one movd; a cast to int * is
+ * undefined behaviour on an unaligned pixel address) */
+static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
+static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
 #endif
 
 static inline uint8_t clip8(int v)
@@ -399,8 +404,8 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
             }
             if (w - x >= 4) {
                 _mm_storeu_si32(d + x,
-                                _mm_avg_epu8(_mm_cvtsi32_si128(*(const int *)(r1 + x)),
-                                             _mm_cvtsi32_si128(*(const int *)(r2 + x))));
+                                _mm_avg_epu8(_mm_cvtsi32_si128(ld32(r1 + x)),
+                                             _mm_cvtsi32_si128(ld32(r2 + x))));
                 x += 4;
             }
 #endif
@@ -442,7 +447,7 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
         const __m128i wd = _mm_set1_epi16((short)(fx * fy));
         const __m128i r32 = _mm_set1_epi16(32);
 #define LDC(q) (w == 8 ? _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(q)), z) \
-                       : _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)(q)), z))
+                       : _mm_unpacklo_epi8(_mm_cvtsi32_si128(ld32(q)), z))
         __m128i a = LDC(src), b = LDC(src + 1);
         for (y = 0; y < h; y++) {
             const uint8_t *q = src + (size_t)(y + 1) * sstride;
@@ -454,7 +459,7 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
             if (w == 8)
                 _mm_storel_epi64((__m128i *)(dst + (size_t)y * dstride), v);
             else
-                *(int *)(dst + (size_t)y * dstride) = _mm_cvtsi128_si32(v);
+                st32(dst + (size_t)y * dstride, _mm_cvtsi128_si32(v));
             a = c;
             b = d;
         }

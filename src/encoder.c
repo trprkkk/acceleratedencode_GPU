@@ -483,7 +483,8 @@ struct aeg_encoder {
     double  abr_cplxr;        /* sum of bits * qscale / rceq (+ the guess) */
     double  abr_wanted;       /* sum of abr_bpf (+ one for the guess)      */
     double  abr_total;        /* bits spent                                */
-    int     abr_frames;       /* pictures coded                            */
+    int     abr_frames;
+    int     abr_prev_intra;   /* the last picture coded was intra          */       /* pictures coded                            */
     double  abr_rceq;         /* this picture's complexity term            */
     double  abr_last_rceq;    /* the last anchor's, for the B pictures     */
     double  abr_last_pqs;     /* the last P picture's qscale (step limit)  */
@@ -493,6 +494,7 @@ struct aeg_encoder {
      * first pass's statistics, the bits that plan expects, and how far the
      * pictures coded so far are from it. */
     double *plan_q, *plan_bits;
+    unsigned char *plan_cls;  /* 0 intra, 1 P, 2 B, as pass 1 coded it    */
     int     plan_n;
     double  plan_total, plan_exp_sum;
 
@@ -8200,9 +8202,20 @@ static double qs2qp(double s) { return 12.0 + 6.0 * log2(s / 0.85); }
  * (x264's second pass).  The pull is weak at the start and grows towards the
  * end of the stream, where there is no time left to make up a difference
  * gradually. */
-static int plan_has(const struct aeg_encoder *e, int poc)
+/* The plan covers a picture only if pass 2 codes it as the same kind (intra,
+ * P, B) as pass 1 did: a plan made for a P picture says nothing useful about
+ * an intra one where pass 2 put a GOP boundary or a scene cut (-g 1 in pass
+ * 2 overspent 100% following it).  Such pictures fall back to the one-pass
+ * controller. */
+static int plan_has(const struct aeg_encoder *e, int poc, int cls)
 {
-    return poc >= 0 && poc < e->plan_n && e->plan_q[poc] >= 0.0;
+    return poc >= 0 && poc < e->plan_n && e->plan_q[poc] >= 0.0 &&
+           e->plan_cls[poc] == cls;
+}
+
+static int cur_cls(const struct aeg_encoder *e)
+{
+    return e->cur_is_intra ? 0 : e->cur_is_b ? 2 : 1;
 }
 
 static double plan_qs(const struct aeg_encoder *e, int poc)
@@ -8237,7 +8250,7 @@ static double abr_anchor_q(struct aeg_encoder *e, int64_t c, int poc)
     double rceq, qs, overflow = 1.0, lmin, lmax;
 
     if (c >= 0 && e->crf_qc > 0.0 && e->crf_cnt > 0.0 &&
-        (double)c * ABR_HELD < e->crf_sum / e->crf_cnt && !plan_has(e, poc)) {
+        (double)c * ABR_HELD < e->crf_sum / e->crf_cnt && !plan_has(e, poc, 1)) {
         /* A held picture (a repeat, or next to nothing moving): whatever
          * QP it gets it costs little more than its skip run, so a finer one
          * only re-codes the same picture again -- 20..37 kbit a picture on
@@ -8287,7 +8300,7 @@ static double abr_anchor_q(struct aeg_encoder *e, int64_t c, int poc)
         lmin = 0.0;
     if (qs < lmin) qs = lmin;
     if (qs > lmax) qs = lmax;
-    if (plan_has(e, poc))
+    if (plan_has(e, poc, 1))
         qs = plan_qs(e, poc);
     e->abr_last_pqs = qs;
     return qs2qp(qs);
@@ -8313,8 +8326,14 @@ static double abr_intra_q(struct aeg_encoder *e, double q, int poc)
                 : c > 0 ? pow((double)c, e->crf_qc) : e->abr_last_rceq;
     if (!(e->abr_rceq >= 1.0))
         e->abr_rceq = 1.0;
-    if (plan_has(e, poc)) {
+    if (plan_has(e, poc, 0)) {
         q = qs2qp(plan_qs(e, poc));
+    } else if (e->abr_frames > 0 && e->abr_prev_intra) {
+        /* An intra picture after an intra picture (all-intra, -g 1): there
+         * are no anchors whose average to take, and the QP would never move
+         * (+39% at -g 1).  As in x264, it is rate-controlled like an anchor,
+         * its intra estimate as its complexity. */
+        q = abr_anchor_q(e, c, poc);
     } else if (e->abr_frames == 0 && c > ABR_FLAT * e->mb_count) {
         /* The first picture has no history to go by, and a fixed start QP
          * is right for one bitrate only: at a low rate the first keyframe
@@ -8366,7 +8385,9 @@ static void rc_update(struct aeg_encoder *e, int bits)
     }
     e->abr_total += (double)bits;
     e->abr_frames++;
-    e->plan_exp_sum += plan_has(e, e->cur_poc) ? e->plan_bits[e->cur_poc]
+    e->abr_prev_intra = e->cur_is_intra;
+    e->plan_exp_sum += plan_has(e, e->cur_poc, cur_cls(e))
+                     ? e->plan_bits[e->cur_poc]
                                                : (double)bits;
 }
 
@@ -10511,7 +10532,7 @@ recode:
                 e->frame_count, e->cur_poc, e->cur_qp, e->abr_qm,
                 (int)(out_len * 8), e->abr_total,
                 e->abr_frames * e->abr_bpf, e->abr_wanted / e->abr_cplxr,
-                e->vbv_full, plan_has(e, e->cur_poc) ? e->plan_bits[e->cur_poc] : -1.0);
+                e->vbv_full, plan_has(e, e->cur_poc, cur_cls(e)) ? e->plan_bits[e->cur_poc] : -1.0);
     vbv_update(e, (int)(out_len * 8));
     rc_update(e, (int)(out_len * 8));
     /* the placement trial of the coefficient stages measures whole pictures
@@ -12574,6 +12595,7 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->vbv_underflows = e->vbv_underflows;
     out->vbv_size_clamps = e->vbv_clamps;
     out->vbv_recodes = e->vbv_recodes;
+    out->bframes = e->p.bframes;
     out->scene_cuts = e->scene_cuts;
     out->macroblocks = e->stat_mbs;
     out->skipped = e->stat_skipped;
@@ -12744,6 +12766,37 @@ int aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n)
 
     if (!e || !f || n <= 0 || !e->abr_on || e->frame_count > 0)
         return AEG_EINVAL;
+    {
+        /* what a first pass of this encoder can have written: anything
+         * else is a damaged or foreign file, and planning from it codes a
+         * stream at whatever rate the garbage implies (QP 999: +85%) */
+        double sum = 0.0;
+        int nb = 0;
+        for (i = 0; i < n; i++) {
+            if (f[i].bits < 0)
+                continue;
+            if (f[i].type < 0 || f[i].type > 3 ||
+                !(f[i].qp >= 0.0 && f[i].qp <= 51.0) ||
+                !(f[i].qp_base >= 0.0 && f[i].qp_base <= 51.0)) {
+                aeg_set_last_error("pass 1 statistics: a picture's type or QP "
+                                   "is out of range");
+                return AEG_EINVAL;
+            }
+            sum += (double)f[i].bits;
+            nb += f[i].type >= 2;
+        }
+        if (!(sum > 0.0)) {
+            aeg_set_last_error("pass 1 statistics: no bits measured");
+            return AEG_EINVAL;
+        }
+        /* x264 refuses a second pass with other B-picture settings; one
+         * without B pictures cannot code the B pictures planned for */
+        if (nb > 0 && e->p.bframes <= 0) {
+            aeg_set_last_error("pass 1 statistics have B pictures and this "
+                               "pass has none: use the same --bframes");
+            return AEG_EINVAL;
+        }
+    }
     cplx = (double *)aeg_alloc((size_t)n * 4 * sizeof(double));
     if (!cplx)
         return AEG_ENOMEM;
@@ -12815,12 +12868,16 @@ int aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n)
     aeg_free(held);
     aeg_free(e->plan_q);
     aeg_free(e->plan_bits);
+    aeg_free(e->plan_cls);
     e->plan_q = (double *)aeg_alloc((size_t)n * sizeof(double));
     e->plan_bits = (double *)aeg_alloc((size_t)n * sizeof(double));
-    if (!e->plan_q || !e->plan_bits) {
+    e->plan_cls = (unsigned char *)aeg_alloc((size_t)n);
+    if (!e->plan_q || !e->plan_bits || !e->plan_cls) {
         aeg_free(e->plan_q);
         aeg_free(e->plan_bits);
+        aeg_free(e->plan_cls);
         e->plan_q = e->plan_bits = NULL;
+        e->plan_cls = NULL;
         e->plan_n = 0;
         aeg_free(cplx);
         return AEG_ENOMEM;   /* held is freed above */
@@ -12828,6 +12885,7 @@ int aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n)
     for (i = 0; i < n; i++) {
         e->plan_q[i] = f[i].bits >= 0 ? base[i] : -1.0;
         e->plan_bits[i] = bits[i];
+        e->plan_cls[i] = f[i].type == 0 ? 0 : f[i].type == 1 ? 1 : 2;
         if (f[i].bits >= 0) {
             total += bits[i];
             qsum += plan_type_qp(e, base[i], f[i].type);
@@ -12900,6 +12958,7 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->crf_cplx);
     aeg_free(e->plan_q);
     aeg_free(e->plan_bits);
+    aeg_free(e->plan_cls);
     aeg_free(e->vbv_satd);
     aeg_lowres_free(&e->crf_low[0]);
     aeg_lowres_free(&e->crf_low[1]);

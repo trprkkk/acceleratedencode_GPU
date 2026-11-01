@@ -118,7 +118,7 @@ typedef struct aeg_params {
      * streams want them).  level_idc: force the level (10 * level, e.g. 41;
      * 0 = the smallest that fits).  qp_min / qp_max: no macroblock is coded
      * outside this range, whatever the rate control, AQ or macroblock tree
-     * ask for (defaults 0 / 51).  chroma_qp_offset: chroma_qp_index_offset,
+     * ask for (defaults 0 / 51; qp_max 0 means 51, unset).  chroma_qp_offset: chroma_qp_index_offset,
      * -12..12 (negative = finer chroma). */
     int aud;
     int level_idc;
@@ -294,6 +294,10 @@ typedef struct aeg_stats {
     /* VBV: pictures coded a second (or third) time because the first attempt
      * did not fit in the buffer */
     int64_t vbv_recodes;
+    /* the most B pictures between two anchors this encoder codes, after the
+     * options were resolved (CAVLC turns them off): what a second pass has
+     * to match its first pass with */
+    int     bframes;
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;
