@@ -4706,9 +4706,96 @@ Mean **-4.21 %**: the gain grows toward high quality (QP 22: +0.11 to +0.45
 dB at 0.4-3.5 % fewer bytes), where the 8-bit prediction loop's rounding is
 a larger share of the error.
 
-**Speed.**  No 10-bit SIMD yet: the same runs at QP 22, default threads,
+**Speed** (at this commit; see *10-bit SIMD* below for the kernels that
+followed).  No 10-bit SIMD yet: the same runs at QP 22, default threads,
 2-core Xeon, median of three, 8-bit / 10-bit fps: vtest 65.4 / 35.7, cock
 25.9 / 12.6, mega 81.3 / 39.2, short 55.6 / 30.4, tree 60.4 / 40.0 --
 1.5-2.1x the time.  The
 SSE2/AVX2 kernels (SAD, SATD, SSD, the quarter-pel filters, the quantiser,
 the transforms) have 16-bit-sample counterparts to write, as x264 has.
+
+## 10-bit SIMD
+
+The vector kernels now have 16-bit-sample forms, so the 10-bit build runs at
+about the 8-bit speed.  Every one returns the 10-bit C path's integers -- the
+10-bit stream is byte-identical to the previous commit's -- and the 8-bit
+code paths compile to the same arithmetic (8-bit output byte-identical too).
+
+**What has a 10-bit form** (SSE2 unless noted; AVX2 chosen at run time as
+before, `AEG_NOAVX2=1` forces SSE2; `AEG_SIMD` in `bitdepth.h` is "SSE2 at
+either depth", `AEG_SSE2` stays "the 8-bit forms"):
+
+| kernel | how it stays exact at 10 bits |
+|---|---|
+| SATD 4x4 / 8xN / 16xN, `satd_avg` (+AVX2) | same code, only the loads differ (`ld_px*` helpers); int16 intermediates reach 16 x 1023 = 16368, and the half-sum 32736 |
+| SA8D 8x8 | the third butterfly stage would reach 64 x 1023; two stages stay in int16, and the third is replaced by \|a+b\|+\|a-b\| = 2 max(\|a\|,\|b\|) |
+| SAD, `sad_x4` (+AVX2 16- and 8-wide) | \|a-b\| = subs(a,b) \| subs(b,a); at most 32 differences per uint16 lane before a multiply-add widens them |
+| SSD, `idct_add_ssd4`, `add_res16_ssd` | `pmaddwd` of differences (+-1023); a 16x16 sum is below 2^28 |
+| 4x4 forward transform, quantiser, inverse (+ add, DC-only path) | int32 lanes throughout, as the scalar code at this depth (no int16 truncation but the residual's final store, which wraps); the 32-bit multiply is `pmuludq` x2 (SSE2 has no `pmulld`); quantiser: \|coef\| <= 2^17 and mf < 2^14 keep product + offset below 2^32 (else the C loop) |
+| 8x8 forward transform, quantiser, dequantiser, inverse, the trellis's column SSD (AVX2 only; SSE2-only machines run C) | one row of eight int32 per register, two transposes; quantiser: \|coef\| <= 2^17, mf < 2^15, product + offset < 2^32; dequantiser: levels beyond what an int32 product holds (per QP) go to C |
+| `idct_8x8_add` | saturating int16 add then a clamp to [0, 1023]: the scalar clip of the exact sum |
+| half-pel planes (h, v, hv) | 20(a+b) - 5(c+d) + (e+f) lies in [-10230, 42966]: not int16, but within 2^16, so wrapping 16-bit arithmetic plus a bias holds it as an unsigned lane; (v+16)>>5 = ((v+16+320x32)>>>5) - 320; the hv stage widens the biased sums and removes 32 x bias at the end |
+| quarter-pel average, chroma filter | `pavgw`; the chroma weights add up to 64 and 64 x 1023 + 32 < 2^16 |
+| `me_pick` rate lanes | no samples involved: now on at both depths |
+| input conversion | for input depths up to the encoder's, x264's dither is an exact shift (the rounding term and every error term are zero), so 8-bit input is `<< 2` directly, without the 16-bit plane and the dither pass; 4:2:2/4:4:4 chroma (resampled) still dithers |
+
+Not vectorised at either depth: deblocking, intra prediction, CABAC.
+
+**Verification.**
+* `tests/simd_check.c`, new, compiled twice (`build/simd_check`, and
+  `build/simd_check10` with `-DBIT_DEPTH=10` and its library references
+  renamed by the same symbol list as the library's 10-bit objects), run by
+  `make test` with and without AVX2.  It compares every kernel above with a
+  scalar reference -- written in the test (the metrics, the filters'
+  formulas) or the library's `_c` functions (transforms; new:
+  `aeg_transform_4x4_c`, `aeg_quant_4x4_c`, `aeg_idct_residual_c`) -- on
+  random, extreme (0 / PIXEL_MAX only), nearly flat and ramp inputs, at 80
+  block shapes, every QP from QP_MIN to 51, levels from the real
+  transform + quantiser, coefficients over the whole legal range and past it
+  (where a vector form must hand over), the half-pel planes and all sixteen
+  quarter-pel positions against the scalar `aeg_mc_luma`, all 64 chroma
+  fractions, and the input conversion of I420 and NV12 at depths 8 to 10 and
+  12 against widening + dither.
+* Mutations caught by it: a wrong butterfly sign, a disabled dequantiser
+  guard, a wrong quantiser clamp, a wrong rounding constant in SA8D, the
+  half-pel filters and the chroma filter, a too-small bias, a wrong input
+  shift.  (Two that it did not catch turned out equivalent: an arithmetic
+  instead of a logical shift in the 4x4 quantiser, and a 2^18 guard -- the
+  largest mf is 13107, so neither product reaches 2^31.)
+* It found two latent issues on the way: the 8-bit SSE2 `aeg_ssd` treated any
+  width other than 8 and 16 as 4 (no caller passes one; other widths now
+  take the C loop), and widening the AVX2 gate to both depths at first also
+  enabled the 8-bit-coefficient AVX2 idct8 / column-SSD kernels in the 10-bit
+  build (the encoder comparison caught that; they are gated to 8 bits again
+  and the test now covers those functions at 10 bits).
+* 10-bit streams byte-identical to the previous commit: `tools/identity.sh
+  --bit-depth 10` (14 configurations, with and without AVX2); the five clips
+  x presets 0/2/4 x `-q 0` / `-q 22` / `-q 51` / `--crf -12` (60); B-frames +
+  weighted P, 2-pass, AQ 2, `--tff`, chroma QP offset +12 at QP 0, CAVLC
+  without 8x8, VBV, frame threads, slices, partitions 31, temporal direct;
+  10- and 12-bit, NV12 and 4:2:2 input (the direct conversion and the dither
+  path).
+* 8-bit: `tools/identity.sh` 14/14 against the previous 8-bit reference;
+  `make test` (all conformance cases bit-exact, simd_check at both depths);
+  the OpenCL conformance run (PoCL) bit-exact; ASan + UBSan on both
+  simd_checks and on 8- and 10-bit encodes (sub-partitions, B-frames, 10-bit
+  and 4:2:2 input); TSan api_check; the 8-bit-only build (no `_10` symbols,
+  `simd_check10` not built); install-check.
+
+**Speed.**  2-core Xeon, 30 frames, preset 3, median of three, interleaved
+runs, fps:
+
+| clip (QP 22, default threads) | 8-bit | 10-bit before | 10-bit now | 10-bit speed-up | 10-bit / 8-bit time |
+|---|---|---|---|---|---|
+| vtest | 59.22 | 33.25 | 65.61 | 1.97x | 0.90 |
+| cock | 28.51 | 14.09 | 25.67 | 1.82x | 1.11 |
+| mega | 75.54 | 39.89 | 69.72 | 1.75x | 1.08 |
+| short | 57.18 | 30.28 | 54.08 | 1.79x | 1.06 |
+| tree | 60.75 | 34.51 | 59.40 | 1.72x | 1.02 |
+| cock QP 26, one thread | 17.47 | 8.16 | 15.21 | 1.86x | 1.15 |
+
+(The machine is noisy at the 10 % level; the 0.90 of vtest is that noise
+and thread scheduling, not a faster 10-bit encoder.)  The sampled profile of
+the one-thread run went from 975 samples at 10 bits against 407 at 8 to 496
+against about 500: what is left at 10 bits is the same work as at 8 (CABAC
+pricing, the trellis, motion search), none of it above 6 % self time.

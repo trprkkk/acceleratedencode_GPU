@@ -35,11 +35,18 @@ typedef int32_t dctcoef;
 #define PIXEL_MID     (1 << (BIT_DEPTH - 1))
 #define QP_BD_OFFSET  (6 * (BIT_DEPTH - 8))
 #define QP_MIN        (-QP_BD_OFFSET)   /* the lowest QPY */
-/* the SIMD paths are written for 8-bit samples and 16-bit coefficients */
+/* AEG_SSE2: the SIMD paths written for 8-bit samples and 16-bit
+ * coefficients.  AEG_SIMD: SSE2 at either depth, for the kernels that have a
+ * 16-bit-sample form too (pixel loads through the helpers in transform.c). */
 #if defined(__SSE2__) && BIT_DEPTH == 8
 #define AEG_SSE2 1
 #else
 #define AEG_SSE2 0
+#endif
+#if defined(__SSE2__)
+#define AEG_SIMD 1
+#else
+#define AEG_SIMD 0
 #endif
 /* n samples of value v (memset at 8 bits) */
 static inline void aeg_pixel_fill(pixel *d, int v, size_t n)

@@ -74,6 +74,38 @@ void aeg_dither_plane(pixel *dst, int dst_stride, const uint16_t *src,
     }
 }
 
+/* A plane of at most BIT_DEPTH bits straight into the encoder's samples.
+ * For such a plane the dither above is an exact shift: its 16-bit input is
+ * v << (16 - depth), (v << (18 - depth)) + half >> rshift is v << (BIT_DEPTH -
+ * depth) since half >> rshift is 0, and every error term stays zero -- so this
+ * is what plane_to16() + aeg_dither_plane() make, without the two passes
+ * (x264 likewise upconverts with a shift). */
+static void plane_up(pixel *dst, int dst_stride, const void *src, int src_stride,
+                     int pitch, int w, int h, int depth)
+{
+    const int sh = BIT_DEPTH - depth;
+    int x, y;
+    if (depth <= 8) {
+        for (y = 0; y < h; y++) {
+            const uint8_t *s = (const uint8_t *)src + (size_t)y * src_stride;
+            pixel *d = dst + (size_t)y * dst_stride;
+            for (x = 0; x < w; x++)
+                d[x] = (pixel)(s[x * pitch] << sh);
+        }
+    } else {
+        const int max = (1 << depth) - 1;
+        for (y = 0; y < h; y++) {
+            const uint16_t *s = (const uint16_t *)((const uint8_t *)src +
+                                                   (size_t)y * src_stride);
+            pixel *d = dst + (size_t)y * dst_stride;
+            for (x = 0; x < w; x++) {
+                int v = s[x * pitch];
+                d[x] = (pixel)((v > max ? max : v) << sh);
+            }
+        }
+    }
+}
+
 /* One source plane (or one component of an interleaved one) to 16 bits. */
 static void plane_to16(uint16_t *dst, int dst_stride, const void *src,
                        int src_stride, int pitch, int w, int h, int depth)
@@ -224,6 +256,9 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
             memcpy(dst[0] + (size_t)y * dst_stride[0],
                    (const uint8_t *)img->plane[0] + (size_t)y * img->stride[0],
                    (size_t)w);
+    } else if (img->depth <= BIT_DEPTH) {
+        plane_up(dst[0], dst_stride[0], img->plane[0], img->stride[0], 1, w, h,
+                 img->depth);
     } else {
         plane_to16(c->a, w, img->plane[0], img->stride[0], 1, w, h, img->depth);
         aeg_dither_plane(dst[0], dst_stride[0], c->a, w, w, h, BIT_DEPTH, c->err);
@@ -262,6 +297,11 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
                 for (x = 0; x < cw; x++)
                     d[x] = s[x * pitch];
             }
+            continue;
+        }
+        if (img->depth <= BIT_DEPTH && sw == cw && sh == ch) {
+            /* 4:2:0 already: no resampling, so the exact shift as for luma */
+            plane_up(dst[p], dst_stride[p], src, sstride, pitch, cw, ch, img->depth);
             continue;
         }
         plane_to16(c->a, sw, src, sstride, pitch, sw, sh, img->depth);

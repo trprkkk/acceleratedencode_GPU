@@ -231,6 +231,21 @@ $(BUILD)/api_check: tests/api_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/input_check: tests/input_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
+# The SSE2/AVX2 kernels against scalar references, at 8 bits and (compiled
+# with BIT_DEPTH=10, its library references renamed like the library's own
+# 10-bit objects) at 10 bits.
+$(BUILD)/simd_check: tests/simd_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+$(BUILD)/obj10/raw/simd_check.o: tests/simd_check.c | $(BUILD)/obj10/raw
+	$(CC) $(CFLAGS) -DBIT_DEPTH=10 -c $< -o $@
+
+$(BUILD)/simd_check10: $(BUILD)/obj10/raw/simd_check.o $(BUILD)/obj10/syms $(BUILD)/libaeg.a
+	$(OBJCOPY) --redefine-syms=$(BUILD)/obj10/syms $< $(BUILD)/obj10/simd_check.o
+	$(CC) $(CFLAGS) $(LDFLAGS) $(BUILD)/obj10/simd_check.o $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+SIMD_CHECKS := $(BUILD)/simd_check $(if $(filter 10,$(BIT_DEPTHS)),$(BUILD)/simd_check10)
+
 # Install into a scratch DESTDIR, then build and run the example against it
 # through pkg-config, shared and static, and check the exported symbols.
 install-check: $(BIN) $(LIB) $(SHLIB) $(BUILD)/genyuv
@@ -242,7 +257,8 @@ install-check: $(BIN) $(LIB) $(SHLIB) $(BUILD)/genyuv
 test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
       $(BUILD)/cabac_check $(BUILD)/cabac_mb_check $(BUILD)/kernel_check \
       $(BUILD)/coef_check $(BUILD)/backend_check $(BUILD)/nvrtc_check \
-      $(BUILD)/api_check $(BUILD)/input_check
+      $(BUILD)/api_check $(BUILD)/input_check $(SIMD_CHECKS)
+	for t in $(SIMD_CHECKS); do ./$$t && AEG_NOAVX2=1 ./$$t || exit 1; done
 	./$(BUILD)/api_check
 	./$(BUILD)/input_check
 	./$(BUILD)/syntax_check

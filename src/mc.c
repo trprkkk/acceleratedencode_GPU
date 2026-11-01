@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if AEG_SSE2
+#if AEG_SIMD
 #include <emmintrin.h>
 
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
@@ -253,6 +253,75 @@ static inline __m128i hpel_hv8(const pixel *p, int s)
     hi = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(hi, widen_hi(a5)), c512), 10);
     return _mm_packs_epi32(lo, hi);
 }
+
+/* eight filtered samples (int16 lanes) clipped to [0, 255] and stored */
+static inline void st_hpel8(pixel *d, __m128i v)
+{
+    _mm_storel_epi64((__m128i *)d, _mm_packus_epi16(v, _mm_setzero_si128()));
+}
+#elif AEG_SIMD
+/* The same filters for 16-bit samples.  20 (a + b) - 5 (c + d) + (e + f) of
+ * 10-bit samples lies in [-10230, 42966]: past int16, but the span is below
+ * 2^16, so wrapping 16-bit arithmetic plus a bias of at least 10230 holds the
+ * biased value exactly as an unsigned lane. */
+static inline __m128i tap6_px16(const pixel *p, ptrdiff_t s, int bias)
+{
+    const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5);
+#define T(k) _mm_loadu_si128((const __m128i *)(p + (k) * s))
+    const __m128i s0 = _mm_add_epi16(T(0), T(1));
+    const __m128i s1 = _mm_add_epi16(T(-1), T(2));
+    const __m128i s2 = _mm_add_epi16(T(-2), T(3));
+#undef T
+    __m128i v = _mm_sub_epi16(_mm_mullo_epi16(s0, c20), _mm_mullo_epi16(s1, c5));
+    return _mm_add_epi16(_mm_add_epi16(v, s2), _mm_set1_epi16((short)bias));
+}
+
+/* (v + 16) >> 5 == ((v + 16 + 320 * 32) >>> 5) - 320 */
+static inline __m128i hpel_h8(const pixel *p)
+{
+    return _mm_sub_epi16(_mm_srli_epi16(tap6_px16(p, 1, 16 + 320 * 32), 5),
+                         _mm_set1_epi16(320));
+}
+
+static inline __m128i hpel_v8(const pixel *p, int s)
+{
+    return _mm_sub_epi16(_mm_srli_epi16(tap6_px16(p, s, 16 + 320 * 32), 5),
+                         _mm_set1_epi16(320));
+}
+
+/* hpel_hv(): the six horizontal sums biased by K = 10230, widened unsigned;
+ * the vertical taps add up to 32, so the bias leaves as 32 K at the end */
+static inline __m128i hpel_hv8(const pixel *p, int s)
+{
+    enum { K = 10230 };
+    const __m128i z = _mm_setzero_si128();
+    const __m128i a0 = tap6_px16(p - 2 * s, 1, K), a1 = tap6_px16(p - s, 1, K);
+    const __m128i a2 = tap6_px16(p, 1, K), a3 = tap6_px16(p + s, 1, K);
+    const __m128i a4 = tap6_px16(p + 2 * s, 1, K), a5 = tap6_px16(p + 3 * s, 1, K);
+    const __m128i rnd = _mm_set1_epi32(512 - 32 * K);
+    __m128i lo, hi;
+#define LO(v) _mm_unpacklo_epi16(v, z)
+#define HI(v) _mm_unpackhi_epi16(v, z)
+#define M20(v) _mm_add_epi32(_mm_slli_epi32(v, 4), _mm_slli_epi32(v, 2))
+#define M5(v) _mm_add_epi32(_mm_slli_epi32(v, 2), v)
+    lo = _mm_add_epi32(LO(a0), M20(_mm_add_epi32(LO(a2), LO(a3))));
+    lo = _mm_sub_epi32(lo, M5(_mm_add_epi32(LO(a1), LO(a4))));
+    lo = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(lo, LO(a5)), rnd), 10);
+    hi = _mm_add_epi32(HI(a0), M20(_mm_add_epi32(HI(a2), HI(a3))));
+    hi = _mm_sub_epi32(hi, M5(_mm_add_epi32(HI(a1), HI(a4))));
+    hi = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(hi, HI(a5)), rnd), 10);
+#undef LO
+#undef HI
+#undef M20
+#undef M5
+    return _mm_packs_epi32(lo, hi);
+}
+
+static inline void st_hpel8(pixel *d, __m128i v)
+{
+    _mm_storeu_si128((__m128i *)d, _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()),
+                                                 _mm_set1_epi16(PIXEL_MAX)));
+}
 #endif
 
 /* Rows ya..yb (picture coordinates, -AEG_PAD..h+AEG_PAD-1) of one plane.
@@ -272,10 +341,10 @@ void aeg_hpel_plane_rows(pixel *pl, int dstride, const pixel *ref,
     for (y = ys; y <= ye; y++) {
         const pixel *rrow = ref + (ptrdiff_t)y * rstride;
         pixel *orow = pl + (ptrdiff_t)y * dstride;
-#if AEG_SSE2
+#if AEG_SIMD
         /* eight samples per iteration; the tail stays scalar, and every load
-         * above reaches at most three bytes past the last output of the row,
-         * which is inside the picture's padding */
+         * above reaches at most three samples past the last output of the
+         * row, which is inside the picture's padding */
         for (x = x0; x + 7 <= x1; x += 8) {
             __m128i v;
             if (which == 1)
@@ -284,8 +353,7 @@ void aeg_hpel_plane_rows(pixel *pl, int dstride, const pixel *ref,
                 v = hpel_v8(rrow + x, rstride);
             else
                 v = hpel_hv8(rrow + x, rstride);
-            _mm_storel_epi64((__m128i *)(orow + x),
-                             _mm_packus_epi16(v, _mm_setzero_si128()));
+            st_hpel8(orow + x, v);
         }
         for (; x <= x1; x++) {
             const pixel *p = rrow + x;
@@ -406,6 +474,18 @@ void aeg_mc_luma_p(pixel *dst, int dstride, const aeg_mc_ctx *mc,
                                              _mm_cvtsi32_si128(ld32(r2 + x))));
                 x += 4;
             }
+#elif AEG_SIMD
+            /* pavgw: the same average of 16-bit samples */
+            for (x = 0; x + 8 <= w; x += 8)
+                _mm_storeu_si128((__m128i *)(d + x),
+                                 _mm_avg_epu16(_mm_loadu_si128((const __m128i *)(r1 + x)),
+                                               _mm_loadu_si128((const __m128i *)(r2 + x))));
+            if (w - x >= 4) {
+                _mm_storel_epi64((__m128i *)(d + x),
+                                 _mm_avg_epu16(_mm_loadl_epi64((const __m128i *)(r1 + x)),
+                                               _mm_loadl_epi64((const __m128i *)(r2 + x))));
+                x += 4;
+            }
 #endif
             for (; x < w; x++)
                 d[x] = (pixel)((r1[x] + r2[x] + 1) >> 1);
@@ -458,6 +538,35 @@ void aeg_mc_chroma(pixel *dst, int dstride, const pixel *src, int sstride,
                 _mm_storel_epi64((__m128i *)(dst + (size_t)y * dstride), v);
             else
                 st32(dst + (size_t)y * dstride, _mm_cvtsi128_si32(v));
+            a = c;
+            b = d;
+        }
+#undef LDC
+        (void)x;
+        return;
+    }
+#elif AEG_SIMD
+    if (w == 8 || w == 4) {
+        /* 16-bit samples: the weights add up to 64 and 64 * 1023 + 32 < 2^16,
+         * so the four products and the rounding fit unsigned 16-bit lanes */
+        const __m128i wa = _mm_set1_epi16((short)((8 - fx) * (8 - fy)));
+        const __m128i wb = _mm_set1_epi16((short)(fx * (8 - fy)));
+        const __m128i wc = _mm_set1_epi16((short)((8 - fx) * fy));
+        const __m128i wd = _mm_set1_epi16((short)(fx * fy));
+        const __m128i r32 = _mm_set1_epi16(32);
+#define LDC(q) (w == 8 ? _mm_loadu_si128((const __m128i *)(q)) \
+                       : _mm_loadl_epi64((const __m128i *)(q)))
+        __m128i a = LDC(src), b = LDC(src + 1);
+        for (y = 0; y < h; y++) {
+            const pixel *q = src + (size_t)(y + 1) * sstride;
+            __m128i c = LDC(q), d = LDC(q + 1), v;
+            v = _mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(a, wa), _mm_mullo_epi16(b, wb)),
+                              _mm_add_epi16(_mm_mullo_epi16(c, wc), _mm_mullo_epi16(d, wd)));
+            v = _mm_srli_epi16(_mm_add_epi16(v, r32), 6);
+            if (w == 8)
+                _mm_storeu_si128((__m128i *)(dst + (size_t)y * dstride), v);
+            else
+                _mm_storel_epi64((__m128i *)(dst + (size_t)y * dstride), v);
             a = c;
             b = d;
         }
@@ -620,7 +729,7 @@ static void me_pick(const me_rate *rt, const int (*pts)[2], const int *sads,
                     int n, int *best, int *bx, int *by)
 {
     int k = 0, b = *best, x = *bx, y = *by;
-#if AEG_SSE2
+#if AEG_SIMD     /* rate lanes only: the same at both depths */
     if (rt->lambda > 0 && rt->lambda < 32768) {
         const __m128i px = _mm_set1_epi32(rt->px), py = _mm_set1_epi32(rt->py);
         const __m128i one = _mm_set1_epi32(1), lam = _mm_set1_epi32(rt->lambda);

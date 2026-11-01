@@ -266,8 +266,11 @@ unlike x264, whose 10-bit `--qp` counts from QP'Y); CRF and the rate
 controls may go below zero, to -12, which is where 10 bits pay off.
 `--dump-recon` writes 16-bit little-endian samples (`yuv420p10le`).  10-bit
 runs on the CPU only -- the device kernels are 8-bit, so `-b opencl` falls
-back with a warning -- and it has no SIMD yet: 1.5-2.1x the time of the
-8-bit encoder.
+back with a warning.  The SSE2/AVX2 kernels have 16-bit-sample forms (SAD,
+SATD/SA8D, SSD, the 4x4 and 8x8 transforms and quantisers, the half-pel,
+quarter-pel and chroma filters), each bit-exact with the C path, so 10 bits
+cost about what 8 bits do: 0.90-1.11x the 8-bit time at default threads,
+1.15x on one thread (it was 1.5-2.1x and 2.1x without them).
 
 What 10 bits buy on 8-bit sources (the five test clips, preset 3, QP 22-37,
 the decoded stream against the source, PSNR of all three planes in the 8-bit

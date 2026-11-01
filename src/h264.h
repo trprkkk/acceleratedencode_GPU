@@ -364,6 +364,12 @@ int  aeg_cavlc_nc(int nz_left, int nz_top, int have_left, int have_top);
 /* Transform / quantisation                                            */
 /* ------------------------------------------------------------------ */
 void aeg_transform_4x4(const int16_t *res, int stride, dctcoef *coef);
+/* the scalar forms of the 4x4 kernels (the vector ones must match them bit
+ * for bit; tests/simd_check.c compares them at both depths) */
+void aeg_transform_4x4_c(const int16_t *res, int stride, dctcoef *coef);
+void aeg_quant_4x4_c(const dctcoef *coef, dctcoef *level, int qp, int intra);
+void aeg_idct_residual_c(const dctcoef *level, int qp, const int32_t *dc_in,
+                         int16_t *res);
 /* 8x8 (High profile) transform pair.  `res` is eight rows of `stride`; the 64
  * coefficients of `coef`, of `level` and of the residual produced by
  * aeg_idct_8x8_residual() are in raster order (index = y * 8 + x), which is the
