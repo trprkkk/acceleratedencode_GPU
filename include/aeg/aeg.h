@@ -95,7 +95,15 @@ typedef enum aeg_rcmode {
 
 typedef struct aeg_params {
     int width, height;        /* luma dimensions, >= 16, any value      */
-    int fps_num, fps_den;     /* frame rate (e.g. 30/1)                 */
+    int fps_num, fps_den;     /* frame rate (e.g. 30/1, 30000/1001)     */
+    /* Signalled in the SPS (VUI) only; they change no coding decision.
+     * sar_w:sar_h is the sample aspect ratio (0:0 = not signalled);
+     * fullrange 1 = the samples use 0..255 (JPEG/"pc" range), 0 = 16..235;
+     * colorprim / transfer / colormatrix are the H.273 code points (1 =
+     * BT.709, 6 = SMPTE 170M, 9 = BT.2020, ...), -1 = not signalled. */
+    int sar_w, sar_h;
+    int fullrange;
+    int colorprim, transfer, colormatrix;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */

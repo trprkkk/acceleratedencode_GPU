@@ -119,12 +119,42 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
     uint32_t units = (uint32_t)(p->fps_den > 0 ? p->fps_den : 1);
     uint32_t scale = (uint32_t)(p->fps_num > 0 ? p->fps_num * 2 : 60);
 
-    aeg_bw_put(bw, 1, 0);            /* aspect_ratio_info_present_flag      */
+    /* Table E-1: the sample aspect ratios that have an index of their own */
+    static const unsigned char sar_tab[17][2] = {
+        { 0, 0 }, { 1, 1 }, { 12, 11 }, { 10, 11 }, { 16, 11 }, { 40, 33 },
+        { 24, 11 }, { 20, 11 }, { 32, 11 }, { 80, 33 }, { 18, 11 }, { 15, 11 },
+        { 64, 33 }, { 160, 99 }, { 4, 3 }, { 3, 2 }, { 2, 1 } };
+    const int colour = p->colorprim >= 0 || p->transfer >= 0 ||
+                       p->colormatrix >= 0;
+
+    if (p->sar_w > 0 && p->sar_h > 0) {
+        int sw = p->sar_w, sh = p->sar_h, a = sw, b = sh, idc = 255, i;
+        while (b) { int t = a % b; a = b; b = t; }  /* reduce */
+        sw /= a, sh /= a;
+        while (sw > 65535 || sh > 65535)
+            sw = (sw + 1) / 2, sh = (sh + 1) / 2;
+        for (i = 1; i < 17; i++)
+            if (sar_tab[i][0] == sw && sar_tab[i][1] == sh)
+                idc = i;
+        aeg_bw_put(bw, 1, 1);        /* aspect_ratio_info_present_flag      */
+        aeg_bw_put(bw, 8, (uint32_t)idc);
+        if (idc == 255) {            /* Extended_SAR                        */
+            aeg_bw_put(bw, 16, (uint32_t)sw);
+            aeg_bw_put(bw, 16, (uint32_t)sh);
+        }
+    } else {
+        aeg_bw_put(bw, 1, 0);        /* aspect_ratio_info_present_flag      */
+    }
     aeg_bw_put(bw, 1, 0);            /* overscan_info_present_flag          */
     aeg_bw_put(bw, 1, 1);            /* video_signal_type_present_flag      */
     aeg_bw_put(bw, 3, 5);            /* video_format = unspecified          */
-    aeg_bw_put(bw, 1, 0);            /* video_full_range_flag = 0 (TV)      */
-    aeg_bw_put(bw, 1, 0);            /* colour_description_present_flag     */
+    aeg_bw_put(bw, 1, p->fullrange ? 1 : 0); /* video_full_range_flag       */
+    aeg_bw_put(bw, 1, colour ? 1 : 0); /* colour_description_present_flag   */
+    if (colour) {                    /* 2 = unspecified                     */
+        aeg_bw_put(bw, 8, (uint32_t)(p->colorprim >= 0 ? p->colorprim : 2));
+        aeg_bw_put(bw, 8, (uint32_t)(p->transfer >= 0 ? p->transfer : 2));
+        aeg_bw_put(bw, 8, (uint32_t)(p->colormatrix >= 0 ? p->colormatrix : 2));
+    }
     aeg_bw_put(bw, 1, 0);            /* chroma_loc_info_present_flag        */
     aeg_bw_put(bw, 1, 1);            /* timing_info_present_flag            */
     aeg_bw_put(bw, 32, units);       /* num_units_in_tick                   */

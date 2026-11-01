@@ -686,6 +686,53 @@ if command -v "$FF" >/dev/null 2>&1; then
         || FAIL=1
 fi
 
+echo "== input and options"
+# YUV4MPEG2: the header's size, rate and aspect ratio have to give the stream
+# the raw input gives with the same values as options, from a file and from a
+# pipe; then the errors the command line must refuse (exit status 2).
+"$BUILD/genyuv" 96 64 5 "$TMP/io.yuv" 1 >/dev/null
+fs=$((96 * 64 * 3 / 2))
+{
+    printf 'YUV4MPEG2 W96 H64 F30000:1001 Ip A12:11 C420jpeg\n'
+    k=0
+    while [ $k -lt 5 ]; do
+        printf 'FRAME\n'
+        dd if="$TMP/io.yuv" bs=$fs skip=$k count=1 2>/dev/null
+        k=$((k + 1))
+    done
+} > "$TMP/io.y4m"
+$BUILD/aegenc -i "$TMP/io.y4m" -o "$TMP/io1.264" -v 0 &&
+    $BUILD/aegenc -o "$TMP/io2.264" -v 0 < "$TMP/io.y4m" &&
+    $BUILD/aegenc -w 96 -h 64 --fps 30000/1001 --sar 12:11 -i "$TMP/io.yuv" \
+        -o "$TMP/io3.264" -v 0 || { echo "   y4m: encode failed"; FAIL=1; }
+if cmp -s "$TMP/io1.264" "$TMP/io2.264" && cmp -s "$TMP/io1.264" "$TMP/io3.264"; then
+    echo "   y4m file = y4m pipe = raw input with --fps/--sar"
+else
+    echo "   y4m: streams differ  FAIL"; FAIL=1
+fi
+head -c $((fs * 2 + 100)) "$TMP/io.yuv" > "$TMP/io_part.yuv"
+if $BUILD/aegenc -w 96 -h 64 -i "$TMP/io_part.yuv" -o "$TMP/io4.264" -v 0 \
+        2>"$TMP/io4.err" && grep -q "partial frame" "$TMP/io4.err"; then
+    echo "   a partial last frame is reported and dropped"
+else
+    echo "   partial frame: not reported  FAIL"; FAIL=1
+fi
+bad=0
+for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
+            "-w 96 -h 64 --bframes 4" "-w 96 -h 64 --ref 3" "-w 96 -h 64 -p 5" \
+            "-w 96 -h 64 --fps 0" "-w 96 -h 64 --sar 4" "-w 96 -h 64 --direct x" \
+            "-w 96 -h 64 --colorprim nope" "-w 64 -h 64 --demuxer y4m" \
+            "--nonsense"; do
+    # shellcheck disable=SC2086
+    rc=0
+    $BUILD/aegenc $args -i "$TMP/io.y4m" -o "$TMP/io5.264" -v 0 \
+        >/dev/null 2>&1 </dev/null || rc=$?
+    if [ $rc -ne 2 ] && [ $rc -ne 1 ]; then
+        echo "   '$args' was accepted (exit $rc)  FAIL"; bad=1
+    fi
+done
+if [ $bad = 0 ]; then echo "   13 malformed command lines refused"; else FAIL=1; fi
+
 echo "== device enumeration"
 $BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 

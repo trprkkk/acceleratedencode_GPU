@@ -3,9 +3,11 @@
  *
  *   aegenc -w 1280 -h 720 -q 23 -i in.yuv -o out.264
  *
- * Input is raw I420 (YUV 4:2:0, 8 bit, planar); output is an H.264 Annex-B
- * elementary stream.
+ * Input is raw I420 (YUV 4:2:0, 8 bit, planar) or YUV4MPEG2 (.y4m, the same
+ * samples with a header that carries the size, frame rate and aspect ratio);
+ * output is an H.264 Annex-B elementary stream.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -19,13 +21,26 @@ static void usage(void)
 "aegenc - software H.264 encoder with CUDA/OpenCL accelerated stages\n"
 "\n"
 "usage: aegenc -w W -h H [-i in.yuv] [-o out.264] [options]\n"
+"       aegenc -i in.y4m [-o out.264] [options]\n"
 "\n"
 "  -w, -h <int>     frame size, any even size (coded as whole macroblocks\n"
-"                   and cropped back in the SPS)\n"
-"  -i <file>        input raw I420 stream (default: stdin)\n"
+"                   and cropped back in the SPS); a .y4m input carries it\n"
+"  -i <file>        input: raw I420, or YUV4MPEG2 (recognised by its\n"
+"                   header, also on stdin; default: stdin)\n"
+"  --demuxer <fmt>  auto (default) | raw | y4m\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
-"  -f <int>         frame rate (default 30)\n"
+"  -f, --fps <r>    frame rate: 25, 30000/1001 or 29.97 (default 30, or\n"
+"                   the .y4m header's)\n"
+"  --sar <w:h>      sample aspect ratio to signal (default: none, or the\n"
+"                   .y4m header's)\n"
+"  --fullrange      the samples are full range 0..255 (signalled in the VUI)\n"
+"  --colorprim <c>  colour primaries to signal: bt709 bt470m bt470bg\n"
+"                   smpte170m smpte240m film bt2020, or the H.273 number\n"
+"  --transfer <t>   transfer: bt709 bt470m bt470bg smpte170m smpte240m\n"
+"                   linear srgb bt2020-10 bt2020-12 smpte2084 arib-std-b67\n"
+"  --colormatrix <m> matrix: gbr bt709 fcc bt470bg smpte170m smpte240m\n"
+"                   ycgco bt2020nc bt2020c\n"
 "  -g <int>         GOP size, 0 = only the first frame is IDR (default 250)\n"
 "  --scenecut <pct> insert an IDR when a scene change is detected (0 = off,\n"
 "                   default 120: inter prediction 20%% worse than intra)\n"
@@ -106,6 +121,209 @@ static void usage(void)
 "  --bench          encode three times (auto/cpu/accelerator) and report\n"
 "\n"
 "Exit status: 0 on success.\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Option values                                                       */
+/* ------------------------------------------------------------------ */
+static char *next_arg(int argc, char **argv, int *i)
+{
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "error: option '%s' needs a value\n", argv[*i]);
+        exit(2);
+    }
+    return argv[++*i];
+}
+
+static int int_arg(const char *opt, const char *v)
+{
+    char *end;
+    long n = strtol(v, &end, 10);
+    if (end == v || *end || n < -1000000000L || n > 1000000000L) {
+        fprintf(stderr, "error: option '%s': '%s' is not a number\n", opt, v);
+        exit(2);
+    }
+    return (int)n;
+}
+
+/* 25, 30000/1001, 29.97 (an NTSC-style decimal becomes n*1000/1001) */
+static int parse_rate(const char *v, int *num, int *den)
+{
+    char *end;
+    double f;
+    long a, b;
+    if (strchr(v, '/') || strchr(v, ':')) {
+        a = strtol(v, &end, 10);
+        if (end == v || (*end != '/' && *end != ':'))
+            return -1;
+        b = strtol(end + 1, &end, 10);
+        if (*end || a <= 0 || b <= 0 || a > 1000000000L || b > 1000000000L)
+            return -1;
+        *num = (int)a, *den = (int)b;
+        return 0;
+    }
+    f = strtod(v, &end);
+    if (end == v || *end || !(f > 0) || f > 1000000)
+        return -1;
+    if (fabs(f - floor(f + 0.5)) < 1e-9) {
+        *num = (int)floor(f + 0.5), *den = 1;
+    } else if (fabs(f * 1001.0 / 1000.0 - floor(f * 1001.0 / 1000.0 + 0.5)) < 0.01) {
+        *num = (int)floor(f * 1001.0 / 1000.0 + 0.5) * 1000, *den = 1001;
+    } else {
+        *num = (int)floor(f * 1000.0 + 0.5), *den = 1000;
+    }
+    return 0;
+}
+
+/* an H.273 code point by name or number, -1 = unknown */
+static int parse_colour(const char *v, const char *const *names,
+                        const int *codes, int n)
+{
+    char *end;
+    long c;
+    int i;
+    for (i = 0; i < n; i++)
+        if (!strcmp(v, names[i]))
+            return codes[i];
+    c = strtol(v, &end, 10);
+    return (end != v && !*end && c >= 0 && c <= 255) ? (int)c : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Input: raw I420 or YUV4MPEG2                                        */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    FILE *f;
+    int y4m;
+    unsigned char peek[16];
+    int npeek, ppeek;
+    /* from a .y4m header (0 = not given) */
+    int w, h, fps_num, fps_den, sar_w, sar_h, fullrange;
+} input_t;
+
+static size_t in_read(input_t *in, void *buf, size_t n)
+{
+    size_t got = 0;
+    unsigned char *b = (unsigned char *)buf;
+    while (got < n && in->ppeek < in->npeek)
+        b[got++] = in->peek[in->ppeek++];
+    if (got < n)
+        got += fread(b + got, 1, n - got, in->f);
+    return got;
+}
+
+/* one header line (without its '\n'); -1 at the end of the input */
+static int in_line(input_t *in, char *line, int cap)
+{
+    int n = 0;
+    unsigned char c;
+    for (;;) {
+        if (in_read(in, &c, 1) != 1)
+            return n ? n : -1;
+        if (c == '\n')
+            break;
+        if (n < cap - 1)
+            line[n++] = (char)c;
+    }
+    line[n] = 0;
+    return n;
+}
+
+/* force: 0 auto, 1 raw, 2 y4m */
+static int in_open(input_t *in, FILE *f, int force)
+{
+    char line[1024], *tok, *save = NULL;
+    memset(in, 0, sizeof(*in));
+    in->f = f;
+    in->npeek = (int)fread(in->peek, 1, 9, f);
+    if (force == 1 || in->npeek < 9 || memcmp(in->peek, "YUV4MPEG2", 9)) {
+        if (force == 2) {
+            fprintf(stderr, "error: the input is not YUV4MPEG2\n");
+            return -1;
+        }
+        return 0;
+    }
+    in->y4m = 1;
+    in->ppeek = 9;
+    if (in_line(in, line, sizeof(line)) < 0) {
+        fprintf(stderr, "error: truncated YUV4MPEG2 header\n");
+        return -1;
+    }
+    for (tok = strtok_r(line, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+        switch (tok[0]) {
+        case 'W': in->w = atoi(tok + 1); break;
+        case 'H': in->h = atoi(tok + 1); break;
+        case 'F':
+            if (parse_rate(tok + 1, &in->fps_num, &in->fps_den) < 0)
+                in->fps_num = in->fps_den = 0;
+            break;
+        case 'A':
+            if (sscanf(tok + 1, "%d:%d", &in->sar_w, &in->sar_h) != 2 ||
+                in->sar_w <= 0 || in->sar_h <= 0)
+                in->sar_w = in->sar_h = 0;
+            break;
+        case 'I':
+            if (tok[1] != 'p' && tok[1] != '?')
+                fprintf(stderr, "warning: interlaced YUV4MPEG2 input (I%c) is "
+                                "coded as progressive frames\n", tok[1]);
+            break;
+        case 'C':
+            if (strncmp(tok + 1, "420", 3) ||
+                (tok[4] && strcmp(tok + 4, "jpeg") && strcmp(tok + 4, "paldv") &&
+                 strcmp(tok + 4, "mpeg2"))) {
+                fprintf(stderr, "error: YUV4MPEG2 colour space '%s': only 8-bit "
+                                "4:2:0 is supported\n", tok + 1);
+                return -1;
+            }
+            break;
+        case 'X':
+            if (!strcmp(tok, "XCOLORRANGE=FULL"))
+                in->fullrange = 1;
+            break;
+        default:
+            break;
+        }
+    }
+    if (in->w <= 0 || in->h <= 0) {
+        fprintf(stderr, "error: YUV4MPEG2 header without a frame size\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* 1 = a frame, 0 = the end, -1 = a damaged or partial frame at the end */
+static int in_frame(input_t *in, uint8_t *frame, size_t fsize)
+{
+    size_t got;
+    if (in->y4m) {
+        char line[256];
+        int n = in_line(in, line, sizeof(line));
+        if (n < 0)
+            return 0;
+        if (strncmp(line, "FRAME", 5)) {
+            fprintf(stderr, "warning: YUV4MPEG2 frame header missing; input "
+                            "stops here\n");
+            return -1;
+        }
+    }
+    got = in_read(in, frame, fsize);
+    if (got == fsize)
+        return 1;
+    if (got > 0) {
+        fprintf(stderr, "warning: the input ends with a partial frame (%zu of "
+                        "%zu bytes); it is not coded\n", got, fsize);
+        return -1;
+    }
+    return 0;
+}
+
+/* a set option outside its range is an error, not a silent clamp */
+static int range_bad(const char *opt, int v, int lo, int hi)
+{
+    if (v >= lo && v <= hi)
+        return 0;
+    fprintf(stderr, "error: %s %d is out of range (%d..%d)\n", opt, v, lo, hi);
+    return 1;
 }
 
 static int parse_backend(const char *s)
@@ -233,7 +451,11 @@ int main(int argc, char **argv)
     aeg_params p;
     aeg_encoder *enc;
     FILE *in = stdin, *out = stdout;
-    int width = 0, height = 0, qp = 23, fps = 30, gop = 250, max_frames = 0;
+    int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
+    int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
+    int fullrange = 0, demux = 0;
+    double fps;
+    input_t inp;
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
@@ -257,53 +479,109 @@ int main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "-w")) width = atoi(argv[++i]);
-        else if (!strcmp(a, "-h")) height = atoi(argv[++i]);
-        else if (!strcmp(a, "-i")) inpath = argv[++i];
-        else if (!strcmp(a, "-o")) outpath = argv[++i];
-        else if (!strcmp(a, "-q")) qp = atoi(argv[++i]);
-        else if (!strcmp(a, "-f")) fps = atoi(argv[++i]);
-        else if (!strcmp(a, "-g")) gop = atoi(argv[++i]);
-        else if (!strcmp(a, "-n")) max_frames = atoi(argv[++i]);
-        else if (!strcmp(a, "-b")) backend = parse_backend(argv[++i]);
-        else if (!strcmp(a, "-p")) p.preset = atoi(argv[++i]);
-        else if (!strcmp(a, "--slices")) p.slices = atoi(argv[++i]);
+        if (!strcmp(a, "-w")) width = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-h")) height = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-i")) inpath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "-o")) outpath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "-q")) qp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-f") || !strcmp(a, "--fps")) {
+            const char *v = next_arg(argc, argv, &i);
+            if (parse_rate(v, &fps_num, &fps_den) < 0) {
+                fprintf(stderr, "error: bad frame rate '%s'\n", v);
+                return 2;
+            }
+            fps_set = 1;
+        }
+        else if (!strcmp(a, "--sar")) {
+            const char *v = next_arg(argc, argv, &i);
+            if (sscanf(v, "%d:%d", &sar_w, &sar_h) != 2 || sar_w <= 0 ||
+                sar_h <= 0) {
+                fprintf(stderr, "error: bad --sar '%s' (want W:H)\n", v);
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "--fullrange")) fullrange = 1;
+        else if (!strcmp(a, "--colorprim") || !strcmp(a, "--transfer") ||
+                 !strcmp(a, "--colormatrix")) {
+            static const char *const pn[] = { "bt709", "bt470m", "bt470bg",
+                "smpte170m", "smpte240m", "film", "bt2020" };
+            static const int pc[] = { 1, 4, 5, 6, 7, 8, 9 };
+            static const char *const tn[] = { "bt709", "bt470m", "bt470bg",
+                "smpte170m", "smpte240m", "linear", "srgb", "iec61966-2-1",
+                "bt2020-10", "bt2020-12", "smpte2084", "arib-std-b67" };
+            static const int tc[] = { 1, 4, 5, 6, 7, 8, 13, 13, 14, 15, 16, 18 };
+            static const char *const mn[] = { "gbr", "bt709", "fcc", "bt470bg",
+                "smpte170m", "smpte240m", "ycgco", "bt2020nc", "bt2020c" };
+            static const int mc[] = { 0, 1, 4, 5, 6, 7, 8, 9, 10 };
+            const char *v = next_arg(argc, argv, &i);
+            const int prim = !strcmp(a, "--colorprim");
+            const int trc = !strcmp(a, "--transfer");
+            int c = prim ? parse_colour(v, pn, pc, 7)
+                         : trc ? parse_colour(v, tn, tc, 12)
+                               : parse_colour(v, mn, mc, 9);
+            if (c < 0) {
+                fprintf(stderr, "error: option '%s': unknown value '%s'\n", a, v);
+                return 2;
+            }
+            if (prim) p.colorprim = c;
+            else if (trc) p.transfer = c;
+            else p.colormatrix = c;
+        }
+        else if (!strcmp(a, "--demuxer")) {
+            const char *v = next_arg(argc, argv, &i);
+            demux = !strcmp(v, "raw") ? 1 : !strcmp(v, "y4m") ? 2 :
+                    !strcmp(v, "auto") ? 0 : -1;
+            if (demux < 0) {
+                fprintf(stderr, "error: --demuxer auto|raw|y4m\n");
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "-g")) gop = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-n")) max_frames = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-b")) backend = parse_backend(next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-p")) p.preset = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--slices")) p.slices = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
-            p.threads = atoi(argv[++i]);
+            p.threads = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--frame-threads"))
-            p.frame_threads = atoi(argv[++i]);
-        else if (!strcmp(a, "--scenecut")) p.scenecut = atoi(argv[++i]);
-        else if (!strcmp(a, "--pass")) pass = atoi(argv[++i]);
-        else if (!strcmp(a, "--qcomp")) qcomp = atoi(argv[++i]);
+            p.frame_threads = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--scenecut")) p.scenecut = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--pass")) pass = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--qcomp")) qcomp = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--stats")) {
-            snprintf(stats_path, sizeof(stats_path), "%s", argv[++i]);
+            snprintf(stats_path, sizeof(stats_path), "%s", next_arg(argc, argv, &i));
             stats_path[0] = stats_path[0];      /* keep -Wall quiet */
         }
         else if (!strcmp(a, "--vbv-maxrate"))
-            p.vbv_maxrate_kbps = atoi(argv[++i]);
+            p.vbv_maxrate_kbps = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--vbv-bufsize"))
-            p.vbv_bufsize_kbits = atoi(argv[++i]);
-        else if (!strcmp(a, "-v")) verbose = atoi(argv[++i]);
-        else if (!strcmp(a, "--range")) range = atoi(argv[++i]);
-        else if (!strcmp(a, "--subme")) subme = atoi(argv[++i]);
-        else if (!strcmp(a, "--refine-mv")) refine_mv = atoi(argv[++i]);
-        else if (!strcmp(a, "--refine-cand")) refine_cand = atoi(argv[++i]);
-        else if (!strcmp(a, "--ref")) refs = atoi(argv[++i]);
-        else if (!strcmp(a, "--weightp")) weightp = atoi(argv[++i]);
-        else if (!strcmp(a, "--b-pyramid")) bpyramid = atoi(argv[++i]);
-        else if (!strcmp(a, "--mbtree")) mbtree = atoi(argv[++i]);
-        else if (!strcmp(a, "--rc-lookahead")) rclookahead = atoi(argv[++i]);
-        else if (!strcmp(a, "--bframes")) bframes = atoi(argv[++i]);
-        else if (!strcmp(a, "--bqp")) bqp = atoi(argv[++i]);
-        else if (!strcmp(a, "--iqp")) iqp = atoi(argv[++i]);
+            p.vbv_bufsize_kbits = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-v")) verbose = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--range")) range = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--subme")) subme = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--refine-mv")) refine_mv = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--refine-cand")) refine_cand = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--ref")) refs = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--weightp")) weightp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--b-pyramid")) bpyramid = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--mbtree")) mbtree = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--rc-lookahead")) rclookahead = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--bframes")) bframes = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--bqp")) bqp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--iqp")) iqp = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--direct")) {
-            const char *v = argv[++i];
-            direct = !strcmp(v, "spatial") ? 1 : (!strcmp(v, "temporal") ? 0 : atoi(v));
+            const char *v = next_arg(argc, argv, &i);
+            direct = !strcmp(v, "spatial") || !strcmp(v, "1") ? 1 :
+                     !strcmp(v, "temporal") || !strcmp(v, "0") ? 0 : -1;
+            if (direct < 0) {
+                fprintf(stderr, "error: --direct spatial|temporal\n");
+                return 2;
+            }
         }
-        else if (!strcmp(a, "--trellis")) trellis = atoi(argv[++i]);
-        else if (!strcmp(a, "--partitions")) partitions = atoi(argv[++i]);
-        else if (!strcmp(a, "--bitrate")) bitrate = atoi(argv[++i]);
-        else if (!strcmp(a, "--aq")) aq = atoi(argv[++i]);
+        else if (!strcmp(a, "--trellis")) trellis = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--partitions")) partitions = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--bitrate")) bitrate = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--aq")) aq = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--no-8x8dct")) p.transform_8x8 = 0;
         else if (!strcmp(a, "--no-cabac")) p.cabac = 0;
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
@@ -313,12 +591,12 @@ int main(int argc, char **argv)
             printf("calibration: %s\n", r == 0 ? "ok" : "accelerator unavailable");
             return r == 0 ? 0 : 1;
         } else if (!strcmp(a, "--bench")) bench = 1;
-        else if (!strcmp(a, "--dump-recon")) dumppath = argv[++i];
-        else if (!strcmp(a, "--dump-order")) orderpath = argv[++i];
-        else if (!strcmp(a, "--b-adapt")) badapt = atoi(argv[++i]);
+        else if (!strcmp(a, "--dump-recon")) dumppath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "--dump-order")) orderpath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "--b-adapt")) badapt = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-s")) {
             char *eq;
-            char *arg = argv[++i];
+            char *arg = next_arg(argc, argv, &i);
             int stg;
             eq = strchr(arg, '=');
             if (!eq) { fprintf(stderr, "bad -s argument\n"); return 2; }
@@ -334,8 +612,64 @@ int main(int argc, char **argv)
         }
     }
 
+    {
+        int bad = 0;
+        bad |= range_bad("-q", qp, 0, 51);
+        bad |= range_bad("-p", p.preset, 0, 4);
+        bad |= range_bad("-g", gop, 0, 1 << 30);
+        bad |= range_bad("-n", max_frames, 0, 1 << 30);
+        bad |= range_bad("--slices", p.slices, 0, 1024);
+        bad |= range_bad("-t", p.threads, 0, 256);
+        bad |= range_bad("--frame-threads", p.frame_threads, 0, 8);
+        bad |= range_bad("--scenecut", p.scenecut, 0, 10000);
+        bad |= range_bad("--pass", pass, 0, 2);
+        bad |= range_bad("--qcomp", qcomp, 0, 100);
+        bad |= range_bad("--bitrate", bitrate, 0, 2000000);
+        bad |= range_bad("--vbv-maxrate", p.vbv_maxrate_kbps, 0, 2000000);
+        bad |= range_bad("--vbv-bufsize", p.vbv_bufsize_kbits, 0, 2000000);
+        bad |= range_bad("-v", verbose, 0, 3);
+        if (aq >= 0) bad |= range_bad("--aq", aq, 0, 30);
+        if (range) bad |= range_bad("--range", range, 1, 512);
+        if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
+        if (refine_mv >= 0) bad |= range_bad("--refine-mv", refine_mv, 0, 3);
+        if (refine_cand >= 0) bad |= range_bad("--refine-cand", refine_cand, 0, 1);
+        if (refs >= 0) bad |= range_bad("--ref", refs, 1, 2);
+        if (weightp >= 0) bad |= range_bad("--weightp", weightp, 0, 1);
+        if (bpyramid >= 0) bad |= range_bad("--b-pyramid", bpyramid, 0, 1);
+        if (mbtree >= 0) bad |= range_bad("--mbtree", mbtree, 0, 1);
+        if (rclookahead >= 0) bad |= range_bad("--rc-lookahead", rclookahead, 0, 60);
+        if (bframes >= 0) bad |= range_bad("--bframes", bframes, 0, 3);
+        if (badapt >= 0) bad |= range_bad("--b-adapt", badapt, 0, 2);
+        if (bqp > -1000) bad |= range_bad("--bqp", bqp, -51, 51);
+        if (iqp > -1000) bad |= range_bad("--iqp", iqp, -51, 51);
+        if (trellis >= 0) bad |= range_bad("--trellis", trellis, 0, 1);
+        if (partitions >= 0) bad |= range_bad("--partitions", partitions, 0, 31);
+        if (bad)
+            return 2;
+    }
+    if (inpath) {
+        in = fopen(inpath, "rb");
+        if (!in) { perror(inpath); return 1; }
+    }
+    if (in_open(&inp, in, demux) < 0)
+        return 1;
+    if (inp.y4m) {
+        if ((width && width != inp.w) || (height && height != inp.h)) {
+            fprintf(stderr, "error: -w/-h %dx%d contradict the YUV4MPEG2 "
+                            "header's %dx%d\n", width, height, inp.w, inp.h);
+            return 2;
+        }
+        width = inp.w, height = inp.h;
+        if (!fps_set && inp.fps_num > 0)
+            fps_num = inp.fps_num, fps_den = inp.fps_den;
+        if (!sar_w && inp.sar_w > 0)
+            sar_w = inp.sar_w, sar_h = inp.sar_h;
+        if (inp.fullrange)
+            fullrange = 1;
+    }
+    fps = (double)fps_num / (double)fps_den;
     if (!width || !height) {
-        fprintf(stderr, "error: -w and -h are required\n");
+        fprintf(stderr, "error: -w and -h are required (or a .y4m input)\n");
         return 2;
     }
     if (width < 2 || height < 2 || (width & 1) || (height & 1) ||
@@ -344,10 +678,6 @@ int main(int argc, char **argv)
                         "(4:2:0 is cropped in units of two samples)\n",
                 width, height);
         return 2;
-    }
-    if (inpath) {
-        in = fopen(inpath, "rb");
-        if (!in) { perror(inpath); return 1; }
     }
     if (outpath) {
         out = fopen(outpath, "wb");
@@ -412,8 +742,11 @@ int main(int argc, char **argv)
     p.width = width;
     p.height = height;
     p.qp = qp;
-    p.fps_num = fps;
-    p.fps_den = 1;
+    p.fps_num = fps_num;
+    p.fps_den = fps_den;
+    p.sar_w = sar_w;
+    p.sar_h = sar_h;
+    p.fullrange = fullrange;
     p.gop_size = gop;
     p.bitrate_kbps = bitrate;
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
@@ -461,7 +794,10 @@ int main(int argc, char **argv)
             q.backend = be[k];
             e = aeg_encoder_open(&q);
             if (!e) { fprintf(stderr, "open failed\n"); return 1; }
-            fseek(in, 0, SEEK_SET);
+            if (fseek(in, 0, SEEK_SET) != 0 || in_open(&inp, in, demux) < 0) {
+                fprintf(stderr, "--bench needs a seekable input file\n");
+                return 1;
+            }
             t0 = aeg_now_ns();
             /* A picture is fed per iteration and counted per iteration, not
              * per packet: with B pictures the first `bframes` pictures produce
@@ -472,7 +808,7 @@ int main(int argc, char **argv)
                 int r;
                 if (max_frames && n >= max_frames)
                     break;
-                if (fread(frame, 1, fsize, in) != fsize)
+                if (in_frame(&inp, frame, fsize) != 1)
                     break;
                 r = aeg_encoder_encode(e, frame, fsize, pts++, &pkt);
                 n++;
@@ -524,7 +860,7 @@ int main(int argc, char **argv)
             }
             pass2_bias(pass1_bits, pass1_n, qcomp, bias_of_frame);
         }
-        while (fread(frame, 1, fsize, in) == fsize) {
+        while (in_frame(&inp, frame, fsize) == 1) {
             aeg_packet pkt;
             int r;
 
@@ -626,7 +962,7 @@ int main(int argc, char **argv)
                         printf(" %s %" PRId64, names[k], st.mb_types[k]);
                 printf("\n");
             }
-            printf("bitrate %.1f kb/s at %d fps, PSNR %.2f dB (Y+U+V average)\n",
+            printf("bitrate %.1f kb/s at %g fps, PSNR %.2f dB (Y+U+V average)\n",
                    st.frames > 0
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0
                        : 0.0,
