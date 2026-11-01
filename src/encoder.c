@@ -109,6 +109,7 @@ typedef struct mbenc {
 #define AEG_MAX_LOOKAHEAD 60
 #define AEG_RING (2 * AEG_MAX_BFRAMES + 6 + AEG_MAX_LOOKAHEAD)
 #define LA_CACHE 512
+#define LA_SF 8      /* lookahead search fields kept per ring slot */
 typedef struct {
     int     type;
     int     nparts;
@@ -393,6 +394,13 @@ struct aeg_encoder {
     int64_t *in_pts;
     aeg_lowres in_low[AEG_RING];   /* b_adapt / mbtree: lowres of the ring */
     int *la_scratch;
+    /* the lookahead's per-picture fields (la_field): the intra estimate of
+     * the picture in each ring slot, and its searches against up to LA_SF
+     * references, tagged with display numbers */
+    struct la_sfield { int d, r, age; int *f; } la_sf[AEG_RING][LA_SF];
+    int la_icost_d[AEG_RING];
+    int *la_icost[AEG_RING];
+    int la_age;
     /* lookahead costs already computed, keyed by display indices (the
      * window slides by a group, so most are reused) */
     struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
@@ -10092,13 +10100,76 @@ static int la_bias(void)
     return v;
 }
 
+/* The intra estimate of display picture d, computed once per picture. */
+static const int *la_intra(struct aeg_encoder *e, int d)
+{
+    int s = d % in_slots(e);
+
+    if (!e->la_icost[s]) {
+        e->la_icost[s] = (int *)aeg_alloc(sizeof(int) * (size_t)e->mb_count);
+        e->la_icost_d[s] = -1;
+        if (!e->la_icost[s])
+            return NULL;
+    }
+    if (e->la_icost_d[s] != d) {
+        aeg_lowres_intra(&e->in_low[s], e->la_icost[s]);
+        e->la_icost_d[s] = d;
+    }
+    return e->la_icost[s];
+}
+
+/* The search field of display picture d against display picture r (vectors
+ * at f, costs at f + 2 * mb_count), computed once per pair while d is in the
+ * ring: the group decision prices the same pair inside several (p0, p1, b)
+ * estimates and the macroblock tree again, 36 % repeats on cock.  An entry
+ * of a picture that left the ring is reused first, then the oldest. */
+static const int *la_field(struct aeg_encoder *e, int d, int r)
+{
+    int slots = in_slots(e), s = d % slots, i, v = 0;
+    struct la_sfield *t = e->la_sf[s];
+
+    for (i = 0; i < LA_SF; i++)
+        if (t[i].f && t[i].d == d && t[i].r == r) {
+            t[i].age = ++e->la_age;
+            return t[i].f;
+        }
+    for (i = 1; i < LA_SF; i++) {
+        int sv = t[v].f && t[v].d == d, si = t[i].f && t[i].d == d;
+        if (!t[i].f) { v = i; break; }
+        if (sv > si || (sv == si && t[i].age < t[v].age))
+            v = i;
+    }
+    if (!t[v].f) {
+        t[v].f = (int *)aeg_alloc(sizeof(int) * 3 * (size_t)e->mb_count);
+        if (!t[v].f)
+            return NULL;
+    }
+    aeg_lowres_search(&e->in_low[s], &e->in_low[r % slots], t[v].f,
+                      t[v].f + 2 * e->mb_count);
+    t[v].d = d;
+    t[v].r = r;
+    t[v].age = ++e->la_age;
+    return t[v].f;
+}
+
 static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
                        int *intra)
 {
-    int slots = in_slots(e);
-    int64_t c = aeg_lowres_cost(&e->in_low[b % slots], &e->in_low[p0 % slots],
-                                p1 != b ? &e->in_low[p1 % slots] : NULL, intra,
-                                e->la_scratch);
+    int slots = in_slots(e), n = e->mb_count;
+    const int *ic = la_intra(e, b), *f0 = la_field(e, b, p0);
+    const int *f1 = p1 != b ? la_field(e, b, p1) : NULL;
+    int64_t c;
+
+    if (!ic || !f0 || (p1 != b && !f1))
+        c = aeg_lowres_cost(&e->in_low[b % slots], &e->in_low[p0 % slots],
+                            p1 != b ? &e->in_low[p1 % slots] : NULL, intra,
+                            e->la_scratch);
+    else
+        c = aeg_lowres_cost_fields(&e->in_low[b % slots],
+                                   &e->in_low[p0 % slots],
+                                   f1 ? &e->in_low[p1 % slots] : NULL, ic,
+                                   f0, f0 + 2 * n, f1, f1 ? f1 + 2 * n : NULL,
+                                   intra);
 
     /* a B picture is coded at a coarser quantiser and nothing predicts from
      * it; x264 discounts its estimate by the same 1/1.2 */
@@ -10331,11 +10402,21 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
 
         memset(m->prop, 0, sizeof(float) * (size_t)nmb);
         if (m->d != pl[k].d || m->p0 != pl[k].r0 || m->p1 != pl[k].r1) {
-            aeg_lowres_mbcosts(&e->in_low[pl[k].d % slots],
-                               pl[k].r0 >= 0 ? &e->in_low[pl[k].r0 % slots] : NULL,
-                               pl[k].r1 >= 0 ? &e->in_low[pl[k].r1 % slots] : NULL,
-                               m->intra, m->inter, m->kind, m->mv,
-                               e->la_scratch);
+            int d = pl[k].d, r0 = pl[k].r0, r1 = pl[k].r1;
+            const aeg_lowres *l0 = r0 >= 0 ? &e->in_low[r0 % slots] : NULL;
+            const aeg_lowres *l1 = r1 >= 0 ? &e->in_low[r1 % slots] : NULL;
+            const int *ic = la_intra(e, d);
+            const int *f0 = r0 >= 0 ? la_field(e, d, r0) : NULL;
+            const int *f1 = r1 >= 0 ? la_field(e, d, r1) : NULL;
+
+            if (!ic || (r0 >= 0 && !f0) || (r1 >= 0 && !f1))
+                aeg_lowres_mbcosts(&e->in_low[d % slots], l0, l1, m->intra,
+                                   m->inter, m->kind, m->mv, e->la_scratch);
+            else
+                aeg_lowres_mbcosts_fields(&e->in_low[d % slots], l0, l1, ic,
+                                          f0, f0 ? f0 + 2 * nmb : NULL,
+                                          f1, f1 ? f1 + 2 * nmb : NULL,
+                                          m->intra, m->inter, m->kind, m->mv);
             m->d = pl[k].d;
             m->p0 = pl[k].r0;
             m->p1 = pl[k].r1;
@@ -11797,8 +11878,13 @@ void aeg_encoder_close(aeg_encoder *enc)
         int i;
         for (i = 0; i < (int)(sizeof(e->in_mem) / sizeof(e->in_mem[0])); i++)
             aeg_free(e->in_mem[i]);
-        for (i = 0; i < AEG_RING; i++)
+        for (i = 0; i < AEG_RING; i++) {
+            int j;
             aeg_lowres_free(&e->in_low[i]);
+            aeg_free(e->la_icost[i]);
+            for (j = 0; j < LA_SF; j++)
+                aeg_free(e->la_sf[i][j].f);
+        }
         aeg_free(e->la_scratch);
         for (i = 0; i < AEG_NPIC; i++) {
             aeg_free(e->pic_mem[i]);

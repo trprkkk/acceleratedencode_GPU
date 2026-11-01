@@ -619,6 +619,23 @@ int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
 void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
                         const aeg_lowres *r1, int *intra, int *inter,
                         uint8_t *kind, int *mv, int *scratch);
+/* The same two estimates assembled from per-picture fields the caller keeps:
+ * the intra estimate of every block (aeg_lowres_intra, 1 int per macroblock)
+ * and the search of every block against one reference (aeg_lowres_search:
+ * 2 ints of vector and 1 of cost per macroblock), which depends on the
+ * (picture, reference) pair only.  Identical results. */
+void aeg_lowres_intra(const aeg_lowres *cur, int *icost);
+void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
+                       int *cost);
+int64_t aeg_lowres_cost_fields(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1, int *intra_mbs);
+void aeg_lowres_mbcosts_fields(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1,
+                               int *intra, int *inter, uint8_t *kind, int *mv);
 
 void *aeg_alloc(size_t size);        /* zeroed, 32-byte aligned            */
 void *aeg_alloc_aligned(size_t size, size_t align);
