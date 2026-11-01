@@ -66,9 +66,23 @@ varies between sessions, so the builds are timed back to back): preset 3
 4 12.0 / 21.5 fps, against 10.5 / 17.6 and 9.0 / 17.0 for 42f1f92 before the
 speed round.  The speed round itself cost +0.0 % BD-rate at preset 3 and
 +0.085 % at preset 4; part of the time it bought at presets 2-3 was then spent
-on chroma in the mode decision (-0.5 to -0.7 %, see `docs/STATUS.md`).  The
-speed figures in the quoted text above are from an earlier, smaller test
-clip.
+on chroma in the mode decision (-0.5 to -0.7 %, see `docs/STATUS.md`).
+Caching the lookahead's per-picture search fields then took another 6-7 %
+off with the same stream (`11366da`; in that session's sandbox preset 3
+3.79 -> 3.52 s with frame threads, 25.6 fps).  The speed figures in the quoted
+text above are from an earlier, smaller test clip.
+
+**GPU groundwork without a GPU** (all on PoCL, every stream byte-identical to
+the CPU encoder's): a fused forward+inverse coefficient kernel for presets 0-2
+and CAVLC (`tq_iq_batch`, -14 % on the batch paths); Intra_16x16 and chroma
+in the coefficient batch (`tq_dc_batch` / `iq_dc_batch`: two calls per
+macroblock instead of 16-32); and *device lanes* -- a device instance per
+frame thread and slice thread (OpenCL: own queue, kernels and buffers on a
+shared context and program; CUDA: own buffers on a shared context and
+module), so frame threads now run with a device backend and the threads'
+device calls overlap instead of queueing (-24 to -43 % on the batch paths
+with three frame threads).  Details under *GPU groundwork without hardware,
+continued* in `docs/STATUS.md`.
 
 ## Why this design
 

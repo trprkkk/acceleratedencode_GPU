@@ -2956,7 +2956,9 @@ x264 at CRF with its macroblock tree (`aq-mode=0`).  Timed back to back with
 the end of the speed round (cock 90 frames, QP 28, best of three, this
 session's sandbox): preset 3 14.8 -> 13.7 fps on one thread, 25.0 -> 23.6
 with frame threads; preset 4 unchanged (11.8 / 21.0 -> 12.0 / 21.5); 42f1f92
-on the same machine 10.5 / 17.6 and 9.0 / 17.0.
+on the same machine 10.5 / 17.6 and 9.0 / 17.0.  (Later, with the trellis
+B-group decision by default at presets 3-4, `336a162`: preset 3 -5.51 %,
+preset 4 -5.91 %, CRF -1.63 %; see *Quality and speed round after CI* below.)
 
 tree is the clip still behind, and it is a peculiar one: each picture is
 repeated six to ten times (four different pictures in thirty), so the result
