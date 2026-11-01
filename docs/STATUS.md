@@ -4283,3 +4283,130 @@ on both backends; the conformance suite bit-exact.  On PoCL the pair makes an
 all-intra encode slower (1.46 s -> 4.49 s for 6 pictures: three times the
 launches at a millisecond each), as every batch path is there; whether a GPU
 wins is the dispatcher's trial to find out.
+
+## Practical encoder features (no GPU needed)
+
+With no GPU to tune for, everything an encoder needs that does not depend on
+one: input formats, stream signalling, the options x264 users expect, and rate
+control.  Each commit leaves CQP streams (and, from CRF on, CRF streams)
+byte-identical unless it says otherwise; every new path has a conformance case
+in `tests/run_tests.sh` (decoded by FFmpeg, compared with `--dump-recon`), and
+both the CPU and the OpenCL (PoCL) suites pass.
+
+* **Any even frame size** (`78daf21`): the coded size is rounded up to whole
+  macroblocks, the margin repeats the last column/row and the SPS crops it;
+  PSNR is measured on the visible picture.  Before, sizes were rounded down and
+  the SPS signalled a negative crop.
+* **Input and VUI** (`fb78a5c`): YUV4MPEG2 (file or pipe; W, H, F, A,
+  XCOLORRANGE), fractional rates, SAR (Table E-1 or Extended_SAR), full range,
+  H.273 colour description; a missing, malformed or out-of-range option value
+  exits with status 2 instead of crashing or clamping silently.
+* **NAL HRD and SEI** (`810aef3`): `--nal-hrd` writes hrd_parameters from the
+  VBV model, a buffering period on every IDR and picture timing on every
+  picture; `tools/hrd_check.py` checks that the signalled output times put the
+  pictures in display order (B groups, several IDRs, and capped CRF).  The
+  level now also covers the VBV max rate (a 400 kb/s VBV stream at QCIF had
+  claimed level 1.2, MaxBR 384).  `--info-sei` writes the options.
+* **Options** (`516a374`): `--deblock a:b`, `--chroma-qp-offset`,
+  `--qpmin/--qpmax` (`--qpmin 40 --qpmax 30` is refused), `--aud`, `--level`,
+  `--seek`.  Two deblocking bugs surfaced, both invisible at zero offsets: the
+  slice header always carried offset 0 while the filter used the parameter,
+  without the `<< 1` of FilterOffsetA/B; and an edge with luma alpha/beta 0
+  skipped its chroma even when a chroma QP offset raised the chroma QP.
+* **CRF and VBV** (`b9ab68c`): x264's CRF, calibrated against x264
+  `--preset medium --tune psnr` at the same CRF (preset 3, four clips, CRF
+  16-38: -0.03 dB at 0.99x the bits with the tree, +0.02 dB at 1.06x
+  without).  VBV with x264's per-type size predictor and re-coding of a picture
+  that would still underflow: 0 underflows over 36 configurations (3 clips, 3
+  buffers, ABR/CRF, with and without B pictures) where 13 underflowed before.
+* **Rate control** (`5b9663f`): below.
+
+### One-pass ABR and two-pass
+
+The previous ABR controller corrected each picture's QP from the running bit
+debt.  On held pictures (a still repeated for several frames) it collapsed the
+QP and overspent -- 744 kb/s for a 300 kb/s target -- and on 30-frame clips it
+missed by up to +383 % (tree).  It was replaced by x264's `ratecontrol.c`
+model:
+
+* one pass: qscale = complexity^(1-qcomp) * (sum of bits * qscale) / (wanted
+  bits), an overflow correction against the total, an asymmetric step limit
+  (x264's lstep) per anchor, intra pictures from the following anchors, B
+  pictures from the anchor before them;
+* the macroblock tree on by default for ABR, as in x264 (VBV keeps it off);
+* the first intra picture is sized from its lowres estimate at 12 pictures'
+  worth of bits and is left out of the rate factor (counted in, its term is
+  several anchors' worth against one picture's budget and drags the first
+  seconds coarse: tree clip -0.75 dB counted in, -0.42 dB left out).  Later
+  intra pictures count: left out, a clip of held pictures with a scene cut
+  every 25 frames overspent 53 % (now 33 % -- each cut is ~15 pictures' worth
+  arriving unannounced, with B pictures nearly free);
+* far off target (overflow above 1.5 or below 0.67) the step limit is lifted
+  in the direction the total needs.  On real clips this never fires (output
+  identical); it shortens the climb out of a start the estimates got wrong.
+
+Two-pass keeps B pictures.  Pass 1 writes `aeg-stats 2` (display index, type,
+average QP, the picture's QP before macroblock offsets, bits);
+`aeg_encoder_set_pass1()` plans every picture as x264's `init_pass2` does:
+complexities blurred with a Gaussian that stops at scene cuts, held pictures
+kept at their reference's level, intra pictures from the following P pictures,
+the rate factor by bisection.  Pass 2 then corrects against the plan.
+
+Measured: 180 frames of five real clips, preset 3, each against the CRF curve
+of the same encoder (CRF + tree, six CRFs, interpolated in log rate); rate
+error, then PSNR difference at that rate (`leval.sh`):
+
+| clip, target | 1-pass ABR | 2-pass | 1-pass, no B | 2-pass, no B |
+|---|---|---|---|---|
+| vtest 250 | -4.4 % -0.48 dB | -0.8 % -0.10 | -2.4 % -3.18 | -0.4 % -2.10 |
+| cock 500 | +5.8 % -0.25 | +0.2 % -0.00 | +3.0 % -0.30 | -0.2 % -0.16 |
+| tree 400 | +4.8 % -0.44 | +0.2 % -0.15 | -13.7 % -1.54 | +0.0 % -0.53 |
+| short 250 | +3.6 % -0.12 | +0.0 % -0.01 | +1.2 % -0.51 | +0.0 % -0.49 |
+| mega 300 | -1.7 % -0.03 | +0.0 % +0.01 | -0.7 % -0.89 | -0.7 % -0.86 |
+
+(The no-B columns are against the CRF curve *with* B pictures, so they include
+what B pictures and the tree are worth.)  Two-pass is within 1 % of the target
+and 0.15 dB of constant quality.  Without the tree, two-pass had undervalued
+held repeats by up to 1.38 dB (vtest).
+
+What decided the first intra picture's share, one pass with the tree (rate
+error, PSNR difference; vtest | cock | tree | short | mega):
+
+| share | vtest | cock | tree | short | mega |
+|---|---|---|---|---|---|
+| 10 pictures | -6.8 % -0.81 | +8.2 % -0.16 | +2.5 % -0.42 | +2.4 % -0.08 | -2.3 % -0.02 |
+| 12 (chosen) | -4.4 % -0.48 | +9.6 % -0.22 | +4.8 % -0.44 | +3.6 % -0.12 | -2.3 % -0.02 |
+| 14 | -2.0 % -0.26 | +11.0 % -0.29 | +6.7 % -0.55 | +4.4 % -0.17 | -2.3 % -0.02 |
+| 20 | +3.2 % +0.19 | +14.4 % -0.48 | +12.0 % -0.76 | +7.6 % -0.32 | -2.3 % -0.02 |
+
+vtest (a static camera: the first picture is referenced for six seconds)
+wants more; the others want less.  12 has the smallest summed loss with every
+rate within 10 %.  (These rows are before later intra pictures counted, which
+moved cock to +5.8 %; the first picture is the only intra one in the others.)
+
+Tried and rejected: subtracting the tree's mean offset from the first intra
+estimate (vtest -1.67 dB); spreading the first picture's excess over the
+following seconds, or decaying the rate factor's history (0.99, 0.97 per
+picture) -- both only moved the rate, the quality within 0.05 dB; sizing the
+first P picture from the coefficient the intra picture measured, and coding
+it again when it came out more than twice its share (the lowres estimate
+averages noise away, so the coefficient does not carry over: tree clip
++24 % -1.50 dB, 30-frame clips up to +197 %).
+
+Limits: a stream of a second or two cannot absorb the first intra picture --
+30-frame clips land +9 %..+71 % over with the tree.  genyuv's whole-frame pan
+(mode 0) is predicted so well that its pictures barely change size with the QP
+(20 kbit at QP 13 and at QP 9), which a model-based controller cannot land a
+target on (it codes 274 kb/s for 400); the suite uses mode 1, 120 frames
+(309 kb/s for 300).  P-only, CRF can beat two-pass across a scene cut (cut
+clip: CRF 26 122.7 kb/s 44.17 dB, two-pass 121.0 kb/s 43.20 dB): CRF's blur
+carries the easy half over the cut and gives the new IDR and the pictures
+after it a lower QP, which pays through prediction -- the effect the tree
+models when there are B pictures (with them two-pass is +0.10 dB over CRF on
+that clip).
+
+Tests: ABR within 10 %; a generous buffer leaves the stream byte-identical
+(at equal tree setting) and reports no clamp; a 30 kbit buffer clamps; VBV
+options alone imply ABR; two-pass with B pictures within 6 % of CRF 26's rate
+and 0.3 dB of its PSNR, P-only within 6 %, both bit-exact against the decoder
+(coding order with B pictures); the stats file's header and types.

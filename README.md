@@ -156,9 +156,7 @@ without a GPU simply reports no CUDA device at run time.
                --dump-recon recon.yuv --bench
 ```
 
-`-b cpu|opencl|cuda|auto` selects the backend, `--bitrate <kbps>` switches from
-constant QP to one-pass average-bitrate rate control (it lands within 0.2 % of
-the target over 90 frames), `--aq <tenths>` turns on variance-based adaptive
+`-b cpu|opencl|cuda|auto` selects the backend (rate control: see below), `--aq <tenths>` turns on variance-based adaptive
 quantisation (off by default: it is worth its PSNR cost only perceptually, see
 `docs/STATUS.md`), `--frame-threads 0|1|2` codes each non-reference B
 picture on a second thread next to the following picture (0 = auto, on with
@@ -194,6 +192,42 @@ measured), `--no-cabac` replaces CABAC with CAVLC (34-36% more bytes at equal
 PSNR; kept as the comparison path and because both coders have to reconstruct
 the same picture), and `--no-deblock`, `--subme N`, `--range N` override the
 preset.
+
+### Rate control
+
+* `-q <qp>` (default): constant QP, with x264's picture-type offsets.
+* `--crf <f>`: constant quality in x264's form (complexity^(1-qcomp) / rate
+  factor; with B pictures the macroblock tree carries the qcomp).  The scale is
+  calibrated so that a CRF gives the PSNR x264 `--preset medium --tune psnr`
+  gives at the same CRF (preset 3, four clips: -0.03 dB at 0.99x the bits).
+* `--bitrate <kbps>`: one-pass average bitrate after x264's `ratecontrol.c`
+  (rate factor from the bits spent, overflow correction, a QP step limit), with
+  the macroblock tree.  Over 180 frames of five real clips it lands within
+  -4 %..+6 % of the target at 0.03-0.48 dB below the CRF curve.  A stream of a
+  second or two cannot absorb the first intra picture -- use two passes there.
+* `--pass 1` / `--pass 2 --bitrate <kbps>` (`--stats <file>`): two-pass, B
+  pictures included.  Pass 1 measures every picture; pass 2 plans every
+  picture's QP from that (x264's `init_pass2`) and lands within 1 % of the
+  target and 0.15 dB of the CRF curve on the same clips.
+* `--vbv-maxrate <kbps> --vbv-bufsize <kbit>`: a buffer model on
+  ABR or CRF (capped CRF), with x264's per-type size predictor; a picture that
+  would still underflow is coded again, coarser.  A stream that fits its buffer
+  is byte-identical to the one without.  `--nal-hrd` signals the model
+  (hrd_parameters, buffering period and picture timing SEI).
+* `--qpmin`, `--qpmax` bound every picture and macroblock QP; `--qcomp <pct>`.
+
+Numbers and the experiments behind them: *Practical encoder features* in
+`docs/STATUS.md`.
+
+### Input and stream options
+
+YUV4MPEG2 input (`.y4m`, from a file or a pipe; size, rate, aspect ratio and
+range from its header) or raw I420 with `-w`/`-h`; any even frame size (coded
+as whole macroblocks, cropped in the SPS); `--fps 30000/1001`, `--sar W:H`,
+`--fullrange`, `--colorprim`/`--transfer`/`--colormatrix` in the VUI;
+`--deblock a:b`, `--chroma-qp-offset`, `--aud`, `--level`, `--seek`,
+`--info-sei` (the options in a user-data SEI), `-g`, `--scenecut`.  A missing,
+malformed or out-of-range value is refused with exit status 2.
 
 ## What is verified, and how
 
