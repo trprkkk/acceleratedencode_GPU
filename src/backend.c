@@ -106,6 +106,16 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
     return AEG_OK;
 }
 
+/* the reference the fused device kernel is checked against: literally the
+ * two operations one after the other */
+static int cpu_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
+                           int intra, int16_t *level, int32_t *nz,
+                           int16_t *rec)
+{
+    cpu_tq_batch(priv, res, nblk, qp, intra, level, nz);
+    return cpu_iq_idct_batch(priv, level, nblk, qp, rec);
+}
+
 static int cpu_sse_batch(void *priv, const uint8_t *a, int sa,
                          const uint8_t *b, int sb, int w, int h,
                          uint64_t *out)
@@ -197,6 +207,7 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->sad_batch = cpu_sad_batch;
     ops->tq_batch = cpu_tq_batch;
     ops->iq_idct_batch = cpu_iq_idct_batch;
+    ops->tq_iq_batch = cpu_tq_iq_batch;
     ops->sse_batch = cpu_sse_batch;
     ops->interp_plane = cpu_interp_plane;
     ops->ref_upload = cpu_ref_upload;
@@ -299,6 +310,18 @@ static int g_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
                     "iq_idct_batch"))
         return AEG_OK;
     return g->cpu.iq_idct_batch(g->cpu.priv, level, nblk, qp, res);
+}
+
+static int g_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
+                         int intra, int16_t *level, int32_t *nz, int16_t *rec)
+{
+    be_guard *g = (be_guard *)priv;
+    if (guard_enter(g) &&
+        guard_leave(g, g->dev.tq_iq_batch(g->dev.priv, res, nblk, qp, intra,
+                                          level, nz, rec), "tq_iq_batch"))
+        return AEG_OK;
+    return g->cpu.tq_iq_batch(g->cpu.priv, res, nblk, qp, intra, level, nz,
+                              rec);
 }
 
 static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
@@ -405,6 +428,7 @@ static int be_guard_wrap(aeg_be_ops *ops)
     if (ops->sad_batch) ops->sad_batch = g_sad_batch;
     if (ops->tq_batch) ops->tq_batch = g_tq_batch;
     if (ops->iq_idct_batch) ops->iq_idct_batch = g_iq_idct_batch;
+    if (ops->tq_iq_batch) ops->tq_iq_batch = g_tq_iq_batch;
     if (ops->interp_plane) ops->interp_plane = g_interp_plane;
     if (ops->sse_batch) ops->sse_batch = g_sse_batch;
     if (ops->ref_upload && ops->satd_batch) {

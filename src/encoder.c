@@ -1680,6 +1680,31 @@ static int batch_host_inverse(const struct aeg_encoder *e)
            e->d.forced[AEG_STAGE_IQUANT_IDCT] < 0;
 }
 
+/* Without level selection (presets 0-2, CAVLC) nothing runs on the host
+ * between the forward and the inverse half of the batch, so a backend with
+ * the fused operation does both in one call: on a device one transfer each
+ * way and one launch per macroblock instead of two round trips.  The fused
+ * kernel is the two kernels' code (kernels.h), so the levels and the residual
+ * are the same; AEG_TQIQ=0 makes the two calls instead, which is how the
+ * separate kernels stay exercised in an encode.  The time goes to both
+ * stages, half each, so -v 2 still shows where each ran. */
+static int use_tq_iq(const struct aeg_encoder *e)
+{
+    static _Atomic int env = -2;
+    if (env == -2) {
+        const char *ev = getenv("AEG_TQIQ");
+        env = ev ? atoi(ev) != 0 : 1;
+    }
+    return env && e->d.ops.tq_iq_batch && !(e->p.trellis > 0 && e->p.cabac);
+}
+
+static void tq_iq_rec(struct aeg_encoder *e, int64_t ns)
+{
+    int g = e->d.ops.backend != AEG_BACKEND_CPU;
+    stage_rec(e, AEG_STAGE_TRANSFORM, g, ns / 2);
+    stage_rec(e, AEG_STAGE_IQUANT_IDCT, g, ns - ns / 2);
+}
+
 static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     const uint8_t *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
@@ -1687,6 +1712,15 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     int blk, qp = c->qp;
 
     luma_inter_gather(e, src, pred, e->coef_res);
+    if (e->coef_batch && use_tq_iq(e)) {
+        int64_t t0 = aeg_now_ns();
+        e->d.ops.tq_iq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
+                             e->coef_lev, e->coef_nz, e->coef_rec);
+        tq_iq_rec(e, aeg_now_ns() - t0);
+        luma_inter_finish(e, mbx, mby, c, e->coef_lev, e->coef_nz, e->coef_rec,
+                          pred);
+        return;
+    }
     if (e->coef_batch) {
         /* One transform+quantise call and one inverse call for the sixteen
          * blocks instead of sixteen of each. */
@@ -5606,8 +5640,14 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
         luma_inter_gather(e, src, e->pred_l, e->rd_res + 256 * nb);
         nb++;
     }
-    /* 2. one launch each for the whole macroblock's 4x4 candidates */
-    if (nb) {
+    /* 2. one launch each for the whole macroblock's 4x4 candidates (one
+     *    for both without level selection, see use_tq_iq()) */
+    if (nb && !trel && !host_inv && use_tq_iq(e)) {
+        t0 = aeg_now_ns();
+        e->d.ops.tq_iq_batch(e->d.ops.priv, e->rd_res, 16 * nb, qp, 0,
+                             e->rd_lev, e->rd_nz, e->rd_rec);
+        tq_iq_rec(e, aeg_now_ns() - t0);
+    } else if (nb) {
         t0 = aeg_now_ns();
         e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * nb, qp, 0, e->rd_lev,
                           e->rd_nz);

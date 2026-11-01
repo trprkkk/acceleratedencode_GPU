@@ -4101,3 +4101,37 @@ bit-exact; `backend_check` 106 checks; `gpu_validate.sh` PASS at `-p 3 -t 2`,
 the default path (`-t 2`) and 30/30 with `AEG_RD_BATCH=1`; ASan + UBSan clean
 on CPU, coefficient-batch, RD-batch and forced-stage encodes at presets 2-4,
 all writing the same stream.
+
+## GPU groundwork without hardware, continued
+
+**Fused forward + inverse (`tq_iq_batch`).**  Without level selection
+(presets 0-2, and CAVLC at any preset) nothing runs on the host between the
+two halves of the coefficient batch, yet they were two round trips: upload
+the residuals, launch, download the levels; upload the same levels, launch,
+download the residual.  A backend may now provide `tq_iq_batch()`: one upload,
+one launch, three downloads (levels, counts, residual).  The 4x4 arithmetic
+moved into two helper functions of the kernel source (`aeg_tq4`, `aeg_iq4`,
+on private arrays; `AEG_DEVFN` is `__device__` under CUDA and `static` in the
+C build of `kernel_check`), which `tq_batch`, `iq_idct_batch` and the new
+`tq_iq_batch` all call, so the fused kernel is the two kernels' code.  The CPU
+op is literally `tq_batch` then `iq_idct_batch`.  Both batch paths
+(`code_luma_inter`, the RD batch) use it when the backend has it and no level
+selection runs (`use_tq_iq()`); `AEG_TQIQ=0` makes the two calls, which keeps
+the separate kernels in an encode.  The time is booked half to each stage.
+
+Checks: `kernel_check` runs the fused kernel (as C) at every QP 0-51, intra
+and inter, full-range and sparse residuals, against the CPU two-step
+sequence, and the CPU fused op against the same (7 kernels now);
+`backend_check` compares the device op with the CPU sequence for every QP /
+batch size / intra case of the coefficient test (186 checks on PoCL);
+`nvrtc_check` requires its PTX entry point for every architecture.
+`gpu_validate.sh` PASS on PoCL at `-p 2 -t 2`, `-p 1 -t 1`, `-p 3 -t 2`; the
+CPU batch modes (`AEG_COEF_BATCH=1`, `AEG_RD_BATCH=1`) equal the serial
+encoder at presets 0-2 on cock and mega and with CAVLC at preset 3; the
+conformance suite bit-exact.  PoCL, vtest 12 pictures, preset 2, `-t 1`
+(best of three, both streams identical and equal to the CPU build's):
+
+| | two calls (`AEG_TQIQ=0`) | fused |
+|---|---|---|
+| `AEG_RD_BATCH=1` | 1358 ms | 1162 ms |
+| `AEG_COEF_BATCH=1` | 5320 ms | 4543 ms |

@@ -38,6 +38,13 @@ typedef struct aeg_be_ops {
     int (*iq_idct_batch)(void *priv, const int16_t *level, int nblk, int qp,
                          int16_t *res);
 
+    /* tq_batch() and then iq_idct_batch() on its levels, in one call: on a
+     * device one transfer each way and one launch instead of two round
+     * trips.  `level`/`nz` are tq_batch()'s outputs, `rec` iq_idct_batch()'s
+     * of the same levels.  Optional (NULL: the caller makes the two calls). */
+    int (*tq_iq_batch)(void *priv, const int16_t *res, int nblk, int qp,
+                       int intra, int16_t *level, int32_t *nz, int16_t *rec);
+
     /* One fractional-pel plane of a reference picture (H.264 8.4.2.2.1),
      * `which` 1 = horizontal, 2 = vertical, 3 = both.  `ref` points at picture
      * (0,0) in a padded buffer (AEG_PAD samples of edge replication on every

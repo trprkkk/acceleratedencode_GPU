@@ -25,6 +25,7 @@ typedef unsigned char uchar;
 typedef unsigned long long ulong;
 #define __kernel
 #define __global
+#define AEG_DEVFN static
 static int aeg_mock_gid;
 #define get_global_id(d) (aeg_mock_gid)
 #include "kernels_gen.c"
@@ -72,6 +73,18 @@ static void call_iq(int i)
 {
     (void)i;
     iq_idct_batch(g_qlevel, g_nblk, g_sh, g_ls0, g_ls1, g_ls2, g_iqres);
+}
+
+/* ------------------------------------------------------------------ */
+/* tq_iq_batch: both in one kernel                                     */
+/* ------------------------------------------------------------------ */
+static int16_t *g_tqrec;
+
+static void call_tqiq(int i)
+{
+    (void)i;
+    tq_iq_batch(g_res, g_nblk, g_qbits, g_f, g_mf0, g_mf1, g_mf2, g_sh, g_ls0,
+                g_ls1, g_ls2, g_level, g_nz, g_tqrec);
 }
 
 /* ------------------------------------------------------------------ */
@@ -233,6 +246,59 @@ int main(void)
             free(g_iqres);
         }
         (void)t;
+    }
+
+    /* ---- fused forward + inverse: the same levels, counts and residual as
+     *      tq_batch followed by iq_idct_batch, at every QP ---------------- */
+    for (qp = 0; qp <= 51; qp++) {
+        for (intra = 0; intra <= 1; intra++) {
+            int16_t *res, *rl, *rr, *cl, *cr;
+            int *rn, *cn;
+            int i, bad = 0, sparse = qp & 1;
+
+            g_nblk = 1 + rnd(32);
+            res = (int16_t *)malloc((size_t)g_nblk * 32);
+            rl = (int16_t *)malloc((size_t)g_nblk * 32);
+            rr = (int16_t *)malloc((size_t)g_nblk * 32);
+            cl = (int16_t *)malloc((size_t)g_nblk * 32);
+            cr = (int16_t *)malloc((size_t)g_nblk * 32);
+            rn = (int *)malloc((size_t)g_nblk * 4);
+            cn = (int *)malloc((size_t)g_nblk * 4);
+            g_level = (int16_t *)malloc((size_t)g_nblk * 32);
+            g_tqrec = (int16_t *)malloc((size_t)g_nblk * 32);
+            g_nz = (int *)malloc((size_t)g_nblk * 4);
+            /* full-range residuals, and (odd QPs) mostly small ones, the way
+             * a batch mostly looks: empty and DC-only blocks */
+            for (i = 0; i < g_nblk * 16; i++)
+                res[i] = (int16_t)(sparse ? (rnd(4) ? rnd(5) - 2 : rnd(511) - 255)
+                                          : rnd(511) - 255);
+            g_res = res;
+            g_qbits = 15 + qp / 6;
+            g_f = aeg_quant_bias(g_qbits, intra ? 3 : 6);
+            g_mf0 = aeg_quant_mf[qp % 6][0];
+            g_mf1 = aeg_quant_mf[qp % 6][1];
+            g_mf2 = aeg_quant_mf[qp % 6][2];
+            g_sh = qp / 6;
+            g_ls0 = aeg_dequant_ls[qp % 6][0];
+            g_ls1 = aeg_dequant_ls[qp % 6][1];
+            g_ls2 = aeg_dequant_ls[qp % 6][2];
+            run_items(g_nblk, call_tqiq);
+            cpu.tq_batch(cpu.priv, res, g_nblk, qp, intra, rl, rn);
+            cpu.iq_idct_batch(cpu.priv, rl, g_nblk, qp, rr);
+            cpu.tq_iq_batch(cpu.priv, res, g_nblk, qp, intra, cl, cn, cr);
+            for (i = 0; i < g_nblk * 16; i++)
+                bad += (g_level[i] != rl[i]) + (g_tqrec[i] != rr[i]) +
+                       (cl[i] != rl[i]) + (cr[i] != rr[i]);
+            for (i = 0; i < g_nblk; i++)
+                bad += (g_nz[i] != rn[i]) + (cn[i] != rn[i]);
+            if (bad) {
+                printf("   kernel_check: tq_iq_batch qp %d intra %d: %d "
+                       "mismatches\n", qp, intra, bad);
+                fail = 1;
+            }
+            free(res); free(rl); free(rr); free(cl); free(cr); free(rn);
+            free(cn); free(g_level); free(g_tqrec); free(g_nz);
+        }
     }
 
     /* ---- SAD over a batch of block pairs ------------------------------ */
@@ -452,6 +518,6 @@ int main(void)
     }
 
     if (!fail)
-        printf("   kernel_check: 6 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 7 kernels agree with the CPU reference\n");
     return fail;
 }

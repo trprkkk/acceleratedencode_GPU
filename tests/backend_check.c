@@ -124,6 +124,20 @@ static void check_coef(void)
                 cpu.iq_idct_batch(cpu.priv, l0, n, qps[qi], r0);
                 dev.iq_idct_batch(dev.priv, l0, n, qps[qi], r1);
                 check(!memcmp(r0, r1, (size_t)n * 32), "iq_idct_batch");
+                /* the fused operation: tq_batch's levels and counts and
+                 * iq_idct_batch's residual of them, from one call */
+                check(dev.tq_iq_batch != NULL, "tq_iq_batch (present)");
+                if (dev.tq_iq_batch) {
+                    memset(l1, 0x55, (size_t)n * 32);
+                    memset(r1, 0x55, (size_t)n * 32);
+                    memset(z1, 0x55, (size_t)n * 4);
+                    dev.tq_iq_batch(dev.priv, res, n, qps[qi], intra, l1, z1,
+                                    r1);
+                    check(!memcmp(l0, l1, (size_t)n * 32) &&
+                              !memcmp(z0, z1, (size_t)n * 4) &&
+                              !memcmp(r0, r1, (size_t)n * 32),
+                          "tq_iq_batch");
+                }
                 free(res); free(l0); free(l1); free(r0); free(r1);
                 free(z0); free(z1);
             }

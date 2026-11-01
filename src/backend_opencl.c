@@ -87,7 +87,7 @@ typedef struct ocl_ctx {
     cl_context ctx;
     cl_command_queue queue;
     cl_program prog;
-    cl_kernel k_sad, k_tq, k_iq, k_sse, k_intp, k_satd;
+    cl_kernel k_sad, k_tq, k_iq, k_tqiq, k_sse, k_intp, k_satd;
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
@@ -246,6 +246,64 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
         return AEG_EBACKEND;
     p_clEnqueueReadBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL);
     return AEG_OK;
+}
+
+static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
+                           int intra, int16_t *level, int32_t *nz,
+                           int16_t *rec)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mres, mlev, mnz, mrec;
+    size_t bytes = (size_t)nblk * 16 * 2;
+    size_t nthreads = (size_t)nblk;
+    int qbits = 15 + qp / 6;
+    int f = aeg_quant_bias(qbits, intra ? 3 : 6);
+    int mf0 = aeg_quant_mf[qp % 6][0], mf1 = aeg_quant_mf[qp % 6][1],
+        mf2 = aeg_quant_mf[qp % 6][2];
+    int sh = qp / 6;
+    int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
+        ls2 = aeg_dequant_ls[qp % 6][2];
+    cl_int st = CL_SUCCESS;
+
+    if (nblk <= 0)
+        return AEG_OK;
+    mres = ocl_buf(o, 0, bytes, CL_MEM_READ_ONLY);
+    mlev = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
+    mnz = ocl_buf(o, 2, (size_t)nblk * 4, CL_MEM_WRITE_ONLY);
+    mrec = ocl_buf(o, 3, bytes, CL_MEM_WRITE_ONLY);
+    if (!mres || !mlev || !mnz || !mrec)
+        return AEG_EBACKEND;
+    st |= p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0,
+                                 NULL, NULL);
+    st |= p_clSetKernelArg(o->k_tqiq, 0, sizeof(cl_mem), &mres);
+    st |= p_clSetKernelArg(o->k_tqiq, 1, sizeof(int), &nblk);
+    st |= p_clSetKernelArg(o->k_tqiq, 2, sizeof(int), &qbits);
+    st |= p_clSetKernelArg(o->k_tqiq, 3, sizeof(int), &f);
+    st |= p_clSetKernelArg(o->k_tqiq, 4, sizeof(int), &mf0);
+    st |= p_clSetKernelArg(o->k_tqiq, 5, sizeof(int), &mf1);
+    st |= p_clSetKernelArg(o->k_tqiq, 6, sizeof(int), &mf2);
+    st |= p_clSetKernelArg(o->k_tqiq, 7, sizeof(int), &sh);
+    st |= p_clSetKernelArg(o->k_tqiq, 8, sizeof(int), &ls0);
+    st |= p_clSetKernelArg(o->k_tqiq, 9, sizeof(int), &ls1);
+    st |= p_clSetKernelArg(o->k_tqiq, 10, sizeof(int), &ls2);
+    st |= p_clSetKernelArg(o->k_tqiq, 11, sizeof(cl_mem), &mlev);
+    st |= p_clSetKernelArg(o->k_tqiq, 12, sizeof(cl_mem), &mnz);
+    st |= p_clSetKernelArg(o->k_tqiq, 13, sizeof(cl_mem), &mrec);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    st = p_clEnqueueNDRangeKernel(o->queue, o->k_tqiq, 1, NULL, &nthreads,
+                                  NULL, 0, NULL, NULL);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    /* blocking reads in order: the last one returns when all are done */
+    st |= p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0,
+                                NULL, NULL);
+    if (nz)
+        st |= p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0,
+                                    (size_t)nblk * 4, nz, 0, NULL, NULL);
+    st |= p_clEnqueueReadBuffer(o->queue, mrec, CL_TRUE, 0, bytes, rec, 0,
+                                NULL, NULL);
+    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
 }
 
 static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
@@ -430,6 +488,7 @@ static void ocl_destroy(void *priv)
     if (o->k_sad) p_clReleaseKernel(o->k_sad);
     if (o->k_tq) p_clReleaseKernel(o->k_tq);
     if (o->k_iq) p_clReleaseKernel(o->k_iq);
+    if (o->k_tqiq) p_clReleaseKernel(o->k_tqiq);
     if (o->k_sse) p_clReleaseKernel(o->k_sse);
     if (o->prog) p_clReleaseProgram(o->prog);
     if (o->queue) p_clReleaseCommandQueue(o->queue);
@@ -535,10 +594,12 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     o->k_sad = p_clCreateKernel(o->prog, "sad_batch", &st);
     o->k_tq = p_clCreateKernel(o->prog, "tq_batch", &st);
     o->k_iq = p_clCreateKernel(o->prog, "iq_idct_batch", &st);
+    o->k_tqiq = p_clCreateKernel(o->prog, "tq_iq_batch", &st);
     o->k_sse = p_clCreateKernel(o->prog, "sse_batch", &st);
     o->k_intp = p_clCreateKernel(o->prog, "interp_plane", &st);
     o->k_satd = p_clCreateKernel(o->prog, "satd_batch", &st);
-    if (!o->k_sad || !o->k_tq || !o->k_iq || !o->k_sse || !o->k_intp ||
+    if (!o->k_sad || !o->k_tq || !o->k_iq || !o->k_tqiq || !o->k_sse ||
+        !o->k_intp ||
         !o->k_satd) {
         ocl_destroy(o);
         return AEG_EBACKEND;
@@ -550,6 +611,7 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     ops->sad_batch = ocl_sad_batch;
     ops->tq_batch = ocl_tq_batch;
     ops->iq_idct_batch = ocl_iq_idct_batch;
+    ops->tq_iq_batch = ocl_tq_iq_batch;
     ops->sse_batch = ocl_sse_batch;
     ops->interp_plane = ocl_interp_plane;
     ops->ref_upload = ocl_ref_upload;
