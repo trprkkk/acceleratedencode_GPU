@@ -399,6 +399,8 @@ void aeg_cabac_set_contexts(aeg_cabac *c, int intra, int qp, int init_idc)
     const int8_t (*tab)[2] = intra ? aeg_cabac_init_I
                                    : aeg_cabac_init_PB[init_idc & 3];
     int i;
+    if (qp < 0)
+        qp = 0;                         /* Clip3(0, 51, SliceQPY) (9.3.1.1) */
     for (i = 0; i < AEG_CABAC_CTX_COUNT; i++) {
         /* preCtxState (9.3.1.1) folded into one byte: the state is
          * 2 * pStateIdx + valMPS, and preCtxState and 127 - preCtxState map to
@@ -580,7 +582,7 @@ int64_t aeg_cabac_coef_price(const aeg_cabac *st, int cat, int n, int pos,
 
 /* aeg_cabac_residual() in price-only mode against `st`, which is left as it
  * is.  Returns 1/256 bit. */
-int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
+int64_t aeg_cabac_residual_price(const aeg_cabac *st, const dctcoef *coef,
                                  int n, int cat, int cbf_ctx)
 {
     const struct cab_cat_ctx *k = &cab_cat[cat];
@@ -662,7 +664,7 @@ int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
 /* aeg_cabac_residual() in price mode: the same bins, priced and advanced in
  * the same order, with the state and the sum kept local (the generic
  * decision has to reload both after every state byte it stores). */
-static int residual_cost(aeg_cabac *cb, const int16_t *coef, int n,
+static int residual_cost(aeg_cabac *cb, const dctcoef *coef, int n,
                          const struct cab_cat_ctx *k, int cbf_ctx, int last,
                          int count)
 {
@@ -736,7 +738,7 @@ static int residual_cost(aeg_cabac *cb, const int16_t *coef, int n,
  * from the last significant coefficient.  `coef[i]` is the coefficient at scan
  * position i; `n` of them.  Returns the number of non-zero coefficients, which
  * is what the neighbouring blocks' contexts want. */
-int aeg_cabac_residual(aeg_cabac *cb, const int16_t *coef, int n, int cat,
+int aeg_cabac_residual(aeg_cabac *cb, const dctcoef *coef, int n, int cat,
                        int cbf_ctx)
 {
     const struct cab_cat_ctx *k = &cab_cat[cat];

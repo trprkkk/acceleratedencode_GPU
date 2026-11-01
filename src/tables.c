@@ -382,10 +382,12 @@ const uint8_t aeg_cbp_codenum_i4x4[48] = {
 /* ------------------------------------------------------------------ */
 /* Lookup helpers                                                      */
 /* ------------------------------------------------------------------ */
-int aeg_qp_chroma(int qp, int offset)
+/* QPc from QPY (8.5.8): qPI = Clip3(-QpBdOffsetC, 51, QPY + offset), and
+ * below 30 QPc = qPI (negative at high bit depth) */
+int aeg_qp_chroma_bd(int qp, int offset, int bd_offset)
 {
-    int qpi = AEG_CLIP3(0, 51, qp + offset);
-    return aeg_qp_chroma_420[qpi];
+    int qpi = AEG_CLIP3(-bd_offset, 51, qp + offset);
+    return qpi < 0 ? qpi : aeg_qp_chroma_420[qpi];
 }
 
 /* ------------------------------------------------------------------ */

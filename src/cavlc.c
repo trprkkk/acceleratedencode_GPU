@@ -26,7 +26,7 @@ static inline int nc_bucket(int nC)
 /* ------------------------------------------------------------------ */
 /* Core block writer (or cost counter when bw->count_only)             */
 /* ------------------------------------------------------------------ */
-static void write_block(aeg_bitwriter *bw, const int16_t *coef,
+static void write_block(aeg_bitwriter *bw, const dctcoef *coef,
                         const uint8_t *scan, int nscan, int nC,
                         int max_coeff, int is_chroma_dc)
 {
@@ -176,7 +176,7 @@ level_done:
 /* ------------------------------------------------------------------ */
 /* kind: 0 = normal 4x4 (16 coeffs), 1 = luma DC (16), 2 = chroma DC (4),
  *       3 = Intra_16x16 AC (15) */
-void aeg_cavlc_write_block(aeg_bitwriter *bw, const int16_t *coef, int nC,
+void aeg_cavlc_write_block(aeg_bitwriter *bw, const dctcoef *coef, int nC,
                            int kind)
 {
     uint8_t ac_scan[15];
@@ -213,10 +213,10 @@ void aeg_cavlc_write_block(aeg_bitwriter *bw, const int16_t *coef, int nC,
  * context of list k depends on the number of coefficients list k-1 turned out
  * to have: the caller therefore reads each list's count back (aeg_cavlc_nz8)
  * and passes it to the neighbouring lists as they come. */
-void aeg_cavlc_write_block8(aeg_bitwriter *bw, const int16_t *coef, int sub,
+void aeg_cavlc_write_block8(aeg_bitwriter *bw, const dctcoef *coef, int sub,
                             int nC)
 {
-    int16_t list[16];
+    dctcoef list[16];
     int n;
     for (n = 0; n < 16; n++)
         list[n] = coef[aeg_zigzag8x8[sub + 4 * n]];
@@ -225,7 +225,7 @@ void aeg_cavlc_write_block8(aeg_bitwriter *bw, const int16_t *coef, int sub,
 
 /* Number of non-zero coefficients of one of the four lists (its
  * TotalCoeff), which is what the neighbouring lists use as their context. */
-int aeg_cavlc_nz8(const int16_t *coef, int sub)
+int aeg_cavlc_nz8(const dctcoef *coef, int sub)
 {
     int n = 0, i;
     for (i = 0; i < 16; i++)
@@ -247,7 +247,7 @@ int aeg_cavlc_nc(int nz_left, int nz_top, int have_left, int have_top)
 /* Number of bits the residual blocks of a macroblock will occupy.
  * Used by the rate-distortion decision; identical arithmetic to the
  * writer above, but nothing is emitted. */
-int aeg_cavlc_block_cost(const int16_t *coef, int nC, int kind)
+int aeg_cavlc_block_cost(const dctcoef *coef, int nC, int kind)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, NULL, 0, 0);
@@ -256,7 +256,7 @@ int aeg_cavlc_block_cost(const int16_t *coef, int nC, int kind)
 }
 
 /* Same measurement for one list of an 8x8 block (aeg_cavlc_write_block8). */
-int aeg_cavlc_block_cost8(const int16_t *coef, int sub, int nC)
+int aeg_cavlc_block_cost8(const dctcoef *coef, int sub, int nC)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, NULL, 0, 0);

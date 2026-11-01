@@ -4617,3 +4617,98 @@ and a CQP/CRF stream with no rate given, which is sized for 20 Mb/s, now
 claims 3.2 instead of 4.0.  Every other byte of 8-bit 4:2:0 progressive
 output is unchanged: 14 configurations compared with the level forced to the
 same value, and the conformance suites.
+
+## High 10 (10-bit), x264's way
+
+`--bit-depth 10` / `params.bit_depth = 10` codes High 10 (`profile_idc` 110,
+`bit_depth_luma/chroma_minus8` 2, 4:2:0).  It is built the way x264 builds
+its high-depth encoder: no run-time sample-size switches in the inner loops,
+the depth-dependent sources compiled twice instead.
+
+**Build.** `src/bitdepth.h` gives one build's `pixel` (`uint8_t` /
+`uint16_t`), `dctcoef` (`int16_t` / `int32_t`: 10-bit levels and transform
+outputs outgrow 16 bits), `PIXEL_MAX`, `QP_BD_OFFSET` (6 per extra bit) and
+`QP_MIN`.  transform, intra, mc, deblock, cavlc, cabac, backend, lowres,
+input and encoder are compiled with `-DBIT_DEPTH=8` and `-DBIT_DEPTH=10`; the
+Makefile renames every symbol the 10-bit objects define with a `_10` suffix
+(`nm` lists them, `objcopy --redefine-syms` applies the list, references
+included), so both sets live in one `libaeg.a`/`libaeg.so`.  tables,
+bitstream, util, lookahead and the device backends are compiled once:
+nothing in them handles a sample at the coded depth (the lookahead works on
+its own 8-bit half-resolution planes, which `lowres.c` -- per depth -- builds
+from the full-depth picture).  `src/api.c` is the public `aeg_encoder_*`
+layer: open dispatches on `params.bit_depth`, every other call on the depth
+stored in the encoder (`aeg_params` is the first member of the encoder's
+struct).  `make BIT_DEPTHS=8` leaves the 10-bit set out; open then refuses
+10 with a message.  The exported symbols are the same 27.
+
+**QP.** Every QP the encoder holds -- per macroblock, the rate control, the
+slice header, `mb_qp_delta`, the deblocking filter -- is QPY, -12..51 at 10
+bits; the offset is added only where a quantiser or lambda table is indexed
+(QP'Y = QPY + 12).  So `-q`, `--crf`, `qp_min`/`qp_max` keep the 8-bit scale
+(the same quantiser step relative to the signal at both depths), and CRF and
+the rate controls may go below zero.  x264 counts its 10-bit `--qp` from
+QP'Y instead; its `--crf` has the 8-bit scale, as here.  The CABAC context
+initialisation clips a negative SliceQPY to 0 (9.3.1.1).  Distortions are in
+10-bit units (SSD x16, SAD/SATD x4 against 8 bits) and the lambdas follow:
+the RD lambda through QP'Y, the motion-search lambda and the UMH early-exit
+threshold `<< 2`, the AQ variance `>> 4`, the weighted-prediction
+thresholds and offsets scaled.
+
+**Input.** 10-bit I420/YV12 images go in as they are (after one OR pass that
+sends a frame with a sample above 1023 -- the caller's error -- through the
+conversion, which clips: coded as it is, the residual and the levels would
+overflow); 8-bit input is scaled up exactly; anything else is resampled and
+dithered to 10 bits.  The reconstruction (`aeg_encoder_recon`,
+`--dump-recon`) is 16-bit samples.  10-bit runs on the CPU only; `-b opencl`
+/ `-b cuda` falls back with a warning.
+
+**Verification.**
+
+* Every 10-bit configuration decodes in FFmpeg 7.0.2 (`yuv420p10le`) to
+  exactly the encoder's reconstruction: presets 1-4, QP 0 and 51, CRF -12 and
+  -6, ABR, VBV + NAL HRD, two-pass, CAVLC, slices, `--tff`, weighted P, chroma
+  QP offsets +-12, true 10-bit input, and four synthetic extremes (full-range
+  noise, a moving 0/1023 checkerboard, frames alternating 0 and 1023, ramps)
+  at QP 0, CRF -12, QP 51 and 50 kb/s.  Ten of these are in
+  `tests/run_tests.sh` (*High 10*, compared after undoing the coding order).
+* The stream does not depend on the threads: frame threads 1 = 3 and slice
+  threads 1 = 3 at constant QP, CRF and ABR (in the suite).
+* `tests/api_check.c`: depth 8/0/10 open, 1/9/12/-8 are refused; the SPS is
+  `profile_idc` 110; every input layout that converts exactly gives the same
+  10-bit stream as I420 (as at 8 bits); a picture with detail below the 8-bit
+  step, coded at QP 0, comes out with an SSD of 8074 at 10 bits against
+  29000 for the 8-bit encoder (the rounding floor, MSE 1.25); samples above
+  1023 give the stream of the clipped picture; an 8-bit stream is unchanged
+  by a 10-bit encoder running beside it; 8- and 10-bit encoders in parallel
+  threads give the bytes they give alone (also under ThreadSanitizer).
+* ASan + UBSan: the extremes above at ten settings each, and api_check,
+  clean.  The 10-bit quantisers take the C path with 64-bit products (the
+  SSE2 ones assume 16-bit coefficients).
+* 8-bit output is byte-identical to the previous commit
+  (`tools/identity.sh`, fourteen configurations, and the suites), with and
+  without the 10-bit build in the library; the 8-bit speed is unchanged.
+
+**What 10 bits buy on 8-bit sources.**  The five test clips, 30 frames,
+preset 3, QP 22/27/32/37, bytes and PSNR (decoded stream against the source,
+all three planes, global MSE, 8-bit scale: a 10-bit decode is compared with
+the source `<< 2`, peak 1023):
+
+| clip | 8-bit | 10-bit | BD-rate |
+|---|---|---|---|
+| vtest | 100119/45.85 58658/42.62 35934/39.90 21091/37.02 | 99692/46.21 58307/42.71 35829/39.96 21199/37.06 | -2.29 % |
+| cock | 223548/47.60 127303/44.88 70476/41.99 38594/39.09 | 219334/48.05 125802/45.11 70111/42.12 38645/39.17 | -4.76 % |
+| mega | 58340/47.54 30562/45.00 16897/42.39 9812/39.62 | 56279/47.97 30155/45.30 16709/42.60 9646/39.78 | -7.35 % |
+| short | 124928/45.50 63869/42.13 31319/39.18 16788/36.51 | 122559/45.83 62481/42.32 31167/39.31 16685/36.59 | -5.13 % |
+| tree | 102643/46.65 66895/41.96 39015/37.84 19993/34.33 | 101787/46.76 66588/42.02 38927/37.93 19901/34.40 | -1.54 % |
+
+Mean **-4.21 %**: the gain grows toward high quality (QP 22: +0.11 to +0.45
+dB at 0.4-3.5 % fewer bytes), where the 8-bit prediction loop's rounding is
+a larger share of the error.
+
+**Speed.**  No 10-bit SIMD yet: the same runs at QP 22, default threads,
+2-core Xeon, median of three, 8-bit / 10-bit fps: vtest 65.4 / 35.7, cock
+25.9 / 12.6, mega 81.3 / 39.2, short 55.6 / 30.4, tree 60.4 / 40.0 --
+1.5-2.1x the time.  The
+SSE2/AVX2 kernels (SAD, SATD, SSD, the quarter-pel filters, the quantiser,
+the transforms) have 16-bit-sample counterparts to write, as x264 has.

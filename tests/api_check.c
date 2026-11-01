@@ -8,7 +8,11 @@
  *  - aeg_encoder_headers() is exactly what the first IDR begins with;
  *  - strided planes give the same bytes as the packed buffer;
  *  - dts increases strictly, never passes pts, and follows the timebase;
- *  - encoders running in parallel threads give the bytes they give alone.
+ *  - encoders running in parallel threads give the bytes they give alone;
+ *  - bit_depth: 8 and 10 open (10 only in a library built with it), other
+ *    depths are refused; a 10-bit encoder writes a High 10 SPS, codes 8-bit
+ *    input scaled up exactly (every layout the same stream), uses the two
+ *    extra bits of 10-bit input, and returns 16-bit reconstructions.
  *
  * usage: api_check
  */
@@ -254,7 +258,7 @@ static void base_params(aeg_params *p, int preset);
 
 /* Every input layout that converts exactly must give the bytes of the same
  * picture given as I420; and the conversion's argument checks. */
-static void check_images(void)
+static void check_images(int bit_depth)
 {
     static const struct { int mode, flat, fv; const char *name; } cases[] = {
         { IMG_NV12, 0, -1, "NV12" }, { IMG_NV21, 0, -1, "NV21" },
@@ -275,6 +279,7 @@ static void check_images(void)
             flat_value = cases[i].fv;
             base_params(&a.p, 2);
             a.p.interlaced = inter ? 2 : 0;
+            a.p.bit_depth = bit_depth;
             a.pts_step = b.pts_step = 1;
             b.p = a.p;
             a.flat = cases[i].flat;
@@ -285,14 +290,14 @@ static void check_images(void)
                   a.rc, b.rc, aeg_last_error());
             CHECK(a.out.n > 0 && a.out.n == b.out.n &&
                   !memcmp(a.out.d, b.out.d, a.out.n),
-                  "%s%s: %zu bytes, I420 %zu: not the same stream",
-                  cases[i].name, inter ? " (interlaced)" : "", b.out.n,
-                  a.out.n);
+                  "%s%s, %d-bit: %zu bytes, I420 %zu: not the same stream",
+                  cases[i].name, inter ? " (interlaced)" : "", bit_depth,
+                  b.out.n, a.out.n);
             free(a.out.d);
             free(b.out.d);
         }
     flat_value = -1;
-    {
+    if (bit_depth == 8) {
         aeg_params p;
         aeg_encoder *e;
         aeg_packet pkt;
@@ -621,40 +626,286 @@ static void *thread_run(void *arg)
     return NULL;
 }
 
+/* the kinds of encoder run side by side: CQP with B pictures, CRF without,
+ * and (with a 10-bit build) a 10-bit CRF one -- the two depths share no
+ * state either */
+#ifdef AEG_HAVE_10BIT
+enum { NK = 3 };
+#else
+enum { NK = 2 };
+#endif
+
 static void check_threads(void)
 {
-    enum { NT = 3 };
-    run ref[2], r[2 * NT];
-    pthread_t th[2 * NT];
+    enum { NT = 2 };
+    run ref[NK], r[NK * NT];
+    pthread_t th[NK * NT];
     int i, k;
 
-    for (k = 0; k < 2; k++) {
+    for (k = 0; k < NK; k++) {
         memset(&ref[k], 0, sizeof(ref[k]));
         base_params(&ref[k].p, 2);
         ref[k].pts_step = 1;
         if (k) {
             ref[k].p.rc_mode = AEG_RC_CRF;
             ref[k].p.crf = 25.0;
-            ref[k].p.bframes = 0;
+            ref[k].p.bframes = k == 1 ? 0 : 2;
         }
+        ref[k].p.bit_depth = k == 2 ? 10 : 8;
         encode_clip(&ref[k]);
         CHECK(ref[k].rc == 0 && ref[k].n == NF, "reference %d", k);
     }
-    for (i = 0; i < 2 * NT; i++) {
-        r[i] = ref[i & 1];
+    for (i = 0; i < NK * NT; i++) {
+        r[i] = ref[i % NK];
         memset(&r[i].out, 0, sizeof(r[i].out));
         pthread_create(&th[i], NULL, thread_run, &r[i]);
     }
-    for (i = 0; i < 2 * NT; i++) {
+    for (i = 0; i < NK * NT; i++) {
         pthread_join(th[i], NULL);
-        CHECK(r[i].rc == 0 && r[i].out.n == ref[i & 1].out.n &&
-              !memcmp(r[i].out.d, ref[i & 1].out.d, r[i].out.n),
+        CHECK(r[i].rc == 0 && r[i].out.n == ref[i % NK].out.n &&
+              !memcmp(r[i].out.d, ref[i % NK].out.d, r[i].out.n),
               "thread %d: %zu bytes, alone %zu", i, r[i].out.n,
-              ref[i & 1].out.n);
+              ref[i % NK].out.n);
         free(r[i].out.d);
     }
-    free(ref[0].out.d);
-    free(ref[1].out.d);
+    for (k = 0; k < NK; k++)
+        free(ref[k].out.d);
+}
+
+#ifdef AEG_HAVE_10BIT
+/* The SPS's profile_idc: the byte after the first NAL header of type 7. */
+static int sps_profile(const uint8_t *d, size_t n)
+{
+    size_t i;
+    for (i = 0; i + 4 < n; i++)
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 && (d[i + 3] & 31) == 7)
+            return d[i + 4];
+    return -1;
+}
+
+/* Sum of squared differences of a W x H plane of 16-bit samples (stride in
+ * bytes) against a reference of 16-bit samples. */
+static double ssd16(const uint8_t *pl, int stride, const uint16_t *ref)
+{
+    double s = 0;
+    int x, y;
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            double d = (double)((const uint16_t *)(pl + (size_t)y * stride))[x] -
+                       ref[y * W + x];
+            s += d * d;
+        }
+    return s;
+}
+#endif
+
+static void check_bit_depth(void)
+{
+    aeg_params p;
+    aeg_encoder *e;
+    int d;
+
+    aeg_params_default(&p);
+    CHECK(p.bit_depth == 8, "default bit_depth %d", p.bit_depth);
+    for (d = 0; d < 4; d++) {
+        static const int bad[4] = { 1, 9, 12, -8 };
+        base_params(&p, 1);
+        p.bit_depth = bad[d];
+        e = aeg_encoder_open(&p);
+        CHECK(e == NULL && strstr(aeg_last_error(), "bit_depth"),
+              "bit_depth %d: opened ('%s')", bad[d], aeg_last_error());
+        aeg_encoder_close(e);
+    }
+    base_params(&p, 1);
+    p.bit_depth = 0;                    /* 0 = 8 */
+    e = aeg_encoder_open(&p);
+    CHECK(e != NULL, "bit_depth 0: %s", aeg_last_error());
+    if (e) {
+        aeg_params q;
+        CHECK(aeg_encoder_get_params(e, &q) == AEG_OK && q.bit_depth == 8,
+              "bit_depth 0 resolves to %d", q.bit_depth);
+        aeg_encoder_close(e);
+    }
+#ifdef AEG_HAVE_10BIT
+    {
+        aeg_params q;
+        aeg_packet pkt;
+        aeg_encoder *e8;
+        const uint8_t *pl[3];
+        int st[3], k, x, y, n8 = 0, n10 = 0, rc;
+        uint16_t *src = (uint16_t *)malloc(sizeof(uint16_t) * W * H);
+        uint8_t *img = (uint8_t *)malloc((size_t)W * H * 3 * 2);
+        uint8_t *f8 = (uint8_t *)malloc(frame_bytes());
+        double ssd8 = 0, ssd10 = 0, maxv = 0;
+
+        base_params(&p, 2);
+        p.bit_depth = 10;
+        e = aeg_encoder_open(&p);
+        CHECK(e != NULL, "open 10-bit: %s", aeg_last_error());
+        if (!e)
+            goto out;
+        CHECK(aeg_encoder_get_params(e, &q) == AEG_OK && q.bit_depth == 10,
+              "get_params: bit_depth %d", q.bit_depth);
+        CHECK(aeg_encoder_headers(e, &pkt) == AEG_OK &&
+              sps_profile(pkt.data, pkt.size) == 110,
+              "10-bit SPS profile_idc %d, expected 110 (High 10)",
+              sps_profile(pkt.data, pkt.size));
+        aeg_encoder_close(e);
+
+        /* A picture with detail below the 8-bit step: a 10-bit ramp plus
+         * texture.  Coded nearly losslessly at both depths, the 10-bit
+         * encoder has to come much closer to it than the 8-bit one can. */
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++)
+                src[y * W + x] = (uint16_t)(200 + x * 3 + y + ((x * y) & 7));
+        {
+            uint16_t *Y = (uint16_t *)img;
+            uint16_t *U = Y + W * H, *V = U + CW * CH;
+            for (k = 0; k < W * H; k++)
+                Y[k] = src[k];
+            for (k = 0; k < CW * CH; k++)
+                U[k] = V[k] = 512;
+            for (k = 0; k < W * H; k++)     /* rounded, for the 8-bit run */
+                f8[k] = (uint8_t)((src[k] + 2) >> 2);
+            memset(f8 + W * H, 128, 2 * (size_t)CW * CH);
+        }
+        for (k = 0; k < 2; k++) {
+            aeg_image im;
+            memset(&im, 0, sizeof(im));
+            im.csp = AEG_CSP_I420;
+            im.depth = 10;
+            im.plane[0] = img;
+            im.plane[1] = img + 2 * W * H;
+            im.plane[2] = img + 2 * (W * H + CW * CH);
+            im.stride[0] = 2 * W;
+            im.stride[1] = im.stride[2] = 2 * CW;
+            base_params(&p, 2);
+            p.bframes = 0;
+            p.qp = 0;
+            p.bit_depth = k ? 10 : 8;
+            e = aeg_encoder_open(&p);
+            CHECK(e != NULL, "open: %s", aeg_last_error());
+            if (!e)
+                continue;
+            rc = k ? aeg_encoder_encode_image(e, &im, 0, &pkt)
+                   : aeg_encoder_encode(e, f8, frame_bytes(), 0, &pkt);
+            if (rc == AEG_EAGAIN)
+                rc = aeg_encoder_flush(e, &pkt);
+            CHECK(rc == AEG_OK, "%d-bit encode: %d", k ? 10 : 8, rc);
+            if (rc == AEG_OK && aeg_encoder_recon(e, pl, st, NULL) == AEG_OK) {
+                if (k) {
+                    CHECK(st[0] >= 2 * W && st[1] >= 2 * CW && !(st[0] & 1),
+                          "10-bit recon strides %d %d", st[0], st[1]);
+                    for (y = 0; y < H; y++)
+                        for (x = 0; x < W; x++) {
+                            int v = ((const uint16_t *)(pl[0] + (size_t)y * st[0]))[x];
+                            if (v > maxv)
+                                maxv = v;
+                        }
+                    ssd10 = ssd16(pl[0], st[0], src);
+                    n10 = 1;
+                } else {
+                    double s = 0;
+                    for (y = 0; y < H; y++)
+                        for (x = 0; x < W; x++) {
+                            double dd = (double)(pl[0][(size_t)y * st[0] + x] << 2) -
+                                        src[y * W + x];
+                            s += dd * dd;
+                        }
+                    ssd8 = s;
+                    n8 = 1;
+                }
+            }
+            aeg_encoder_close(e);
+        }
+        if (n8 && n10) {
+            CHECK(maxv > 255 && maxv <= 1023, "10-bit recon peak %g", maxv);
+            /* QP 0: the 8-bit stream cannot do better than its rounding
+             * (MSE ~1.25 in 10-bit units); the 10-bit one quantises 4x
+             * finer */
+            CHECK(ssd10 * 2 < ssd8, "10-bit SSD %g not well below 8-bit %g",
+                  ssd10, ssd8);
+        }
+
+        /* 10-bit samples above 1023 (the caller's error) are clipped: the
+         * same stream as the picture with 1023 there */
+        {
+            buf o[2] = { { NULL, 0, 0 }, { NULL, 0, 0 } };
+            uint16_t *Y = (uint16_t *)img;
+            for (k = 0; k < 2; k++) {
+                aeg_image im;
+                for (y = 0; y < H; y++)
+                    for (x = 0; x < W; x++)
+                        Y[y * W + x] = (uint16_t)((x / 8 + y / 8) & 1
+                                       ? (k ? 0xFFFF : 1023) : src[y * W + x]);
+                memset(&im, 0, sizeof(im));
+                im.csp = AEG_CSP_I420;
+                im.depth = 10;
+                im.plane[0] = img;
+                im.plane[1] = img + 2 * W * H;
+                im.plane[2] = img + 2 * (W * H + CW * CH);
+                im.stride[0] = 2 * W;
+                im.stride[1] = im.stride[2] = 2 * CW;
+                base_params(&p, 2);
+                p.qp = 4;
+                p.bit_depth = 10;
+                e = aeg_encoder_open(&p);
+                if (!e)
+                    continue;
+                if (aeg_encoder_encode_image(e, &im, 0, &pkt) == AEG_OK)
+                    put(&o[k], pkt.data, pkt.size);
+                while (aeg_encoder_flush(e, &pkt) == AEG_OK)
+                    put(&o[k], pkt.data, pkt.size);
+                aeg_encoder_close(e);
+            }
+            CHECK(o[0].n > 0 && o[0].n == o[1].n && !memcmp(o[0].d, o[1].d, o[0].n),
+                  "10-bit samples above 1023 not clipped (%zu vs %zu bytes)",
+                  o[1].n, o[0].n);
+            free(o[0].d);
+            free(o[1].d);
+        }
+
+        /* 8-bit and 10-bit encoders open at once, coding alternately */
+        base_params(&p, 2);
+        e8 = aeg_encoder_open(&p);
+        p.bit_depth = 10;
+        e = aeg_encoder_open(&p);
+        CHECK(e8 && e, "open both: %s", aeg_last_error());
+        if (e8 && e) {
+            run ref8;
+            buf o8 = { NULL, 0, 0 };
+            memset(&ref8, 0, sizeof(ref8));
+            base_params(&ref8.p, 2);
+            ref8.pts_step = 1;
+            encode_clip(&ref8);
+            for (k = 0; k < NF; k++) {
+                const uint8_t *fr = clip + frame_bytes() * k;
+                if (aeg_encoder_encode(e8, fr, frame_bytes(), 1000 + k, &pkt) == AEG_OK)
+                    put(&o8, pkt.data, pkt.size);
+                aeg_encoder_encode(e, fr, frame_bytes(), 1000 + k, &pkt);
+            }
+            while (aeg_encoder_flush(e8, &pkt) == AEG_OK)
+                put(&o8, pkt.data, pkt.size);
+            CHECK(o8.n == ref8.out.n && !memcmp(o8.d, ref8.out.d, o8.n),
+                  "8-bit stream changed by a 10-bit encoder beside it");
+            free(o8.d);
+            free(ref8.out.d);
+        }
+        aeg_encoder_close(e8);
+        aeg_encoder_close(e);
+    out:
+        free(src);
+        free(img);
+        free(f8);
+    }
+#else
+    base_params(&p, 1);
+    p.bit_depth = 10;
+    e = aeg_encoder_open(&p);
+    CHECK(e == NULL && strstr(aeg_last_error(), "bit_depth"),
+          "10-bit opened in a library built without it");
+    aeg_encoder_close(e);
+#endif
 }
 
 int main(void)
@@ -670,7 +921,11 @@ int main(void)
     check_planes_and_dts(3, AEG_RC_CQP, 0);
     check_planes_and_dts(0, AEG_RC_CRF, 0);
     check_planes_and_dts(2, AEG_RC_CRF, 1);
-    check_images();
+    check_images(8);
+#ifdef AEG_HAVE_10BIT
+    check_images(10);
+#endif
+    check_bit_depth();
     check_threads();
     aeg_set_log_level(old);
     free(clip);

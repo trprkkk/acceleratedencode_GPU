@@ -66,13 +66,22 @@ PY
 # the last, incomplete group -- and the loop below rebuilds it from the frame and
 # B counts to check the reported order against it.
 cat > "$TMP/cmp_b.py" <<'PY'
-import sys, os
+import sys, os, array
 rec, dec, w, h, n, b, tag = (sys.argv[1], sys.argv[2], int(sys.argv[3]),
                              int(sys.argv[4]), int(sys.argv[5]),
                              int(sys.argv[6]), sys.argv[7])
 fs = w * h * 3 // 2
 A = open(rec, 'rb').read() if os.path.exists(rec) else b''
 B = open(dec, 'rb').read() if os.path.exists(dec) else b''
+if os.environ.get('CMP_BPS') == '2':
+    # 10 bits: both files hold 16-bit little-endian samples (yuv420p10le)
+    if len(A) % 2 or len(B) % 2:
+        print("   %-22s ODD SIZE recon=%d dec=%d" % (tag, len(A), len(B)))
+        sys.exit(1)
+    A, B = array.array('H', A), array.array('H', B)
+    if sys.byteorder != 'little':
+        A.byteswap()
+        B.byteswap()
 if len(A) != len(B) or len(A) < fs * n:
     print("   %-22s SIZE MISMATCH recon=%d dec=%d (expected %d)"
           % (tag, len(A), len(B), fs * n))
@@ -145,21 +154,26 @@ run_bcase() {
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
         return
     fi
-    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
+    gop=0
+    fixed=0
+    pix=yuv420p
+    bps=1
+    for a in "$@"; do
+        if [ "$prev" = "-g" ]; then gop=$a; fi
+        if [ "$prev" = "--b-adapt" ] && [ "$a" = "0" ]; then fixed=1; fi
+        if [ "$prev" = "--bit-depth" ] && [ "$a" = "10" ]; then
+            pix=yuv420p10le; bps=2
+        fi
+        prev=$a
+    done
+    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt $pix \
         "$TMP/$name.dec" 2>"$TMP/$name.decerr"
     if [ -s "$TMP/$name.decerr" ]; then
         echo "   $name: decoder reported problems:"
         sed 's/^/     /' "$TMP/$name.decerr" | head -3
         FAIL=1
     fi
-    gop=0
-    fixed=0
-    for a in "$@"; do
-        if [ "$prev" = "-g" ]; then gop=$a; fi
-        if [ "$prev" = "--b-adapt" ] && [ "$a" = "0" ]; then fixed=1; fi
-        prev=$a
-    done
-    python3 "$TMP/cmp_b.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" \
+    CMP_BPS=$bps python3 "$TMP/cmp_b.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" \
         "$n" "$b" "$name" "$gop" "$TMP/$name.order" "$fixed" || FAIL=1
 }
 
@@ -943,6 +957,64 @@ if command -v "$FF" >/dev/null 2>&1; then
     fi
 else
     echo "   skipped (no ffmpeg)"
+fi
+
+# High 10: the 10-bit build of the encoder (x264 --output-depth 10).  Every
+# reconstruction against ffmpeg's 10-bit decode (yuv420p10le), the paths whose
+# arithmetic depends on the depth: QPs below 0 (CRF), CAVLC, slices, the rate
+# controls, weighted prediction, true 10-bit input; then that the stream does
+# not depend on the threads, and that it is High 10.
+echo "== High 10 (10-bit)"
+rc=0
+"$BUILD/genyuv" 64 64 2 "$TMP/h10probe.yuv" 1 >/dev/null
+$BUILD/aegenc -w 64 -h 64 -i "$TMP/h10probe.yuv" -o "$TMP/h10probe.264" \
+    --bit-depth 10 -v 0 2>/dev/null || rc=$?
+if [ $rc != 0 ]; then
+    echo "   skipped (library built without the 10-bit encoder)"
+elif ! command -v "$FF" >/dev/null 2>&1; then
+    echo "   skipped (no ffmpeg)"
+else
+    run_bcase h10_cqp     176 144 12 3 4 -q 24 -p 2 --bit-depth 10
+    run_bcase h10_p4      176 144 12 3 1 -q 30 -p 4 --bit-depth 10
+    run_bcase h10_lowqp   176 144  8 2 4 -q 0  -p 3 --bit-depth 10
+    run_bcase h10_crfneg  176 144 12 3 4 -p 3 --crf -6 --bit-depth 10
+    run_bcase h10_cavlc   176 144 12 0 4 -q 26 -p 2 --no-cabac --bit-depth 10
+    run_bcase h10_slices  176 144 12 2 6 -q 26 -p 3 --slices 3 --tff --bit-depth 10
+    run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
+        --vbv-bufsize 200 --nal-hrd --bit-depth 10
+    run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10
+    run_bcase h10_qpmin   176 144 12 3 4 -p 2 --crf 2 --qpmin 6 --bit-depth 10
+    # true 10-bit input: a 352x288 clip scaled down by ffmpeg into 10 bits
+    "$BUILD/genyuv" 352 288 12 "$TMP/h10big.yuv" 4 >/dev/null
+    "$FF" -v error -y -f rawvideo -s 352x288 -pix_fmt yuv420p \
+        -i "$TMP/h10big.yuv" -vf scale=176:144 -pix_fmt yuv420p10le \
+        -f rawvideo "$TMP/h10in.yuv"
+    IN_FILE="$TMP/h10in.yuv" run_bcase h10_in10 176 144 12 3 0 -q 22 -p 3 \
+        --input-depth 10 --bit-depth 10
+    for o in "-q 24 -p 3" "--crf 20 -p 4" "--bitrate 300 -p 3"; do
+        rc=0
+        for k in ft1 ft3 s1 s3; do
+            case $k in
+                ft1) t="--frame-threads 1" ;; ft3) t="--frame-threads 3" ;;
+                s1) t="--slices 3 -t 1" ;;    s3) t="--slices 3 -t 3" ;;
+            esac
+            $BUILD/aegenc -w 176 -h 144 -n 12 -i "$TMP/h10_cqp.yuv" -v 0 \
+                --bit-depth 10 $o $t -o "$TMP/h10_$k.264" || rc=$?
+        done
+        if [ $rc = 0 ] && cmp -s "$TMP/h10_ft1.264" "$TMP/h10_ft3.264" &&
+           cmp -s "$TMP/h10_s1.264" "$TMP/h10_s3.264"; then
+            echo "   10-bit $o: frame threads 1 = 3, slice threads 1 = 3"
+        else
+            echo "   10-bit $o: the stream depends on the threads (rc $rc)  FAIL"
+            FAIL=1
+        fi
+    done
+    if "$FF" -i "$TMP/h10_cqp.264" 2>&1 | grep -q 'h264 (High 10).*yuv420p10le'; then
+        echo "   10-bit stream: High 10, yuv420p10le"
+    else
+        echo "   10-bit stream: not reported as High 10 / yuv420p10le  FAIL"
+        FAIL=1
+    fi
 fi
 
 echo "== device enumeration"

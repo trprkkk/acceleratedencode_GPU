@@ -152,6 +152,19 @@ typedef struct aeg_params {
      * Blu-ray, with the field order of --tff/--bff.  The height must be a
      * multiple of 4; the levels that allow it are 2.1 to 4.1. */
     int interlaced;
+    /* Bits per coded sample: 8 (the default; 0 also means 8) or 10 (High 10
+     * profile, as x264's 10-bit build: the library holds both, compiled
+     * twice, and picks one per encoder).  The rate controls, qp, crf, qp_min,
+     * qp_max and the per-picture QPs keep the 8-bit scale (QPY: a QP of 22
+     * means the same quantiser step relative to the signal at both depths);
+     * at 10 bits the rate control may go below 0, down to -12, unless qp_min
+     * says otherwise.  10-bit runs on the CPU only (the GPU kernels are
+     * 8-bit).  Input: aeg_encoder_encode_image() with 10-bit I420/YV12 goes
+     * in unchanged, anything else is converted (8-bit input is scaled up
+     * exactly, deeper input dithered to 10 bits); aeg_encoder_encode() and
+     * _encode_planes() take 8-bit samples.  aeg_encoder_recon() returns
+     * uint16_t samples (strides in bytes) for a 10-bit encoder. */
+    int bit_depth;
     int level_idc;
     int qp_min, qp_max;
     int chroma_qp_offset;
@@ -159,7 +172,7 @@ typedef struct aeg_params {
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
     /* AEG_RC_CRF: the quality to hold, on x264's scale (lower is better;
-     * 0..51, fractions allowed).  qcomp: how far the quantiser follows the
+     * 0..51, fractions allowed; -12..51 at 10 bits).  qcomp: how far the quantiser follows the
      * picture's complexity, in percent (x264's qcomp; 60 by default): 100
      * holds the QP constant, 0 holds the bits per picture constant.  With the
      * macroblock tree the tree does that work per macroblock instead. */

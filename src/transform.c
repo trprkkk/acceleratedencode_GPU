@@ -17,6 +17,14 @@
 #include <pthread.h>
 #include <string.h>
 
+/* qp is QPY everywhere; the tables are indexed by QP'Y = QPY + QpBdOffsetY */
+#define QPM(q) (((q) + QP_BD_OFFSET) % 6)
+#define QPD(q) (((q) + QP_BD_OFFSET) / 6)
+/* 8.5.12.1: no scaled coefficient outside -2^(7+BitDepth)..2^(7+BitDepth)-1
+ * (the reference 8-bit decoder's int16 block) */
+#define COEF_MAX ((1 << (7 + BIT_DEPTH)) - 1)
+#define COEF_MIN (-(1 << (7 + BIT_DEPTH)))
+
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
  * undefined behaviour on an unaligned pixel address) */
 static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
@@ -29,14 +37,14 @@ static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
  * returns bit-identical values to the scalar one and cannot change a decision:
  * the CPU fallback, the batch operations and the device kernels all keep
  * agreeing (tests/kernel_check.c compares them sample by sample). */
-#if defined(__SSE2__)
+#if AEG_SSE2
 #include <emmintrin.h>
 #endif
 
 /* AVX2 kernels are compiled per function (target attribute) and chosen at run
  * time, so the build stays baseline x86-64; AEG_NOAVX2=1 forces the SSE2 ones.
  * Every AVX2 kernel computes exactly what its SSE2/C counterpart does. */
-#if defined(__SSE2__) && defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#if AEG_SSE2 && defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>
 #define AEG_X86_AVX2 1
 static int cpu_avx2(void)
@@ -51,7 +59,7 @@ static int cpu_avx2(void)
 }
 #endif
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* 4x4 transpose of int16 held four lanes per register (the upper four lanes of
  * each register are zero): the two column pairs the unpacks produce are split
  * apart again so that every register holds one column. */
@@ -84,7 +92,7 @@ static inline void transpose4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *
     (s3) = t3_ - t2_ * 2;                                            \
 } while (0)
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* 4x4 forward transform, four lanes at a time.
  *
  * Every intermediate of the transform is an exact integer: a residual sample is
@@ -110,7 +118,7 @@ static inline void fdct4_1d_sse2(__m128i *r0, __m128i *r1, __m128i *r2,
     *r3 = _mm_sub_epi16(t3, _mm_slli_epi16(t2, 1));
 }
 
-static void transform_4x4_sse2(const int16_t *res, int stride, int16_t *coef)
+static void transform_4x4_sse2(const int16_t *res, int stride, dctcoef *coef)
 {
     __m128i r0 = _mm_loadl_epi64((const __m128i *)(res + 0 * stride));
     __m128i r1 = _mm_loadl_epi64((const __m128i *)(res + 1 * stride));
@@ -135,12 +143,12 @@ static void transform_4x4_sse2(const int16_t *res, int stride, int16_t *coef)
 }
 #endif
 
-void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef)
+void aeg_transform_4x4(const int16_t *res, int stride, dctcoef *coef)
 {
     int d[16];
     int i, t[16];
 
-#if defined(__SSE2__)
+#if AEG_SSE2
     transform_4x4_sse2(res, stride, coef);
     return;
 #endif
@@ -155,11 +163,11 @@ void aeg_transform_4x4(const int16_t *res, int stride, int16_t *coef)
                 d[0 * 4 + i], d[1 * 4 + i], d[2 * 4 + i], d[3 * 4 + i]);
     }
     for (i = 0; i < 16; i++)
-        coef[i] = (int16_t)d[i];
+        coef[i] = (dctcoef)d[i];
 }
 
 /* 4x4 Hadamard used by the luma DC transform of Intra_16x16 */
-void aeg_transform_dc4x4(const int16_t dc[16], int16_t out[16])
+void aeg_transform_dc4x4(const dctcoef dc[16], dctcoef out[16])
 {
     int t[16], d[16], i;
     for (i = 0; i < 4; i++) {
@@ -179,11 +187,11 @@ void aeg_transform_dc4x4(const int16_t dc[16], int16_t out[16])
         d[2 * 4 + i] = s0 - s1; d[3 * 4 + i] = s3 - s2;
     }
     for (i = 0; i < 16; i++)
-        out[i] = (int16_t)d[i];
+        out[i] = (dctcoef)d[i];
 }
 
 /* inverse luma DC Hadamard; total gain 1/4 (matches the spec's rounding) */
-void aeg_itransform_dc4x4(const int16_t in[16], int16_t out[16])
+void aeg_itransform_dc4x4(const dctcoef in[16], dctcoef out[16])
 {
     int t[16], d[16], i;
     for (i = 0; i < 4; i++) {
@@ -207,32 +215,32 @@ void aeg_itransform_dc4x4(const int16_t in[16], int16_t out[16])
         d[3 * 4 + i] = (s0 - s3 + 1) >> 1;
     }
     for (i = 0; i < 16; i++)
-        out[i] = (int16_t)d[i];
+        out[i] = (dctcoef)d[i];
 }
 
 /* 2x2 Hadamard for chroma DC (4:2:0) */
-void aeg_transform_dc2x2(const int16_t dc[4], int16_t out[4])
+void aeg_transform_dc2x2(const dctcoef dc[4], dctcoef out[4])
 {
     int s0 = dc[0] + dc[3];
     int s1 = dc[1] + dc[2];
     int s2 = dc[1] - dc[2];
     int s3 = dc[0] - dc[3];
-    out[0] = (int16_t)(s0 + s1);
-    out[1] = (int16_t)(s3 + s2);
-    out[2] = (int16_t)(s0 - s1);
-    out[3] = (int16_t)(s3 - s2);
+    out[0] = (dctcoef)(s0 + s1);
+    out[1] = (dctcoef)(s3 + s2);
+    out[2] = (dctcoef)(s0 - s1);
+    out[3] = (dctcoef)(s3 - s2);
 }
 
-void aeg_itransform_dc2x2(const int16_t in[4], int16_t out[4])
+void aeg_itransform_dc2x2(const dctcoef in[4], dctcoef out[4])
 {
     int s0 = in[0] + in[2];
     int s1 = in[0] - in[2];
     int s2 = in[1] - in[3];
     int s3 = in[1] + in[3];
-    out[0] = (int16_t)(s0 + s3);
-    out[1] = (int16_t)(s1 + s2);
-    out[2] = (int16_t)(s1 - s2);
-    out[3] = (int16_t)(s0 - s3);
+    out[0] = (dctcoef)(s0 + s3);
+    out[1] = (dctcoef)(s1 + s2);
+    out[2] = (dctcoef)(s1 - s2);
+    out[3] = (dctcoef)(s0 - s3);
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,22 +271,22 @@ int aeg_quant_bias(int qbits, int den)
                  (den * QUANT_BIAS_DEN));
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* Quantiser for the 4x4 block, sixteen coefficients at a time.  The multiply
  * goes through pmaddwd (|coef| <= 4080 for any residual, so the 16x16 product
  * is exact) and the result is stored transposed, which is the layout the
  * decoder expects -- see the scalar loop below. */
-static int quant_4x4_sse2(const int16_t *coef, int16_t *level, int qp,
+static int quant_4x4_sse2(const dctcoef *coef, dctcoef *level, int qp,
                           int intra)
 {
     /* All sixteen at once: |coef| <= 32768 read as unsigned and mf < 2^14,
      * so the unsigned 16x16 product (mullo / mulhi_epu16) plus the rounding
      * offset fits a 32-bit lane, and the level (< 2^15) packs back exactly. */
-    const int qbits = 15 + (qp / 6);
+    const int qbits = 15 + (QPD(qp));
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
-    const int mf0 = aeg_quant_mf[qp % 6][0];
-    const int mf1 = aeg_quant_mf[qp % 6][1];
-    const int mf2 = aeg_quant_mf[qp % 6][2];
+    const int mf0 = aeg_quant_mf[QPM(qp)][0];
+    const int mf1 = aeg_quant_mf[QPM(qp)][1];
+    const int mf2 = aeg_quant_mf[QPM(qp)][2];
     const __m128i qb = _mm_cvtsi32_si128(qbits);
     const __m128i fv = _mm_set1_epi32(f);
     /* coef rows 0/2 use [mf0 mf1 mf0 mf1], rows 1/3 [mf1 mf2 mf1 mf2] */
@@ -308,9 +316,9 @@ static int quant_4x4_sse2(const int16_t *coef, int16_t *level, int qp,
 }
 #endif
 
-void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
+void aeg_quant_4x4(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (quant_4x4_sse2(coef, level, qp, intra))
         return;
 #endif
@@ -318,11 +326,11 @@ void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
      * whether this is an intra block), so they are computed once for the
      * sixteen coefficients: aeg_quant_bias() is a 64-bit division and this
      * function runs a million times per thirty frames. */
-    const int qbits = 15 + (qp / 6);
+    const int qbits = 15 + (QPD(qp));
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
-    const int mf0 = aeg_quant_mf[qp % 6][0];
-    const int mf1 = aeg_quant_mf[qp % 6][1];
-    const int mf2 = aeg_quant_mf[qp % 6][2];
+    const int mf0 = aeg_quant_mf[QPM(qp)][0];
+    const int mf1 = aeg_quant_mf[QPM(qp)][1];
+    const int mf2 = aeg_quant_mf[QPM(qp)][2];
     int x, y;
     /* The decoder's 4x4 inverse transform is the transpose of ours: a
      * coefficient in slot (row 1, column 0) comes out as a horizontal ramp
@@ -337,50 +345,50 @@ void aeg_quant_4x4(const int16_t *coef, int16_t *level, int qp, int intra)
             const int mf = cls == 0 ? mf0 : (cls == 1 ? mf1 : mf2);
             const int abs = c < 0 ? -c : c;
             const int lv = (int)(((int64_t)abs * mf + f) >> qbits);
-            level[y * 4 + x] = (int16_t)(c < 0 ? -lv : lv);
+            level[y * 4 + x] = (dctcoef)(c < 0 ? -lv : lv);
         }
 }
 
-void aeg_quant_4x4_dc(const int16_t *coef, int16_t *level, int qp, int intra)
+void aeg_quant_4x4_dc(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
     /* The 4x4 Hadamard multiplies the DC by another 16 on top of the 16 the
      * per-block transform already put there; the reference decoder in turn
      * normalises with a 1/4 in the dequantiser and a 1/64 in its DC inverse,
      * which leaves two more bits of shift than for an AC block. */
-    const int qbits = 17 + (qp / 6);
-    const int mf = aeg_quant_mf[qp % 6][0];
+    const int qbits = 17 + (QPD(qp));
+    const int mf = aeg_quant_mf[QPM(qp)][0];
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     int i;
     for (i = 0; i < 16; i++) {
         int abs = coef[i] < 0 ? -coef[i] : coef[i];
         int lv = (int)(((int64_t)abs * mf + f) >> qbits);
-        level[i] = (int16_t)(coef[i] < 0 ? -lv : lv);
+        level[i] = (dctcoef)(coef[i] < 0 ? -lv : lv);
     }
 }
 
-void aeg_quant_2x2_dc(const int16_t *coef, int16_t *level, int qp, int intra)
+void aeg_quant_2x2_dc(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
     /* 2x2 Hadamard gain 4 on top of the per-block gain of 16; the chroma DC
      * inverse normalises by one bit less than the luma one. */
-    const int qbits = 16 + (qp / 6);
-    const int mf = aeg_quant_mf[qp % 6][0];
+    const int qbits = 16 + (QPD(qp));
+    const int mf = aeg_quant_mf[QPM(qp)][0];
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
     int i;
     for (i = 0; i < 4; i++) {
         int abs = coef[i] < 0 ? -coef[i] : coef[i];
         int lv = (int)(((int64_t)abs * mf + f) >> qbits);
-        level[i] = (int16_t)(coef[i] < 0 ? -lv : lv);
+        level[i] = (dctcoef)(coef[i] < 0 ? -lv : lv);
     }
 }
 
-void aeg_dequant_4x4(const int16_t *level, int32_t *coef, int qp)
+void aeg_dequant_4x4(const dctcoef *level, int32_t *coef, int qp)
 {
-    int x, y, sh = qp / 6;
+    int x, y, sh = QPD(qp);
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
             int cls = (x & 1) + (y & 1);
             coef[y * 4 + x] = (int32_t)level[x * 4 + y] *
-                              aeg_dequant_ls[qp % 6][cls] * (1 << sh);
+                              aeg_dequant_ls[QPM(qp)][cls] * (1 << sh);
         }
 }
 
@@ -390,11 +398,11 @@ void aeg_dequant_4x4(const int16_t *level, int32_t *coef, int qp)
  * and its rounding.  `dc[b]` is the DC coefficient of block b expressed in the
  * same units as the dequantised AC coefficients (the inverse transform below
  * divides by 64). */
-void aeg_dequant_4x4_dc_out(const int16_t *level, int32_t *dc, int qp)
+void aeg_dequant_4x4_dc_out(const dctcoef *level, int32_t *dc, int qp)
 {
     static const int base[4] = { 0, 2, 8, 10 };
     int in[16], temp[16];
-    int i, qmul = aeg_dequant_ls[qp % 6][0] << (qp / 6 + 6);
+    int i, qmul = aeg_dequant_ls[QPM(qp)][0] << (QPD(qp) + 6);
 
     for (i = 0; i < 16; i++)
         in[i] = level[i];
@@ -413,10 +421,10 @@ void aeg_dequant_4x4_dc_out(const int16_t *level, int32_t *dc, int qp)
         int z1 = temp[i] - temp[8 + i];
         int z2 = temp[4 + i] - temp[12 + i];
         int z3 = temp[4 + i] + temp[12 + i];
-        dc[base[i] + 0] = (int16_t)(((z0 + z3) * qmul + 128) >> 8);
-        dc[base[i] + 1] = (int16_t)(((z1 + z2) * qmul + 128) >> 8);
-        dc[base[i] + 4] = (int16_t)(((z1 - z2) * qmul + 128) >> 8);
-        dc[base[i] + 5] = (int16_t)(((z0 - z3) * qmul + 128) >> 8);
+        dc[base[i] + 0] = (dctcoef)(((z0 + z3) * qmul + 128) >> 8);
+        dc[base[i] + 1] = (dctcoef)(((z1 + z2) * qmul + 128) >> 8);
+        dc[base[i] + 4] = (dctcoef)(((z1 - z2) * qmul + 128) >> 8);
+        dc[base[i] + 5] = (dctcoef)(((z0 - z3) * qmul + 128) >> 8);
     }
 }
 
@@ -439,7 +447,7 @@ void aeg_dc_block_unpermute(int32_t *dc)
         dc[i] = t[p2[i]];
 }
 
-void aeg_transform_dc4x4_fwd(const int16_t *dc, int16_t *level)
+void aeg_transform_dc4x4_fwd(const dctcoef *dc, dctcoef *level)
 {
     /* Exact inverse of aeg_dequant_4x4_dc_out().  The decoder runs a
      * 4x4 Hadamard as two passes, temp = M * in (rows) followed by
@@ -477,34 +485,34 @@ void aeg_transform_dc4x4_fwd(const int16_t *dc, int16_t *level)
         t[12 + i] = x0 - x1 + x2 - x3;
     }
     for (i = 0; i < 16; i++)
-        level[i] = (int16_t)t[i];
+        level[i] = (dctcoef)t[i];
 }
 
 /* 4:2:0 chroma DC, again bit-exact with the reference decoder. */
-void aeg_dequant_2x2_dc_out(const int16_t *level, int32_t *dc, int qp)
+void aeg_dequant_2x2_dc_out(const dctcoef *level, int32_t *dc, int qp)
 {
-    int qmul = aeg_dequant_ls[qp % 6][0] << (qp / 6 + 6);
+    int qmul = aeg_dequant_ls[QPM(qp)][0] << (QPD(qp) + 6);
     int a = level[0], b = level[1], c = level[2], d = level[3];
     int e = a - b;
     a = a + b;
     b = c - d;
     c = c + d;
-    /* The reference decoder keeps the dequantised block in int16_t, so the
+    /* The reference decoder keeps the dequantised block in dctcoef, so the
      * values wrap at high quantisers; reproducing that keeps the recon
      * bit-identical to a real decoder. */
-    dc[0] = (int16_t)((a + c) * qmul >> 7);
-    dc[1] = (int16_t)((e + b) * qmul >> 7);
-    dc[2] = (int16_t)((a - c) * qmul >> 7);
-    dc[3] = (int16_t)((e - b) * qmul >> 7);
+    dc[0] = (dctcoef)((a + c) * qmul >> 7);
+    dc[1] = (dctcoef)((e + b) * qmul >> 7);
+    dc[2] = (dctcoef)((a - c) * qmul >> 7);
+    dc[3] = (dctcoef)((e - b) * qmul >> 7);
 }
 
-void aeg_transform_dc2x2_fwd(const int16_t *dc, int16_t *level)
+void aeg_transform_dc2x2_fwd(const dctcoef *dc, dctcoef *level)
 {
     int a = dc[0], b = dc[1], c = dc[2], d = dc[3];
-    level[0] = (int16_t)(a + b + c + d);
-    level[1] = (int16_t)(a - b + c - d);
-    level[2] = (int16_t)(a + b - c - d);
-    level[3] = (int16_t)(a - b - c + d);
+    level[0] = (dctcoef)(a + b + c + d);
+    level[1] = (dctcoef)(a - b + c - d);
+    level[2] = (dctcoef)(a + b - c - d);
+    level[3] = (dctcoef)(a - b - c + d);
 }
 
 /* ------------------------------------------------------------------ */
@@ -513,9 +521,9 @@ void aeg_transform_dc2x2_fwd(const int16_t *dc, int16_t *level)
 /* Applies the inverse transform to the dequantised coefficients and adds
  * the result to the prediction.  `dc`, when non-NULL, replaces coefficient
  * 0 (Intra_16x16 luma DC path). */
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* Four int16 in the low lanes of a register, and the reverse. */
-static inline __m128i load4_i16(const int16_t *p)
+static inline __m128i load4_i16(const dctcoef *p)
 {
     return _mm_loadl_epi64((const __m128i *)p);
 }
@@ -555,15 +563,15 @@ static inline void idct_pass(__m128i *a0, __m128i *a1, __m128i *a2, __m128i *a3)
  * buffers at all), and the differential test in tests/run_tests.sh compares
  * this against the scalar loop on random levels at every QP to keep it that
  * way. */
-static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
-                         int qp, const uint8_t *pred, int pred_stride,
+static int idct_add_sse2(pixel *dst, int stride, const dctcoef *level,
+                         int qp, const pixel *pred, int pred_stride,
                          const int32_t *dc_in)
 {
-    const int sh = qp / 6;
-    const int qm = qp % 6;
+    const int sh = QPD(qp);
+    const int qm = QPM(qp);
     const __m128i zero = _mm_setzero_si128();
     const __m128i shv = _mm_cvtsi32_si128(sh);
-    const int16_t ls0 = aeg_dequant_ls[qm][0], ls1 = aeg_dequant_ls[qm][1],
+    const dctcoef ls0 = aeg_dequant_ls[qm][0], ls1 = aeg_dequant_ls[qm][1],
                   ls2 = aeg_dequant_ls[qm][2];
     const __m128i e = _mm_setr_epi16(ls0, 0, ls1, 0, ls0, 0, ls1, 0);
     const __m128i o = _mm_setr_epi16(ls1, 0, ls2, 0, ls1, 0, ls2, 0);
@@ -596,8 +604,8 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
          * intermediate truncation a very large DC coefficient does depend on.
          */
         if (pred && _mm_movemask_epi8(_mm_cmpeq_epi16(ac, zero)) == 0xFFFF) {
-            const int dc = dc_in ? (int16_t)*dc_in :
-                           (int16_t)((int32_t)(int16_t)_mm_extract_epi16(a0, 0) *
+            const int dc = dc_in ? (dctcoef)*dc_in :
+                           (dctcoef)((int32_t)(dctcoef)_mm_extract_epi16(a0, 0) *
                                      ls0 * (1 << sh));
             const int add = (dc + (1 << 5)) >> 6;
             const __m128i bias = _mm_set1_epi32(add);
@@ -624,7 +632,7 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
     a1 = _mm_sll_epi32(a1, shv);
     a2 = _mm_sll_epi32(a2, shv);
     a3 = _mm_sll_epi32(a3, shv);
-    /* the scalar's (int16_t) cast after the dequantiser ... */
+    /* the scalar's (dctcoef) cast after the dequantiser ... */
     a0 = _mm_srai_epi32(_mm_slli_epi32(a0, 16), 16);
     a1 = _mm_srai_epi32(_mm_slli_epi32(a1, 16), 16);
     a2 = _mm_srai_epi32(_mm_slli_epi32(a2, 16), 16);
@@ -633,7 +641,7 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
      * value, truncated the same way */
     if (dc_in)
         a0 = _mm_or_si128(_mm_andnot_si128(_mm_setr_epi32(-1, 0, 0, 0), a0),
-                          _mm_cvtsi32_si128((int16_t)*dc_in));
+                          _mm_cvtsi32_si128((dctcoef)*dc_in));
     /* ... and only then the reference decoder's DC rounding, which the scalar
      * loop also adds after that cast */
     a0 = _mm_add_epi32(a0, _mm_setr_epi32(1 << 5, 0, 0, 0));
@@ -671,7 +679,7 @@ static int idct_add_sse2(uint8_t *dst, int stride, const int16_t *level,
  * into the first pass, truncate through the second one.  `res` receives the
  * signed residual; without a prediction to add it is also what the batched
  * device path returns, so this is the single definition of the arithmetic. */
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* One pass of the inverse transform, four values at a time.  The registers are
  * the four *input* values and the four outputs replace them, so a pass along
  * one axis is four register operations whatever the axis is -- which is why the
@@ -700,13 +708,13 @@ static inline __m128i trunc16_epi32(__m128i v)
 }
 #endif
 
-static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
+static void idct_core(const dctcoef *level, int qp, const int32_t *dc_in,
                       int16_t *res)
 {
     int32_t d[16];
     int t[16];
-    int i, x, y, sh = qp / 6;
-#if defined(__SSE2__)
+    int i, x, y, sh = QPD(qp);
+#if AEG_SSE2
     __m128i r0, r1, r2, r3;
 #endif
 
@@ -714,15 +722,15 @@ static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
         for (x = 0; x < 4; x++) {
             int cls = (x & 1) + (y & 1);
             int v = level[x * 4 + y];   /* level[] is in decoder order */
-            d[y * 4 + x] = (int16_t)((int32_t)v * aeg_dequant_ls[qp % 6][cls] * (1 << sh));
+            d[y * 4 + x] = (dctcoef)((int32_t)v * aeg_dequant_ls[QPM(qp)][cls] * (1 << sh));
         }
     if (dc_in)
-        d[0] = (int16_t)*dc_in;
+        d[0] = (dctcoef)*dc_in;
     /* The reference decoder rounds the DC coefficient into the first pass and
      * then truncates in the second one (block[0] += 1 << 5 ... >> 6). */
     d[0] += 1 << 5;
 
-#if defined(__SSE2__)
+#if AEG_SSE2
     /* Same two passes, same two int16 truncation points, four lanes at a time.
      * The first pass runs along the *rows* of the block, so it has to run along
      * the register index: load (and transpose) so that a register holds a
@@ -754,10 +762,10 @@ static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
         int32_t s1 = d[i * 4 + 0] - d[i * 4 + 2];
         int32_t s2 = (d[i * 4 + 1] >> 1) - d[i * 4 + 3];
         int32_t s3 = d[i * 4 + 1] + (d[i * 4 + 3] >> 1);
-        t[i * 4 + 0] = (int16_t)(s0 + s3);
-        t[i * 4 + 1] = (int16_t)(s1 + s2);
-        t[i * 4 + 2] = (int16_t)(s1 - s2);
-        t[i * 4 + 3] = (int16_t)(s0 - s3);
+        t[i * 4 + 0] = (dctcoef)(s0 + s3);
+        t[i * 4 + 1] = (dctcoef)(s1 + s2);
+        t[i * 4 + 2] = (dctcoef)(s1 - s2);
+        t[i * 4 + 3] = (dctcoef)(s0 - s3);
     }
     /* columns */
     for (i = 0; i < 4; i++) {
@@ -773,23 +781,23 @@ static void idct_core(const int16_t *level, int qp, const int32_t *dc_in,
     }
 }
 
-void aeg_idct_residual(const int16_t *level, int qp, int16_t *res)
+void aeg_idct_residual(const dctcoef *level, int qp, int16_t *res)
 {
     idct_core(level, qp, NULL, res);
 }
 
-void aeg_idct_residual_dc(const int16_t *level, int qp, int32_t dc,
+void aeg_idct_residual_dc(const dctcoef *level, int qp, int32_t dc,
                           int16_t *res)
 {
     idct_core(level, qp, &dc, res);
 }
 
-static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
-                            int qp, const uint8_t *pred, int pred_stride,
+static void idct_add_scalar(pixel *dst, int stride, const dctcoef *level,
+                            int qp, const pixel *pred, int pred_stride,
                             const int32_t *dc_in)
 {
     int16_t res[16];
-    int x, y, sh = qp / 6;
+    int x, y, sh = QPD(qp);
     int ac_nonzero = 0;
 
     if (pred) {
@@ -802,14 +810,14 @@ static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
     }
     if (pred && !ac_nonzero) {
         /* DC only: every pixel gets (dc + 32) >> 6 */
-        int dc = dc_in ? (int16_t)*dc_in
-                       : (int16_t)((int32_t)level[0] *
-                                   aeg_dequant_ls[qp % 6][0] * (1 << sh));
+        int dc = dc_in ? (dctcoef)*dc_in
+                       : (dctcoef)((int32_t)level[0] *
+                                   aeg_dequant_ls[QPM(qp)][0] * (1 << sh));
         int v = (dc + 32) >> 6;
         for (y = 0; y < 4; y++)
             for (x = 0; x < 4; x++) {
                 int p = pred[y * pred_stride + x] + v;
-                dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+                dst[y * stride + x] = (pixel)(p < 0 ? 0 : (p > PIXEL_MAX ? PIXEL_MAX : p));
             }
         return;
     }
@@ -817,15 +825,15 @@ static void idct_add_scalar(uint8_t *dst, int stride, const int16_t *level,
     for (y = 0; y < 4; y++)
         for (x = 0; x < 4; x++) {
             int p = (pred ? pred[y * pred_stride + x] : 0) + (int)res[y * 4 + x];
-            dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+            dst[y * stride + x] = (pixel)(p < 0 ? 0 : (p > PIXEL_MAX ? PIXEL_MAX : p));
         }
 }
 
-void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
-                        int qp, const uint8_t *pred, int pred_stride,
+void aeg_idct_add_block(pixel *dst, int stride, const dctcoef *level,
+                        int qp, const pixel *pred, int pred_stride,
                         const int32_t *dc_in)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     /* The Intra_16x16 AC blocks (dc_in) too: coefficient 0 is overridden from
      * the DC Hadamard at the scalar loop's truncation point. */
     if (idct_add_sse2(dst, stride, level, qp, pred, pred_stride, dc_in))
@@ -835,13 +843,13 @@ void aeg_idct_add_block(uint8_t *dst, int stride, const int16_t *level,
 }
 
 /* aeg_idct_add_block() into a scratch block, and its SSE against src. */
-int64_t aeg_idct_add_ssd4(const int16_t *level, int qp, const uint8_t *pred,
+int64_t aeg_idct_add_ssd4(const dctcoef *level, int qp, const pixel *pred,
                           int pred_stride, const int32_t *dc_in,
-                          const uint8_t *src, int stride)
+                          const pixel *src, int stride)
 {
-    uint8_t r[16];
+    pixel r[16];
     aeg_idct_add_block(r, 4, level, qp, pred, pred_stride, dc_in);
-#if defined(__SSE2__)
+#if AEG_SSE2
     {
         const __m128i z = _mm_setzero_si128();
         __m128i va = _mm_loadu_si128((const __m128i *)r);
@@ -861,25 +869,25 @@ int64_t aeg_idct_add_ssd4(const int16_t *level, int qp, const uint8_t *pred,
 }
 
 /* The scalar reference, for the differential test. */
-void aeg_idct_add_block_c(uint8_t *dst, int stride, const int16_t *level,
-                          int qp, const uint8_t *pred, int pred_stride,
+void aeg_idct_add_block_c(pixel *dst, int stride, const dctcoef *level,
+                          int qp, const pixel *pred, int pred_stride,
                           const int32_t *dc_in)
 {
     idct_add_scalar(dst, stride, level, qp, pred, pred_stride, dc_in);
 }
 
 /* Sum of squared differences of two blocks of `w` x `h` (w = 4, 8 or 16). */
-int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
+int64_t aeg_ssd(int w, int h, const pixel *a, int sa, const pixel *b,
                 int sb)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     const __m128i z = _mm_setzero_si128();
     __m128i acc = z;
     int y;
     if ((w == 4 && (h & 3) == 0) || (w == 8 && (h & 1) == 0)) {
         /* four 4-byte rows or two 8-byte rows per register */
         for (y = 0; y < h; y += 16 / w) {
-            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
             __m128i va, vb, d0, d1;
             if (w == 4) {
                 va = _mm_setr_epi32(ld32(pa), ld32(pa + sa),
@@ -933,14 +941,14 @@ int64_t aeg_ssd(int w, int h, const uint8_t *a, int sa, const uint8_t *b,
 #endif
 }
 
-void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
+void aeg_recon_add(pixel *dst, int stride, const pixel *pred,
                    int pred_stride, const int16_t *res, int w, int h)
 {
     int x, y;
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
             int p = pred[y * pred_stride + x] + res[y * w + x];
-            dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+            dst[y * stride + x] = (pixel)(p < 0 ? 0 : (p > PIXEL_MAX ? PIXEL_MAX : p));
         }
 }
 
@@ -953,8 +961,8 @@ void aeg_recon_add(uint8_t *dst, int stride, const uint8_t *pred,
  * saturation clips to 0..255 exactly as the scalar form does (a sum outside
  * int16 is outside 0..255 either way), and the SSE is an integer sum
  * (at most 256 * 255^2, so int32 lanes cannot overflow). */
-static uint64_t add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
-                                const int16_t *rec, const uint8_t *src,
+static uint64_t add_res16_ssd_c(pixel *dst, int stride, const pixel *pred,
+                                const int16_t *rec, const pixel *src,
                                 int sstride)
 {
     uint64_t sse = 0;
@@ -963,18 +971,18 @@ static uint64_t add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
         for (x = 0; x < 16; x++) {
             int r = rec[16 * ((y >> 2) * 4 + (x >> 2)) + (y & 3) * 4 + (x & 3)];
             int p = (int)pred[y * 16 + x] + r, d;
-            p = p < 0 ? 0 : (p > 255 ? 255 : p);
-            dst[y * stride + x] = (uint8_t)p;
+            p = p < 0 ? 0 : (p > PIXEL_MAX ? PIXEL_MAX : p);
+            dst[y * stride + x] = (pixel)p;
             d = p - (int)src[y * sstride + x];
             sse += (uint64_t)(d * d);
         }
     return sse;
 }
 
-uint64_t aeg_add_res16_ssd(uint8_t *dst, int stride, const uint8_t *pred,
-                           const int16_t *rec, const uint8_t *src, int sstride)
+uint64_t aeg_add_res16_ssd(pixel *dst, int stride, const pixel *pred,
+                           const int16_t *rec, const pixel *src, int sstride)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     const __m128i z = _mm_setzero_si128();
     __m128i acc = z;
     int y;
@@ -1007,8 +1015,8 @@ uint64_t aeg_add_res16_ssd(uint8_t *dst, int stride, const uint8_t *pred,
 #endif
 }
 
-uint64_t aeg_add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
-                             const int16_t *rec, const uint8_t *src,
+uint64_t aeg_add_res16_ssd_c(pixel *dst, int stride, const pixel *pred,
+                             const int16_t *rec, const pixel *src,
                              int sstride)
 {
     return add_res16_ssd_c(dst, stride, pred, rec, src, sstride);
@@ -1037,7 +1045,7 @@ uint64_t aeg_add_res16_ssd_c(uint8_t *dst, int stride, const uint8_t *pred,
  *
  * The 8x8 transform is not in the batched interface yet (tq_batch and
  * iq_idct_batch take 4x4 blocks), so it always runs on the CPU. */
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* 8x8 transpose of int16 rows, in place. */
 static inline void tr8_epi16(__m128i r[8])
 {
@@ -1102,7 +1110,7 @@ static inline void idct8_1d(const int *s, int *d)
     d[7] = b0 - b7;
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* fdct8_1d() across eight vectors of four int32 lanes. */
 static inline void fdct8_v(const __m128i *s, __m128i *d)
 {
@@ -1150,9 +1158,9 @@ static inline void fdct8_pass(__m128i r[8])
 /* The SIMD path keeps the row pass in sixteen bits, which is exact for any
  * residual of eight-bit samples (|res| <= 255: the largest row output is
  * 8 * 255); anything wider takes the C path. */
-void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef)
+void aeg_transform_8x8(const int16_t *res, int stride, dctcoef *coef)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     {
         __m128i r[8], mx = _mm_setzero_si128(), mn = _mm_setzero_si128();
         int k;
@@ -1177,7 +1185,7 @@ void aeg_transform_8x8(const int16_t *res, int stride, int16_t *coef)
     aeg_transform_8x8_c(res, stride, coef);
 }
 
-void aeg_transform_8x8_c(const int16_t *res, int stride, int16_t *coef)
+void aeg_transform_8x8_c(const int16_t *res, int stride, dctcoef *coef)
 {
     int tmp[64], out[64], s[8], d[8];
     int x, y;
@@ -1197,13 +1205,13 @@ void aeg_transform_8x8_c(const int16_t *res, int stride, int16_t *coef)
             /* The coefficient buffer is 16 bits wide, as in the reference
              * encoder; an eight-bit residual cannot reach the clamp (the
              * largest single coefficient of a +-255 residual is about 7700). */
-            coef[y * 8 + x] = (int16_t)(v < -32768 ? -32768 :
-                                        (v > 32767 ? 32767 : v));
+            coef[y * 8 + x] = (dctcoef)(v < COEF_MIN ? COEF_MIN :
+                                        (v > COEF_MAX ? COEF_MAX : v));
         }
     }
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* The level clamp below for every QP and position. */
 static int32_t q8_lim[52][64];
 static void q8_init(void)
@@ -1211,21 +1219,21 @@ static void q8_init(void)
     int q, i;
     for (q = 0; q < 52; q++)
         for (i = 0; i < 64; i++)
-            q8_lim[q][i] = (int32_t)(((int64_t)32767 << 6) /
+            q8_lim[q][i] = (int32_t)(((int64_t)COEF_MAX << 6) /
                 ((int64_t)aeg_dequant8_ls[q % 6][aeg_cls8[i >> 3][i & 7]] << (q / 6)));
 }
 static pthread_once_t q8_once = PTHREAD_ONCE_INIT;
 #endif
 
-void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra)
+void aeg_quant_8x8(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     /* The scalar loop eight at a time: |coef| <= 32768 and mf < 65536, so the
      * product and the rounding offset (< 2^24) fit an unsigned 32-bit lane;
      * the level is clamped as below, then wrapped to 16 bits and signed the
      * way the scalar int16 store does. */
     if (qp >= 0 && qp < 52) {
-        const int qbits = DCT8_QUANT_SHIFT + qp / 6, m = qp % 6;
+        const int qbits = DCT8_QUANT_SHIFT + QPD(qp), m = QPM(qp);
         const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
         const __m128i fv = _mm_set1_epi32(f), qb = _mm_cvtsi32_si128(qbits);
         int k;
@@ -1259,11 +1267,11 @@ void aeg_quant_8x8(const int16_t *coef, int16_t *level, int qp, int intra)
 }
 
 /* The scalar reference, for the differential test. */
-void aeg_quant_8x8_c(const int16_t *coef, int16_t *level, int qp, int intra)
+void aeg_quant_8x8_c(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
-    const int qbits = DCT8_QUANT_SHIFT + qp / 6;
+    const int qbits = DCT8_QUANT_SHIFT + QPD(qp);
     const int f = aeg_quant_bias(qbits, intra ? 3 : 6);
-    const int m = qp % 6, sh = qp / 6;
+    const int m = QPM(qp), sh = QPD(qp);
     int x, y;
 
     for (y = 0; y < 8; y++)
@@ -1275,33 +1283,33 @@ void aeg_quant_8x8_c(const int16_t *coef, int16_t *level, int qp, int intra)
             /* Keep the dequantised level inside the decoder's int16 range:
              * |level * V8 * 16 * 2^(qp/6) >> 6| <= 32767. */
             if (lv) {
-                const int64_t lim = ((int64_t)32767 << 6) /
+                const int64_t lim = ((int64_t)COEF_MAX << 6) /
                                     ((int64_t)aeg_dequant8_ls[m][aeg_cls8[y][x]]
                                      << sh);
                 if (lv > lim)
                     lv = (int)lim;
             }
-            level[y * 8 + x] = (int16_t)(c < 0 ? -lv : lv);
+            level[y * 8 + x] = (dctcoef)(c < 0 ? -lv : lv);
         }
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* level * (V8 << qp/6) for every position and QP: at most 58 << 8, so it fits
  * in int16 and the product in int32 (16 * x + 32 >> 6 == x + 2 >> 2). */
-static int16_t dq8_mul[52][64];
+static dctcoef dq8_mul[52][64];
 static void dq8_init(void)
 {
     int q, i;
     for (q = 0; q < 52; q++)
         for (i = 0; i < 64; i++)
-            dq8_mul[q][i] = (int16_t)(aeg_dequant8_ls[q % 6][aeg_cls8[i >> 3][i & 7]] << (q / 6));
+            dq8_mul[q][i] = (dctcoef)(aeg_dequant8_ls[q % 6][aeg_cls8[i >> 3][i & 7]] << (q / 6));
 }
 static pthread_once_t dq8_once = PTHREAD_ONCE_INIT;
 #endif
 
-void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp)
+void aeg_dequant_8x8(const dctcoef *level, dctcoef *coef, int qp)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (qp >= 0 && qp < 52) {
         const __m128i two = _mm_set1_epi32(2);
         int k;
@@ -1321,21 +1329,21 @@ void aeg_dequant_8x8(const int16_t *level, int16_t *coef, int qp)
     aeg_dequant_8x8_c(level, coef, qp);
 }
 
-void aeg_dequant_8x8_c(const int16_t *level, int16_t *coef, int qp)
+void aeg_dequant_8x8_c(const dctcoef *level, dctcoef *coef, int qp)
 {
-    const int m = qp % 6, sh = qp / 6;
+    const int m = QPM(qp), sh = QPD(qp);
     int x, y;
     for (y = 0; y < 8; y++)
         for (x = 0; x < 8; x++) {
             const int64_t v = ((int64_t)level[y * 8 + x] *
                                (aeg_dequant8_ls[m][aeg_cls8[y][x]] << sh) * 16
                                + 32) >> 6;
-            coef[y * 8 + x] = (int16_t)(v < -32768 ? -32768 :
-                                        (v > 32767 ? 32767 : v));
+            coef[y * 8 + x] = (dctcoef)(v < COEF_MIN ? COEF_MIN :
+                                        (v > COEF_MAX ? COEF_MAX : v));
         }
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* idct8_1d() across eight vectors of four int32 lanes. */
 static inline void idct8_v(const __m128i *s, __m128i *d)
 {
@@ -1417,13 +1425,13 @@ static inline void idct8_pass_avx2(__m128i r[8], int shift)
 }
 
 __attribute__((target("avx2")))
-static void idct_8x8_residual_avx2(const int16_t *level, int qp, int16_t *res)
+static void idct_8x8_residual_avx2(const dctcoef *level, int qp, int16_t *res)
 {
-    int16_t d[64];
+    dctcoef d[64];
     __m128i r[8];
     int k;
     aeg_dequant_8x8(level, d, qp);
-    d[0] = (int16_t)(d[0] + 32);
+    d[0] = (dctcoef)(d[0] + 32);
     for (k = 0; k < 8; k++)
         r[k] = _mm_loadu_si128((const __m128i *)(d + 8 * k));
     tr8_epi16(r);
@@ -1435,7 +1443,7 @@ static void idct_8x8_residual_avx2(const int16_t *level, int qp, int16_t *res)
 }
 #endif
 
-void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
+void aeg_idct_8x8_residual(const dctcoef *level, int qp, int16_t *res)
 {
 #if defined(AEG_X86_AVX2)
     if (cpu_avx2()) {
@@ -1443,13 +1451,13 @@ void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
         return;
     }
 #endif
-#if defined(__SSE2__)
+#if AEG_SSE2
     {
-        int16_t d[64];
+        dctcoef d[64];
         __m128i r[8];
         int k;
         aeg_dequant_8x8(level, d, qp);
-        d[0] = (int16_t)(d[0] + 32);
+        d[0] = (dctcoef)(d[0] + 32);
         for (k = 0; k < 8; k++)
             r[k] = _mm_loadu_si128((const __m128i *)(d + 8 * k));
         /* rows: transpose so that a pass down the columns runs along them */
@@ -1465,15 +1473,15 @@ void aeg_idct_8x8_residual(const int16_t *level, int qp, int16_t *res)
     aeg_idct_8x8_residual_c(level, qp, res);
 }
 
-void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res)
+void aeg_idct_8x8_residual_c(const dctcoef *level, int qp, int16_t *res)
 {
-    int16_t d[64];
-    int16_t t[64];
+    dctcoef d[64];
+    dctcoef t[64];
     int s[8], o[8];
     int x, y;
 
     aeg_dequant_8x8(level, d, qp);
-    d[0] = (int16_t)(d[0] + 32);        /* the decoder's rounding offset */
+    d[0] = (dctcoef)(d[0] + 32);        /* the decoder's rounding offset */
     /* Rows first, then columns.  The forward transform post-multiplies by the
      * 1-D transform along the rows and pre-multiplies by it along the columns,
      * so its inverse has to run in the same order to undo both; running the
@@ -1486,7 +1494,7 @@ void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res)
             s[x] = d[y * 8 + x];
         idct8_1d(s, o);
         for (x = 0; x < 8; x++)
-            t[y * 8 + x] = (int16_t)o[x];
+            t[y * 8 + x] = (dctcoef)o[x];
     }
     for (x = 0; x < 8; x++) {                   /* columns */
         for (y = 0; y < 8; y++)
@@ -1503,30 +1511,30 @@ void aeg_idct_8x8_residual_c(const int16_t *level, int qp, int16_t *res)
  * only.  Every step is the one aeg_idct_8x8_add() takes -- same dequantiser,
  * same int16 truncation after the rows, same shift, same clip -- so the SSE
  * of a trial is exactly aeg_ssd() of what aeg_idct_8x8_add() would make. */
-static int16_t dq8_one(int lev, int qp, int pos)
+static dctcoef dq8_one(int lev, int qp, int pos)
 {
-    const int64_t v = ((int64_t)(int16_t)lev *
-                       (aeg_dequant8_ls[qp % 6][aeg_cls8[pos >> 3][pos & 7]] << (qp / 6)) * 16
+    const int64_t v = ((int64_t)(dctcoef)lev *
+                       (aeg_dequant8_ls[QPM(qp)][aeg_cls8[pos >> 3][pos & 7]] << (QPD(qp))) * 16
                        + 32) >> 6;
-    int16_t d = (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
-    return pos ? d : (int16_t)(d + 32);
+    dctcoef d = (dctcoef)(v < COEF_MIN ? COEF_MIN : (v > COEF_MAX ? COEF_MAX : v));
+    return pos ? d : (dctcoef)(d + 32);
 }
 
-static void idct8_row(const int16_t *d, int16_t *t)
+static void idct8_row(const dctcoef *d, dctcoef *t)
 {
     int s[8], o[8], x;
     for (x = 0; x < 8; x++)
         s[x] = d[x];
     idct8_1d(s, o);
     for (x = 0; x < 8; x++)
-        t[x] = (int16_t)o[x];
+        t[x] = (dctcoef)o[x];
 }
 
-void aeg_idct8_cache_init(aeg_idct8_cache *c, const int16_t *level, int qp)
+void aeg_idct8_cache_init(aeg_idct8_cache *c, const dctcoef *level, int qp)
 {
     int y;
     aeg_dequant_8x8(level, c->d, qp);
-    c->d[0] = (int16_t)(c->d[0] + 32);
+    c->d[0] = (dctcoef)(c->d[0] + 32);
     c->qp = qp;
     for (y = 0; y < 8; y++)
         idct8_row(c->d + 8 * y, c->t + 8 * y);
@@ -1538,8 +1546,8 @@ void aeg_idct8_cache_set(aeg_idct8_cache *c, int pos, int lev)
     idct8_row(c->d + (pos & ~7), c->t + (pos & ~7));
 }
 
-static int64_t col_ssd_c(const int16_t *t, const int16_t *trow, int ty,
-                         const uint8_t *pred, int ps, const uint8_t *src, int ss)
+static int64_t col_ssd_c(const dctcoef *t, const dctcoef *trow, int ty,
+                         const pixel *pred, int ps, const pixel *src, int ss)
 {
     int s[8], o[8], x, y;
     int64_t sum = 0;
@@ -1548,8 +1556,8 @@ static int64_t col_ssd_c(const int16_t *t, const int16_t *trow, int ty,
             s[y] = y == ty ? trow[x] : t[y * 8 + x];
         idct8_1d(s, o);
         for (y = 0; y < 8; y++) {
-            int v = (int)pred[y * ps + x] + (int16_t)(o[y] >> 6), dd;
-            v = v < 0 ? 0 : (v > 255 ? 255 : v);
+            int v = (int)pred[y * ps + x] + (dctcoef)(o[y] >> 6), dd;
+            v = v < 0 ? 0 : (v > PIXEL_MAX ? PIXEL_MAX : v);
             dd = v - (int)src[y * ss + x];
             sum += dd * dd;
         }
@@ -1559,8 +1567,8 @@ static int64_t col_ssd_c(const int16_t *t, const int16_t *trow, int ty,
 
 #if defined(AEG_X86_AVX2)
 __attribute__((target("avx2")))
-static int64_t col_ssd_avx2(const int16_t *t, const int16_t *trow, int ty,
-                            const uint8_t *pred, int ps, const uint8_t *src, int ss)
+static int64_t col_ssd_avx2(const dctcoef *t, const dctcoef *trow, int ty,
+                            const pixel *pred, int ps, const pixel *src, int ss)
 {
 #define ADD _mm256_add_epi32
 #define SUB _mm256_sub_epi32
@@ -1605,9 +1613,9 @@ static int64_t col_ssd_avx2(const int16_t *t, const int16_t *trow, int ty,
 #endif
 
 int64_t aeg_idct8_cache_ssd(const aeg_idct8_cache *c, int pos, int lev,
-                            const uint8_t *pred, int ps, const uint8_t *src, int ss)
+                            const pixel *pred, int ps, const pixel *src, int ss)
 {
-    int16_t drow[8], trow[8];
+    dctcoef drow[8], trow[8];
     const int y = pos >> 3;
     if (pos >= 0) {
         memcpy(drow, c->d + 8 * y, sizeof(drow));
@@ -1621,13 +1629,13 @@ int64_t aeg_idct8_cache_ssd(const aeg_idct8_cache *c, int pos, int lev,
     return col_ssd_c(c->t, trow, pos >= 0 ? y : -1, pred, ps, src, ss);
 }
 
-void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
-                      const uint8_t *pred, int pred_stride)
+void aeg_idct_8x8_add(pixel *dst, int stride, const dctcoef *level, int qp,
+                      const pixel *pred, int pred_stride)
 {
     int16_t res[64];
     int x, y;
     aeg_idct_8x8_residual(level, qp, res);
-#if defined(__SSE2__)
+#if AEG_SSE2
     {
         const __m128i z = _mm_setzero_si128();
         for (y = 0; y < 8; y++) {
@@ -1644,16 +1652,16 @@ void aeg_idct_8x8_add(uint8_t *dst, int stride, const int16_t *level, int qp,
     for (y = 0; y < 8; y++)
         for (x = 0; x < 8; x++) {
             int p = (int)pred[y * pred_stride + x] + (int)res[y * 8 + x];
-            dst[y * stride + x] = (uint8_t)(p < 0 ? 0 : (p > 255 ? 255 : p));
+            dst[y * stride + x] = (pixel)(p < 0 ? 0 : (p > PIXEL_MAX ? PIXEL_MAX : p));
         }
 }
 
 /* ------------------------------------------------------------------ */
 /* Distortion                                                          */
 /* ------------------------------------------------------------------ */
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* One 16-byte row pair (w == 16) or a zero-extended 8/4-byte load. */
-static inline int sad_row(__m128i *acc, const uint8_t *a, const uint8_t *b, int w)
+static inline int sad_row(__m128i *acc, const pixel *a, const pixel *b, int w)
 {
     __m128i va, vb;
     if (w >= 16) {
@@ -1680,15 +1688,15 @@ static inline int sad_reduce(__m128i acc)
 }
 #endif
 
-int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_sad(int w, int h, const pixel *a, int sa, const pixel *b, int sb)
 {
     int x, y, sum = 0;
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (w == 16) {
         /* the motion searches' common case: two rows per step, two sums */
         __m128i acc0 = _mm_setzero_si128(), acc1 = _mm_setzero_si128();
         for (y = 0; y + 1 < h; y += 2) {
-            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
             acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(
                 _mm_loadu_si128((const __m128i *)pa),
                 _mm_loadu_si128((const __m128i *)pb)));
@@ -1704,7 +1712,7 @@ int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
         /* two 8-byte rows fill one register */
         __m128i acc = _mm_setzero_si128();
         for (y = 0; y + 1 < h; y += 2) {
-            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
             __m128i va = _mm_unpacklo_epi64(
                 _mm_loadl_epi64((const __m128i *)pa),
                 _mm_loadl_epi64((const __m128i *)(pa + sa)));
@@ -1742,13 +1750,13 @@ int aeg_sad(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 
 /* aeg_sad() of one block against four candidate positions, each row of
  * the block loaded once (the motion searches' patterns). */
-void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4],
+void aeg_sad_x4(int w, int h, const pixel *a, int sa, const pixel *const b[4],
                 int sb, int out[4])
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (w == 16) {
         __m128i s0 = _mm_setzero_si128(), s1 = s0, s2 = s0, s3 = s0;
-        const uint8_t *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
+        const pixel *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
         int y;
         for (y = 0; y < h; y++) {
             const __m128i va = _mm_loadu_si128((const __m128i *)(a + (size_t)y * sa));
@@ -1768,7 +1776,7 @@ void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4
         __m128i s0 = _mm_setzero_si128(), s1 = s0, s2 = s0, s3 = s0;
         int y, k;
         for (y = 0; y < h; y += 2) {
-            const uint8_t *pa = a + (size_t)y * sa;
+            const pixel *pa = a + (size_t)y * sa;
             const size_t o = (size_t)y * sb;
             const __m128i va = _mm_unpacklo_epi64(
                 _mm_loadl_epi64((const __m128i *)pa),
@@ -1807,13 +1815,13 @@ void aeg_sad_x4(int w, int h, const uint8_t *a, int sa, const uint8_t *const b[4
     (d3) = t1_ - t3_;                                                \
 } while (0)
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* Hadamard transform of one 4x4 block, four int16 lanes per register: the
  * butterfly runs across the four rows first, then the block is transposed and
  * the same butterfly runs across the four columns.  The sum of absolute values
  * does not care about the order of the sixteen outputs, so this is the scalar
  * transform's result exactly (16-bit is enough: |coef| <= 255*16). */
-static inline __m128i satd_row(const uint8_t *a, const uint8_t *b)
+static inline __m128i satd_row(const pixel *a, const pixel *b)
 {
     const __m128i zero = _mm_setzero_si128();
     __m128i va = _mm_cvtsi32_si128(ld32(a));
@@ -1832,7 +1840,7 @@ static inline void hadamard4x4(__m128i *r0, __m128i *r1, __m128i *r2, __m128i *r
 }
 
 
-static int satd_4x4_sse2(const uint8_t *a, int sa, const uint8_t *b, int sb)
+static int satd_4x4_sse2(const pixel *a, int sa, const pixel *b, int sb)
 {
     const __m128i zero = _mm_setzero_si128();
     const __m128i ones = _mm_set1_epi16(1);
@@ -1858,10 +1866,10 @@ static int satd_4x4_sse2(const uint8_t *a, int sa, const uint8_t *b, int sb)
 }
 #endif
 
-int aeg_satd_4x4(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd_4x4(const pixel *a, int sa, const pixel *b, int sb)
 {
     int t[16], d[16], i, y, sum = 0;
-#if defined(__SSE2__)
+#if AEG_SSE2
     return satd_4x4_sse2(a, sa, b, sb);
 #endif
     for (y = 0; y < 4; y++) {
@@ -1893,9 +1901,9 @@ static void hadamard8(int *v)
             }
 }
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* One row of eight differences, as int16. */
-static inline __m128i diff8(const uint8_t *a, const uint8_t *b)
+static inline __m128i diff8(const pixel *a, const pixel *b)
 {
     const __m128i z = _mm_setzero_si128();
     return _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)a), z),
@@ -1961,9 +1969,9 @@ static inline void hadamard8_v(__m128i r[8])
  *
  * The vector path keeps the transform in int16 (|coefficient| <= 255 * 64)
  * and is therefore the scalar result exactly. */
-int aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_sa8d_8x8(const pixel *a, int sa, const pixel *b, int sb)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     __m128i r[8], acc = _mm_setzero_si128();
     const __m128i ones = _mm_set1_epi16(1);
     int k;
@@ -1982,7 +1990,7 @@ int aeg_sa8d_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
 #endif
 }
 
-int aeg_sa8d_8x8_c(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_sa8d_8x8_c(const pixel *a, int sa, const pixel *b, int sb)
 {
     int t[64], d[64], x, y, sum = 0;
     for (y = 0; y < 8; y++) {
@@ -2004,7 +2012,7 @@ int aeg_sa8d_8x8_c(const uint8_t *a, int sa, const uint8_t *b, int sb)
     return (sum + 2) >> 2;
 }
 
-int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd_8x8(const pixel *a, int sa, const pixel *b, int sb)
 {
     return aeg_satd(8, 8, a, sa, b, sb);
 }
@@ -2012,7 +2020,7 @@ int aeg_satd_8x8(const uint8_t *a, int sa, const uint8_t *b, int sb)
 /* The sum of a 4x4 block's absolute Hadamard coefficients is always even
  * (their plain sum is 16 times the first sample), so aeg_satd_4x4()'s
  * rounding is an exact halving and a larger block is the halved total. */
-#if defined(__SSE2__) && defined(__GNUC__)
+#if AEG_SSE2 && defined(__GNUC__)
 /* Half the summed |4x4 Hadamard| of the two 4x4 blocks in four rows of eight
  * differences, x264's way: the vertical butterflies across the registers, a
  * transpose of each 4x4 (within each 128-bit lane, so the AVX2 version below
@@ -2045,14 +2053,14 @@ static inline __m128i abs16_sse2(__m128i x)
     return _mm_max_epi16(x, _mm_sub_epi16(_mm_setzero_si128(), x));
 }
 
-static int satd_w8_sse2(int w, int h, const uint8_t *a, int sa,
-                        const uint8_t *b, int sb)
+static int satd_w8_sse2(int w, int h, const pixel *a, int sa,
+                        const pixel *b, int sb)
 {
     const __m128i ones = _mm_set1_epi16(1);
     __m128i acc = _mm_setzero_si128();
     int x, y;
     for (y = 0; y < h; y += 4) {
-        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
         for (x = 0; x < w; x += 8) {
             __m128i r0 = diff8(pa + x, pb + x);
             __m128i r1 = diff8(pa + sa + x, pb + sb + x);
@@ -2075,8 +2083,8 @@ static int satd_w8_sse2(int w, int h, const uint8_t *a, int sa,
 /* Sixteen columns at a time: rows of sixteen differences widened to int16
  * fill a 256-bit register whose two lanes are two 8x4 halves. */
 __attribute__((target("avx2")))
-static int satd_w16_avx2(int w, int h, const uint8_t *a, int sa,
-                         const uint8_t *b, int sb)
+static int satd_w16_avx2(int w, int h, const pixel *a, int sa,
+                         const pixel *b, int sb)
 {
     const __m256i ones = _mm256_set1_epi16(1);
     __m256i acc = _mm256_setzero_si256();
@@ -2084,7 +2092,7 @@ static int satd_w16_avx2(int w, int h, const uint8_t *a, int sa,
     int x, y;
 #define LD16(p) _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p)))
     for (y = 0; y < h; y += 4) {
-        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
         for (x = 0; x < w; x += 16) {
             __m256i r0 = _mm256_sub_epi16(LD16(pa + x), LD16(pb + x));
             __m256i r1 = _mm256_sub_epi16(LD16(pa + sa + x), LD16(pb + sb + x));
@@ -2109,7 +2117,7 @@ static int satd_w16_avx2(int w, int h, const uint8_t *a, int sa,
 /* Eight columns, eight rows at a time: rows y..y+3 in the low lane and
  * y+4..y+7 in the high lane. */
 __attribute__((target("avx2")))
-static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+static int satd_w8_avx2(int h, const pixel *a, int sa, const pixel *b, int sb)
 {
     const __m256i ones = _mm256_set1_epi16(1);
     __m256i acc = _mm256_setzero_si256();
@@ -2119,7 +2127,7 @@ static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int s
         _mm_loadl_epi64((const __m128i *)(p)),                               \
         _mm_loadl_epi64((const __m128i *)((p) + 4 * (size_t)(s)))))
     for (y = 0; y < h; y += 8) {
-        const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+        const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
         __m256i r0 = _mm256_sub_epi16(LD8X2(pa, sa), LD8X2(pb, sb));
         __m256i r1 = _mm256_sub_epi16(LD8X2(pa + sa, sa), LD8X2(pb + sb, sb));
         __m256i r2 = _mm256_sub_epi16(LD8X2(pa + 2 * sa, sa), LD8X2(pb + 2 * sb, sb));
@@ -2146,8 +2154,8 @@ static int satd_w8_avx2(int h, const uint8_t *a, int sa, const uint8_t *b, int s
 /* satd_w16_avx2()/satd_w8_avx2() of the rounded average of two blocks
  * (both with stride sr) against `a`: the average is pavgb, exactly. */
 __attribute__((target("avx2")))
-static int satd_avg_avx2(int w, int h, const uint8_t *a, int sa,
-                         const uint8_t *r1, const uint8_t *r2, int sr)
+static int satd_avg_avx2(int w, int h, const pixel *a, int sa,
+                         const pixel *r1, const pixel *r2, int sr)
 {
     const __m256i ones = _mm256_set1_epi16(1);
     __m256i acc = _mm256_setzero_si256();
@@ -2163,7 +2171,7 @@ static int satd_avg_avx2(int w, int h, const uint8_t *a, int sa,
         _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(r2 + (o))),     \
                            _mm_loadl_epi64((const __m128i *)(r2 + (o) + 4 * (size_t)sr)))))
         for (y = 0; y < h; y += 8) {
-            const uint8_t *pa = a + (size_t)y * sa;
+            const pixel *pa = a + (size_t)y * sa;
             const size_t o = (size_t)y * sr;
             __m256i q0 = _mm256_sub_epi16(LDA8(pa, sa), LDB8(o));
             __m256i q1 = _mm256_sub_epi16(LDA8(pa + sa, sa), LDB8(o + sr));
@@ -2185,7 +2193,7 @@ static int satd_avg_avx2(int w, int h, const uint8_t *a, int sa,
         _mm_loadu_si128((const __m128i *)(r1 + (o))),                        \
         _mm_loadu_si128((const __m128i *)(r2 + (o)))))
         for (y = 0; y < h; y += 4) {
-            const uint8_t *pa = a + (size_t)y * sa;
+            const pixel *pa = a + (size_t)y * sa;
             const size_t o = (size_t)y * sr;
             for (x = 0; x < w; x += 16) {
                 __m256i q0 = _mm256_sub_epi16(LDA16(pa + x), LDB16(o + x));
@@ -2214,10 +2222,10 @@ static int satd_avg_avx2(int w, int h, const uint8_t *a, int sa,
 /* aeg_satd(w, h, a, sa, avg, w) where avg is the rounded average of the two
  * blocks r1 and r2 (stride sr) -- a quarter-pel prediction measured without
  * being stored first. */
-int aeg_satd_avg(int w, int h, const uint8_t *a, int sa, const uint8_t *r1,
-                 const uint8_t *r2, int sr)
+int aeg_satd_avg(int w, int h, const pixel *a, int sa, const pixel *r1,
+                 const pixel *r2, int sr)
 {
-    uint8_t buf[16 * 16];
+    pixel buf[16 * 16];
     int x, y;
 #if defined(AEG_HAVE_AVX2_SATD)
     if ((((w & 15) == 0 && (h & 3) == 0) || (w == 8 && (h & 7) == 0)) && cpu_avx2())
@@ -2234,13 +2242,13 @@ int aeg_satd_avg(int w, int h, const uint8_t *a, int sa, const uint8_t *r1,
     }
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++)
-            buf[y * w + x] = (uint8_t)((r1[(size_t)y * sr + x] + r2[(size_t)y * sr + x] + 1) >> 1);
+            buf[y * w + x] = (pixel)((r1[(size_t)y * sr + x] + r2[(size_t)y * sr + x] + 1) >> 1);
     return aeg_satd(w, h, buf, w, a, sa);
 }
 
-int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd(int w, int h, const pixel *a, int sa, const pixel *b, int sb)
 {
-#if defined(__SSE2__) && defined(__GNUC__)
+#if AEG_SSE2 && defined(__GNUC__)
     if ((h & 3) == 0) {
 #if defined(AEG_HAVE_AVX2_SATD)
         if ((w & 15) == 0 && cpu_avx2())
@@ -2256,14 +2264,14 @@ int aeg_satd(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
 }
 
 /* The previous SSE2 form, kept as a second reference for the test. */
-int aeg_satd_sse2_ref(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd_sse2_ref(int w, int h, const pixel *a, int sa, const pixel *b, int sb)
 {
-#if defined(__SSE2__)
+#if AEG_SSE2
     if ((w & 7) == 0 && (h & 3) == 0) {
         __m128i acc = _mm_setzero_si128();
         int x, y;
         for (y = 0; y < h; y += 4) {
-            const uint8_t *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
+            const pixel *pa = a + (size_t)y * sa, *pb = b + (size_t)y * sb;
             for (x = 0; x < w; x += 8)
                 acc = _mm_add_epi32(acc, satd8x4_abs(
                     diff8(pa + x, pb + x), diff8(pa + sa + x, pb + sb + x),
@@ -2276,7 +2284,7 @@ int aeg_satd_sse2_ref(int w, int h, const uint8_t *a, int sa, const uint8_t *b, 
     return aeg_satd_c(w, h, a, sa, b, sb);
 }
 
-int aeg_satd_c(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd_c(int w, int h, const pixel *a, int sa, const pixel *b, int sb)
 {
     int sum = 0, x, y;
     for (y = 0; y < h; y += 4)
@@ -2285,7 +2293,7 @@ int aeg_satd_c(int w, int h, const uint8_t *a, int sa, const uint8_t *b, int sb)
     return sum;
 }
 
-int aeg_satd_16x16(const uint8_t *a, int sa, const uint8_t *b, int sb)
+int aeg_satd_16x16(const pixel *a, int sa, const pixel *b, int sb)
 {
     return aeg_satd(16, 16, a, sa, b, sb);
 }

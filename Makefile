@@ -12,6 +12,7 @@
 #                         stages it, LIBDIR/INCLUDEDIR/BINDIR override parts
 #   make uninstall        remove what install put there
 #   make examples         the example program, built against the public API
+#   make BIT_DEPTHS=8     leave out the 10-bit (High 10) encoder
 #
 CC      ?= gcc
 NVCC    ?= nvcc
@@ -45,10 +46,28 @@ INCLUDEDIR ?= $(PREFIX)/include
 PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
 INSTALL    ?= install
 
-SRC := src/tables.c src/transform.c src/intra.c src/mc.c src/deblock.c \
-       src/bitstream.c src/cavlc.c src/cabac.c src/util.c src/backend.c \
-       src/lookahead.c src/input.c src/encoder.c
+# Bit depths, as x264 builds them: the sources that handle samples or
+# coefficients (DEPTH_SRC) are compiled once per depth -- BIT_DEPTH=8 into
+# $(BUILD)/, BIT_DEPTH=10 into $(BUILD)/obj10/ with every symbol they define
+# renamed with a _10 suffix (objcopy), so both live in one library.  The rest
+# (SHARED_SRC) is compiled once; api.c dispatches on aeg_params.bit_depth.
+BIT_DEPTHS ?= 8 10
+DEPTH_SRC  := src/transform.c src/intra.c src/mc.c src/deblock.c \
+              src/cavlc.c src/cabac.c src/backend.c src/lowres.c \
+              src/input.c src/encoder.c
+SHARED_SRC := src/tables.c src/bitstream.c src/util.c src/lookahead.c \
+              src/api.c
+SRC := $(SHARED_SRC) $(DEPTH_SRC)
 OBJ := $(patsubst %,$(BUILD)/%.o,$(basename $(notdir $(SRC))))
+OBJCOPY ?= objcopy
+NM      ?= nm
+ifneq ($(filter 10,$(BIT_DEPTHS)),)
+CFLAGS  += -DAEG_HAVE_10BIT
+DEPTH_NAMES := $(basename $(notdir $(DEPTH_SRC)))
+RAW10   := $(patsubst %,$(BUILD)/obj10/raw/%.o,$(DEPTH_NAMES))
+OBJ10   := $(patsubst %,$(BUILD)/obj10/%.o,$(DEPTH_NAMES))
+OBJ     += $(OBJ10)
+endif
 
 ifeq ($(OPENCL),1)
 CFLAGS  += -DAEG_HAVE_OPENCL
@@ -70,6 +89,21 @@ $(BUILD):
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# the 10-bit objects: compiled, then every symbol they define gets _10
+# (references to the shared objects' symbols are left alone)
+$(BUILD)/obj10/raw $(BUILD)/pic/obj10/raw:
+	mkdir -p $@
+
+$(BUILD)/obj10/raw/%.o: src/%.c | $(BUILD)/obj10/raw
+	$(CC) $(CFLAGS) -DBIT_DEPTH=10 -c $< -o $@
+
+$(BUILD)/obj10/syms: $(RAW10)
+	$(NM) -A -P -g --defined-only $(RAW10) | \
+	    awk '{ print $$2 " " $$2 "_10" }' | sort -u > $@
+
+$(BUILD)/obj10/%.o: $(BUILD)/obj10/raw/%.o $(BUILD)/obj10/syms
+	$(OBJCOPY) --redefine-syms=$(BUILD)/obj10/syms $< $@
+
 $(BUILD)/aegenc.o: cli/aegenc.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -89,6 +123,18 @@ $(BUILD)/pic:
 
 $(BUILD)/pic/%.o: src/%.c | $(BUILD)/pic
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+
+PIC_RAW10 := $(patsubst $(BUILD)/%,$(BUILD)/pic/%,$(RAW10))
+
+$(BUILD)/pic/obj10/raw/%.o: src/%.c | $(BUILD)/pic/obj10/raw
+	$(CC) $(CFLAGS) -DBIT_DEPTH=10 -fPIC -fvisibility=hidden -c $< -o $@
+
+$(BUILD)/pic/obj10/syms: $(PIC_RAW10)
+	$(NM) -A -P -g --defined-only $(PIC_RAW10) | \
+	    awk '{ print $$2 " " $$2 "_10" }' | sort -u > $@
+
+$(BUILD)/pic/obj10/%.o: $(BUILD)/pic/obj10/raw/%.o $(BUILD)/pic/obj10/syms
+	$(OBJCOPY) --redefine-syms=$(BUILD)/pic/obj10/syms $< $@
 
 $(SHLIB): $(PIC_OBJ)
 	$(CC) -shared -Wl,-soname,$(SONAME) $(LDFLAGS) $(PIC_OBJ) -o $@ $(LDLIBS)
@@ -215,4 +261,5 @@ clean:
 .PHONY: all test clean shared install uninstall examples install-check
 # every object's header dependencies (-MMD), the CLI's and the tests' too:
 # a changed struct in aeg.h has to rebuild everything that includes it
--include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d)
+-include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d) \
+         $(RAW10:.o=.d) $(PIC_RAW10:.o=.d)

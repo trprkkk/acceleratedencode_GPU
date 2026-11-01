@@ -24,18 +24,18 @@ typedef struct aeg_be_ops {
      * source position has to be part of the candidate because a batch covers
      * many macroblocks: a whole picture's search is one call, so `cur` is the
      * picture and not one block. */
-    int (*sad_batch)(void *priv, const uint8_t *cur, int cstride,
-                     const uint8_t *ref, int rstride, int bw, int bh,
+    int (*sad_batch)(void *priv, const pixel *cur, int cstride,
+                     const pixel *ref, int rstride, int bw, int bh,
                      const int16_t *mv, int count, int32_t *out);
 
     /* Forward transform + quantisation of `nblk` 4x4 blocks.
      * res is 16 int16 per block (raster), level receives 16 int16 per block. */
     int (*tq_batch)(void *priv, const int16_t *res, int nblk, int qp,
-                    int intra, int16_t *level, int32_t *nz);
+                    int intra, dctcoef *level, int32_t *nz);
 
     /* Inverse quantisation + inverse transform of `nblk` 4x4 blocks.
      * Writes the reconstructed residual (signed) into `res`. */
-    int (*iq_idct_batch)(void *priv, const int16_t *level, int nblk, int qp,
+    int (*iq_idct_batch)(void *priv, const dctcoef *level, int nblk, int qp,
                          int16_t *res);
 
     /* tq_batch() and then iq_idct_batch() on its levels, in one call: on a
@@ -43,7 +43,7 @@ typedef struct aeg_be_ops {
      * trips.  `level`/`nz` are tq_batch()'s outputs, `rec` iq_idct_batch()'s
      * of the same levels.  Optional (NULL: the caller makes the two calls). */
     int (*tq_iq_batch)(void *priv, const int16_t *res, int nblk, int qp,
-                       int intra, int16_t *level, int32_t *nz, int16_t *rec);
+                       int intra, dctcoef *level, int32_t *nz, int16_t *rec);
 
     /* The DC-split pair for Intra_16x16 and chroma, whose block DCs go
      * through a Hadamard of their own (on the host: four or sixteen values).
@@ -53,8 +53,8 @@ typedef struct aeg_be_ops {
      * dequantised DC of block b replaced by dc[b] (as aeg_idct_add_block()'s
      * dc argument).  Optional, both or neither. */
     int (*tq_dc_batch)(void *priv, const int16_t *res, int nblk, int qp,
-                       int intra, int16_t *level, int32_t *nz, int32_t *dc);
-    int (*iq_dc_batch)(void *priv, const int16_t *level, const int32_t *dc,
+                       int intra, dctcoef *level, int32_t *nz, int32_t *dc);
+    int (*iq_dc_batch)(void *priv, const dctcoef *level, const int32_t *dc,
                        int nblk, int qp, int16_t *res);
 
     /* One fractional-pel plane of a reference picture (H.264 8.4.2.2.1),
@@ -63,9 +63,9 @@ typedef struct aeg_be_ops {
      * side); `dst` receives the same geometry, filled exactly as
      * aeg_hpel_plane_fill() does.  This is the per-picture interpolation pass
      * the motion search reads all its subpel candidates from. */
-    int (*interp_plane)(void *priv, const uint8_t *ref, int rstride,
-                        int w, int h, int which, uint8_t *dst, int dstride);
-    int (*sse_batch)(void *priv, const uint8_t *a, int sa, const uint8_t *b,
+    int (*interp_plane)(void *priv, const pixel *ref, int rstride,
+                        int w, int h, int which, pixel *dst, int dstride);
+    int (*sse_batch)(void *priv, const pixel *a, int sa, const pixel *b,
                      int sb, int w, int h, uint64_t *out);
 
     /* Register the reference picture for the calls below: planes[0] is the
@@ -73,7 +73,7 @@ typedef struct aeg_be_ops {
      * fractional planes (aeg_mc_ctx).  A GPU keeps them resident for the whole
      * picture, which is why this is a separate call and not an argument of
      * every batch. */
-    int (*ref_upload)(void *priv, const uint8_t *const planes[4], int pstride,
+    int (*ref_upload)(void *priv, const pixel *const planes[4], int pstride,
                       int w, int h);
 
     /* SATD of a batch of fractional-pel candidates against `cur`.
@@ -81,7 +81,7 @@ typedef struct aeg_be_ops {
      * coordinates of the block origin) and the quarter-pel motion vector
      * (mvx, mvy).  The samples come from the registered reference and its
      * planes, i.e. this is exactly aeg_mc_luma_p() followed by aeg_satd(). */
-    int (*satd_batch)(void *priv, const uint8_t *cur, int cstride, int bw,
+    int (*satd_batch)(void *priv, const pixel *cur, int cstride, int bw,
                       int bh, const int16_t *pos, int count, int32_t *out);
 
     void (*sync)(void *priv);

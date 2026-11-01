@@ -1,7 +1,8 @@
 /*
  * Input conversion: whatever the caller has (aeg_image: planar, semi-planar
- * or grey, 4:2:0 / 4:2:2 / 4:4:4, 8 to 16 bits per sample) to the 8-bit
- * planar 4:2:0 picture the encoder codes.
+ * or grey, 4:2:0 / 4:2:2 / 4:4:4, 8 to 16 bits per sample) to the planar
+ * 4:2:0 picture of BIT_DEPTH-bit samples the encoder codes (compiled once
+ * per bit depth).
  *
  * Every plane goes through a 16-bit stage (a sample of depth d is scaled by
  * 2^(16 - d), as x264's input filters do), the chroma planes are resampled
@@ -9,7 +10,8 @@
  * depth with x264's Sierra-2-4A error diffusion (filters/video/depth.c),
  * reproduced exactly: the error buffer is cleared at the start of every
  * plane, and a source that was itself scaled up from the output depth comes
- * back unchanged.  8-bit 4:2:0 input does not come here at all.
+ * back unchanged (so 8-bit input to the 10-bit encoder is exactly scaled
+ * by 4).  8-bit 4:2:0 input to the 8-bit encoder does not come here at all.
  *
  * Chroma resampling, for chroma_loc_type 0 (MPEG-2/H.264's default: chroma
  * co-sited with the even luma columns, vertically half-way between rows):
@@ -48,8 +50,8 @@ int aeg_csp_info(int csp, aeg_csp_info_t *ci)
 }
 
 /* x264's dither_plane_1/_2 (filters/video/depth.c) with BIT_DEPTH = depth:
- * src holds 16-bit samples, dst gets depth-bit ones (8 here; 10 later). */
-void aeg_dither_plane(uint8_t *dst, int dst_stride, const uint16_t *src,
+ * src holds 16-bit samples, dst gets depth-bit ones (depth <= BIT_DEPTH). */
+void aeg_dither_plane(pixel *dst, int dst_stride, const uint16_t *src,
                       int src_stride, int width, int height, int depth,
                       int16_t *errors)
 {
@@ -66,7 +68,7 @@ void aeg_dither_plane(uint8_t *dst, int dst_stride, const uint16_t *src,
             err = err * 2 + errors[x] + errors[x + 1];
             v = ((src[x] << 2) + err + half) >> rshift;
             v = v < 0 ? 0 : v > pixel_max ? pixel_max : v;
-            dst[x] = (uint8_t)v;
+            dst[x] = (pixel)v;
             errors[x] = (int16_t)(err = src[x] - (v << lshift));
         }
     }
@@ -193,7 +195,7 @@ int aeg_image_check(const aeg_image *img, int w, int h)
 }
 
 int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
-                      int interlaced, uint8_t *dst[3], const int dst_stride[3])
+                      int interlaced, pixel *dst[3], const int dst_stride[3])
 {
     aeg_csp_info_t ci;
     int cw = (w + 1) / 2, ch = (h + 1) / 2, p, y;
@@ -217,14 +219,14 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
         c->cap = need;
     }
     /* luma */
-    if (img->depth == 8) {
+    if (BIT_DEPTH == 8 && img->depth == 8) {
         for (y = 0; y < h; y++)
             memcpy(dst[0] + (size_t)y * dst_stride[0],
                    (const uint8_t *)img->plane[0] + (size_t)y * img->stride[0],
                    (size_t)w);
     } else {
         plane_to16(c->a, w, img->plane[0], img->stride[0], 1, w, h, img->depth);
-        aeg_dither_plane(dst[0], dst_stride[0], c->a, w, w, h, 8, c->err);
+        aeg_dither_plane(dst[0], dst_stride[0], c->a, w, w, h, BIT_DEPTH, c->err);
     }
     /* chroma */
     for (p = 1; p <= 2; p++) {
@@ -233,7 +235,12 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
         int sstride, pitch = 1;
         if (ci.grey) {
             for (y = 0; y < ch; y++)
-                memset(dst[p] + (size_t)y * dst_stride[p], 128, (size_t)cw);
+                {
+                    pixel *d = dst[p] + (size_t)y * dst_stride[p];
+                    int x;
+                    for (x = 0; x < cw; x++)
+                        d[x] = PIXEL_MID;
+                }
             continue;
         }
         if (ci.interleave == 2) {
@@ -246,11 +253,11 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
             src = img->plane[idx];
             sstride = img->stride[idx];
         }
-        if (img->depth == 8 && sw == cw && sh == ch) {
+        if (BIT_DEPTH == 8 && img->depth == 8 && sw == cw && sh == ch) {
             /* 8-bit 4:2:0, only rearranged (NV12/NV21): exact */
             for (y = 0; y < ch; y++) {
                 const uint8_t *s = (const uint8_t *)src + (size_t)y * sstride;
-                uint8_t *d = dst[p] + (size_t)y * dst_stride[p];
+                pixel *d = dst[p] + (size_t)y * dst_stride[p];
                 int x;
                 for (x = 0; x < cw; x++)
                     d[x] = s[x * pitch];
@@ -259,7 +266,7 @@ int aeg_input_convert(aeg_input_cvt *c, const aeg_image *img, int w, int h,
         }
         plane_to16(c->a, sw, src, sstride, pitch, sw, sh, img->depth);
         aeg_chroma_to420(c->b, cw, c->a, sw, sw, sh, cw, ch, interlaced, c->t);
-        aeg_dither_plane(dst[p], dst_stride[p], c->b, cw, cw, ch, 8, c->err);
+        aeg_dither_plane(dst[p], dst_stride[p], c->b, cw, cw, ch, BIT_DEPTH, c->err);
     }
     return AEG_OK;
 }

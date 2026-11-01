@@ -32,11 +32,16 @@ static void usage(void)
 "                   yv16 nv16 i444 yv24 i400; a .y4m header's C tag sets it\n"
 "  --input-depth <n> raw input bits per sample, 8 (default) .. 16; above 8\n"
 "                   two bytes per sample, little-endian (yuv420p10le etc.)\n"
-"                   Anything but 8-bit 4:2:0 is converted: chroma resampled\n"
-"                   to 4:2:0, then dithered to 8 bits (as x264's 8-bit build)\n"
+"                   Anything but 4:2:0 at the coded depth is converted:\n"
+"                   chroma resampled to 4:2:0, then dithered to the coded\n"
+"                   depth (as x264); 8-bit input to a 10-bit stream is\n"
+"                   scaled up exactly\n"
+"  --bit-depth <n>  coded bits per sample: 8 (default) or 10 (High 10\n"
+"                   profile, CPU only; x264 --output-depth 10)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
 "  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
+"                   -12..51 at 10 bits)\n"
 "                   0..51; 18..28 is the usual range).  The QP follows each\n"
 "                   picture's complexity (--qcomp), or, with the macroblock\n"
 "                   tree, each macroblock's importance\n"
@@ -114,7 +119,8 @@ static void usage(void)
 "  --iqp <n>        QP subtracted from I pictures at constant QP (default 3,\n"
 "                   x264's ipratio 1.4)\n"
 "  --direct <mode>  B direct prediction: spatial (default) or temporal\n"
-"  --dump-recon <f> write the reconstruction (coding order, I420)\n"
+"  --dump-recon <f> write the reconstruction (coding order, I420; 16-bit\n"
+"                   little-endian samples at --bit-depth 10)\n"
 "  --dump-order <f> write each packet's display index, one per line\n"
 "  --trellis <n>    rate-distortion level selection on the luma residual:\n"
 "                   0 = off, 1 = on (the default from preset 3 up: 0.15-2.4\n"
@@ -555,6 +561,8 @@ static int pass1_put(aeg_pass1_frame **f, int *n, int *cap, int64_t d,
  * the packets come out (= the order of the reconstruction dump). */
 static FILE *g_order;
 
+static int g_bps = 1;   /* bytes per reconstructed sample (2 at 10 bits) */
+
 static void write_packet(FILE *out, const char *dumppath, aeg_encoder *enc,
                          const aeg_packet *pkt, int *first,
                          int width, int height)
@@ -571,14 +579,14 @@ static void write_packet(FILE *out, const char *dumppath, aeg_encoder *enc,
         if (!df)
             return;
         aeg_encoder_recon(enc, pl, str, NULL);
+        /* planar I420 (yuv420p10le at 10 bits on a little-endian host), the
+         * layout the decoder dumps so the two can be compared byte for byte */
         for (y = 0; y < height; y++)
-            fwrite(pl[0] + (size_t)y * str[0], 1, (size_t)width, df);
-        /* planar I420, same layout as the decoder dumps so the two can be
-         * compared byte for byte */
+            fwrite(pl[0] + (size_t)y * str[0], g_bps, (size_t)width, df);
         for (y = 0; y < height / 2; y++)
-            fwrite(pl[1] + (size_t)y * str[1], 1, (size_t)width / 2, df);
+            fwrite(pl[1] + (size_t)y * str[1], g_bps, (size_t)width / 2, df);
         for (y = 0; y < height / 2; y++)
-            fwrite(pl[2] + (size_t)y * str[2], 1, (size_t)width / 2, df);
+            fwrite(pl[2] + (size_t)y * str[2], g_bps, (size_t)width / 2, df);
         fclose(df);
     }
 }
@@ -595,6 +603,7 @@ int main(int argc, char **argv)
     aeg_image layout;
     size_t poff[3];
     double crf = -1.0;
+    int crf_given = 0, bit_depth = 8;
     double fps;
     input_t inp;
     int bitrate = 0, aq = -1;
@@ -658,6 +667,8 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--input-depth"))
             in_depth = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--bit-depth") || !strcmp(a, "--output-depth"))
+            bit_depth = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--tff")) interlaced = 1;
         else if (!strcmp(a, "--bff")) interlaced = 2;
         else if (!strcmp(a, "--qpmin")) p.qp_min = int_arg(a, next_arg(argc, argv, &i));
@@ -740,10 +751,12 @@ int main(int argc, char **argv)
             const char *v = next_arg(argc, argv, &i);
             char *end;
             crf = strtod(v, &end);
-            if (end == v || *end || !(crf >= 0.0 && crf <= 51.0)) {
-                fprintf(stderr, "error: --crf %s: expected a number in 0..51\n", v);
+            if (end == v || *end || !(crf >= -12.0 && crf <= 51.0)) {
+                fprintf(stderr, "error: --crf %s: expected a number in 0..51 "
+                        "(-12..51 at --bit-depth 10)\n", v);
                 return 2;
             }
+            crf_given = 1;
         }
         else if (!strcmp(a, "--stats")) {
             snprintf(stats_path, sizeof(stats_path), "%s", next_arg(argc, argv, &i));
@@ -812,6 +825,14 @@ int main(int argc, char **argv)
     {
         int bad = 0;
         bad |= range_bad("-q", qp, 0, 51);
+        if (bit_depth != 8 && bit_depth != 10) {
+            fprintf(stderr, "error: --bit-depth %d: expected 8 or 10\n", bit_depth);
+            bad = 1;
+        }
+        if (crf_given && crf < 0.0 && bit_depth == 8) {
+            fprintf(stderr, "error: --crf %g: below 0 needs --bit-depth 10\n", crf);
+            bad = 1;
+        }
         bad |= range_bad("-p", p.preset, 0, 4);
         bad |= range_bad("-g", gop, 0, 1 << 30);
         bad |= range_bad("-n", max_frames, 0, 1 << 30);
@@ -915,7 +936,7 @@ int main(int argc, char **argv)
 
     /* Two-pass keys its measurement by display index (the packet's pts): with
      * B pictures the packets come out in coding order. */
-    if (crf >= 0.0 && (bitrate > 0 || pass)) {
+    if (crf_given && (bitrate > 0 || pass)) {
         fprintf(stderr, "error: --crf cannot be combined with %s\n",
                 bitrate > 0 ? "--bitrate" : "--pass");
         return 2;
@@ -1019,7 +1040,8 @@ int main(int argc, char **argv)
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
     p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
     p.qcomp = qcomp;
-    if (crf >= 0.0) {
+    p.bit_depth = bit_depth;
+    if (crf_given) {
         p.rc_mode = AEG_RC_CRF;
         p.crf = crf;
     }
@@ -1053,10 +1075,11 @@ int main(int argc, char **argv)
 
     fsize = frame_layout(in_csp, in_depth, width, height, &layout, poff);
     frame = (uint8_t *)malloc(fsize);
-    if (verbose && (in_csp != AEG_CSP_I420 || in_depth != 8))
-        fprintf(stderr, "input: %s, %d bit -> 4:2:0, 8 bit%s\n",
-                csps[csp_index(in_csp)].name, in_depth,
-                in_depth > 8 || csps[csp_index(in_csp)].ys == 0 ||
+    g_bps = bit_depth > 8 ? 2 : 1;
+    if (verbose && (in_csp != AEG_CSP_I420 || in_depth != bit_depth))
+        fprintf(stderr, "input: %s, %d bit -> 4:2:0, %d bit%s\n",
+                csps[csp_index(in_csp)].name, in_depth, bit_depth,
+                in_depth > bit_depth || csps[csp_index(in_csp)].ys == 0 ||
                 csps[csp_index(in_csp)].xs == 0 ? " (dithered)" : "");
     if (!frame) { fprintf(stderr, "out of memory\n"); return 1; }
 

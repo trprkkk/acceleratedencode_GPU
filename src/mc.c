@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 #include <emmintrin.h>
 
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
@@ -26,20 +26,17 @@ static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
 static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
 #endif
 
-static inline uint8_t clip8(int v)
-{
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-}
+
 
 /* ------------------------------------------------------------------ */
 /* Half-pel interpolation                                              */
 /* ------------------------------------------------------------------ */
 /* 6-tap horizontal half-pel at p[0] (needs p[-2..3]) */
-static inline int hpel_h(const uint8_t *p)
+static inline int hpel_h(const pixel *p)
 {
     return (p[-2] + p[3] - 5 * (p[-1] + p[2]) + 20 * (p[0] + p[1]) + 16) >> 5;
 }
-static inline int hpel_v(const uint8_t *p, int s)
+static inline int hpel_v(const pixel *p, int s)
 {
     return ((int)p[-2 * s] + p[3 * s] - 5 * (p[-s] + p[2 * s]) +
             20 * (p[0] + p[s]) + 16) >> 5;
@@ -48,14 +45,14 @@ static inline int hpel_v(const uint8_t *p, int s)
  * two-dimensional half-pel position is built from (H.264 8.4.2.2.1).  The
  * reference decoder keeps these at 16-bit precision and shifts once at the
  * end, so rounding the horizontal stage first would give different samples. */
-static inline int hsum_h(const uint8_t *p)
+static inline int hsum_h(const pixel *p)
 {
     return (p[0] + p[1]) * 20 - (p[-1] + p[2]) * 5 + (p[-2] + p[3]);
 }
 
 /* both axes: vertical 6-tap over the unshifted horizontal intermediates, with
  * both gains (32 * 32) removed at once */
-static inline int hpel_hv(const uint8_t *p, int s)
+static inline int hpel_hv(const pixel *p, int s)
 {
     return (hsum_h(p - 2 * s) - 5 * hsum_h(p - s) + 20 * hsum_h(p) +
             20 * hsum_h(p + s) - 5 * hsum_h(p + 2 * s) + hsum_h(p + 3 * s) +
@@ -67,17 +64,17 @@ static inline int hpel_hv(const uint8_t *p, int s)
 static const uint8_t hpel_ref0[16] = { 0, 1, 1, 1, 0, 1, 1, 1, 2, 3, 3, 3, 0, 1, 1, 1 };
 static const uint8_t hpel_ref1[16] = { 0, 0, 1, 0, 2, 2, 3, 2, 2, 2, 3, 2, 2, 2, 3, 2 };
 
-static inline int plane_get(int plane, const uint8_t *p, int s)
+static inline int plane_get(int plane, const pixel *p, int s)
 {
     switch (plane) {
     case 0:  return p[0];
-    case 1:  return clip8(hpel_h(p));
-    case 2:  return clip8(hpel_v(p, s));
-    default: return clip8(hpel_hv(p, s));
+    case 1:  return aeg_clip_pixel(hpel_h(p));
+    case 2:  return aeg_clip_pixel(hpel_v(p, s));
+    default: return aeg_clip_pixel(hpel_hv(p, s));
     }
 }
 
-void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
+void aeg_mc_luma(pixel *dst, int dstride, const pixel *src, int sstride,
                  int w, int h, int fx, int fy)
 {
     int x, y;
@@ -85,7 +82,7 @@ void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
 
     if (!fx && !fy) {
         for (y = 0; y < h; y++)
-            memcpy(dst + y * dstride, src + y * sstride, (size_t)w);
+            memcpy(dst + y * dstride, src + y * sstride, (size_t)w * sizeof(pixel));
         return;
     }
     if (!(idx & 5)) {
@@ -93,7 +90,7 @@ void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
         int plane = hpel_ref0[idx];
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++)
-                dst[y * dstride + x] = (uint8_t)plane_get(plane, src + y * sstride + x, sstride);
+                dst[y * dstride + x] = (pixel)plane_get(plane, src + y * sstride + x, sstride);
         return;
     }
     {
@@ -101,12 +98,12 @@ void aeg_mc_luma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
         int o1y = (fy == 3) ? 1 : 0;   /* src1 is vertically offset by one */
         int o2x = (fx == 3) ? 1 : 0;   /* src2 is horizontally offset by one */
         for (y = 0; y < h; y++) {
-            const uint8_t *r1 = src + (y + o1y) * sstride;
-            const uint8_t *r2 = src + y * sstride;
+            const pixel *r1 = src + (y + o1y) * sstride;
+            const pixel *r2 = src + y * sstride;
             for (x = 0; x < w; x++) {
                 int a = plane_get(p1, r1 + x, sstride);
                 int b = plane_get(p2, r2 + x + o2x, sstride);
-                dst[y * dstride + x] = (uint8_t)((a + b + 1) >> 1);
+                dst[y * dstride + x] = (pixel)((a + b + 1) >> 1);
             }
         }
     }
@@ -126,7 +123,7 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     int i;
     (void)w;
     mc->stride = stride;
-    mc->buf = aeg_alloc(3 * (size_t)stride * rows);
+    mc->buf = aeg_alloc(3 * (size_t)stride * rows * sizeof(pixel));
     mc->base[0] = NULL;
     mc->ready = 0;
     mc->chroma = 0;
@@ -165,19 +162,19 @@ void aeg_mc_ctx_free(aeg_mc_ctx *mc)
  * operation: the GPU kernel computes the same samples for the same region and
  * fills the margin the same way, so the buffer it produces is byte-identical
  * and the two paths can be cross-checked (tests/kernel_check.c). */
-#if defined(__SSE2__)
+#if AEG_SSE2
 /* Six taps of eight consecutive output samples, as int16 lanes: byte loads are
  * widened to int16 and combined with the filter of hpel_h().  Every
  * intermediate is inside int16 (20 * (255 + 255) + 2 * 255 = 10710), so the
  * lanes hold the scalar value exactly, and the trailing `packus` is the same
- * clip to [0, 255] that clip8() does -- `packus` saturates unsigned. */
-static inline __m128i taps8(const uint8_t *p, int off)
+ * clip to [0, 255] that aeg_clip_pixel() does -- `packus` saturates unsigned. */
+static inline __m128i taps8(const pixel *p, int off)
 {
     return _mm_unpacklo_epi8(
         _mm_loadl_epi64((const __m128i *)(p + off)), _mm_setzero_si128());
 }
 
-static inline __m128i hpel_h8(const uint8_t *p)
+static inline __m128i hpel_h8(const pixel *p)
 {
     const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5),
                   c16 = _mm_set1_epi16(16);
@@ -190,7 +187,7 @@ static inline __m128i hpel_h8(const uint8_t *p)
     return _mm_srai_epi16(_mm_add_epi16(v, c16), 5);
 }
 
-static inline __m128i hpel_v8(const uint8_t *p, int s)
+static inline __m128i hpel_v8(const pixel *p, int s)
 {
     const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5),
                   c16 = _mm_set1_epi16(16);
@@ -204,7 +201,7 @@ static inline __m128i hpel_v8(const uint8_t *p, int s)
 }
 
 /* The unshifted horizontal intermediate of hsum_h(), eight lanes at a time. */
-static inline __m128i hsum_h8(const uint8_t *p)
+static inline __m128i hsum_h8(const pixel *p)
 {
     const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5);
     const __m128i s0 = _mm_add_epi16(taps8(p, 0), taps8(p, 1));
@@ -238,7 +235,7 @@ static inline __m128i times5_epi32(__m128i v)
  * 6-tap over them in int32 lanes, one shift at the end (H.264 8.4.2.2.1 keeps
  * the horizontal stage unshifted, which is why this cannot be built from the
  * clipped plane-1 samples). */
-static inline __m128i hpel_hv8(const uint8_t *p, int s)
+static inline __m128i hpel_hv8(const pixel *p, int s)
 {
     const __m128i a0 = hsum_h8(p - 2 * s), a1 = hsum_h8(p - s);
     const __m128i a2 = hsum_h8(p), a3 = hsum_h8(p + s);
@@ -265,7 +262,7 @@ static inline __m128i hpel_hv8(const uint8_t *p, int s)
  * the rows in several calls gives the same plane as one call over all of
  * them, which is what lets a reference be filtered band by band as it is
  * reconstructed (frame threads). */
-void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
+void aeg_hpel_plane_rows(pixel *pl, int dstride, const pixel *ref,
                          int rstride, int w, int h, int which, int ya, int yb)
 {
     int x0 = -AEG_PAD + 2, x1 = w + AEG_PAD - 4;
@@ -273,9 +270,9 @@ void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
     int x, y, ys = ya < y0 ? y0 : ya, ye = yb > y1 ? y1 : yb;
 
     for (y = ys; y <= ye; y++) {
-        const uint8_t *rrow = ref + (ptrdiff_t)y * rstride;
-        uint8_t *orow = pl + (ptrdiff_t)y * dstride;
-#if defined(__SSE2__)
+        const pixel *rrow = ref + (ptrdiff_t)y * rstride;
+        pixel *orow = pl + (ptrdiff_t)y * dstride;
+#if AEG_SSE2
         /* eight samples per iteration; the tail stays scalar, and every load
          * above reaches at most three bytes past the last output of the row,
          * which is inside the picture's padding */
@@ -291,7 +288,7 @@ void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
                              _mm_packus_epi16(v, _mm_setzero_si128()));
         }
         for (; x <= x1; x++) {
-            const uint8_t *p = rrow + x;
+            const pixel *p = rrow + x;
             int v;
             if (which == 1)
                 v = hpel_h(p);
@@ -299,12 +296,12 @@ void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
                 v = hpel_v(p, rstride);
             else
                 v = hpel_hv(p, rstride);
-            orow[x] = clip8(v);
+            orow[x] = aeg_clip_pixel(v);
         }
         x = x1 + 1;
 #else
         for (x = x0; x <= x1; x++) {
-            const uint8_t *p = rrow + x;
+            const pixel *p = rrow + x;
             int v;
             if (which == 1)
                 v = hpel_h(p);
@@ -312,7 +309,7 @@ void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
                 v = hpel_v(p, rstride);
             else
                 v = hpel_hv(p, rstride);
-            orow[x] = clip8(v);
+            orow[x] = aeg_clip_pixel(v);
         }
         x = x1 + 1;
 #endif
@@ -324,26 +321,26 @@ void aeg_hpel_plane_rows(uint8_t *pl, int dstride, const uint8_t *ref,
     for (y = ya < -AEG_PAD ? -AEG_PAD : ya; y < y0 && y <= yb; y++)
         memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
                pl + (ptrdiff_t)y0 * dstride - AEG_PAD,
-               (size_t)(w + 2 * AEG_PAD));
+               (size_t)(w + 2 * AEG_PAD) * sizeof(pixel));
     for (y = ya > y1 + 1 ? ya : y1 + 1; y < h + AEG_PAD && y <= yb; y++)
         memcpy(pl + (ptrdiff_t)y * dstride - AEG_PAD,
                pl + (ptrdiff_t)y1 * dstride - AEG_PAD,
-               (size_t)(w + 2 * AEG_PAD));
+               (size_t)(w + 2 * AEG_PAD) * sizeof(pixel));
 }
 
-void aeg_hpel_plane_fill(uint8_t *pl, int dstride, const uint8_t *ref,
+void aeg_hpel_plane_fill(pixel *pl, int dstride, const pixel *ref,
                          int rstride, int w, int h, int which)
 {
     aeg_hpel_plane_rows(pl, dstride, ref, rstride, w, h, which, -AEG_PAD,
                         h + AEG_PAD - 1);
 }
 
-void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const uint8_t *ref)
+void aeg_mc_ctx_setref(aeg_mc_ctx *mc, const pixel *ref)
 {
     mc->base[0] = ref;
 }
 
-void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h)
+void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const pixel *ref, int w, int h)
 {
     int i;
     mc->base[0] = ref;
@@ -352,15 +349,15 @@ void aeg_mc_ctx_refresh(aeg_mc_ctx *mc, const uint8_t *ref, int w, int h)
         return;
     }
     for (i = 1; i < 4; i++)
-        aeg_hpel_plane_fill((uint8_t *)mc->base[i], mc->stride, ref, mc->stride,
+        aeg_hpel_plane_fill((pixel *)mc->base[i], mc->stride, ref, mc->stride,
                             w, h, i);
     mc->ready = 1;
 }
 
 /* Plane-based motion compensation: same samples as aeg_mc_luma(), read from the
  * precomputed planes instead of being filtered per block. */
-void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
-                   const uint8_t *src, int w, int h, int fx, int fy)
+void aeg_mc_luma_p(pixel *dst, int dstride, const aeg_mc_ctx *mc,
+                   const pixel *src, int w, int h, int fx, int fy)
 {
     const ptrdiff_t off = src - mc->base[0];
     const int idx = (fy << 2) | fx;
@@ -373,10 +370,10 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
     if (!(idx & 5)) {
         /* exactly a half-pel position: a single plane (the integer plane is
          * one of the four a quarter-pel position may combine) */
-        const uint8_t *p = mc->base[hpel_ref0[idx]] + off;
+        const pixel *p = mc->base[hpel_ref0[idx]] + off;
         for (y = 0; y < h; y++)
             memcpy(dst + (size_t)y * dstride, p + (ptrdiff_t)y * mc->stride,
-                   (size_t)w);
+                   (size_t)w * sizeof(pixel));
         return;
     }
     {
@@ -384,10 +381,11 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
         const int o1y = (fy == 3) ? 1 : 0;
         const int o2x = (fx == 3) ? 1 : 0;
         for (y = 0; y < h; y++) {
-            const uint8_t *r1 = mc->base[pl1] + off + (ptrdiff_t)(y + o1y) * mc->stride;
-            const uint8_t *r2 = mc->base[pl2] + off + (ptrdiff_t)y * mc->stride + o2x;
-            uint8_t *d = dst + (size_t)y * dstride;
-#if defined(__SSE2__)
+            const pixel *r1 = mc->base[pl1] + off + (ptrdiff_t)(y + o1y) * mc->stride;
+            const pixel *r2 = mc->base[pl2] + off + (ptrdiff_t)y * mc->stride + o2x;
+            pixel *d = dst + (size_t)y * dstride;
+            x = 0;
+#if AEG_SSE2
             /* pavgb is exactly (r1 + r2 + 1) >> 1, the average H.264 8.4.2.2.2
              * specifies, sixteen samples at a time.  The search averages a
              * block per candidate (a million times per 30 frames), so this is
@@ -410,33 +408,33 @@ void aeg_mc_luma_p(uint8_t *dst, int dstride, const aeg_mc_ctx *mc,
             }
 #endif
             for (; x < w; x++)
-                d[x] = (uint8_t)((r1[x] + r2[x] + 1) >> 1);
+                d[x] = (pixel)((r1[x] + r2[x] + 1) >> 1);
         }
     }
 }
 
 /* aeg_satd() of aeg_mc_luma_p()'s prediction at a quarter-pel position
  * (one that averages two planes) against `cur`, without storing it. */
-static int mc_satd_qpel(const aeg_mc_ctx *mc, const uint8_t *src, int w, int h,
-                        int fx, int fy, const uint8_t *cur, int cstride)
+static int mc_satd_qpel(const aeg_mc_ctx *mc, const pixel *src, int w, int h,
+                        int fx, int fy, const pixel *cur, int cstride)
 {
     const ptrdiff_t off = src - mc->base[0];
     const int idx = (fy << 2) | fx;
-    const uint8_t *r1 = mc->base[hpel_ref0[idx]] + off + (fy == 3 ? mc->stride : 0);
-    const uint8_t *r2 = mc->base[hpel_ref1[idx]] + off + (fx == 3 ? 1 : 0);
+    const pixel *r1 = mc->base[hpel_ref0[idx]] + off + (fy == 3 ? mc->stride : 0);
+    const pixel *r2 = mc->base[hpel_ref1[idx]] + off + (fx == 3 ? 1 : 0);
     return aeg_satd_avg(w, h, cur, cstride, r1, r2, mc->stride);
 }
 
-void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
+void aeg_mc_chroma(pixel *dst, int dstride, const pixel *src, int sstride,
                    int w, int h, int fx, int fy)
 {
     int x, y;
     if (!fx && !fy) {
         for (y = 0; y < h; y++)
-            memcpy(dst + y * dstride, src + y * sstride, (size_t)w);
+            memcpy(dst + y * dstride, src + y * sstride, (size_t)w * sizeof(pixel));
         return;
     }
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (w == 8 || w == 4) {
         /* the same four products and rounding, eight (or four) pixels at a
          * time in int16: 64 * 255 fits */
@@ -450,7 +448,7 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
                        : _mm_unpacklo_epi8(_mm_cvtsi32_si128(ld32(q)), z))
         __m128i a = LDC(src), b = LDC(src + 1);
         for (y = 0; y < h; y++) {
-            const uint8_t *q = src + (size_t)(y + 1) * sstride;
+            const pixel *q = src + (size_t)(y + 1) * sstride;
             __m128i c = LDC(q), d = LDC(q + 1), v;
             v = _mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(a, wa), _mm_mullo_epi16(b, wb)),
                               _mm_add_epi16(_mm_mullo_epi16(c, wc), _mm_mullo_epi16(d, wd)));
@@ -470,11 +468,11 @@ void aeg_mc_chroma(uint8_t *dst, int dstride, const uint8_t *src, int sstride,
 #endif
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++) {
-            const uint8_t *p = src + y * sstride + x;
+            const pixel *p = src + y * sstride + x;
             int a = p[0], b = p[1], c = p[sstride], d = p[sstride + 1];
             int v = (8 - fx) * (8 - fy) * a + fx * (8 - fy) * b +
                     (8 - fx) * fy * c + fx * fy * d;
-            dst[y * dstride + x] = (uint8_t)((v + 32) >> 6);
+            dst[y * dstride + x] = (pixel)((v + 32) >> 6);
         }
 }
 
@@ -488,7 +486,7 @@ static const int8_t sq_dx[9]  = { 0, -1,  0,  1, -1,  1, -1,  0,  1 };
 static const int8_t sq_dy[9]  = { 0,  0, -1,  0, -1,  1,  1,  1, -1 };
 
 /* integer-pel SAD at displacement (dx, dy) */
-static inline int me_sad(const uint8_t *ref, int rstride, const uint8_t *cur,
+static inline int me_sad(const pixel *ref, int rstride, const pixel *cur,
                          int cstride, int bw, int bh, int dx, int dy)
 {
     return aeg_sad(bw, bh, cur, cstride, ref + dy * rstride + dx, rstride);
@@ -496,13 +494,13 @@ static inline int me_sad(const uint8_t *ref, int rstride, const uint8_t *cur,
 
 /* me_sad() of n integer positions pts[i] (all inside the range), four at a
  * time through aeg_sad_x4(). */
-static void me_sad_list(const uint8_t *ref, int rstride, const uint8_t *cur,
+static void me_sad_list(const pixel *ref, int rstride, const pixel *cur,
                         int cstride, int bw, int bh, const int (*pts)[2], int n,
                         int *out)
 {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        const uint8_t *b[4];
+        const pixel *b[4];
         int k;
         for (k = 0; k < 4; k++)
             b[k] = ref + pts[i + k][1] * rstride + pts[i + k][0];
@@ -511,7 +509,7 @@ static void me_sad_list(const uint8_t *ref, int rstride, const uint8_t *cur,
     if (n - i >= 2) {
         /* two or three left: one more four-way call (the last position
          * repeated) is cheaper than two or three single ones */
-        const uint8_t *b[4];
+        const pixel *b[4];
         int k, o[4];
         for (k = 0; k < 4; k++) {
             int q = i + k < n ? i + k : n - 1;
@@ -551,7 +549,7 @@ static inline int me_mv_cost(const me_rate *r, int qx, int qy)
 }
 
 /* `cost` is the cost (SAD + rate) of the start, already measured */
-static int hex_search(const uint8_t *ref, int rstride, const uint8_t *cur,
+static int hex_search(const pixel *ref, int rstride, const pixel *cur,
                       int cstride, int bw, int bh, int range,
                       const me_rate *rt, int cost, int *mvx, int *mvy, int *dist)
 {
@@ -622,7 +620,7 @@ static void me_pick(const me_rate *rt, const int (*pts)[2], const int *sads,
                     int n, int *best, int *bx, int *by)
 {
     int k = 0, b = *best, x = *bx, y = *by;
-#if defined(__SSE2__)
+#if AEG_SSE2
     if (rt->lambda > 0 && rt->lambda < 32768) {
         const __m128i px = _mm_set1_epi32(rt->px), py = _mm_set1_epi32(rt->py);
         const __m128i one = _mm_set1_epi32(1), lam = _mm_set1_epi32(rt->lambda);
@@ -665,7 +663,7 @@ static void me_pick(const me_rate *rt, const int (*pts)[2], const int *sads,
  * cross of every other sample out to +-r horizontally and +-r/2 vertically,
  * a 5x5 square, and 16-point hexagons at radii 4, 8, .. r; each stage keeps
  * the best position.  The caller's hexagon walk refines the result. */
-static void umh_search(const uint8_t *ref, int rstride, const uint8_t *cur,
+static void umh_search(const pixel *ref, int rstride, const pixel *cur,
                        int cstride, int bw, int bh, int range, int r,
                        const me_rate *rt, int *mvx, int *mvy, int *best_cost)
 {
@@ -749,16 +747,16 @@ static int me_try_pmv(void)
 
 /* SATD of both chroma planes of the block at `cur` (luma) predicted with the
  * quarter-pel luma vector (nx, ny), i.e. an eighth-pel chroma vector. */
-static int me_chroma_satd(const aeg_mc_ctx *mc, const uint8_t *cur,
+static int me_chroma_satd(const aeg_mc_ctx *mc, const pixel *cur,
                           int rstride, int bw, int bh, int nx, int ny)
 {
     ptrdiff_t off = cur - mc->cur_y;
     int y = (int)(off / rstride), x = (int)(off - (ptrdiff_t)y * rstride);
     int cw = bw >> 1, ch = bh >> 1, pl, d = 0;
-    uint8_t buf[8 * 8];
+    pixel buf[8 * 8];
 
     for (pl = 0; pl < 2; pl++) {
-        const uint8_t *src = mc->cref[pl] +
+        const pixel *src = mc->cref[pl] +
                              ((y >> 1) + (ny >> 3)) * mc->cstride +
                              (x >> 1) + (nx >> 3);
         aeg_mc_chroma(buf, 8, src, mc->cstride, cw, ch, nx & 7, ny & 7);
@@ -770,7 +768,7 @@ static int me_chroma_satd(const aeg_mc_ctx *mc, const uint8_t *cur,
 }
 
 /* subpel refinement: quarter-pel, SATD (+ lambda * mvd bits) driven */
-static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
+static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
                          int cstride, int bw, int bh, int range,
                          const aeg_mc_ctx *mc, const me_rate *rt,
                          int *mvx, int *mvy, int *dist)
@@ -778,7 +776,7 @@ static int subpel_refine(const uint8_t *ref, int rstride, const uint8_t *cur,
     static const int8_t offs[9][2] = {
         {0,0},{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
     };
-    uint8_t buf[16 * 16];
+    pixel buf[16 * 16];
     int best, bd, bx = *mvx, by = *mvy;
     int i, pass;
     int cx = *mvx, cy = *mvy;
@@ -886,10 +884,11 @@ int aeg_me_lambda(int qp)
     };
     if (qp < 0) qp = 0;
     if (qp > 51) qp = 51;
-    return tab[qp];
+    /* a SAD at high bit depth is 2^(BIT_DEPTH-8) times the 8-bit one */
+    return tab[qp] << (BIT_DEPTH - 8);
 }
 
-int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
+int aeg_me_block(const pixel *ref, int rstride, const pixel *cur,
                  int cstride, int bw, int bh, int range, int subme,
                  int pred_x, int pred_y, const int seed[2],
                  const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out)
@@ -904,7 +903,7 @@ int aeg_me_block(const uint8_t *ref, int rstride, const uint8_t *cur,
  * and `seed`; `lambda` > 0 adds lambda * mvd bits to every cost.  *sad_out is
  * the distortion (SAD, or SATD after the fractional stage) of the vector
  * returned, without the rate term. */
-int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
+int aeg_me_block_l(const pixel *ref, int rstride, const pixel *cur,
                    int cstride, int bw, int bh, int range, int subme,
                    int pred_x, int pred_y, const int seed[2],
                    const int (*extra)[2], int nextra, int lambda,
@@ -980,7 +979,10 @@ int aeg_me_block_l(const uint8_t *ref, int rstride, const uint8_t *cur,
         /* x264-style early exit: when the best of the predictors is the
          * (rounded) predicted MV itself and already cheap, the
          * multi-hexagon stage is skipped and only the hexagon walk runs. */
-        if (ur > 0 && mc->umh_et > 0 && best_cost * 256 < mc->umh_et * bw * bh &&
+        /* (the threshold is in 8-bit cost units: x4 at 10 bits, as the SAD
+         * and the motion lambda) */
+        if (ur > 0 && mc->umh_et > 0 &&
+            best_cost * 256 < (mc->umh_et << (BIT_DEPTH - 8)) * bw * bh &&
             ((bx == pred_x >> 2 && by == pred_y >> 2) ||
              (bx == (pred_x + 2) >> 2 && by == (pred_y + 2) >> 2)))
             ur = 0;

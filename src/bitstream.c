@@ -328,18 +328,20 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
      * only a stream with neither tool is Baseline (the rest of the syntax stays
      * inside the Baseline tool set, so no further constraints apply). */
     const int high = p->transform_8x8 != 0;
+    /* High 10 (profile_idc 110) for 10-bit samples */
+    const int bd = p->bit_depth > 8 ? p->bit_depth : 8;
     /* Baseline does not allow an interlaced stream; Main does (CAVLC too) */
     const int main = !high && (p->cabac || p->interlaced);
 
     aeg_bw_init(&bw, rbsp, cap, 0);
-    aeg_bw_put(&bw, 8, high ? 100 : (main ? 77 : 66)); /* profile_idc         */
-    aeg_bw_put(&bw, 8, (high || main) ? 0x00 : 0xc0); /* constraint_set0/1   */
+    aeg_bw_put(&bw, 8, bd > 8 ? 110 : high ? 100 : (main ? 77 : 66)); /* profile_idc */
+    aeg_bw_put(&bw, 8, (high || main || bd > 8) ? 0x00 : 0xc0); /* constraint_set0/1 */
     aeg_bw_put(&bw, 8, (uint32_t)level_idc);
     aeg_bw_ue(&bw, 0);                   /* seq_parameter_set_id            */
-    if (high) {
+    if (high || bd > 8) {
         aeg_bw_ue(&bw, 1);               /* chroma_format_idc = 4:2:0       */
-        aeg_bw_ue(&bw, 0);               /* bit_depth_luma_minus8           */
-        aeg_bw_ue(&bw, 0);               /* bit_depth_chroma_minus8         */
+        aeg_bw_ue(&bw, (uint32_t)(bd - 8)); /* bit_depth_luma_minus8        */
+        aeg_bw_ue(&bw, (uint32_t)(bd - 8)); /* bit_depth_chroma_minus8      */
         aeg_bw_put(&bw, 1, 0);           /* qpprime_y_zero_transform_bypass */
         aeg_bw_put(&bw, 1, 0);           /* seq_scaling_matrix_present_flag */
     }

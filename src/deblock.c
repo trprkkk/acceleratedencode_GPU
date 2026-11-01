@@ -15,10 +15,6 @@
  */
 #include "h264.h"
 
-static inline uint8_t clip8(int v)
-{
-    return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-}
 static inline int clip3(int lo, int hi, int v)
 {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -31,15 +27,16 @@ void aeg_deblock_thresholds(int qp, int slice_alpha, int slice_beta,
 {
     int ia = AEG_CLIP3(0, 51, qp + 2 * slice_alpha);
     int ib = AEG_CLIP3(0, 51, qp + 2 * slice_beta);
-    *alpha = aeg_alpha_tab[ia];
-    *beta = aeg_beta_tab[ib];
+    /* 8.7.2.2: alpha, beta and tc0 scale with the bit depth */
+    *alpha = aeg_alpha_tab[ia] << (BIT_DEPTH - 8);
+    *beta = aeg_beta_tab[ib] << (BIT_DEPTH - 8);
     *tc0 = aeg_tc0_tab[ia];
 }
 
 /* ------------------------------------------------------------------ */
 /* Edge filters                                                        */
 /* ------------------------------------------------------------------ */
-static void filter_luma_edge(uint8_t *pix, int xs, int alpha, int beta, int tc0)
+static void filter_luma_edge(pixel *pix, int xs, int alpha, int beta, int tc0)
 {
     int p2 = pix[-3 * xs], p1 = pix[-2 * xs], p0 = pix[-1 * xs];
     int q0 = pix[0], q1 = pix[1 * xs], q2 = pix[2 * xs];
@@ -48,23 +45,23 @@ static void filter_luma_edge(uint8_t *pix, int xs, int alpha, int beta, int tc0)
         int tc = tc0, delta;
         if (abs(p2 - p0) < beta) {
             if (tc0)
-                pix[-2 * xs] = clip8(p1 + clip3(-tc0, tc0,
+                pix[-2 * xs] = aeg_clip_pixel(p1 + clip3(-tc0, tc0,
                                    ((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1));
             tc++;
         }
         if (abs(q2 - q0) < beta) {
             if (tc0)
-                pix[1 * xs] = clip8(q1 + clip3(-tc0, tc0,
+                pix[1 * xs] = aeg_clip_pixel(q1 + clip3(-tc0, tc0,
                                   ((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1));
             tc++;
         }
         delta = clip3(-tc, tc, (((q0 - p0) * 4) + (p1 - q1) + 4) >> 3);
-        pix[-1 * xs] = clip8(p0 + delta);
-        pix[0] = clip8(q0 - delta);
+        pix[-1 * xs] = aeg_clip_pixel(p0 + delta);
+        pix[0] = aeg_clip_pixel(q0 - delta);
     }
 }
 
-static void filter_luma_intra_edge(uint8_t *pix, int xs, int alpha, int beta)
+static void filter_luma_intra_edge(pixel *pix, int xs, int alpha, int beta)
 {
     int p2 = pix[-3 * xs], p1 = pix[-2 * xs], p0 = pix[-1 * xs];
     int q0 = pix[0], q1 = pix[1 * xs], q2 = pix[2 * xs];
@@ -73,43 +70,43 @@ static void filter_luma_intra_edge(uint8_t *pix, int xs, int alpha, int beta)
         if (abs(p0 - q0) < ((alpha >> 2) + 2)) {
             if (abs(p2 - p0) < beta) {
                 int p3 = pix[-4 * xs];
-                pix[-1 * xs] = (uint8_t)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-                pix[-2 * xs] = (uint8_t)((p2 + p1 + p0 + q0 + 2) >> 2);
-                pix[-3 * xs] = (uint8_t)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
+                pix[-1 * xs] = (pixel)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                pix[-2 * xs] = (pixel)((p2 + p1 + p0 + q0 + 2) >> 2);
+                pix[-3 * xs] = (pixel)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
             } else {
-                pix[-1 * xs] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
+                pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
             }
             if (abs(q2 - q0) < beta) {
                 int q3 = pix[3 * xs];
-                pix[0] = (uint8_t)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-                pix[1 * xs] = (uint8_t)((p0 + q0 + q1 + q2 + 2) >> 2);
-                pix[2 * xs] = (uint8_t)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
+                pix[0] = (pixel)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                pix[1 * xs] = (pixel)((p0 + q0 + q1 + q2 + 2) >> 2);
+                pix[2 * xs] = (pixel)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
             } else {
-                pix[0] = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+                pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
             }
         } else {
-            pix[-1 * xs] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
-            pix[0] = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+            pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
+            pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
         }
     }
 }
 
-static void filter_chroma_edge(uint8_t *pix, int xs, int alpha, int beta, int tc)
+static void filter_chroma_edge(pixel *pix, int xs, int alpha, int beta, int tc)
 {
     int p1 = pix[-2 * xs], p0 = pix[-1 * xs], q0 = pix[0], q1 = pix[1 * xs];
     if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
         int delta = clip3(-tc, tc, (((q0 - p0) * 4) + (p1 - q1) + 4) >> 3);
-        pix[-1 * xs] = clip8(p0 + delta);
-        pix[0] = clip8(q0 - delta);
+        pix[-1 * xs] = aeg_clip_pixel(p0 + delta);
+        pix[0] = aeg_clip_pixel(q0 - delta);
     }
 }
 
-static void filter_chroma_intra_edge(uint8_t *pix, int xs, int alpha, int beta)
+static void filter_chroma_intra_edge(pixel *pix, int xs, int alpha, int beta)
 {
     int p1 = pix[-2 * xs], p0 = pix[-1 * xs], q0 = pix[0], q1 = pix[1 * xs];
     if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
-        pix[-1 * xs] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
-        pix[0] = (uint8_t)((2 * q1 + q0 + p1 + 2) >> 2);
+        pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
+        pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
     }
 }
 
@@ -221,7 +218,7 @@ static void edge_bs(const aeg_mb *p, const aeg_mb *q, int vertical, int k,
  * bS[0]; otherwise every sample line with a non-negative tc0 is filtered
  * (tc0 == -1 means "do not filter").  `step` is the distance between two
  * samples along the edge. */
-static void luma_edge_filter(uint8_t *pix, int xs, int step, int alpha,
+static void luma_edge_filter(pixel *pix, int xs, int step, int alpha,
                              int beta, const int8_t *tc0, const int bs[4],
                              int intra)
 {
@@ -235,6 +232,7 @@ static void luma_edge_filter(uint8_t *pix, int xs, int step, int alpha,
         int tc = tc0[bs[i]];
         if (tc < 0)
             continue;
+        tc <<= BIT_DEPTH - 8;
         for (s = 0; s < 4; s++)
             filter_luma_edge(pix + (i * 4 + s) * step, xs, alpha, beta, tc);
     }
@@ -243,7 +241,7 @@ static void luma_edge_filter(uint8_t *pix, int xs, int step, int alpha,
 /* Chroma edge: 8 samples, the first pair uses bS[0], the second bS[1], and so
  * on (the reference decoder's 4:2:0 loop runs two samples per bS entry).  The
  * intra filter is again selected from bS[0] for the whole edge. */
-static void chroma_edge_filter(uint8_t *pix, int xs, int step, int alpha,
+static void chroma_edge_filter(pixel *pix, int xs, int step, int alpha,
                                int beta, const int8_t *tc0, const int bs[4],
                                int intra)
 {
@@ -254,9 +252,10 @@ static void chroma_edge_filter(uint8_t *pix, int xs, int step, int alpha,
         return;
     }
     for (i = 0; i < 4; i++) {
-        int tc = tc0[bs[i]] + 1;
-        if (tc <= 0)
+        int tc = tc0[bs[i]];
+        if (tc < 0)
             continue;
+        tc = (tc << (BIT_DEPTH - 8)) + 1;    /* chroma: tC0 + 1 */
         for (s = 0; s < 2; s++)
             filter_chroma_edge(pix + (i * 2 + s) * step, xs, alpha, beta, tc);
     }

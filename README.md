@@ -143,7 +143,14 @@ make install         # aegenc, libaeg.a, libaeg.so, aeg/aeg.h, aeg.pc under
 make uninstall
 make install-check   # install into a scratch DESTDIR and build the example
                      # against it through pkg-config, shared and static
+make BIT_DEPTHS=8    # leave out the 10-bit (High 10) encoder
 ```
+
+The library holds two encoders, 8-bit and 10-bit, as x264 does: the sources
+that touch samples or coefficients are compiled twice (`-DBIT_DEPTH=8` and
+`-DBIT_DEPTH=10`, the second set's symbols renamed with a `_10` suffix by
+`objcopy`), and `aeg_encoder_open()` picks one from `params.bit_depth`.  Use a
+separate `BUILD=` directory when switching `BIT_DEPTHS`.
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
 resolves `libOpenCL.so` with `dlopen()` so a CPU-only machine can still build
@@ -238,14 +245,36 @@ as whole macroblocks, cropped in the SPS); `--fps 30000/1001`, `--sar W:H`,
 `--info-sei` (the options in a user-data SEI), `-g`, `--scenecut`.  A missing,
 malformed or out-of-range value is refused with exit status 2.
 
-Other input formats are converted to the 8-bit 4:2:0 that is coded, the way
-x264's 8-bit build does: `--input-csp i420|yv12|nv12|nv21|i422|yv16|nv16|
+Other input formats are converted to the 4:2:0 at the coded depth, the way
+x264 does: `--input-csp i420|yv12|nv12|nv21|i422|yv16|nv16|
 i444|yv24|i400` and `--input-depth 8..16` for raw input (above 8 bits, two
 bytes per sample, little-endian: `yuv422p10le` and the like), or a `.y4m`
 header's `C` tag (`420p10`, `422`, `444p12`, `mono16`, ...).  The chroma is
 resampled to 4:2:0 in 16-bit precision (per field for interlaced material),
-then every plane is dithered to 8 bits with x264's error diffusion.  8-bit
-I420 goes through untouched.
+then every plane is dithered to the coded depth with x264's error diffusion.
+I420 at the coded depth goes through untouched; 8-bit input to a 10-bit
+stream is scaled up exactly.
+
+### High 10 (10-bit)
+
+`--bit-depth 10` (alias `--output-depth 10`, x264's name) codes a High 10
+profile stream (`profile_idc` 110, 4:2:0, 10 bits luma and chroma) with the
+10-bit build of the same encoder: every tool, preset, rate control, the frame
+and slice threads, interlace signalling.  The QPs keep the 8-bit scale
+(`-q 22` is the same quantiser step relative to the signal at both depths,
+unlike x264, whose 10-bit `--qp` counts from QP'Y); CRF and the rate
+controls may go below zero, to -12, which is where 10 bits pay off.
+`--dump-recon` writes 16-bit little-endian samples (`yuv420p10le`).  10-bit
+runs on the CPU only -- the device kernels are 8-bit, so `-b opencl` falls
+back with a warning -- and it has no SIMD yet: 1.5-2.1x the time of the
+8-bit encoder.
+
+What 10 bits buy on 8-bit sources (the five test clips, preset 3, QP 22-37,
+the decoded stream against the source, PSNR of all three planes in the 8-bit
+scale): **-4.2 %** BD-rate on average against the same encoder at 8 bits
+(vtest -2.3, cock -4.8, mega -7.4, short -5.1, tree -1.5) -- less rounding in
+the prediction loop and finer quantisers.  Every 10-bit configuration in the
+test suite decodes in FFmpeg to exactly the encoder's reconstruction.
 
 `--tff` / `--bff` (or a `.y4m` header's `It` / `Ib`) mark the stream as
 interlaced with that field order: the pictures are still coded as frames
@@ -279,6 +308,8 @@ rc = aeg_encoder_encode_planes(e, plane, stride, pts, &pkt);
 /* ... or anything else: NV12, 4:2:2, 10-bit, grey ... (converted) */
 aeg_image img = { AEG_CSP_I422, 10, { y, u, v }, { ys, us, vs } };
 rc = aeg_encoder_encode_image(e, &img, pts, &pkt);
+/* 10-bit stream: p.bit_depth = 10 before open; the reconstruction
+ * (aeg_encoder_recon) is then uint16_t samples, strides in bytes */
 if (rc == AEG_OK) write(pkt.data, pkt.size);   /* AEG_EAGAIN: no packet yet */
 while (aeg_encoder_flush(e, &pkt) == AEG_OK) write(pkt.data, pkt.size);
 aeg_encoder_close(e);
@@ -304,6 +335,10 @@ aeg_encoder_close(e);
   run in parallel threads and each produces the bytes it produces alone
   (checked by `tests/api_check.c`, also under ThreadSanitizer in CI);
   `aeg_last_error()` is per thread.
+* **Bit depth**: `params.bit_depth` 8 (or 0) or 10 picks the encoder build;
+  anything else, or 10 in a `BIT_DEPTHS=8` library, fails in open with a
+  message.  10-bit I420/YV12 images are coded as they are (a sample above
+  1023 is clipped); everything else is converted.
 * **ABI**: the shared library exports only the `AEG_API` functions (checked
   against the header by `tests/install_check.sh`).  While the soname is
   `libaeg.so.0` the struct layouts may still change between releases: rebuild
@@ -404,6 +439,11 @@ include/aeg/aeg.h   public API
 examples/encode.c   a complete program using only the public API
 aeg.pc.in           pkg-config template (make install fills in the paths)
 src/h264.h          internal data structures and prototypes
+src/bitdepth.h      pixel/dctcoef types and constants of one bit-depth build
+src/api.c           the public encoder calls: dispatch to the 8- or 10-bit build
+src/api_impl.h      the names each build's encoder.c defines
+src/input.c         input conversion (layouts, chroma resampling, dither)
+src/lowres.c        the lookahead's half-resolution planes (per depth)
 src/tables.c        all constant tables (quantiser, deblock, CAVLC, zigzag, QP map)
 src/transform.c     forward/inverse 4x4 transform, DC Hadamard, quantisation
 src/intra.c         Intra_4x4 (9 modes) / Intra_16x16 / chroma prediction
@@ -422,6 +462,7 @@ tests/nvrtc_check.c the CUDA kernels through NVRTC (no GPU needed)
 tests/api_check.c   the public API alone (see above)
 tests/install_check.sh  make install, pkg-config, exports, header as C/C++
 tools/pocl_env.sh   a real OpenCL device without a GPU (PoCL), for the above
+tools/identity.sh   byte-compare two aegenc builds over fourteen configurations
 cli/aegenc.c        command line front end
 tests/              synthetic clip generator, single-MB probe, test runner
 ```

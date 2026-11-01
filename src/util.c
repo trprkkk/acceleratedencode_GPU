@@ -147,6 +147,7 @@ void aeg_params_default(aeg_params *p)
     p->colorprim = p->transfer = p->colormatrix = -1;
     p->qp_max = 51;
     p->qp = 23;
+    p->bit_depth = 8;
     p->crf = 23.0;
     p->qcomp = 60;
     p->rc_mode = AEG_RC_CQP;

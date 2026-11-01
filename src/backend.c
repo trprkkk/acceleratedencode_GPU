@@ -26,19 +26,19 @@
 /* ------------------------------------------------------------------ */
 /* CPU reference implementations                                       */
 /* ------------------------------------------------------------------ */
-static int cpu_sad_batch(void *priv, const uint8_t *cur, int cstride,
-                         const uint8_t *ref, int rstride, int bw, int bh,
+static int cpu_sad_batch(void *priv, const pixel *cur, int cstride,
+                         const pixel *ref, int rstride, int bw, int bh,
                          const int16_t *mv, int count, int32_t *out)
 {
     int i;
     (void)priv;
     for (i = 0; i < count; i++) {
-        const uint8_t *c0 = cur + (ptrdiff_t)mv[4 * i + 1] * cstride + mv[4 * i + 0];
-        const uint8_t *r = ref + (ptrdiff_t)mv[4 * i + 3] * rstride + mv[4 * i + 2];
+        const pixel *c0 = cur + (ptrdiff_t)mv[4 * i + 1] * cstride + mv[4 * i + 0];
+        const pixel *r = ref + (ptrdiff_t)mv[4 * i + 3] * rstride + mv[4 * i + 2];
         int x, y, sad = 0;
         for (y = 0; y < bh; y++) {
-            const uint8_t *c = c0 + y * cstride;
-            const uint8_t *rr = r + y * rstride;
+            const pixel *c = c0 + y * cstride;
+            const pixel *rr = r + y * rstride;
             for (x = 0; x < bw; x++) {
                 int d = (int)c[x] - (int)rr[x];
                 sad += d < 0 ? -d : d;
@@ -50,12 +50,12 @@ static int cpu_sad_batch(void *priv, const uint8_t *cur, int cstride,
 }
 
 static int cpu_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
-                        int intra, int16_t *level, int32_t *nz)
+                        int intra, dctcoef *level, int32_t *nz)
 {
     int b;
     (void)priv;
     for (b = 0; b < nblk; b++) {
-        int16_t coef[16];
+        dctcoef coef[16];
         int i, n = 0;
         aeg_transform_4x4(res + 16 * b, 4, coef);
         aeg_quant_4x4(coef, level + 16 * b, qp, intra);
@@ -67,7 +67,7 @@ static int cpu_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     return AEG_OK;
 }
 
-static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
+static int cpu_iq_idct_batch(void *priv, const dctcoef *level, int nblk,
                              int qp, int16_t *res)
 {
     int b;
@@ -87,15 +87,16 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
      * every sample is ((int16)d[0]) >> 6 -- the same value aeg_idct_residual()
      * computes, including at the int16 extremes (coef_check covers both). */
     for (b = 0; b < nblk; b++) {
-        const int16_t *l = level + 16 * b;
+        const dctcoef *l = level + 16 * b;
         int16_t *r = res + 16 * b;
         int i, ac = 0;
         for (i = 1; i < 16; i++)
             ac |= l[i];
         if (!ac) {
-            int16_t d0 = (int16_t)((int16_t)((int32_t)l[0] *
-                                             aeg_dequant_ls[qp % 6][0] *
-                                             (1 << (qp / 6))) + 32);
+            const int qpi = qp + QP_BD_OFFSET;          /* QP'Y */
+            dctcoef d0 = (dctcoef)((dctcoef)((int32_t)l[0] *
+                                             aeg_dequant_ls[qpi % 6][0] *
+                                             (1 << (qpi / 6))) + 32);
             int16_t v = (int16_t)(d0 >> 6);
             for (i = 0; i < 16; i++)
                 r[i] = v;
@@ -109,7 +110,7 @@ static int cpu_iq_idct_batch(void *priv, const int16_t *level, int nblk,
 /* the reference the fused device kernel is checked against: literally the
  * two operations one after the other */
 static int cpu_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
-                           int intra, int16_t *level, int32_t *nz,
+                           int intra, dctcoef *level, int32_t *nz,
                            int16_t *rec)
 {
     cpu_tq_batch(priv, res, nblk, qp, intra, level, nz);
@@ -119,12 +120,12 @@ static int cpu_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
 /* the DC-split pair: exactly the per-block steps of code_luma_i16() and
  * code_chroma_run() */
 static int cpu_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
-                           int intra, int16_t *level, int32_t *nz, int32_t *dc)
+                           int intra, dctcoef *level, int32_t *nz, int32_t *dc)
 {
     int b;
     (void)priv;
     for (b = 0; b < nblk; b++) {
-        int16_t coef[16];
+        dctcoef coef[16];
         int i, n = 0;
         aeg_transform_4x4(res + 16 * b, 4, coef);
         dc[b] = coef[0];
@@ -138,7 +139,7 @@ static int cpu_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
     return AEG_OK;
 }
 
-static int cpu_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
+static int cpu_iq_dc_batch(void *priv, const dctcoef *level, const int32_t *dc,
                            int nblk, int qp, int16_t *res)
 {
     int b;
@@ -148,8 +149,8 @@ static int cpu_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
     return AEG_OK;
 }
 
-static int cpu_sse_batch(void *priv, const uint8_t *a, int sa,
-                         const uint8_t *b, int sb, int w, int h,
+static int cpu_sse_batch(void *priv, const pixel *a, int sa,
+                         const pixel *b, int sb, int w, int h,
                          uint64_t *out)
 {
     int tw = w / 8, th = h / 8, tx, ty, x, y;
@@ -170,8 +171,8 @@ static int cpu_sse_batch(void *priv, const uint8_t *a, int sa,
 /* One fractional-pel plane of the reference picture: the same function the
  * encoder's plane cache uses when the stage stays on the CPU, so the two
  * implementations of the operation cannot drift apart. */
-static int cpu_interp_plane(void *priv, const uint8_t *ref, int rstride,
-                            int w, int h, int which, uint8_t *dst, int dstride)
+static int cpu_interp_plane(void *priv, const pixel *ref, int rstride,
+                            int w, int h, int which, pixel *dst, int dstride)
 {
     (void)priv;
     aeg_hpel_plane_fill(dst, dstride, ref, rstride, w, h, which);
@@ -187,11 +188,11 @@ static int cpu_interp_plane(void *priv, const uint8_t *ref, int rstride,
  * searches at the same time, each against its own reference, and the
  * registration and the batches of one picture always run on one thread. */
 static __thread struct {
-    const uint8_t *base[4];
+    const pixel *base[4];
     int            stride;
 } g_cpu_ref;
 
-static int cpu_ref_upload(void *priv, const uint8_t *const planes[4],
+static int cpu_ref_upload(void *priv, const pixel *const planes[4],
                           int pstride, int w, int h)
 {
     (void)priv; (void)w; (void)h;
@@ -203,11 +204,11 @@ static int cpu_ref_upload(void *priv, const uint8_t *const planes[4],
     return AEG_OK;
 }
 
-static int cpu_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+static int cpu_satd_batch(void *priv, const pixel *cur, int cstride, int bw,
                           int bh, const int16_t *pos, int count, int32_t *out)
 {
     aeg_mc_ctx mc;
-    uint8_t buf[16 * 16];
+    pixel buf[16 * 16];
     int i;
     (void)priv;
     if (bw > 16 || bh > 16)
@@ -301,7 +302,7 @@ struct be_guard {
 static __thread struct {
     const be_lane  *l;
     uint64_t        seq;
-    const uint8_t  *planes[4];
+    const pixel  *planes[4];
     int             stride, w, h;
 } g_tls_ref[BE_LANES];
 
@@ -341,8 +342,8 @@ static int tls_slot(const be_lane *l)
     return (int)(((uintptr_t)l >> 6) % BE_LANES);
 }
 
-static int g_sad_batch(void *priv, const uint8_t *cur, int cstride,
-                       const uint8_t *ref, int rstride, int bw, int bh,
+static int g_sad_batch(void *priv, const pixel *cur, int cstride,
+                       const pixel *ref, int rstride, int bw, int bh,
                        const int16_t *mv, int count, int32_t *out)
 {
     be_lane *l = (be_lane *)priv;
@@ -355,7 +356,7 @@ static int g_sad_batch(void *priv, const uint8_t *cur, int cstride,
 }
 
 static int g_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
-                      int intra, int16_t *level, int32_t *nz)
+                      int intra, dctcoef *level, int32_t *nz)
 {
     be_lane *l = (be_lane *)priv;
     if (guard_enter(l) &&
@@ -365,7 +366,7 @@ static int g_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     return l->g->cpu.tq_batch(l->g->cpu.priv, res, nblk, qp, intra, level, nz);
 }
 
-static int g_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
+static int g_iq_idct_batch(void *priv, const dctcoef *level, int nblk, int qp,
                            int16_t *res)
 {
     be_lane *l = (be_lane *)priv;
@@ -377,7 +378,7 @@ static int g_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
 }
 
 static int g_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
-                         int intra, int16_t *level, int32_t *nz, int16_t *rec)
+                         int intra, dctcoef *level, int32_t *nz, int16_t *rec)
 {
     be_lane *l = (be_lane *)priv;
     if (guard_enter(l) &&
@@ -389,7 +390,7 @@ static int g_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
 }
 
 static int g_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
-                         int intra, int16_t *level, int32_t *nz, int32_t *dc)
+                         int intra, dctcoef *level, int32_t *nz, int32_t *dc)
 {
     be_lane *l = (be_lane *)priv;
     if (guard_enter(l) &&
@@ -400,7 +401,7 @@ static int g_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
                                  nz, dc);
 }
 
-static int g_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
+static int g_iq_dc_batch(void *priv, const dctcoef *level, const int32_t *dc,
                          int nblk, int qp, int16_t *res)
 {
     be_lane *l = (be_lane *)priv;
@@ -411,8 +412,8 @@ static int g_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
     return l->g->cpu.iq_dc_batch(l->g->cpu.priv, level, dc, nblk, qp, res);
 }
 
-static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
-                          int h, int which, uint8_t *dst, int dstride)
+static int g_interp_plane(void *priv, const pixel *ref, int rstride, int w,
+                          int h, int which, pixel *dst, int dstride)
 {
     be_lane *l = (be_lane *)priv;
     if (guard_enter(l) &&
@@ -424,7 +425,7 @@ static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
                                   dst, dstride);
 }
 
-static int g_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
+static int g_sse_batch(void *priv, const pixel *a, int sa, const pixel *b,
                        int sb, int w, int h, uint64_t *out)
 {
     be_lane *l = (be_lane *)priv;
@@ -435,7 +436,7 @@ static int g_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     return l->g->cpu.sse_batch(l->g->cpu.priv, a, sa, b, sb, w, h, out);
 }
 
-static int g_ref_upload(void *priv, const uint8_t *const planes[4], int pstride,
+static int g_ref_upload(void *priv, const pixel *const planes[4], int pstride,
                         int w, int h)
 {
     be_lane *l = (be_lane *)priv;
@@ -458,7 +459,7 @@ static int g_ref_upload(void *priv, const uint8_t *const planes[4], int pstride,
     return AEG_OK;
 }
 
-static int g_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
+static int g_satd_batch(void *priv, const pixel *cur, int cstride, int bw,
                         int bh, const int16_t *pos, int count, int32_t *out)
 {
     be_lane *l = (be_lane *)priv;
@@ -638,6 +639,17 @@ int aeg_be_create(int which, aeg_be_ops *ops)
 static int be_create_raw(int which, aeg_be_ops *ops)
 {
     aeg_be_cpu_ops(ops);
+#if BIT_DEPTH != 8
+    /* the device kernels are 8-bit: a high-depth encoder runs on the CPU */
+    if (which == AEG_BACKEND_OPENCL || which == AEG_BACKEND_CUDA) {
+        aeg_log(AEG_LOG_WARNING, "aeg: %s requested, but the device kernels "
+                "are 8-bit: this 10-bit encoder runs on the CPU",
+                aeg_backend_name(which));
+        aeg_set_last_error("GPU backends support 8-bit only, using CPU");
+        return AEG_EBACKEND;
+    }
+    return AEG_OK;
+#endif
     switch (which) {
     case AEG_BACKEND_CPU:
         return AEG_OK;
@@ -896,6 +908,7 @@ void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
     disp_unlock(r);
 }
 
+#if BIT_DEPTH == 8   /* public, and the device stubs: the 8-bit build's */
 /* ------------------------------------------------------------------ */
 /* Device enumeration                                                  */
 /* ------------------------------------------------------------------ */
@@ -1008,3 +1021,4 @@ int aeg_cuda_compile_check(int cc, char *log, size_t logsz, size_t *ptx_size)
     return AEG_EBACKEND;
 }
 #endif
+#endif /* BIT_DEPTH == 8 */

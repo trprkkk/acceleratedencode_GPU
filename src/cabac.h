@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "bitdepth.h"
+
 /* 4:2:0, 8-bit: contexts 0..459 (the extra ones are chroma_format_idc 3) */
 #define AEG_CABAC_CTX_COUNT 460
 
@@ -202,26 +204,26 @@ static inline int64_t aeg_cabac_coef_price_inl(const aeg_cabac *st, int cat,
  * coefficient at scan position i; `cat` is the ctxBlockCat of 4:2:0 (0 = luma
  * DC, 1 = luma AC, 2 = luma 4x4, 3 = chroma DC, 4 = chroma AC, 5 = luma 8x8).
  * Returns the number of non-zero coefficients. */
-int aeg_cabac_residual(aeg_cabac *c, const int16_t *coef, int n, int cat,
+int aeg_cabac_residual(aeg_cabac *c, const dctcoef *coef, int n, int cat,
                        int cbf_ctx);
 
 /* Price in 1/256 bit of one coefficient of a residual block (see cabac.c):
  * `pos` is the scan position, `n` the block's coefficient count. */
 int64_t aeg_cabac_coef_price(const aeg_cabac *c, int cat, int n, int pos,
                              int level, int is_last, int with_sig);
-int64_t aeg_cabac_residual_price(const aeg_cabac *st, const int16_t *coef,
+int64_t aeg_cabac_residual_price(const aeg_cabac *st, const dctcoef *coef,
                                  int n, int cat, int cbf_ctx);
 
-#if defined(__SSE2__)
+#if AEG_SSE2
 #include <emmintrin.h>
 #endif
 /* The number of non-zero values of v[0..n-1] and the index of the last one
  * (-1 when there is none): the loop every block price and level search
  * starts with, eight values per compare. */
-static inline int aeg_nz_last(const int16_t *v, int n, int *last)
+static inline int aeg_nz_last(const dctcoef *v, int n, int *last)
 {
     int i = 0, cnt = 0, l = -1;
-#if defined(__SSE2__)
+#if AEG_SSE2
     const __m128i z = _mm_setzero_si128();
     for (; i + 8 <= n; i += 8) {
         const __m128i e = _mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(v + i)), z);
