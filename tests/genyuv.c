@@ -11,7 +11,10 @@
  * quadrants in four directions, which is what makes P_8x8 (one motion vector
  * per 8x8 block) worth coding; mode 5 is mode 0 fading out (every sample
  * drawn towards black, chroma towards grey), which is what explicit weighted
- * prediction is for.
+ * prediction is for; mode 6 holds each picture of mode 0 for five frames and
+ * adds a fine texture -- a clip of repeated frames with detail, where a held
+ * picture coded finer than its reference costs far more than its (zero)
+ * difference from it suggests, which is what the VBV re-coding is for.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +32,9 @@ int main(int argc, char **argv)
 
     if (!f) { perror(path); return 1; }
     for (t = 0; t < n; t++) {
+        int t0 = t;
+        if (mode == 6)
+            t = (t / 5) * 5;
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
                 int cx = x + t * 3, cy = y + t * 2;
@@ -49,6 +55,14 @@ int main(int argc, char **argv)
                         ((cx / 24 + cy / 24) & 1) * 30;
                 if (v < 16) v = 16;
                 if (v > 235) v = 235;
+                if (mode == 6) {
+                    unsigned hsh = (unsigned)(cx * 73856093) ^ (unsigned)(cy * 19349663);
+                    hsh ^= hsh >> 13;
+                    hsh *= 0x5bd1e995u;
+                    v += (int)((hsh >> 24) & 63) - 32;
+                    if (v < 16) v = 16;
+                    if (v > 235) v = 235;
+                }
                 if (mode == 5)
                     v = 16 + (v - 16) * (100 - 4 * t) / 100;
                 fputc(v, f);
@@ -61,6 +75,7 @@ int main(int argc, char **argv)
             for (x = 0; x < w / 2; x++)
                 fputc(128 + (int)(40 * cos((y + (mode == 3 ? 0 : t)) * 0.07) *
                                   (mode == 5 ? (100 - 4 * t) / 100.0 : 1.0)), f);
+        t = t0;
     }
     fclose(f);
     printf("wrote %s (%dx%d, %d frames, mode %d)\n", path, w, h, n, mode);

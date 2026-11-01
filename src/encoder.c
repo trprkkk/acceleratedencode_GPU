@@ -379,6 +379,7 @@ struct aeg_encoder {
     const uint8_t *wp_orig0;
     int cur_is_p;           /* the picture being coded is a P slice */
     int cur_is_b;           /* ... is a B slice                     */
+    int cur_is_intra;       /* ... is an I slice (IDR or not)       */
     int mode_lambda_off;    /* QP offset of a B picture over its anchors:
                              * the mode decision prices with the lambda of
                              * the QP without it (see code_mb)         */
@@ -462,6 +463,24 @@ struct aeg_encoder {
     int    rc_active;
     int    rc_qp_offset;    /* user bias on the per-picture QP (two-pass)     */
 
+    /* CRF (`AEG_RC_CRF`, x264's constant rate factor): an anchor's QP follows
+     * qscale = blurred_complexity^(1 - qcomp) / crf_rf, the complexity being
+     * the lookahead's estimate of the picture coded as P.  `crf_cplx` holds
+     * that estimate per ring slot, written when the picture is scheduled; the
+     * picture QP is fractional, the fraction going to a run of macroblocks
+     * coded one step coarser (crf_dither). */
+    int     crf_on;
+    double  crf_rf;           /* rate factor                               */
+    double  crf_qc;           /* 1 - effective qcomp (0 with the tree)     */
+    double  crf_tree_off;     /* the QP shift: tree centring + calibration */
+    double  crf_sum, crf_cnt; /* the short-term complexity blur            */
+    double  crf_pqp, crf_pnorm; /* decaying average of the anchors' QP     */
+    double  crf_anchor_q;     /* the last anchor's fractional QP            */
+    double  crf_frac;         /* this picture's fraction (0..1)             */
+    int64_t *crf_cplx;        /* per ring slot (-1 = none)                  */
+    aeg_lowres crf_low[2];    /* without B pictures: this and the last input */
+    int64_t crf_last;         /* the last estimate (no-B path)              */
+
     /* VBV/HRD (H.264 Annex C): the receiver's buffer is modelled picture by
      * picture.  `vbv_full` is what the model says is in the buffer when the
      * next picture starts.  A picture may not take more bits than that, so the
@@ -481,6 +500,7 @@ struct aeg_encoder {
     double vbv_min_full;    /* lowest level seen                            */
     int    vbv_underflows;
     int    vbv_clamps;
+    int    vbv_recodes;     /* pictures coded again to fit (frame_body)     */
     int    last_pic_bits;   /* the previous picture, to predict this one    */
     int    last_pic_qp;
     /* The previous *anchor*, for the VBV model: a B picture is much cheaper
@@ -490,6 +510,20 @@ struct aeg_encoder {
      * would then fire on a buffer that is nowhere near empty. */
     int    last_anchor_bits;
     int    last_anchor_qp;
+    /* ... and per type: an intra picture is several times a P picture, so
+     * neither may be predicted from the other while the type has its own */
+    int    last_i_bits, last_i_qp;
+    int    last_p_bits, last_p_qp;
+    /* x264's size predictor (predict_size / update_predictor):
+     * bits = (coef * satd + offset) / (qscale * count) per picture type, satd
+     * being the lowres estimate of the picture as it is coded (intra, against
+     * its reference, or between its two), the sums decaying by half per
+     * picture of the type.  vbv_satd per ring slot is written when the
+     * picture is queued (cur_satd: the picture being coded, -1 = none). */
+    double vbv_coef[3], vbv_off[3], vbv_cnt[3];
+    int64_t *vbv_satd;
+    int64_t cur_satd;
+    int    job_nb_last, job_nb_prev; /* the last two non-B pictures queued */
     int    mbt_qoff;        /* mean macroblock-tree offset of this picture */
     /* Frame threads (see "Frame threads" near aeg_encoder_encode): a worker
      * that codes non-reference B pictures next to the main thread, and the
@@ -7914,6 +7948,25 @@ static int mbt_mean(const struct aeg_encoder *e)
     return (int)floor(t / n + 0.5);
 }
 
+/* CRF's fractional QP: round(frac * n) macroblocks are coded one step
+ * coarser.  They form one run (in raster order, wrapping), so the picture
+ * pays for two QP changes rather than one per macroblock, and the run starts
+ * somewhere else in every picture so that no region is always the coarse
+ * one. */
+static void crf_dither(struct aeg_encoder *e, int poc)
+{
+    int n = e->mb_count, k, s, i;
+
+    if (!e->crf_on || e->crf_frac <= 0.0)
+        return;
+    k = (int)(e->crf_frac * n + 0.5);
+    s = (int)(((unsigned)poc * 2654435761u) % (unsigned)n);
+    for (i = 0; i < k; i++) {
+        int j = (s + i) % n, d = e->mb_dqp[j] + 1;
+        e->mb_dqp[j] = (int8_t)(d > AQ_MAX_DQP ? AQ_MAX_DQP : d);
+    }
+}
+
 /* The offsets the macroblock tree gave this picture when it was queued (a
  * B picture nothing predicts from has none: nothing inherits its error). */
 static void mbt_apply(struct aeg_encoder *e)
@@ -7956,6 +8009,8 @@ static double vbv_available(const struct aeg_encoder *e)
     return level;
 }
 
+static const int *la_intra(struct aeg_encoder *e, int d);
+
 /* Raise the QP if the picture would not fit in the buffer.
  *
  * The size of a picture is not known before it is coded, so it is predicted
@@ -7971,25 +8026,78 @@ static void vbv_clamp_qp(struct aeg_encoder *e)
     int ref_bits = e->last_pic_bits, ref_qp = e->last_pic_qp;
 
     /* A B picture is predicted from the last anchor rather than from the last
-     * picture, for the reason given at last_anchor_bits. */
+     * picture, for the reason given at last_anchor_bits; an intra or a P
+     * picture from the last one of its own type. */
     if (e->cur_is_b && e->last_anchor_bits > 0 && e->last_anchor_qp >= 0) {
         ref_bits = e->last_anchor_bits;
         ref_qp = e->last_anchor_qp;
+    } else if (e->cur_is_intra && e->last_i_bits > 0) {
+        ref_bits = e->last_i_bits;
+        ref_qp = e->last_i_qp;
+    } else if (!e->cur_is_intra && !e->cur_is_b) {
+        if (e->last_p_bits > 0) {
+            ref_bits = e->last_p_bits;
+            ref_qp = e->last_p_qp;
+        } else if (e->last_i_bits > 0) {
+            /* the first P picture: a quarter of the intra picture, which errs
+             * high (x264's measure 1/16 on a static scene) */
+            ref_bits = e->last_i_bits / 4;
+            ref_qp = e->last_i_qp;
+        }
     }
-    if (!e->vbv_active || ref_bits <= 0 || ref_qp < 0)
+    if (!e->vbv_active)
         return;
     /* The B picture's QP already carries the B offset, so the prediction has to
      * start from the QP the encoder will actually quantise with. */
     avail = vbv_available(e);
+    if (e->crf_on) {
+        /* Capped CRF has no rate target pulling the level back, so a run of
+         * pictures that each fit could still drain the buffer until one the
+         * prediction underestimates no longer does.  A picture may therefore
+         * only spend what lies above half the buffer (at least half of one
+         * picture's delivery, so that the QP does not jump to the top). */
+        double lim = avail - 0.5 * e->vbv_buf_bits;
+        double low = 0.5 * e->vbv_rate_bits;
+
+        if (lim < low)
+            lim = low < 0.9 * avail ? low : 0.9 * avail;
+        avail = lim;
+    }
     if (avail < 1.0)
         avail = 1.0;
-    /* the macroblock tree moves the picture's QP by its mean offset, and the
-     * pictures the prediction starts from carry theirs (vbv_update) */
-    pred = (double)ref_bits *
-           pow(2.0, (double)(ref_qp - e->cur_qp - e->mbt_qoff) / 6.0);
-    if (pred <= avail)
-        return;
-    q_min = (double)ref_qp - 6.0 * log2(avail / (double)ref_bits);
+    /* Two predictions of the QP the picture needs to fit: the size
+     * predictor's (the smallest qscale with its estimate <= avail) and the
+     * last picture of the type's, scaled by the QP difference.  The smaller
+     * one decides: a picture both expect to overflow is raised, and one only
+     * a single predictor worries about is left alone -- a stream that fits
+     * its buffer must come out byte for byte as it would without one, and
+     * the re-coding in frame_body() catches what both miss. */
+    q_min = -1e9;
+    {
+        int have = 0;
+        double qs = 1e9, qr = 1e9;
+
+        if (e->cur_satd > 0) {
+            int t = e->cur_is_intra ? 0 : e->cur_is_b ? 2 : 1;
+            double need = (e->vbv_coef[t] * (double)e->cur_satd +
+                           e->vbv_off[t]) / (e->vbv_cnt[t] * avail);
+            qs = 12.0 + 6.0 * log2(need / 0.85);
+            have = 1;
+        }
+        if (ref_bits > 0 && ref_qp >= 0) {
+            /* the macroblock tree moves the picture's QP by its mean offset,
+             * and the pictures the prediction starts from carry theirs
+             * (vbv_update) */
+            pred = (double)ref_bits *
+                   pow(2.0, (double)(ref_qp - e->cur_qp - e->mbt_qoff) / 6.0);
+            qr = pred <= avail ? -1e9
+               : (double)ref_qp - 6.0 * log2(avail / (double)ref_bits);
+            have = 1;
+        }
+        if (!have)
+            return;
+        q_min = qs < qr ? qs : qr;
+    }
     if ((double)(e->cur_qp + e->mbt_qoff) < q_min) {
         int q = (int)ceil(q_min) - e->mbt_qoff;
 
@@ -8008,6 +8116,36 @@ static void vbv_update(struct aeg_encoder *e, int bits)
 
     e->last_pic_bits = bits;
     e->last_pic_qp = e->cur_qp + e->mbt_qoff;
+    if (e->cur_satd >= 10 && bits > 0) {
+        /* x264's update: the new coefficient within 1.5x of the running one,
+         * the rest of the picture's bits going to the offset (a picture can
+         * cost bits its difference does not explain: noise coded at a low QP) */
+        int t = e->cur_is_intra ? 0 : e->cur_is_b ? 2 : 1;
+        double bq = (double)bits * 0.85 *
+                    pow(2.0, (e->cur_qp + e->mbt_qoff - 12) / 6.0);
+        double var = (double)e->cur_satd;
+        double oc = e->vbv_coef[t] / e->vbv_cnt[t];
+        double oo = e->vbv_off[t] / e->vbv_cnt[t];
+        double nc = (bq - oo) / var, ncc, no;
+
+        if (nc < 1.5 / 4.0) nc = 1.5 / 4.0;          /* coeff_min */
+        ncc = nc < oc / 1.5 ? oc / 1.5 : nc > oc * 1.5 ? oc * 1.5 : nc;
+        no = bq - ncc * var;
+        if (no >= 0.0)
+            nc = ncc;
+        else
+            no = 0.0;
+        e->vbv_cnt[t] = e->vbv_cnt[t] * 0.5 + 1.0;
+        e->vbv_coef[t] = e->vbv_coef[t] * 0.5 + nc;
+        e->vbv_off[t] = e->vbv_off[t] * 0.5 + no;
+    }
+    if (e->cur_is_intra) {
+        e->last_i_bits = bits;
+        e->last_i_qp = e->cur_qp + e->mbt_qoff;
+    } else if (!e->cur_is_b) {
+        e->last_p_bits = bits;
+        e->last_p_qp = e->cur_qp + e->mbt_qoff;
+    }
     if (!e->cur_is_b) {
         e->last_anchor_bits = bits;
         e->last_anchor_qp = e->cur_qp + e->mbt_qoff;
@@ -9654,6 +9792,43 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
 
     /* the picture's QP: constant in CQP, the controller's output in ABR */
     e->cur_qp = e->p.qp;
+    e->crf_frac = 0.0;
+    if (e->crf_on) {
+        /* An anchor follows its complexity (x264's get_qscale: blurred over
+         * the last few anchors, so that one odd picture does not swing the
+         * quality); an intra picture takes the anchors' recent average and a
+         * B picture the anchor coded just before it -- the offsets the
+         * picture type gets in CQP are applied below, as they would be to
+         * -q. */
+        double q;
+        if (is_idr || slice == AEG_SLICE_I) {
+            q = e->crf_pqp / e->crf_pnorm;
+        } else if (e->cur_is_b) {
+            q = e->crf_anchor_q;
+        } else {
+            int64_t c = e->crf_qc <= 0.0 ? -1
+                      : e->p.bframes > 0 ? e->crf_cplx[poc % in_slots(e)]
+                      : e->crf_last;
+            if (c >= 0) {
+                double qs;
+                e->crf_sum = e->crf_sum * 0.5 + (double)c;
+                e->crf_cnt = e->crf_cnt * 0.5 + 1.0;
+                qs = pow(e->crf_sum / e->crf_cnt, e->crf_qc) / e->crf_rf;
+                q = 12.0 + 6.0 * log2(qs / 0.85);
+            } else {
+                q = e->p.crf + e->crf_tree_off;
+            }
+            if (q < 0.0) q = 0.0;
+            if (q > 51.0) q = 51.0;
+            e->crf_pqp = e->crf_pqp * 0.95 + q;
+            e->crf_pnorm = e->crf_pnorm * 0.95 + 1.0;
+        }
+        if (!e->cur_is_b)
+            e->crf_anchor_q = q;
+        e->cur_qp = (int)floor(q);
+        e->crf_frac = q - e->cur_qp;
+        if (e->cur_qp >= 51) e->cur_qp = 51, e->crf_frac = 0.0;
+    }
     if (e->rc_active) {
         e->cur_qp = (int)(e->rc_qp + 0.5);
         /* a keyframe carries the whole picture on its own, so it gets a
@@ -9705,6 +9880,9 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         if (e->cur_qp > 51) e->cur_qp = 51;
     }
     e->mbt_qoff = mbt_mean(e);
+    e->cur_is_intra = is_idr || slice == AEG_SLICE_I;
+    if (e->p.bframes > 0)
+        e->cur_satd = e->vbv_satd ? e->vbv_satd[poc % in_slots(e)] : -1;
     if (e->vbv_active)
         vbv_clamp_qp(e);
     if (e->cur_qp < e->p.qp_min) e->cur_qp = e->p.qp_min;
@@ -9713,6 +9891,16 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
     resolve_coef_stages(e);
     aq_compute(e);
     mbt_apply(e);
+    crf_dither(e, poc);
+    if (aeg_log_level >= 2) {
+        long t = 0;
+        int i;
+        for (i = 0; i < e->mb_count; i++)
+            t += mb_qp_of(e, i % e->mb_w, i / e->mb_w);
+        aeg_log(2, "aeg: picture %d %c qp %d, macroblock average %.2f", poc,
+                is_idr || slice == AEG_SLICE_I ? 'I' : e->cur_is_b ? 'B' : 'P',
+                e->cur_qp, (double)t / e->mb_count);
+    }
     *slice_io = slice;
     *idr_io = is_idr;
     return AEG_OK;
@@ -9724,9 +9912,11 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
     int is_p = e->cur_is_p;
     size_t out_len;
     int64_t dbg_type0[AEG_MB_TYPE_COUNT];
+    int vbv_retry = 0;
 
     (void)poc;
     memcpy(dbg_type0, e->stat_type, sizeof(dbg_type0));
+recode:
     if (ensure_buf(&e->out, &e->out_cap,
                    (size_t)e->mb_count * 400 * 3 + 65536) != AEG_OK)
         return AEG_ENOMEM;
@@ -10062,6 +10252,31 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
     if (e->fsync && (ft_wp_check(e, 1) || e->ft_abort))
         return FT_RESTART;
 
+    /* VBV emergency: a picture the buffer cannot take (the size predictor
+     * cannot foresee everything -- a static picture coded much finer than its
+     * reference costs far more than its difference from it suggests) is coded
+     * again, coarser by the QP its overshoot asks for (bits ~ 2^(-QP/6)),
+     * before anything else sees it.  Nothing the first attempt did outlives
+     * it: the macroblocks, the reconstruction and its row post-processing are
+     * written afresh, and the weighted reference is rebuilt.  Up to three
+     * attempts; at the QP ceiling the model reports the underflow. */
+    if (e->vbv_active && !e->fsync && vbv_retry < 3 &&
+        e->cur_qp < e->p.qp_max) {
+        double avail = vbv_available(e), bits = (double)out_len * 8.0;
+
+        if (bits > avail) {
+            int dq = (int)ceil(6.0 * log2(bits / (avail > 1.0 ? avail : 1.0))) + 1;
+
+            e->cur_qp += dq;
+            if (e->cur_qp > e->p.qp_max) e->cur_qp = e->p.qp_max;
+            vbv_retry++;
+            e->vbv_recodes++;
+            memcpy(e->stat_type, dbg_type0, sizeof(dbg_type0));
+            wp_finish(e);
+            goto recode;
+        }
+    }
+
     /* deblock the reconstructed picture (what rowpost_row has not done yet)
      * and, for a reference, finish its border, half-resolution copy and
      * half-pel planes */
@@ -10300,6 +10515,9 @@ static void push_input(struct aeg_encoder *e, const uint8_t *yuv420p,
     e->in_count++;
 }
 
+static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
+                       int *intra);
+
 static void add_job_r(struct aeg_encoder *e, int display, int slice, int idr,
                       int bref)
 {
@@ -10311,6 +10529,26 @@ static void add_job_r(struct aeg_encoder *e, int display, int slice, int idr,
     e->job_idr[n] = idr;
     e->job_bref[n] = bref;
     e->job_n = n + 1;
+    if (e->vbv_satd) {
+        int s = display % in_slots(e);
+        int64_t c = -1;
+        if (slice == AEG_SLICE_I) {
+            const int *ic = la_intra(e, display);
+            int i;
+            if (ic)
+                for (c = 0, i = 0; i < e->mb_count; i++)
+                    c += ic[i];
+        } else if (slice == AEG_SLICE_P && e->job_nb_last >= 0) {
+            c = la_cost(e, e->job_nb_last, display, display, NULL);
+        } else if (slice == AEG_SLICE_B && e->job_nb_prev >= 0) {
+            c = la_cost(e, e->job_nb_prev, e->job_nb_last, display, NULL);
+        }
+        e->vbv_satd[s] = c;
+    }
+    if (slice != AEG_SLICE_B) {
+        e->job_nb_prev = e->job_nb_last;
+        e->job_nb_last = display;
+    }
 }
 static void add_job(struct aeg_encoder *e, int display, int slice, int idr)
 {
@@ -10769,6 +11007,8 @@ static void schedule_(struct aeg_encoder *e)
             for (d = e->anchor + 1; d <= last; d++) {
                 add_job(e, d, AEG_SLICE_P, 0);
                 nq = mbt_add(pl, nq, d, d - 1, -1, 1);
+                if (e->crf_on && e->crf_qc > 0.0)
+                    e->crf_cplx[d % in_slots(e)] = la_cost(e, d - 1, d, d, NULL);
             }
             if (e->la_depth)
                 mbt_run(e, pl, nq, e->anchor, last, e->last_idr_poc);
@@ -10813,8 +11053,11 @@ static void schedule_(struct aeg_encoder *e)
     if (idr) {
         /* No B pictures can precede an IDR, so the group's B pictures go out as
          * P pictures first, in display order, and the IDR comes last. */
-        for (d = e->anchor + 1; d < nxt; d++)
+        for (d = e->anchor + 1; d < nxt; d++) {
             add_job(e, d, AEG_SLICE_P, 0);
+            if (e->crf_on && e->crf_qc > 0.0)
+                e->crf_cplx[d % in_slots(e)] = la_cost(e, d - 1, d, d, NULL);
+        }
         add_job(e, nxt, AEG_SLICE_I, 1);
     } else {
         add_job(e, nxt, AEG_SLICE_P, 0);
@@ -10831,6 +11074,8 @@ static void schedule_(struct aeg_encoder *e)
                 add_job(e, d, AEG_SLICE_B, 0);
         }
     }
+    if (e->crf_on && e->crf_qc > 0.0 && !idr)
+        e->crf_cplx[nxt % in_slots(e)] = la_cost(e, e->anchor, nxt, nxt, NULL);
     if (e->la_depth) {
         int nq = mbt_group(e, pl, 0, e->anchor, nxt, idr);
         mbt_run(e, pl, nq, e->anchor, nxt, idr ? nxt : e->last_idr_poc);
@@ -10990,8 +11235,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->b_qp_offset = pp->mbtree ? 2 : 4;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns
-     * ABR on, with the maximum rate as the target when no bitrate was given. */
-    if (pp->vbv_maxrate_kbps > 0 && pp->vbv_bufsize_kbits > 0) {
+     * ABR on, with the maximum rate as the target when no bitrate was given.
+     * CRF is the exception: there the buffer is a cap on the constant-quality
+     * stream ("capped CRF"), the QP rising only where the buffer runs low. */
+    if (pp->rc_mode == AEG_RC_CRF) {
+        if (!(pp->crf >= 0.0)) pp->crf = 0.0;      /* also catches NaN */
+        if (pp->crf > 51.0) pp->crf = 51.0;
+        if (pp->qcomp < 0) pp->qcomp = 0;
+        if (pp->qcomp > 100) pp->qcomp = 100;
+        pp->bitrate_kbps = 0;
+        if (pp->vbv_maxrate_kbps <= 0 || pp->vbv_bufsize_kbits <= 0)
+            pp->vbv_maxrate_kbps = pp->vbv_bufsize_kbits = 0;
+        e->crf_on = 1;
+    } else if (pp->vbv_maxrate_kbps > 0 && pp->vbv_bufsize_kbits > 0) {
         if (pp->bitrate_kbps <= 0)
             pp->bitrate_kbps = pp->vbv_maxrate_kbps;
         if (pp->bitrate_kbps > pp->vbv_maxrate_kbps) {
@@ -11003,7 +11259,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     } else
         pp->vbv_maxrate_kbps = pp->vbv_bufsize_kbits = 0;
 
-    if (pp->rc_mode != AEG_RC_ABR || pp->bitrate_kbps <= 0)
+    if (e->crf_on)
+        ;
+    else if (pp->rc_mode != AEG_RC_ABR || pp->bitrate_kbps <= 0)
         pp->rc_mode = AEG_RC_CQP;
     else {
         double fps = (double)pp->fps_num / (double)pp->fps_den;
@@ -11019,7 +11277,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->rc_frames = 0;
         aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
                 pp->bitrate_kbps, e->rc_bits_per_frame, fps, pp->qp);
-        if (pp->vbv_maxrate_kbps > 0) {
+    }
+    if (pp->vbv_maxrate_kbps > 0 && (e->rc_active || e->crf_on)) {
+        double fps = (double)pp->fps_num / (double)pp->fps_den;
+        {
             e->vbv_active = 1;
             e->vbv_buf_bits = (double)pp->vbv_bufsize_kbits * 1000.0;
             e->vbv_rate_bits = (double)pp->vbv_maxrate_kbps * 1000.0 / fps;
@@ -11188,7 +11449,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         }
         for (i = 0; i < slots; i++)
             e->in_pts[i] = 0;
-        if (e->p.b_adapt || e->la_depth) {
+        if (e->p.b_adapt || e->la_depth || e->crf_on || e->vbv_active) {
             e->la_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 *
                                              sizeof(int));
             for (i = 0; i < slots; i++)
@@ -11199,6 +11460,26 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                 aeg_encoder_close(e);
                 return NULL;
             }
+        }
+        if (e->vbv_active) {
+            e->vbv_satd = (int64_t *)aeg_alloc((size_t)slots * sizeof(int64_t));
+            if (!e->vbv_satd) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+            for (i = 0; i < slots; i++)
+                e->vbv_satd[i] = -1;
+        }
+        if (e->crf_on) {
+            e->crf_cplx = (int64_t *)aeg_alloc((size_t)slots * sizeof(int64_t));
+            if (!e->crf_cplx) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+            for (i = 0; i < slots; i++)
+                e->crf_cplx[i] = -1;
         }
         for (i = 0; e->la_depth && i < slots; i++) {
             struct mbt_slot *m = &e->mbt[i];
@@ -11216,6 +11497,66 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                 aeg_encoder_close(e);
                 return NULL;
             }
+        }
+    }
+    if (e->crf_on) {
+        /* x264's form: a picture whose lowres estimate is base_cplx (80 per
+         * macroblock, 120 with B pictures) is coded at qscale(crf + shift);
+         * with the tree, qcomp is the tree's business and the shift also
+         * centres the tree's (all negative) offsets -- x264's
+         * (1 - qcomp) * 13.5 for its strength 5 * (1 - qcomp), scaled to
+         * ours.  On top of that the scale is calibrated so that a CRF gives
+         * the PSNR x264 --preset medium --tune psnr gives at the same CRF
+         * (preset 3, four clips, CRF 16..38; docs/STATUS.md): +2.25 with the
+         * tree, +1 without (B pictures or not). */
+        double base = (double)e->mb_count * (e->p.bframes > 0 ? 120.0 : 80.0);
+        double q0;
+
+        e->crf_qc = e->la_depth ? 0.0 : 1.0 - e->p.qcomp / 100.0;
+        e->crf_tree_off = e->la_depth ? 2.7 * mbt_strength() + 2.25 : 1.0;
+        q0 = e->p.crf + e->crf_tree_off;
+        e->crf_rf = pow(base, e->crf_qc) / (0.85 * pow(2.0, (q0 - 12.0) / 6.0));
+        e->crf_pnorm = 0.01;
+        e->crf_pqp = q0 * e->crf_pnorm;
+        e->crf_anchor_q = q0;
+        e->crf_last = -1;
+        if (e->p.bframes <= 0 && (e->crf_qc > 0.0 || e->vbv_active)) {
+            e->la_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 *
+                                             sizeof(int));
+            if (!e->la_scratch ||
+                aeg_lowres_alloc(&e->crf_low[0], e->mb_w, e->mb_h) ||
+                aeg_lowres_alloc(&e->crf_low[1], e->mb_w, e->mb_h)) {
+                aeg_set_last_error("out of memory");
+                aeg_encoder_close(e);
+                return NULL;
+            }
+        }
+        aeg_log(1, "aeg: CRF %.2f, qcomp %.2f%s", e->p.crf, e->p.qcomp / 100.0,
+                e->la_depth ? " (with the macroblock tree)" : "");
+    }
+    e->job_nb_last = e->job_nb_prev = -1;
+    e->cur_satd = -1;
+    e->crf_last = -1;
+    if (e->vbv_active && e->p.bframes <= 0 && !e->crf_low[0].mem) {
+        if (!e->la_scratch)
+            e->la_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 *
+                                             sizeof(int));
+        if (!e->la_scratch ||
+            aeg_lowres_alloc(&e->crf_low[0], e->mb_w, e->mb_h) ||
+            aeg_lowres_alloc(&e->crf_low[1], e->mb_w, e->mb_h)) {
+            aeg_set_last_error("out of memory");
+            aeg_encoder_close(e);
+            return NULL;
+        }
+    }
+    {
+        /* bits * qscale / satd measured 0.44..1.76 for intra pictures over
+         * five clips (docs/STATUS.md); the start value errs high */
+        int t;
+        for (t = 0; t < 3; t++) {
+            e->vbv_coef[t] = 1.5;
+            e->vbv_off[t] = 0.0;
+            e->vbv_cnt[t] = 1.0;
         }
     }
     e->mbs = (aeg_mb *)aeg_alloc(sizeof(aeg_mb) * (size_t)e->mb_count);
@@ -11286,6 +11627,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (e->p.info_sei) {
         /* what shaped the stream -- not how it was computed (threads,
          * backend), so a threaded encode writes the same bytes */
+        char crf_txt[48] = "";
+        if (e->crf_on)
+            snprintf(crf_txt, sizeof(crf_txt), " crf=%.2f qcomp=%.2f",
+                     e->p.crf, e->p.qcomp / 100.0);
         snprintf(e->info, sizeof(e->info),
                  "aeg %s - H.264/AVC encoder (CPU, CUDA/OpenCL stages) - "
                  "options: preset=%d rc=%s qp=%d bitrate=%d vbv=%d:%d "
@@ -11293,9 +11638,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  "bqp=%d iqp=%d direct=%s ref=%d weightp=%d mbtree=%d "
                  "rc-lookahead=%d aq=%d:%d trellis=%d subme=%d range=%d "
                  "refine-mv=%d refine-cand=%d partitions=%d cabac=%d "
-                 "8x8dct=%d deblock=%d:%d:%d slices=%d",
+                 "8x8dct=%d deblock=%d:%d:%d slices=%d%s",
                  AEG_VERSION_STRING, e->p.preset,
-                 e->rc_active ? (e->vbv_active ? "abr+vbv" : "abr") : "cqp",
+                 e->rc_active ? (e->vbv_active ? "abr+vbv" : "abr")
+                 : e->crf_on ? (e->vbv_active ? "crf+vbv" : "crf") : "cqp",
                  e->p.qp, e->p.bitrate_kbps, e->p.vbv_maxrate_kbps,
                  e->p.vbv_bufsize_kbits, e->p.gop_size, e->p.scenecut,
                  e->p.bframes, e->p.b_adapt, e->p.b_pyramid, e->p.b_qp_offset,
@@ -11306,7 +11652,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  e->p.search_range, e->p.refine_mv, e->p.refine_cand,
                  e->p.partitions, e->p.cabac, e->p.transform_8x8,
                  e->p.deblock, e->p.deblock_alpha, e->p.deblock_beta,
-                 e->n_slices);
+                 e->n_slices, crf_txt);
     }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
@@ -12027,6 +12373,24 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
     if (!e->p.bframes) {
         copy_yuv(e, e->srcp, yuv420p);
         is_idr = idr_due(e, e->frame_count);
+        if (e->crf_low[0].mem) {
+            /* CRF's complexity and the VBV's size estimate: this picture
+             * against the last one (or alone, intra), from the lowres
+             * pictures the B-picture lookahead would have used */
+            aeg_lowres *cur = &e->crf_low[e->frame_count & 1];
+            aeg_lowres_build(cur, e->srcp[0], e->stride[0], e->w, e->h);
+            e->crf_last = e->frame_count && !is_idr
+                ? aeg_lowres_cost(cur, &e->crf_low[(e->frame_count - 1) & 1],
+                                  NULL, NULL, e->la_scratch)
+                : -1;
+            e->cur_satd = e->crf_last;
+            if (e->vbv_active && e->crf_last < 0) {
+                int i;
+                aeg_lowres_intra(cur, e->la_scratch);
+                for (e->cur_satd = 0, i = 0; i < e->mb_count; i++)
+                    e->cur_satd += e->la_scratch[i];
+            }
+        }
         return encode_frame(e, is_idr ? AEG_SLICE_I : AEG_SLICE_P, is_idr,
                             e->frame_count, pts, pkt);
     }
@@ -12092,6 +12456,7 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->vbv_min_fill_bits = e->vbv_active ? e->vbv_min_full : 0.0;
     out->vbv_underflows = e->vbv_underflows;
     out->vbv_size_clamps = e->vbv_clamps;
+    out->vbv_recodes = e->vbv_recodes;
     out->scene_cuts = e->scene_cuts;
     out->macroblocks = e->stat_mbs;
     out->skipped = e->stat_skipped;
@@ -12201,6 +12566,10 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->par_mv);
     aeg_free(e->par_cost);
     aeg_free(e->mb_dqp);
+    aeg_free(e->crf_cplx);
+    aeg_free(e->vbv_satd);
+    aeg_lowres_free(&e->crf_low[0]);
+    aeg_lowres_free(&e->crf_low[1]);
     {
         int i;
         for (i = 0; i < AEG_RING; i++) {

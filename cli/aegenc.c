@@ -30,6 +30,10 @@ static void usage(void)
 "  --demuxer <fmt>  auto (default) | raw | y4m\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
+"  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
+"                   0..51; 18..28 is the usual range).  The QP follows each\n"
+"                   picture's complexity (--qcomp), or, with the macroblock\n"
+"                   tree, each macroblock's importance\n"
 "  -f, --fps <r>    frame rate: 25, 30000/1001 or 29.97 (default 30, or\n"
 "                   the .y4m header's)\n"
 "  --sar <w:h>      sample aspect ratio to signal (default: none, or the\n"
@@ -47,8 +51,8 @@ static void usage(void)
 "  --pass <1|2>     two-pass rate control: pass 1 measures each picture, pass 2\n"
 "                   spends the bits where they buy the most (needs --bitrate)\n"
 "  --stats <file>   statistics file for --pass (default: <output>.stats)\n"
-"  --qcomp <pct>    complexity-to-bits exponent of pass 2, in percent\n"
-"                   (default 60: bits ~ complexity^0.6)\n"
+"  --qcomp <pct>    complexity-to-bits exponent of --crf and of pass 2, in\n"
+"                   percent (default 60: bits ~ complexity^0.6)\n"
 "  -n <int>         encode at most n frames\n"
 "  -b <backend>     auto | cpu | opencl | cuda (default auto)\n"
 "  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
@@ -466,6 +470,7 @@ int main(int argc, char **argv)
     int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
     int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
     int fullrange = 0, demux = 0, seek = 0;
+    double crf = -1.0;
     double fps;
     input_t inp;
     int bitrate = 0, aq = -1;
@@ -591,6 +596,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--scenecut")) p.scenecut = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--pass")) pass = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--qcomp")) qcomp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--crf")) {
+            const char *v = next_arg(argc, argv, &i);
+            char *end;
+            crf = strtod(v, &end);
+            if (end == v || *end || !(crf >= 0.0 && crf <= 51.0)) {
+                fprintf(stderr, "error: --crf %s: expected a number in 0..51\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--stats")) {
             snprintf(stats_path, sizeof(stats_path), "%s", next_arg(argc, argv, &i));
             stats_path[0] = stats_path[0];      /* keep -Wall quiet */
@@ -744,6 +758,11 @@ int main(int argc, char **argv)
      * so the measurement of picture i would end up on a different picture.
      * Asking for B pictures *explicitly* in a two-pass run is therefore an
      * error; leaving them at their default just turns them off for the run. */
+    if (crf >= 0.0 && (bitrate > 0 || pass)) {
+        fprintf(stderr, "error: --crf cannot be combined with %s\n",
+                bitrate > 0 ? "--bitrate" : "--pass");
+        return 2;
+    }
     if (pass && bframes > 0) {
         fprintf(stderr, "error: --pass and --bframes cannot be combined yet\n");
         return 1;
@@ -805,6 +824,11 @@ int main(int argc, char **argv)
     p.bitrate_kbps = bitrate;
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
     p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
+    p.qcomp = qcomp;
+    if (crf >= 0.0) {
+        p.rc_mode = AEG_RC_CRF;
+        p.crf = crf;
+    }
     /* In pass 2 the rate controller stays on -- it is what keeps the stream on
      * target -- and the first pass's measurement arrives per picture as a QP
      * bias (aeg_encoder_set_qp_offset), so the two never fight: the controller
@@ -1036,9 +1060,10 @@ int main(int argc, char **argv)
                        st.scene_cuts);
             if (st.vbv_min_fill_bits > 0.0 || st.vbv_underflows)
                 printf("vbv: buffer low water %.1f kbit, %" PRId64
-                       " underflow(s), %" PRId64 " picture(s) raised to fit\n",
+                       " underflow(s), %" PRId64 " picture(s) raised to fit, %"
+                       PRId64 " coded again\n",
                        st.vbv_min_fill_bits / 1000.0, st.vbv_underflows,
-                       st.vbv_size_clamps);
+                       st.vbv_size_clamps, st.vbv_recodes);
             for (i = 0; i < AEG_STAGE_COUNT; i++)
                 if (st.stage_ns[i] > 0)
                     printf("  stage %-12s %8.1f ms  %s\n", aeg_stage_name(i),

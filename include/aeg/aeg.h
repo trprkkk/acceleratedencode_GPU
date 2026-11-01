@@ -90,7 +90,8 @@ typedef enum aeg_preset {
 
 typedef enum aeg_rcmode {
     AEG_RC_CQP = 0,   /* constant QP                                */
-    AEG_RC_ABR = 1    /* average bitrate (1-pass QP feedback)       */
+    AEG_RC_ABR = 1,   /* average bitrate (1-pass QP feedback)       */
+    AEG_RC_CRF = 2    /* constant rate factor (constant quality)    */
 } aeg_rcmode;
 
 typedef struct aeg_params {
@@ -126,6 +127,13 @@ typedef struct aeg_params {
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
+    /* AEG_RC_CRF: the quality to hold, on x264's scale (lower is better;
+     * 0..51, fractions allowed).  qcomp: how far the quantiser follows the
+     * picture's complexity, in percent (x264's qcomp; 60 by default): 100
+     * holds the QP constant, 0 holds the bits per picture constant.  With the
+     * macroblock tree the tree does that work per macroblock instead. */
+    double crf;
+    int qcomp;
     /* VBV/HRD (H.264 Annex C) buffer model: the decoder's buffer must never
      * run dry, so a picture may not take more bits than the buffer holds at
      * the moment it starts.  Both 0 = no constraint.  Setting them implies
@@ -272,6 +280,9 @@ typedef struct aeg_stats {
     /* How many macroblocks were coded with each type, indexed by the internal
      * AEG_MB_* enumeration (0 = skip ... 12 = B_Bi_16x16). */
     int64_t mb_types[16];
+    /* VBV: pictures coded a second (or third) time because the first attempt
+     * did not fit in the buffer */
+    int64_t vbv_recodes;
 } aeg_stats;
 
 typedef struct aeg_encoder aeg_encoder;

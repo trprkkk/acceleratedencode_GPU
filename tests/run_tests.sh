@@ -658,6 +658,54 @@ if grep -q "options: preset=" "$TMP/hrd.264"; then
 else
     echo "   info SEI missing  FAIL"; FAIL=1
 fi
+# A clip that holds each picture for five frames, with fine texture: a held
+# picture the controller codes finer than its reference costs far more than
+# the size predictor expects, so these streams only fit because frame_body()
+# codes such a picture again.  None may underflow, and the re-coded pictures
+# must decode to what the encoder reconstructed.
+run_bcase vbv_recode 320 192 40 3 6 -p 3 --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 150
+run_bcase vbv_recode0 320 192 30 0 6 -p 2 --bitrate 200 --vbv-maxrate 200 --vbv-bufsize 100 --weightp 1
+for c in vbv_recode vbv_recode0; do
+    if grep -q " 0 underflow(s)" "$TMP/$c.log" && ! grep -q " 0 coded again" "$TMP/$c.log"; then
+        echo "   $c: $(grep -o '[0-9]* coded again' "$TMP/$c.log"), no underflow"
+    else
+        echo "   $c: $(grep -o 'vbv:.*' "$TMP/$c.log")  FAIL"; FAIL=1
+    fi
+done
+
+echo "== CRF"
+# Constant quality: the tree's path (B pictures), the complexity path with and
+# without B pictures (a fractional CRF: a run of macroblocks one QP coarser),
+# CRF under a buffer cap, and the order of the scale.
+run_bcase crf_tree   176 144 16 3 0 -p 3 --crf 24
+run_bcase crf_cplx   176 144 16 3 4 -p 1 --crf 23.5 --mbtree 0
+run_case  crf_nob    176 144 12 4 -p 2 --crf 26.3 --bframes 0
+run_bcase crf_vbv    320 192 30 3 6 -p 3 --crf 12 --vbv-maxrate 300 --vbv-bufsize 150 --nal-hrd
+if grep -q " 0 underflow(s)" "$TMP/crf_vbv.log"; then
+    echo "   capped CRF: no underflow"
+else
+    echo "   capped CRF: $(grep -o 'vbv:.*' "$TMP/crf_vbv.log")  FAIL"; FAIL=1
+fi
+"$BUILD/genyuv" 176 144 16 "$TMP/crfs.yuv" 4 >/dev/null
+prev=0
+for c in 30 24 18; do
+    $BUILD/aegenc -w 176 -h 144 -n 16 -i "$TMP/crfs.yuv" -o "$TMP/crfs$c.264" \
+        -p 2 --crf $c -v 0 || FAIL=1
+    sz=$(wc -c < "$TMP/crfs$c.264")
+    if [ "$sz" -le "$prev" ]; then
+        echo "   --crf $c: $sz bytes, not more than the coarser CRF ($prev)  FAIL"; FAIL=1
+    fi
+    prev=$sz
+done
+echo "   --crf 30/24/18: sizes increase"
+rc=0
+$BUILD/aegenc -w 176 -h 144 -n 2 -i "$TMP/crfs.yuv" -o "$TMP/crfx.264" --crf 20 \
+    --bitrate 100 >/dev/null 2>&1 || rc=$?
+if [ "$rc" = 2 ]; then
+    echo "   --crf with --bitrate: refused"
+else
+    echo "   --crf with --bitrate: exit $rc (want 2)  FAIL"; FAIL=1
+fi
 
 echo "== two-pass rate control"
 # Two-pass on a clip whose two halves have very different complexity: the point

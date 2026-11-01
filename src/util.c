@@ -93,6 +93,8 @@ void aeg_params_default(aeg_params *p)
     p->colorprim = p->transfer = p->colormatrix = -1;
     p->qp_max = 51;
     p->qp = 23;
+    p->crf = 23.0;
+    p->qcomp = 60;
     p->rc_mode = AEG_RC_CQP;
     p->gop_size = 250;
     /* 0 would mean "off"; a scene change is common enough that the default is
