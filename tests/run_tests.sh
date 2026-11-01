@@ -135,7 +135,7 @@ run_bcase() {
         -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes "$b" \
         --dump-order "$TMP/$name.order" \
         ${AEG_TEST_BACKEND:+-b "$AEG_TEST_BACKEND"} "$@" \
-        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
+        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed (exit $?)"; tail -5 "$TMP/$name.log" | sed 's/^/     /'; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
         return
@@ -169,7 +169,7 @@ run_case() {
     $BUILD/aegenc -w "$w" -h "$h" -n "$n" -i "$TMP/$name.yuv" \
         -o "$TMP/$name.264" --dump-recon "$TMP/$name.recon" --bframes 0 \
         ${AEG_TEST_BACKEND:+-b "$AEG_TEST_BACKEND"} "$@" \
-        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed"; FAIL=1; return; }
+        >"$TMP/$name.log" 2>&1 || { echo "   $name: encode failed (exit $?)"; tail -5 "$TMP/$name.log" | sed 's/^/     /'; FAIL=1; return; }
     if ! command -v "$FF" >/dev/null 2>&1; then
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
         return
