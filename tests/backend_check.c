@@ -240,7 +240,8 @@ static int16_t *satd_positions(int w, int h, int bs, int *count)
     return pos;
 }
 
-static int satd_agree(const pic *cur, pic planes[4], int bs, int upload)
+static int satd_agree_on(const aeg_be_ops *d, const pic *cur, pic planes[4],
+                         int bs, int upload)
 {
     const uint8_t *pl[4] = { planes[0].org, planes[1].org, planes[2].org,
                              planes[3].org };
@@ -249,13 +250,18 @@ static int satd_agree(const pic *cur, pic planes[4], int bs, int upload)
     int32_t *o0 = (int32_t *)malloc((size_t)n * 4);
     int32_t *o1 = (int32_t *)malloc((size_t)n * 4);
     if (upload)
-        dev.ref_upload(dev.priv, pl, planes[0].stride, cur->w, cur->h);
+        d->ref_upload(d->priv, pl, planes[0].stride, cur->w, cur->h);
     cpu.ref_upload(cpu.priv, pl, planes[0].stride, cur->w, cur->h);
     cpu.satd_batch(cpu.priv, cur->org, cur->stride, bs, bs, pos, n, o0);
-    dev.satd_batch(dev.priv, cur->org, cur->stride, bs, bs, pos, n, o1);
+    d->satd_batch(d->priv, cur->org, cur->stride, bs, bs, pos, n, o1);
     ok = !memcmp(o0, o1, (size_t)n * 4);
     free(pos); free(o0); free(o1);
     return ok;
+}
+
+static int satd_agree(const pic *cur, pic planes[4], int bs, int upload)
+{
+    return satd_agree_on(&dev, cur, planes, bs, upload);
 }
 
 /* ---------------------------------------------------------------- */
@@ -264,6 +270,7 @@ static int satd_agree(const pic *cur, pic planes[4], int bs, int upload)
 typedef struct {
     pic cur, planes[4];
     int id, bad;
+    aeg_be_ops ops;             /* the device as this thread sees it */
 } worker;
 
 static pthread_barrier_t g_bar;
@@ -280,9 +287,10 @@ static void *lockstep(void *arg)
         int step;
         for (step = 0; step < 4; step++) {
             if (step == wk->id)
-                dev.ref_upload(dev.priv, pl, wk->planes[0].stride, wk->cur.w,
-                               wk->cur.h);
-            if (step == 2 + wk->id && !satd_agree(&wk->cur, wk->planes, 16, 0))
+                wk->ops.ref_upload(wk->ops.priv, pl, wk->planes[0].stride,
+                                   wk->cur.w, wk->cur.h);
+            if (step == 2 + wk->id &&
+                !satd_agree_on(&wk->ops, &wk->cur, wk->planes, 16, 0))
                 wk->bad = 1;
             pthread_barrier_wait(&g_bar);
         }
@@ -305,9 +313,9 @@ static void *hammer(void *arg)
             res[i] = (int16_t)((int)((s >> 16) % 511u) - 255);
         }
         cpu.tq_batch(cpu.priv, res, 64, qp, 0, l0, z0);
-        dev.tq_batch(dev.priv, res, 64, qp, 0, l1, z1);
+        wk->ops.tq_batch(wk->ops.priv, res, 64, qp, 0, l1, z1);
         cpu.iq_idct_batch(cpu.priv, l0, 64, qp, r0);
-        dev.iq_idct_batch(dev.priv, l0, 64, qp, r1);
+        wk->ops.iq_idct_batch(wk->ops.priv, l0, 64, qp, r1);
         if (memcmp(l0, l1, sizeof(l0)) || memcmp(z0, z1, sizeof(z0)) ||
             memcmp(r0, r1, sizeof(r0)))
             wk->bad = 1;
@@ -315,7 +323,76 @@ static void *hammer(void *arg)
     return NULL;
 }
 
-static void check_threads(int w, int h)
+/* free-running on a lane of its own: every operation, the reference
+ * registered once and searched against repeatedly (no other thread can
+ * replace it on this lane) */
+static void *lane_run(void *arg)
+{
+    worker *wk = (worker *)arg;
+    const aeg_be_ops *d = &wk->ops;
+    const pic *c = &wk->cur;
+    int it, i, n = 64;
+    int16_t res[64 * 16], l0[64 * 16], l1[64 * 16], r0[64 * 16], r1[64 * 16];
+    int16_t c0[64 * 16], c1[64 * 16], mv[4 * 64];
+    int32_t z0[64], z1[64], s0[64], s1[64];
+    uint64_t e0, e1;
+    uint32_t s = 4242u + (uint32_t)wk->id;
+    const uint8_t *pl[4] = { wk->planes[0].org, wk->planes[1].org,
+                             wk->planes[2].org, wk->planes[3].org };
+    pic ip;
+
+    pic_alloc(&ip, c->w, c->h);
+    d->ref_upload(d->priv, pl, wk->planes[0].stride, c->w, c->h);
+    for (it = 0; it < 40 && !wk->bad; it++) {
+        int qp = (it * 7 + wk->id * 13) % 52;
+        for (i = 0; i < 64 * 16; i++) {
+            s = s * 1103515245u + 12345u;
+            res[i] = (int16_t)((int)((s >> 16) % 511u) - 255);
+        }
+        cpu.tq_iq_batch(cpu.priv, res, n, qp, it & 1, l0, z0, r0);
+        d->tq_iq_batch(d->priv, res, n, qp, it & 1, l1, z1, r1);
+        if (memcmp(l0, l1, sizeof(l0)) || memcmp(z0, z1, sizeof(z0)) ||
+            memcmp(r0, r1, sizeof(r0)))
+            wk->bad = 1;
+        cpu.iq_idct_batch(cpu.priv, l0, n, qp, c0);
+        d->iq_idct_batch(d->priv, l0, n, qp, c1);
+        if (memcmp(c0, c1, sizeof(c0)))
+            wk->bad = 2;
+        for (i = 0; i < n; i++) {
+            s = s * 1103515245u + 12345u;
+            mv[4 * i + 0] = (int16_t)((i % (c->w / 16)) * 16);
+            mv[4 * i + 1] = (int16_t)(((i / (c->w / 16)) % (c->h / 16)) * 16);
+            mv[4 * i + 2] = (int16_t)(mv[4 * i + 0] + (int)((s >> 16) % 33u) - 16);
+            mv[4 * i + 3] = (int16_t)(mv[4 * i + 1] + (int)((s >> 8) % 33u) - 16);
+        }
+        cpu.sad_batch(cpu.priv, c->org, c->stride, wk->planes[0].org,
+                      wk->planes[0].stride, 16, 16, mv, n, s0);
+        d->sad_batch(d->priv, c->org, c->stride, wk->planes[0].org,
+                     wk->planes[0].stride, 16, 16, mv, n, s1);
+        if (memcmp(s0, s1, sizeof(s0)))
+            wk->bad = 3;
+        cpu.sse_batch(cpu.priv, c->org, c->stride, wk->planes[1].org,
+                      wk->planes[1].stride, c->w, c->h, &e0);
+        d->sse_batch(d->priv, c->org, c->stride, wk->planes[1].org,
+                     wk->planes[1].stride, c->w, c->h, &e1);
+        if (e0 != e1)
+            wk->bad = 4;
+        d->interp_plane(d->priv, wk->planes[0].org, wk->planes[0].stride, c->w,
+                        c->h, 1 + it % 3, ip.org, ip.stride);
+        for (i = 0; i < c->h; i++)
+            if (memcmp(ip.org + (ptrdiff_t)i * ip.stride,
+                       wk->planes[1 + it % 3].org +
+                           (ptrdiff_t)i * wk->planes[0].stride,
+                       (size_t)c->w))
+                wk->bad = 5;
+        if (!satd_agree_on(d, c, wk->planes, it & 1 ? 8 : 16, 0))
+            wk->bad = 6;
+    }
+    pic_free(&ip);
+    return NULL;
+}
+
+static void check_threads(int w, int h, int lanes)
 {
     worker wk[2];
     pthread_t th[2];
@@ -323,6 +400,10 @@ static void check_threads(int w, int h)
     for (i = 0; i < 2; i++) {
         memset(&wk[i], 0, sizeof(wk[i]));
         wk[i].id = i;
+        if (lanes)
+            aeg_be_lane(&dev, 1 + i, &wk[i].ops);
+        else
+            wk[i].ops = dev;
         pic_alloc(&wk[i].cur, w, h);
         pic_fill(&wk[i].cur, 1);
         pic_alloc(&wk[i].planes[0], w, h);
@@ -348,6 +429,27 @@ static void check_threads(int w, int h)
     for (i = 0; i < 2; i++)
         pthread_join(th[i], NULL);
     check(!wk[0].bad && !wk[1].bad, "tq/iq batches from two threads at once");
+    if (lanes) {
+        aeg_be_ops again;
+        wk[0].bad = wk[1].bad = 0;
+        for (i = 0; i < 2; i++)
+            pthread_create(&th[i], NULL, lane_run, &wk[i]);
+        for (i = 0; i < 2; i++)
+            pthread_join(th[i], NULL);
+        if (wk[0].bad || wk[1].bad)
+            printf("   lane_run: %d %d\n", wk[0].bad, wk[1].bad);
+        check(!wk[0].bad && !wk[1].bad,
+              "every operation on two lanes at once, own references");
+        /* both device backends can clone: the lanes are instances of their
+         * own (a clone that fails maps the lane to lane 0, correct but
+         * serialised -- this would catch it) */
+        check(wk[0].ops.priv != dev.priv && wk[1].ops.priv != dev.priv &&
+              wk[0].ops.priv != wk[1].ops.priv, "lanes are separate instances");
+        aeg_be_lane(&wk[1].ops, 1, &again);
+        check(again.priv == wk[0].ops.priv, "a lane asked for twice is one lane");
+        aeg_be_lane(&wk[1].ops, 0, &again);
+        check(again.priv == dev.priv, "lane 0 is the backend itself");
+    }
     for (i = 0; i < 2; i++)
         for (k = 0; k < 4; k++)
             pic_free(i ? &wk[1].planes[k] : &wk[0].planes[k]);
@@ -387,7 +489,8 @@ int main(int argc, char **argv)
         for (i = 0; i < 4; i++)
             pic_free(&planes[i]);
     }
-    check_threads(176, 144);
+    check_threads(176, 144, 0);
+    check_threads(176, 144, 1);
     if (dev.destroy)
         dev.destroy(dev.priv);
     if (fails) {

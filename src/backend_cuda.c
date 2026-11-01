@@ -107,6 +107,7 @@ typedef struct cuda_ctx {
     char name[96];
     int16_t *pos;               /* sad_batch: the rebased positions */
     size_t pos_cap;
+    int is_clone;               /* shares ctx/mod/libraries with the first */
 } cuda_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -459,6 +460,10 @@ static void cuda_destroy(void *priv)
         if (o->buf[i])
             p_cuMemFree_v2(o->buf[i]);
     free(o->pos);
+    if (o->is_clone) {
+        free(o);
+        return;
+    }
     if (o->ctx) {
         if (o->mod)
             p_cuModuleUnload(o->mod);
@@ -717,6 +722,52 @@ int aeg_cuda_compile_check(int cc, char *log, size_t logsz, size_t *ptx_size)
     return AEG_OK;
 }
 
+/* Another instance for another thread (aeg_be_ops.clone): the context, the
+ * module and its functions are shared (a context may be current on several
+ * threads, and launches take their arguments per call); the buffers, the
+ * registered reference and the sad_batch scratch are its own.  It uses the
+ * legacy default stream like the first instance, so its work is ordered with
+ * theirs on the device -- correct, and still free of the host-side lock. */
+static int cuda_clone(void *priv, aeg_be_ops *out)
+{
+    const cuda_ctx *src = (const cuda_ctx *)priv;
+    cuda_ctx *o = (cuda_ctx *)calloc(1, sizeof(*o));
+
+    if (!o)
+        return AEG_ENOMEM;
+    o->is_clone = 1;
+    o->device = src->device;
+    o->ctx = src->ctx;
+    o->mod = src->mod;
+    o->k_sad = src->k_sad;
+    o->k_tq = src->k_tq;
+    o->k_iq = src->k_iq;
+    o->k_sse = src->k_sse;
+    o->k_intp = src->k_intp;
+    o->k_satd = src->k_satd;
+    o->k_tqiq = src->k_tqiq;
+    o->cus = src->cus;
+    o->mem = src->mem;
+    memcpy(o->name, src->name, sizeof(o->name));
+    memset(out, 0, sizeof(*out));
+    out->priv = o;
+    out->backend = AEG_BACKEND_CUDA;
+    out->sad_batch = cuda_sad_batch;
+    out->tq_batch = cuda_tq_batch;
+    out->iq_idct_batch = cuda_iq_idct_batch;
+    out->tq_iq_batch = cuda_tq_iq_batch;
+    out->sse_batch = cuda_sse_batch;
+    out->interp_plane = cuda_interp_plane;
+    out->ref_upload = cuda_ref_upload;
+    out->satd_batch = cuda_satd_batch;
+    out->sync = cuda_sync;
+    out->destroy = cuda_destroy;
+    out->clone = cuda_clone;
+    snprintf(out->desc, sizeof(out->desc), "CUDA %.48s (%d SMs)", o->name,
+             o->cus);
+    return AEG_OK;
+}
+
 int aeg_be_cuda_create(aeg_be_ops *ops)
 {
     cuda_ctx *o;
@@ -794,6 +845,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     ops->satd_batch = cuda_satd_batch;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
+    ops->clone = cuda_clone;
     snprintf(ops->desc, sizeof(ops->desc), "CUDA %.48s (%d SMs)", o->name,
              o->cus);
     return AEG_OK;

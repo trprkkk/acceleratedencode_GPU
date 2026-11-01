@@ -74,7 +74,24 @@ typedef struct aeg_be_ops {
 
     void (*sync)(void *priv);
     void (*destroy)(void *priv);
+
+    /* A second instance on the same device for another thread: shares what
+     * is expensive and read-only (OpenCL context and built program, CUDA
+     * context and module) and owns everything a call writes (queue, kernel
+     * objects -- clSetKernelArg is not thread-safe --, buffers, the
+     * registered reference).  Raw backends only; the guard uses it for its
+     * lanes (aeg_be_lane) and does not pass it on.  Optional. */
+    int (*clone)(void *priv, struct aeg_be_ops *out);
 } aeg_be_ops;
+
+/* The operations of lane `k` of a backend, for a thread that should not wait
+ * for the others' device calls (frame-thread worker k, slice thread k).  Lane
+ * 0 is `ops` itself; lane k >= 1 is a clone made on first use, with its own
+ * lock and its own registered reference, so calls of different lanes run
+ * concurrently.  Without clone() (or if it fails) a lane is lane 0, which is
+ * correct and serialised.  The CPU backend has no state to split: its ops are
+ * returned as they are.  Lanes live as long as `ops`; do not destroy them. */
+void aeg_be_lane(const aeg_be_ops *ops, int k, aeg_be_ops *out);
 
 /* sad_batch() on a device: the candidates of one call cover a whole picture
  * (source positions anywhere in `cur`, reference positions anywhere in `ref`
@@ -151,9 +168,22 @@ typedef struct aeg_dispatcher {
     int        coef_since[3];
     int        coef_dev[3];
     int        coef_decided[3];
+    /* Copies of the encoder made for other threads (frame threads, slice
+     * threads) carry a copy of the dispatcher.  Their measurements
+     * (aeg_dispatch_record, aeg_dispatch_coef_done) go to `root`, the
+     * encoder's own, under `mu`, which aeg_dispatch_init creates and every
+     * copy shares; their aeg_dispatch_update is a no-op -- the decisions are
+     * the root's, made by the thread that owns it, and a copy keeps the ones
+     * it was made with.  NULL root: this is the root. */
+    struct aeg_dispatcher *root;
+    void      *mu;
 } aeg_dispatcher;
 
 void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p);
+/* Hold the root's lock, e.g. while copying the dispatcher for another thread
+ * when copies made earlier may be reporting to it. */
+void aeg_dispatch_lock(aeg_dispatcher *d);
+void aeg_dispatch_unlock(aeg_dispatcher *d);
 void aeg_dispatch_destroy(aeg_dispatcher *d);
 /* Record the wall time spent in a stage on the CPU or the GPU this frame. */
 void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns);

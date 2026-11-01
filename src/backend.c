@@ -225,193 +225,297 @@ int aeg_be_cuda_create(aeg_be_ops *ops);
 /* Every device backend is wrapped in this before the encoder sees it, for
  * three reasons the backends themselves do not handle:
  *
- *  1. One device context serves every thread.  Frame threads and slice
- *     threads are copies of the encoder that share ops.priv, and a backend
- *     keeps its staging buffers and kernel arguments in the context, so two
- *     calls at once corrupt each other (on a real OpenCL device: a crash on the
- *     first picture with -t 2).  The guard serialises the calls.
- *  2. The registered reference is device state that outlives a call.  Picture
- *     A registers its reference, picture B registers another one on its own
- *     thread, then A's satd_batch() would read B's.  The guard remembers, per
- *     thread, what that thread registered and re-uploads it before a batch
- *     whenever another thread's registration replaced it.
+ *  1. Threads.  Frame threads and slice threads are copies of the encoder,
+ *     and a backend keeps its staging buffers and kernel arguments in its
+ *     instance, so two calls at once into one instance corrupt each other (on
+ *     a real OpenCL device: a crash on the first picture with -t 2).  The
+ *     guard has *lanes*: lane 0 is the backend as created, lane k a clone of
+ *     it (aeg_be_ops.clone: same device, shared context and program, own
+ *     queue, kernel objects and buffers), made when a thread first asks for
+ *     it (aeg_be_lane).  Each lane has its own lock, so threads on different
+ *     lanes run their device calls concurrently and threads that share a lane
+ *     are serialised.  A backend without clone() maps every lane to lane 0.
+ *  2. The registered reference (ref_upload, then satd_batch) is device state
+ *     that outlives a call.  Two threads on one lane would read each other's
+ *     reference, so each lane remembers, per thread, what that thread
+ *     registered and re-uploads it before a batch whenever another thread's
+ *     registration replaced it.
  *  3. A failing device call must not change the stream.  The encoder ignores
  *     the return codes of the batch operations (they cannot fail on the CPU),
  *     so the guard runs the CPU reference instead -- the same arithmetic, so
- *     the same bytes -- and keeps the device off from then on. */
-typedef struct be_guard {
-    aeg_be_ops      dev;
-    aeg_be_ops      cpu;
+ *     the same bytes -- and keeps the device off from then on, on every lane. */
+#define BE_LANES 16
+
+typedef struct be_guard be_guard;
+
+typedef struct be_lane {
+    be_guard       *g;
+    aeg_be_ops      dev;        /* this lane's device instance             */
+    int             owned;      /* a clone made for this lane              */
     pthread_mutex_t mu;
     uint64_t        seq;        /* registrations so far                     */
     uint64_t        dev_seq;    /* the one resident on the device           */
+} be_lane;
+
+struct be_guard {
+    aeg_be_ops      cpu;
+    pthread_mutex_t mk;         /* lane creation                            */
+    be_lane        *lane[BE_LANES];
     int             failed;     /* a device call failed: CPU from now on    */
-} be_guard;
+};
 
 static __thread struct {
-    const be_guard *g;
+    const be_lane  *l;
     uint64_t        seq;
     const uint8_t  *planes[4];
     int             stride, w, h;
-} g_tls_ref;
+} g_tls_ref[BE_LANES];
+
+static int guard_failed(be_guard *g)
+{
+    return __atomic_load_n(&g->failed, __ATOMIC_ACQUIRE);
+}
 
 /* lock, or return 0 when the device is off and the CPU op has to run */
-static int guard_enter(be_guard *g)
+static int guard_enter(be_lane *l)
 {
-    pthread_mutex_lock(&g->mu);
-    if (g->failed) {
-        pthread_mutex_unlock(&g->mu);
+    if (guard_failed(l->g))
+        return 0;
+    pthread_mutex_lock(&l->mu);
+    if (guard_failed(l->g)) {
+        pthread_mutex_unlock(&l->mu);
         return 0;
     }
     return 1;
 }
 
 /* unlock; a failure switches the device off for good */
-static int guard_leave(be_guard *g, int rc, const char *op)
+static int guard_leave(be_lane *l, int rc, const char *op)
 {
-    if (rc != AEG_OK && !g->failed) {
-        g->failed = 1;
+    if (rc != AEG_OK && !__atomic_exchange_n(&l->g->failed, 1, __ATOMIC_ACQ_REL))
         aeg_log(1, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
-    }
-    pthread_mutex_unlock(&g->mu);
+    pthread_mutex_unlock(&l->mu);
     return rc == AEG_OK;
+}
+
+/* the slot of g_tls_ref for lane l.  A thread normally uses one lane; two
+ * lanes on one slot (another encoder in the same thread, a hash collision)
+ * evict each other, and an evicted registration only sends satd_batch to the
+ * CPU reference -- the same bytes. */
+static int tls_slot(const be_lane *l)
+{
+    return (int)(((uintptr_t)l >> 6) % BE_LANES);
 }
 
 static int g_sad_batch(void *priv, const uint8_t *cur, int cstride,
                        const uint8_t *ref, int rstride, int bw, int bh,
                        const int16_t *mv, int count, int32_t *out)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.sad_batch(g->dev.priv, cur, cstride, ref, rstride,
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.sad_batch(l->dev.priv, cur, cstride, ref, rstride,
                                         bw, bh, mv, count, out), "sad_batch"))
         return AEG_OK;
-    return g->cpu.sad_batch(g->cpu.priv, cur, cstride, ref, rstride, bw, bh,
-                            mv, count, out);
+    return l->g->cpu.sad_batch(l->g->cpu.priv, cur, cstride, ref, rstride, bw,
+                               bh, mv, count, out);
 }
 
 static int g_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
                       int intra, int16_t *level, int32_t *nz)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.tq_batch(g->dev.priv, res, nblk, qp, intra, level,
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.tq_batch(l->dev.priv, res, nblk, qp, intra, level,
                                        nz), "tq_batch"))
         return AEG_OK;
-    return g->cpu.tq_batch(g->cpu.priv, res, nblk, qp, intra, level, nz);
+    return l->g->cpu.tq_batch(l->g->cpu.priv, res, nblk, qp, intra, level, nz);
 }
 
 static int g_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
                            int16_t *res)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.iq_idct_batch(g->dev.priv, level, nblk, qp, res),
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.iq_idct_batch(l->dev.priv, level, nblk, qp, res),
                     "iq_idct_batch"))
         return AEG_OK;
-    return g->cpu.iq_idct_batch(g->cpu.priv, level, nblk, qp, res);
+    return l->g->cpu.iq_idct_batch(l->g->cpu.priv, level, nblk, qp, res);
 }
 
 static int g_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
                          int intra, int16_t *level, int32_t *nz, int16_t *rec)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.tq_iq_batch(g->dev.priv, res, nblk, qp, intra,
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.tq_iq_batch(l->dev.priv, res, nblk, qp, intra,
                                           level, nz, rec), "tq_iq_batch"))
         return AEG_OK;
-    return g->cpu.tq_iq_batch(g->cpu.priv, res, nblk, qp, intra, level, nz,
-                              rec);
+    return l->g->cpu.tq_iq_batch(l->g->cpu.priv, res, nblk, qp, intra, level,
+                                 nz, rec);
 }
 
 static int g_interp_plane(void *priv, const uint8_t *ref, int rstride, int w,
                           int h, int which, uint8_t *dst, int dstride)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.interp_plane(g->dev.priv, ref, rstride, w, h,
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.interp_plane(l->dev.priv, ref, rstride, w, h,
                                            which, dst, dstride),
                     "interp_plane"))
         return AEG_OK;
-    return g->cpu.interp_plane(g->cpu.priv, ref, rstride, w, h, which, dst,
-                               dstride);
+    return l->g->cpu.interp_plane(l->g->cpu.priv, ref, rstride, w, h, which,
+                                  dst, dstride);
 }
 
 static int g_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
                        int sb, int w, int h, uint64_t *out)
 {
-    be_guard *g = (be_guard *)priv;
-    if (guard_enter(g) &&
-        guard_leave(g, g->dev.sse_batch(g->dev.priv, a, sa, b, sb, w, h, out),
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.sse_batch(l->dev.priv, a, sa, b, sb, w, h, out),
                     "sse_batch"))
         return AEG_OK;
-    return g->cpu.sse_batch(g->cpu.priv, a, sa, b, sb, w, h, out);
+    return l->g->cpu.sse_batch(l->g->cpu.priv, a, sa, b, sb, w, h, out);
 }
 
 static int g_ref_upload(void *priv, const uint8_t *const planes[4], int pstride,
                         int w, int h)
 {
-    be_guard *g = (be_guard *)priv;
-    int k;
+    be_lane *l = (be_lane *)priv;
+    int k, t = tls_slot(l);
     /* the CPU registration too, so that a fallback has a reference */
-    g->cpu.ref_upload(g->cpu.priv, planes, pstride, w, h);
+    l->g->cpu.ref_upload(l->g->cpu.priv, planes, pstride, w, h);
     for (k = 0; k < 4; k++)
-        g_tls_ref.planes[k] = planes[k];
-    g_tls_ref.stride = pstride;
-    g_tls_ref.w = w;
-    g_tls_ref.h = h;
-    g_tls_ref.g = g;
-    g_tls_ref.seq = 0;
-    if (!guard_enter(g))
+        g_tls_ref[t].planes[k] = planes[k];
+    g_tls_ref[t].stride = pstride;
+    g_tls_ref[t].w = w;
+    g_tls_ref[t].h = h;
+    g_tls_ref[t].l = l;
+    g_tls_ref[t].seq = 0;
+    if (!guard_enter(l))
         return AEG_OK;
-    k = g->dev.ref_upload(g->dev.priv, planes, pstride, w, h);
+    k = l->dev.ref_upload(l->dev.priv, planes, pstride, w, h);
     if (k == AEG_OK)
-        g->dev_seq = g_tls_ref.seq = ++g->seq;
-    guard_leave(g, k, "ref_upload");
+        l->dev_seq = g_tls_ref[t].seq = ++l->seq;
+    guard_leave(l, k, "ref_upload");
     return AEG_OK;
 }
 
 static int g_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
                         int bh, const int16_t *pos, int count, int32_t *out)
 {
-    be_guard *g = (be_guard *)priv;
-    if (g_tls_ref.g == g && guard_enter(g)) {
+    be_lane *l = (be_lane *)priv;
+    int t = tls_slot(l);
+    if (g_tls_ref[t].l == l && guard_enter(l)) {
         int rc = AEG_OK;
-        if (g_tls_ref.seq != g->dev_seq) {
-            /* another thread registered its reference since this one did */
-            rc = g->dev.ref_upload(g->dev.priv, g_tls_ref.planes,
-                                   g_tls_ref.stride, g_tls_ref.w, g_tls_ref.h);
+        if (g_tls_ref[t].seq != l->dev_seq) {
+            /* another thread on this lane registered its reference since */
+            rc = l->dev.ref_upload(l->dev.priv, g_tls_ref[t].planes,
+                                   g_tls_ref[t].stride, g_tls_ref[t].w,
+                                   g_tls_ref[t].h);
             if (rc == AEG_OK)
-                g->dev_seq = g_tls_ref.seq = ++g->seq;
+                l->dev_seq = g_tls_ref[t].seq = ++l->seq;
         }
         if (rc == AEG_OK)
-            rc = g->dev.satd_batch(g->dev.priv, cur, cstride, bw, bh, pos, count,
+            rc = l->dev.satd_batch(l->dev.priv, cur, cstride, bw, bh, pos, count,
                                    out);
-        if (guard_leave(g, rc, "satd_batch"))
+        if (guard_leave(l, rc, "satd_batch"))
             return AEG_OK;
     }
-    return g->cpu.satd_batch(g->cpu.priv, cur, cstride, bw, bh, pos, count, out);
+    return l->g->cpu.satd_batch(l->g->cpu.priv, cur, cstride, bw, bh, pos, count,
+                                out);
 }
 
 static void g_sync(void *priv)
 {
-    be_guard *g = (be_guard *)priv;
-    if (!guard_enter(g))
+    be_lane *l = (be_lane *)priv;
+    if (!guard_enter(l))
         return;
-    if (g->dev.sync)
-        g->dev.sync(g->dev.priv);
-    pthread_mutex_unlock(&g->mu);
+    if (l->dev.sync)
+        l->dev.sync(l->dev.priv);
+    pthread_mutex_unlock(&l->mu);
+}
+
+static be_lane *lane_new(be_guard *g, const aeg_be_ops *dev, int owned)
+{
+    be_lane *l = (be_lane *)calloc(1, sizeof(*l));
+    if (!l)
+        return NULL;
+    l->g = g;
+    l->dev = *dev;
+    l->owned = owned;
+    pthread_mutex_init(&l->mu, NULL);
+    return l;
 }
 
 static void g_destroy(void *priv)
 {
-    be_guard *g = (be_guard *)priv;
-    if (!g)
+    be_lane *l0 = (be_lane *)priv;
+    be_guard *g;
+    int k;
+    if (!l0)
         return;
-    if (g->dev.destroy)
-        g->dev.destroy(g->dev.priv);
-    pthread_mutex_destroy(&g->mu);
+    g = l0->g;
+    /* the clones first: they share the first instance's context */
+    for (k = BE_LANES - 1; k >= 0; k--) {
+        be_lane *l = g->lane[k];
+        if (!l || (k > 0 && l == l0))
+            continue;
+        if ((k == 0 || l->owned) && l->dev.destroy)
+            l->dev.destroy(l->dev.priv);
+        pthread_mutex_destroy(&l->mu);
+        free(l);
+    }
+    pthread_mutex_destroy(&g->mk);
     free(g);
+}
+
+static void g_lane_destroy(void *priv)
+{
+    (void)priv;                 /* lanes go with lane 0 (g_destroy) */
+}
+
+void aeg_be_lane(const aeg_be_ops *ops, int k, aeg_be_ops *out)
+{
+    be_lane *l0, *l;
+    be_guard *g;
+
+    *out = *ops;
+    if (!ops->priv || (ops->destroy != g_destroy &&
+                       ops->destroy != g_lane_destroy))
+        return;                 /* the CPU backend: nothing to split */
+    g = ((be_lane *)ops->priv)->g;
+    l0 = g->lane[0];
+    k = k < 0 ? 0 : k % BE_LANES;
+    {
+        /* AEG_LANES=0: every thread on lane 0, serialised (the measurement
+         * of what the lanes buy, and a way out should a driver mishandle
+         * several queues) */
+        const char *ev = getenv("AEG_LANES");
+        if (ev && atoi(ev) == 0)
+            k = 0;
+    }
+    pthread_mutex_lock(&g->mk);
+    if (!g->lane[k]) {
+        aeg_be_ops c;
+        l = NULL;
+        if (!guard_failed(g) && l0->dev.clone &&
+            l0->dev.clone(l0->dev.priv, &c) == AEG_OK) {
+            l = lane_new(g, &c, 1);
+            if (!l && c.destroy)
+                c.destroy(c.priv);
+        }
+        if (l)
+            aeg_log(2, "aeg: device lane %d: %s", k, c.desc);
+        g->lane[k] = l ? l : l0;
+    }
+    l = g->lane[k];
+    pthread_mutex_unlock(&g->mk);
+    /* every table has the same wrappers; only priv and destroy differ */
+    if (l != ops->priv) {
+        out->priv = l;
+        out->destroy = g_lane_destroy;
+    }
 }
 
 /* Wrap a freshly created device backend; an operation the device does not
@@ -419,12 +523,19 @@ static void g_destroy(void *priv)
 static int be_guard_wrap(aeg_be_ops *ops)
 {
     be_guard *g = (be_guard *)calloc(1, sizeof(*g));
+    be_lane *l0;
     if (!g)
         return AEG_ENOMEM;
-    g->dev = *ops;
     aeg_be_cpu_ops(&g->cpu);
-    pthread_mutex_init(&g->mu, NULL);
-    ops->priv = g;
+    pthread_mutex_init(&g->mk, NULL);
+    l0 = lane_new(g, ops, 0);
+    if (!l0) {
+        pthread_mutex_destroy(&g->mk);
+        free(g);
+        return AEG_ENOMEM;
+    }
+    g->lane[0] = l0;
+    ops->priv = l0;
     if (ops->sad_batch) ops->sad_batch = g_sad_batch;
     if (ops->tq_batch) ops->tq_batch = g_tq_batch;
     if (ops->iq_idct_batch) ops->iq_idct_batch = g_iq_idct_batch;
@@ -440,6 +551,7 @@ static int be_guard_wrap(aeg_be_ops *ops)
     }
     ops->sync = g_sync;
     ops->destroy = g_destroy;
+    ops->clone = NULL;
     return AEG_OK;
 }
 
@@ -505,6 +617,9 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
      * previous macroblock as they go) are always kept on the CPU: the
      * latency of a device round trip would be paid per macroblock. */
     d->use_gpu[AEG_STAGE_DEBLOCK] = 0;
+    d->mu = malloc(sizeof(pthread_mutex_t));
+    if (d->mu)
+        pthread_mutex_init((pthread_mutex_t *)d->mu, NULL);
     d->launch_ns = 5 * 1000;      /* refined by aeg_backend_calibrate() */
     d->min_items_for_gpu = 256;
     aeg_log(1, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
@@ -517,13 +632,42 @@ void aeg_dispatch_destroy(aeg_dispatcher *d)
         d->ops.destroy(d->ops.priv);
     d->ops.destroy = NULL;
     d->ops.priv = NULL;
+    if (d->mu && !d->root) {
+        pthread_mutex_destroy((pthread_mutex_t *)d->mu);
+        free(d->mu);
+    }
+    d->mu = NULL;
 }
 
-void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns)
+/* the dispatcher measurements go to, locked */
+static aeg_dispatcher *disp_lock(aeg_dispatcher *d)
+{
+    aeg_dispatcher *r = d->root ? d->root : d;
+    if (r->mu)
+        pthread_mutex_lock((pthread_mutex_t *)r->mu);
+    return r;
+}
+
+static void disp_unlock(aeg_dispatcher *r)
+{
+    if (r->mu)
+        pthread_mutex_unlock((pthread_mutex_t *)r->mu);
+}
+
+void aeg_dispatch_lock(aeg_dispatcher *d)
+{
+    disp_lock(d);
+}
+
+void aeg_dispatch_unlock(aeg_dispatcher *d)
+{
+    disp_unlock(d->root ? d->root : d);
+}
+
+static void dispatch_record(aeg_dispatcher *d, int stage, int on_gpu,
+                            int64_t ns)
 {
     int64_t *slot;
-    if (stage < 0 || stage >= AEG_STAGE_COUNT)
-        return;
     slot = on_gpu ? &d->gpu_ns[stage][1] : &d->cpu_ns[stage][1];
     if (*slot == 0)
         *slot = ns;
@@ -533,7 +677,16 @@ void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns)
     d->gpu_ns[stage][0] += on_gpu ? ns : 0;
 }
 
-void aeg_dispatch_update(aeg_dispatcher *d)
+void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns)
+{
+    if (stage < 0 || stage >= AEG_STAGE_COUNT)
+        return;
+    d = disp_lock(d);
+    dispatch_record(d, stage, on_gpu, ns);
+    disp_unlock(d);
+}
+
+static void dispatch_update(aeg_dispatcher *d)
 {
     int i;
     d->frames_measured++;
@@ -575,6 +728,15 @@ void aeg_dispatch_update(aeg_dispatcher *d)
     }
 }
 
+void aeg_dispatch_update(aeg_dispatcher *d)
+{
+    if (d->root)
+        return;
+    disp_lock(d);
+    dispatch_update(d);
+    disp_unlock(d);
+}
+
 /* Placing the coefficient stages.
  *
  * Timing the batch calls themselves cannot decide this one: the CPU form of
@@ -596,7 +758,7 @@ void aeg_dispatch_update(aeg_dispatcher *d)
 #define AEG_COEF_PROBE 3        /* counted pictures per placement and kind */
 #define AEG_COEF_RETRY 64
 
-int aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind)
+static int dispatch_coef_pick(aeg_dispatcher *d, int kind)
 {
     if (kind < 0 || kind > 2)
         return 0;
@@ -615,8 +777,16 @@ int aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind)
     return d->coef_dev[kind];
 }
 
-void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
-                            int mbs)
+int aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind)
+{
+    aeg_dispatcher *r = disp_lock(d);
+    int dev = dispatch_coef_pick(r, kind);
+    disp_unlock(r);
+    return dev;
+}
+
+static void dispatch_coef_done(aeg_dispatcher *d, int kind, int dev,
+                               int64_t ns, int mbs)
 {
     int64_t per, *slot;
     if (kind <= 0 || kind > 2 || mbs <= 0 || !d->have_gpu ||
@@ -650,6 +820,14 @@ void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
                     kind == 1 ? 'P' : 'B', d->coef_dev[kind] ? "device" : "CPU",
                     c / 1000.0, g / 1000.0);
     }
+}
+
+void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
+                            int mbs)
+{
+    aeg_dispatcher *r = disp_lock(d);
+    dispatch_coef_done(r, kind, dev, ns, mbs);
+    disp_unlock(r);
 }
 
 /* ------------------------------------------------------------------ */

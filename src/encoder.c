@@ -485,6 +485,12 @@ struct aeg_encoder {
      * that codes non-reference B pictures next to the main thread, and the
      * queue that hands the packets out in coding order. */
     int    ft_on;
+    /* The device lane this copy's thread uses (aeg_be_lane): 0 for the
+     * encoder itself, 1 + k * (slice threads) for frame-thread worker k, plus
+     * the slice index for the copies of a picture's slice threads -- so that
+     * no two threads coding at the same time wait for each other's device
+     * calls. */
+    int    lane;
     struct ft_worker *ftw;   /* ft_nw workers */
     int    ft_nw;
     int64_t ft_seq;
@@ -8890,12 +8896,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
 }
 
 /* How many threads the slice loop may use.  A device stage does not limit it:
- * the backend guard (backend.c) serialises the threads' calls into the one
- * device context, so the other slices go on with their CPU work while one
- * waits for the device.  (This used to drop to one thread whenever the
- * dispatcher had a stage on a device -- and missed the forced batch paths,
- * which then crashed the OpenCL backend from two threads.)  A per-thread
- * device context would let the calls overlap as well. */
+ * each slice thread calls the device through a lane of its own (aeg_be_lane:
+ * a clone of the backend with its own queue and buffers, behind its own lock
+ * in the guard), so the slices' device calls overlap as well as their CPU
+ * work.  (This used to drop to one thread whenever the dispatcher had a stage
+ * on a device -- and missed the forced batch paths, which then crashed the
+ * OpenCL backend from two threads.) */
 static int slice_thread_count(const struct aeg_encoder *e)
 {
     if (e->n_threads <= 1 || e->n_slices <= 1)
@@ -9621,8 +9627,15 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
         int64_t t0 = aeg_now_ns();
         int list;
 
-        if (e->d.use_gpu[AEG_STAGE_INTER_PRED] && e->d.ops.interp_plane &&
-            e->d.ops.backend != AEG_BACKEND_CPU) {
+        /* a frame-thread worker's reference may still be being coded: its
+         * rows are only there up to fsync->rows, and filtering the whole
+         * plane would wait for all of them.  The planes built as the
+         * reference was coded are the same samples, read row by row. */
+        int dev_ip = e->d.use_gpu[AEG_STAGE_INTER_PRED] &&
+                     e->d.ops.interp_plane &&
+                     e->d.ops.backend != AEG_BACKEND_CPU && !e->fsync;
+
+        if (dev_ip) {
             /* the planes are what the GPU stage is for: one launch per plane,
              * every output sample independent, and the kernel is checked
              * against aeg_hpel_plane_fill() by tests/kernel_check.c */
@@ -9674,10 +9687,7 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                 umh_radii(e, ctx->umh, &ctx->umh_et);
             }
         }
-        stage_rec(e, AEG_STAGE_INTER_PRED,
-                            e->d.use_gpu[AEG_STAGE_INTER_PRED] &&
-                            e->d.ops.backend != AEG_BACKEND_CPU,
-                            aeg_now_ns() - t0);
+        stage_rec(e, AEG_STAGE_INTER_PRED, dev_ip, aeg_now_ns() - t0);
         e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
     }
     me_seed_frame(e);
@@ -9767,8 +9777,12 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                        sizeof(copies[si].st.stage_gpu_ns));
                 memset(copies[si].st.stage_cpu_ns, 0,
                        sizeof(copies[si].st.stage_cpu_ns));
-                memset(copies[si].d.cpu_ns, 0, sizeof(copies[si].d.cpu_ns));
-                memset(copies[si].d.gpu_ns, 0, sizeof(copies[si].d.gpu_ns));
+                /* the dispatcher measurements go straight to the root's
+                 * (aeg_dispatcher.root), the device calls to a lane of the
+                 * slice's own */
+                copies[si].lane = e->lane + si;
+                aeg_be_lane(&e->d.ops, copies[si].lane, &copies[si].d.ops);
+                copies[si].d.root = e->d.root ? e->d.root : &e->d;
                 jobs[si].te = &copies[si];
                 jobs[si].tid = si;
                 jobs[si].nthreads = nt;
@@ -9801,8 +9815,6 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                         e->st.stage_ns[k] += copies[si].st.stage_ns[k];
                         e->st.stage_gpu_ns[k] += copies[si].st.stage_gpu_ns[k];
                         e->st.stage_cpu_ns[k] += copies[si].st.stage_cpu_ns[k];
-                        e->d.cpu_ns[k][0] += copies[si].d.cpu_ns[k][0];
-                        e->d.gpu_ns[k][0] += copies[si].d.gpu_ns[k][0];
                     }
                 }
                 free(copies);
@@ -11006,9 +11018,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (getenv("AEG_FTW"))
             ft = atoi(getenv("AEG_FTW"));
         if (ft >= 2 && e->p.bframes > 0 && !e->rc_active && !e->vbv_active &&
-            e->n_slices == 1 && e->d.ops.backend == AEG_BACKEND_CPU &&
-            e->coef_force != 1 && e->rd_force != 1 && !getenv("AEG_SEED") &&
-            !getenv("AEG_POISON")) {
+            e->n_slices == 1 && !getenv("AEG_SEED") && !getenv("AEG_POISON") &&
+            !(e->d.have_gpu &&
+              (e->p.stage_backend[AEG_STAGE_MOTION_EST] == AEG_BACKEND_OPENCL ||
+               e->p.stage_backend[AEG_STAGE_MOTION_EST] == AEG_BACKEND_CUDA))) {
             if (ft_alloc(e, ft) != AEG_OK) {
                 aeg_set_last_error("out of memory");
                 aeg_encoder_close(e);
@@ -11526,8 +11539,17 @@ static int ft_launch(struct aeg_encoder *e)
     w->t_all = t_all;
 
     c = w->c;
+    /* the workers still coding report their measurements to e->d */
+    aeg_dispatch_lock(&e->d);
     *c = *e;
+    aeg_dispatch_unlock(&e->d);
     c->ft_on = 0;
+    {
+        int nt = slice_thread_count(e);
+        c->lane = 1 + (int)(w - e->ftw) * (nt > 1 ? nt : 1);
+        aeg_be_lane(&e->d.ops, c->lane, &c->d.ops);
+        c->d.root = &e->d;
+    }
     c->ftw = NULL;
     c->ftq = NULL;
     c->mbs = w->mbs;

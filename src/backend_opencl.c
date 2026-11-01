@@ -72,6 +72,8 @@ static void ocl_load_error(const char *name)
     X(cl_int, clReleaseProgram, (cl_program)) \
     X(cl_int, clReleaseCommandQueue, (cl_command_queue)) \
     X(cl_int, clReleaseContext, (cl_context)) \
+    X(cl_int, clRetainContext, (cl_context)) \
+    X(cl_int, clRetainProgram, (cl_program)) \
     X(cl_int, clFinish, (cl_command_queue))
 
 #define DECL(ret, name, args) typedef ret (*fn_##name) args; static fn_##name p_##name;
@@ -490,6 +492,8 @@ static void ocl_destroy(void *priv)
     if (o->k_iq) p_clReleaseKernel(o->k_iq);
     if (o->k_tqiq) p_clReleaseKernel(o->k_tqiq);
     if (o->k_sse) p_clReleaseKernel(o->k_sse);
+    if (o->k_intp) p_clReleaseKernel(o->k_intp);
+    if (o->k_satd) p_clReleaseKernel(o->k_satd);
     if (o->prog) p_clReleaseProgram(o->prog);
     if (o->queue) p_clReleaseCommandQueue(o->queue);
     if (o->ctx) p_clReleaseContext(o->ctx);
@@ -522,6 +526,82 @@ static int ocl_load(void **lib)
             return AEG_OK;
     }
     return AEG_EBACKEND;
+}
+
+/* The kernel objects of one instance (each clone has its own: setting a
+ * kernel's arguments and launching it is not thread-safe). */
+static int ocl_kernels(ocl_ctx *o)
+{
+    cl_int st;
+    o->k_sad = p_clCreateKernel(o->prog, "sad_batch", &st);
+    o->k_tq = p_clCreateKernel(o->prog, "tq_batch", &st);
+    o->k_iq = p_clCreateKernel(o->prog, "iq_idct_batch", &st);
+    o->k_tqiq = p_clCreateKernel(o->prog, "tq_iq_batch", &st);
+    o->k_sse = p_clCreateKernel(o->prog, "sse_batch", &st);
+    o->k_intp = p_clCreateKernel(o->prog, "interp_plane", &st);
+    o->k_satd = p_clCreateKernel(o->prog, "satd_batch", &st);
+    return o->k_sad && o->k_tq && o->k_iq && o->k_tqiq && o->k_sse &&
+           o->k_intp && o->k_satd ? AEG_OK : AEG_EBACKEND;
+}
+
+static int ocl_clone(void *priv, aeg_be_ops *out);
+
+static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
+{
+    memset(ops, 0, sizeof(*ops));
+    ops->priv = o;
+    ops->backend = AEG_BACKEND_OPENCL;
+    ops->sad_batch = ocl_sad_batch;
+    ops->tq_batch = ocl_tq_batch;
+    ops->iq_idct_batch = ocl_iq_idct_batch;
+    ops->tq_iq_batch = ocl_tq_iq_batch;
+    ops->sse_batch = ocl_sse_batch;
+    ops->interp_plane = ocl_interp_plane;
+    ops->ref_upload = ocl_ref_upload;
+    ops->satd_batch = ocl_satd_batch;
+    ops->sync = ocl_sync;
+    ops->destroy = ocl_destroy;
+    ops->clone = ocl_clone;
+    snprintf(ops->desc, sizeof(ops->desc), "%.48s %.96s (%d CUs, %s)",
+             o->vendor, o->name, o->cus, o->is_gpu ? "GPU" : "CPU device");
+}
+
+/* Another instance for another thread (aeg_be_ops.clone): the context and
+ * the built program are retained, not rebuilt; the queue, the kernel objects
+ * and the buffers are its own.  The library stays loaded by the first
+ * instance, which the guard destroys last. */
+static int ocl_clone(void *priv, aeg_be_ops *out)
+{
+    const ocl_ctx *src = (const ocl_ctx *)priv;
+    ocl_ctx *o = (ocl_ctx *)calloc(1, sizeof(*o));
+    cl_int st;
+
+    if (!o)
+        return AEG_ENOMEM;
+    o->platform = src->platform;
+    o->device = src->device;
+    o->is_gpu = src->is_gpu;
+    o->mem = src->mem;
+    o->cus = src->cus;
+    memcpy(o->name, src->name, sizeof(o->name));
+    memcpy(o->vendor, src->vendor, sizeof(o->vendor));
+    if (p_clRetainContext(src->ctx) != CL_SUCCESS) {
+        free(o);
+        return AEG_EBACKEND;
+    }
+    o->ctx = src->ctx;
+    if (p_clRetainProgram(src->prog) != CL_SUCCESS) {
+        ocl_destroy(o);
+        return AEG_EBACKEND;
+    }
+    o->prog = src->prog;
+    o->queue = p_clCreateCommandQueue(o->ctx, o->device, 0, &st);
+    if (!o->queue || st != CL_SUCCESS || ocl_kernels(o) != AEG_OK) {
+        ocl_destroy(o);
+        return AEG_EBACKEND;
+    }
+    ocl_fill_ops(o, out);
+    return AEG_OK;
 }
 
 int aeg_be_opencl_create(aeg_be_ops *ops)
@@ -591,35 +671,11 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         ocl_destroy(o);
         return AEG_EBACKEND;
     }
-    o->k_sad = p_clCreateKernel(o->prog, "sad_batch", &st);
-    o->k_tq = p_clCreateKernel(o->prog, "tq_batch", &st);
-    o->k_iq = p_clCreateKernel(o->prog, "iq_idct_batch", &st);
-    o->k_tqiq = p_clCreateKernel(o->prog, "tq_iq_batch", &st);
-    o->k_sse = p_clCreateKernel(o->prog, "sse_batch", &st);
-    o->k_intp = p_clCreateKernel(o->prog, "interp_plane", &st);
-    o->k_satd = p_clCreateKernel(o->prog, "satd_batch", &st);
-    if (!o->k_sad || !o->k_tq || !o->k_iq || !o->k_tqiq || !o->k_sse ||
-        !o->k_intp ||
-        !o->k_satd) {
+    if (ocl_kernels(o) != AEG_OK) {
         ocl_destroy(o);
         return AEG_EBACKEND;
     }
-
-    memset(ops, 0, sizeof(*ops));
-    ops->priv = o;
-    ops->backend = AEG_BACKEND_OPENCL;
-    ops->sad_batch = ocl_sad_batch;
-    ops->tq_batch = ocl_tq_batch;
-    ops->iq_idct_batch = ocl_iq_idct_batch;
-    ops->tq_iq_batch = ocl_tq_iq_batch;
-    ops->sse_batch = ocl_sse_batch;
-    ops->interp_plane = ocl_interp_plane;
-    ops->ref_upload = ocl_ref_upload;
-    ops->satd_batch = ocl_satd_batch;
-    ops->sync = ocl_sync;
-    ops->destroy = ocl_destroy;
-    snprintf(ops->desc, sizeof(ops->desc), "%.48s %.96s (%d CUs, %s)",
-             o->vendor, o->name, o->cus, o->is_gpu ? "GPU" : "CPU device");
+    ocl_fill_ops(o, ops);
     return AEG_OK;
 }
 

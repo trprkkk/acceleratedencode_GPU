@@ -2401,9 +2401,10 @@ Two things a copy cannot do, both handled in `encode_frame()`:
   after the join.  The bitstream is unaffected by that sum.
 
 A device context -- one OpenCL command queue or one CUDA stream -- is not safe
-to submit to from several threads, so the slice loop stays serial while any
-stage is dispatched to a non-CPU backend (`slice_thread_count()`); per-thread
-device contexts are the follow-up that lifts that restriction.
+to submit to from several threads.  The slice loop first stayed serial while
+any stage was on a device; then the backend guard serialised the threads'
+calls into one context; now each slice thread has a device *lane* of its own
+(see "Device lanes" under *GPU groundwork without hardware, continued*).
 
 320x192, 60 frames, preset 2, QP 26, on **two** cores:
 
@@ -2482,7 +2483,11 @@ wavefront**:
   reconstruction and macroblock QPs for `aeg_encoder_recon()`.
 
 Gate: B pictures, constant QP (rate control and VBV feed each picture's size
-into the next picture's QP), one slice, the CPU backend.  ThreadSanitizer is
+into the next picture's QP), one slice, and no whole-frame device search
+(`AEG_SEED`, or the motion stage forced onto a device: its rounds read the
+whole reference at once).  Device backends and the forced batch paths have
+been allowed since the device lanes (*GPU groundwork without hardware,
+continued*); the CPU backend was a condition before.  ThreadSanitizer is
 clean (the environment-variable caches the workers would race to fill are
 settled before the threads start).
 
@@ -4135,3 +4140,80 @@ conformance suite bit-exact.  PoCL, vtest 12 pictures, preset 2, `-t 1`
 |---|---|---|
 | `AEG_RD_BATCH=1` | 1358 ms | 1162 ms |
 | `AEG_COEF_BATCH=1` | 5320 ms | 4543 ms |
+
+**Device lanes: a device instance per thread.**  Frame threads were off with
+a device backend and with the forced batch paths, and slice threads queued on
+one lock: every thread called the one backend instance through the guard,
+which had to serialise them (a backend keeps its staging buffers and kernel
+arguments in the instance, and `clSetKernelArg` is not thread-safe).  The
+guard now has up to 16 *lanes*, each its own instance behind its own lock:
+
+* A backend may provide `clone()`: another instance on the same device that
+  shares what is expensive and read-only and owns everything a call writes.
+  OpenCL: the context and the built program are retained (`clRetainContext`,
+  `clRetainProgram`), the command queue, the seven kernel objects and the
+  buffers are new.  CUDA: the context, the module and its functions are
+  shared (a context may be current on several threads; launches take their
+  arguments per call), the buffers, the registered reference and the
+  `sad_batch` scratch are new; the clone uses the legacy default stream like
+  the first instance, so the device orders their work -- correct, and the
+  host-side lock is still gone.  A clone does not unload the library, the
+  module or the context; the guard destroys the clones first.
+* `aeg_be_lane(ops, k, &out)` gives lane k (k mod 16), creating its clone on
+  first use under the guard's creation lock.  Lane 0 is the backend itself.
+  Without `clone()`, or if it fails, the lane is lane 0 (never one instance
+  under two locks); the CPU backend has nothing to split and is returned as
+  it is.  The registered-reference bookkeeping (each thread's registration,
+  re-uploaded when another thread on the lane replaced it) is per lane; a
+  failing call still switches the device off for every lane.
+* The encoder gives each thread that codes at the same time as others a lane
+  of its own: frame-thread worker k uses lane 1 + k * (slice threads), the
+  slice threads of a picture add their index; the encoder itself is lane 0.
+  `AEG_LANES=0` puts every thread on lane 0 (the measurement below, and a way
+  out should a driver mishandle several queues).
+* The copies of the encoder the threads run on carry a copy of the
+  dispatcher.  Their measurements (stage timings, the coefficient-placement
+  trials) used to be lost with the copy -- a frame thread's picture time never
+  reached the coefficient trial, a slice thread's stage timings were summed
+  back by hand.  `aeg_dispatcher.root` now points the copies at the
+  encoder's dispatcher, whose mutex every copy shares; the decisions stay
+  with the thread that owns it, and a copy's `aeg_dispatch_update` is a
+  no-op.  ThreadSanitizer found the one unlocked reader this left (the
+  struct copy that launches a frame thread now holds the lock) and is clean
+  with frame threads in the CPU, coefficient-batch and RD-batch modes, and
+  with slice threads.
+* Frame threads are now allowed with any backend and with `AEG_COEF_BATCH=1`
+  / `AEG_RD_BATCH=1`.  Two exclusions remain: `AEG_SEED` (as before) and the
+  motion stage forced onto a device (`-s est=...`): the whole-frame search
+  rounds read the whole reference at once, which the row wavefront does not
+  provide.  For the same reason a worker does not filter the fractional
+  planes on the device (`interp_plane` reads the whole reference); it uses
+  the planes built as the reference was coded, the same samples
+  (`kernel_check` holds the kernel to them).
+
+Checks: `backend_check` (192 on PoCL) adds the two-thread tests on two lanes,
+both threads running every operation at once against their own registered
+references, and that the lanes are separate instances (so a clone that
+silently fell back would fail); `gpu_validate.sh` PASS on PoCL at `-p 2
+--frame-threads 3`; on the OpenCL backend, presets 2-4, the default,
+coefficient-batch, RD-batch and forced-stage (`-s tq/iq/inter=opencl`) paths
+with 1 and 3 frame threads all write the CPU serial stream (24/24); the CPU
+batch modes with 2 and 4 frame threads equal the serial encode; ASan + UBSan
+clean on `backend_check` and on the batch paths with slice threads and frame
+threads (PoCL); no leak of ours under LeakSanitizer; `nvrtc_check`; the
+conformance suite bit-exact.  The CUDA clone compiles but, like the rest of
+the CUDA backend, has not met a GPU.
+
+PoCL on the two-core sandbox, vtest 384x288, 24 pictures, preset 3, QP 28,
+best of three, every stream identical:
+
+| | serial | one lane (`AEG_LANES=0`) | lanes |
+|---|---|---|---|
+| `AEG_COEF_BATCH=1`, `--frame-threads 3` | 10116 ms (1 thread, one run) | 6282 ms | 3555 ms |
+| `AEG_RD_BATCH=1`, `--frame-threads 3` | 4160 ms (1 thread, one run) | 2325 ms | 1764 ms |
+| `AEG_COEF_BATCH=1`, `-t 2` (slices) | | 7248 ms | 4845 ms |
+| `AEG_RD_BATCH=1`, `-t 2` (slices) | | 2832 ms | 1947 ms |
+
+On PoCL the "device" is the same two cores and every launch costs about a
+millisecond of latency, so this mostly measures launches overlapping instead
+of queueing; what a GPU gains depends on its queue count and launch cost.
