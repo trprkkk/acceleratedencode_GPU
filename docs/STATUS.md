@@ -4394,7 +4394,7 @@ averages noise away, so the coefficient does not carry over: tree clip
 +24 % -1.50 dB, 30-frame clips up to +197 %).
 
 Limits: a stream of a second or two cannot absorb the first intra picture --
-30-frame clips land +9 %..+71 % over with the tree.  genyuv's whole-frame pan
+30-frame clips land between -12 % and +71 % with the tree.  genyuv's whole-frame pan
 (mode 0) is predicted so well that its pictures barely change size with the QP
 (20 kbit at QP 13 and at QP 9), which a model-based controller cannot land a
 target on (it codes 274 kb/s for 400); the suite uses mode 1, 120 frames
