@@ -1724,6 +1724,53 @@ gap is the coding of long groups (x264 gives the reference B picture QP+1
 and the others +2, we +4 for both; lowering ours was measured worse on the
 average).
 
+**Update: the trellis is the default at presets 3 and 4.**  Re-measured with
+everything since (macroblock tree in CQP, second reference, trellis
+quantisation), against x264 medium psy=0, global PSNR, QP 22-37:
+
+| preset 3 | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| fast rule (b-adapt 1) | -0.73 | -11.50 | -7.28 | -9.39 | +2.04 | -5.37 |
+| trellis (b-adapt 2) | -0.75 | -11.39 | -11.30 | -6.22 | +2.11 | **-5.51** |
+| trellis, `AEG_LABIAS=110` | -0.45 | -9.48 | -10.30 | -6.22 | +2.11 | -4.87 |
+| trellis, `AEG_LABIAS=100` | -4.59 | -6.94 | -7.55 | -8.70 | +1.98 | -5.16 |
+
+| preset 3, validation | cock | vtest | mega | tree | vtest2 | mega2 | mean |
+|---|---|---|---|---|---|---|---|
+| fast rule | -1.53 | -13.06 | -5.57 | +9.90 | -10.17 | -5.78 | -4.37 |
+| trellis | -0.29 | -13.64 | -7.83 | +5.15 | -10.02 | -9.78 | **-6.07** |
+| trellis, `AEG_LABIAS=110` | -2.21 | -12.73 | -7.16 | +5.15 | -7.85 | -2.06 | -4.48 |
+| trellis, `AEG_LABIAS=100` | -3.76 | -6.61 | -4.41 | +5.15 | -6.07 | +9.95 | -0.96 |
+
+Preset 4: -5.84 -> -5.91 (five clips), -4.66 -> -6.47 (validation).  Time
++3% at preset 3, not measurable at preset 4.  The case that decided it is
+the validation tree segment (frames 30-59 of the same source: unlike the
+first segment it has no repeated pictures, the foliage moves in every
+frame).  The fast rule's absolute cost threshold (300 - 50/step SATD per
+macroblock) is always exceeded there (a far P costs ~650 per macroblock
+even though it is only ~9% dearer than a near one and a B picture costs
+0.7 of a P), so it codes one B per group; the trellis and x264 code three.
+The B discount is still chaotic (the 100/110 rows), so it stays at x264's
+1.2.  Presets below 3 keep the fast rule, as x264 does below slow.
+
+The price is at the high-quality end, and almost all of it is short (where
+the trellis codes three B pictures per group instead of one, and our tree
+loses with long groups -- see "Why 3-B groups lose on short" below):
+
+| QP 16-25, preset 3 | cock | vtest | mega | short | tree | mean |
+|---|---|---|---|---|---|---|
+| fast rule | +0.64 | -12.99 | -6.57 | -13.38 | +2.40 | -5.98 |
+| trellis | +0.93 | -12.69 | -8.06 | **-2.58** | +2.43 | -3.99 |
+
+| QP 16-25, validation | cock | vtest | mega | tree | vtest2 | mega2 | mean |
+|---|---|---|---|---|---|---|---|
+| fast rule | -1.75 | -12.26 | -3.04 | +8.94 | -12.47 | -1.40 | -3.66 |
+| trellis | +0.99 | -12.50 | -5.15 | +7.24 | -12.15 | -6.54 | -4.68 |
+
+Over the eleven clips: QP 22-37 -4.82 -> -5.82 %, QP 16-25 -4.71 -> -4.37 %.
+Against x264 at CRF with its tree (`aq-mode=0`): -0.99 -> **-1.63 %**
+(cock -0.26, vtest -1.01, mega -4.71, short -4.04, tree +1.87).
+
 **Two P references with the B pyramid** (`--ref 2` with B pictures; the
 default stays one reference when there are B pictures).  x264's reference
 count is worth 0.39 points from 1 to 2 and 0.29 from 2 to 3 on these clips

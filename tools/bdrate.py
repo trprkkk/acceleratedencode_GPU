@@ -25,7 +25,10 @@ decoded stream for both, never `aegenc`'s own PSNR summary, which is about
 0.9 dB optimistic relative to a per-plane comparison of the YUV files).
 """
 import argparse
+import atexit
 import json
+import shutil
+import tempfile
 import math
 import os
 import subprocess
@@ -66,6 +69,10 @@ def decode(ffmpeg, path, w, h, out):
 
 
 CACHE = '/tmp/aegenc_bdref%s.json' % ('_global' if os.environ.get('BD_GLOBAL') else '')
+# scratch files are private to this run, so concurrent runs cannot
+# overwrite each other's streams (and poison the reference cache)
+TMP = tempfile.mkdtemp(prefix='bdrate_')
+atexit.register(shutil.rmtree, TMP, True)
 
 
 def cache_load():
@@ -77,7 +84,9 @@ def cache_load():
 
 def cache_save(c):
     try:
-        json.dump(c, open(CACHE, 'w'))
+        tmp = '%s.%d' % (CACHE, os.getpid())
+        json.dump(c, open(tmp, 'w'))
+        os.replace(tmp, CACHE)
     except Exception:
         pass
 
@@ -99,7 +108,7 @@ def ref_point(args, clip, q, w, h, n, cache):
     fs = w * h * 3 // 2
     src = open(clip, 'rb').read()
     rb = x264(args, clip, q, w, h)
-    rp = psnr(src, decode(args.ffmpeg, '/tmp/bd_ref.264', w, h, '/tmp/bd_ref.yuv'), fs)
+    rp = psnr(src, decode(args.ffmpeg, os.path.join(TMP, 'bd_ref.264'), w, h, os.path.join(TMP, 'bd_ref.yuv')), fs)
     cache[key] = [rb, rp]
     cache_save(cache)
     return rb, rp
@@ -123,10 +132,10 @@ def has_bframes(args):
 
 
 def ours(args, clip, q, w, h, n):
-    dst = '/tmp/bd_ours.264'
+    dst = os.path.join(TMP, 'bd_ours.264')
     subprocess.run([args.bin, '-w', str(w), '-h', str(h), '-i', clip, '-o', dst,
                     '-q', str(q), '-n', str(n), '-p', str(args.preset),
-                    '--dump-recon', '/tmp/bd_ours.rec'] + args.extra.split(),
+                    '--dump-recon', os.path.join(TMP, 'bd_ours.rec')] + args.extra.split(),
                    check=True, capture_output=True)
     return os.path.getsize(dst) * 8 / 1000.0
 
@@ -144,12 +153,12 @@ def ours_recon(args, w, h):
     display order and the dump is used, which keeps the numbers of every
     recorded measurement unchanged."""
     if has_bframes(args):
-        return decode(args.ffmpeg, '/tmp/bd_ours.264', w, h, '/tmp/bd_ours.yuv')
-    return open('/tmp/bd_ours.rec', 'rb').read()
+        return decode(args.ffmpeg, os.path.join(TMP, 'bd_ours.264'), w, h, os.path.join(TMP, 'bd_ours.yuv'))
+    return open(os.path.join(TMP, 'bd_ours.rec'), 'rb').read()
 
 
 def x264(args, clip, q, w, h):
-    dst = '/tmp/bd_ref.264'
+    dst = os.path.join(TMP, 'bd_ref.264')
     if args.x264:
         subprocess.run([args.x264, '--input-res', '%dx%d' % (w, h), '--fps', '30',
                         '--crf' if args.xrc == 'crf' else '-q', str(q),

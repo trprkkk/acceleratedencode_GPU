@@ -10566,8 +10566,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->i_qp_offset = 3;
     if (pp->direct < 0 || pp->direct > 1)
         pp->direct = 1;
+    /* The group decision.  The trellis (b-adapt 2) prices every split of the
+     * window; the fast rule stops adding B pictures once a far P picture's
+     * lowres cost per macroblock passes an absolute threshold, which busy
+     * texture (tree2: ~650 against 250) always does even where B pictures
+     * pay -- one B per group there, against three from the trellis and from
+     * x264.  Global-PSNR BD-rate of the trellis against the fast rule, vs
+     * x264 medium: preset 3 -5.37 -> -5.51 % on the five clips and -4.37 ->
+     * -6.07 % on the six validation clips (preset 4: -5.84 -> -5.91, -4.66
+     * -> -6.47); short loses (-9.39 -> -6.22), mega, mega2 and tree2 gain
+     * 4-5 points each.  +3 % time at preset 3, none measurable at 4.  x264
+     * also switches to the trellis at its slow preset. */
     if (pp->b_adapt < 0 || pp->b_adapt > 2)
-        pp->b_adapt = 1;
+        pp->b_adapt = pp->preset >= 3 ? 2 : 1;
     if (pp->weightp < 0)
         pp->weightp = pp->preset >= 2;
     if (pp->refs < 1)
