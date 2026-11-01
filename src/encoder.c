@@ -472,6 +472,12 @@ struct aeg_encoder {
     double vbv_buf_bits;    /* B: the buffer size                           */
     double vbv_rate_bits;   /* R: bits delivered per picture period         */
     double vbv_full;        /* modelled fullness, bits                      */
+    /* the NAL HRD signalled from that model (nal_hrd): rate and CPB size as
+     * the SPS states them, and the coded index of the last buffering period */
+    int    hrd_on;
+    double hrd_rate, hrd_cpb;
+    int    hrd_bp_c;
+    char   info[768];       /* the info SEI's text (info_sei)                */
     double vbv_min_full;    /* lowest level seen                            */
     int    vbv_underflows;
     int    vbv_clamps;
@@ -9870,6 +9876,43 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                                      3, 8, pps, pl, 0);
         }
     }
+    /* SEI, before the slices: the HRD's buffering period (IDR) and picture
+     * timing (every picture), and the info text on the first picture.  A
+     * frame lasts two clock ticks (time_scale = 2 * fps_num). */
+    if (e->hrd_on || (e->p.info_sei && e->frame_count == 0)) {
+        aeg_sei s;
+        uint8_t sei[1200];
+        size_t sn;
+
+        memset(&s, 0, sizeof(s));
+        if (e->hrd_on) {
+            const int c = e->frame_count;
+            const int reorder = e->p.bframes > 0 ? e->p.bframes : 0;
+            int dpb = 2 * (poc - c + reorder);
+            if (is_idr) {
+                /* the picture leaves the CPB when the model's level before
+                 * it has arrived; delay + offset spans the whole buffer */
+                double whole = e->hrd_cpb / e->hrd_rate * 90000.0;
+                double d0 = vbv_available(e) / e->hrd_rate * 90000.0;
+                if (d0 > whole) d0 = whole;
+                if (d0 < 1.0) d0 = 1.0;
+                s.bp = 1;
+                s.bp_delay = (uint32_t)d0;
+                s.bp_offset = (uint32_t)(whole - (double)s.bp_delay);
+                s.cpb_delay = c ? (uint32_t)(2 * (c - e->hrd_bp_c)) : 0;
+                e->hrd_bp_c = c;
+            } else {
+                s.cpb_delay = (uint32_t)(2 * (c - e->hrd_bp_c));
+            }
+            s.pt = 1;
+            s.dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
+        }
+        if (e->p.info_sei && e->frame_count == 0)
+            s.info = e->info;
+        sn = aeg_write_sei(sei, sizeof(sei), &s);
+        out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 0, 6,
+                                 sei, sn, 0);
+    }
     /* a reference picture coded as one slice is post-processed row by row
      * behind its decision pass (rowpost_row) */
     e->rp_on = e->cur_is_ref && e->n_slices == 1 && e->slot_mbs[e->role_cur] &&
@@ -11208,6 +11251,38 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             }
             e->ft_on = 1;
         }
+    }
+    if (aeg_hrd_values(&e->p, &e->hrd_rate, &e->hrd_cpb) && e->vbv_active) {
+        e->hrd_on = 1;
+    } else if (e->p.nal_hrd) {
+        aeg_log(1, "aeg: nal_hrd needs the VBV model (vbv maxrate and buffer "
+                   "size); no HRD is signalled");
+        e->p.nal_hrd = 0;
+    }
+    if (e->p.info_sei) {
+        /* what shaped the stream -- not how it was computed (threads,
+         * backend), so a threaded encode writes the same bytes */
+        snprintf(e->info, sizeof(e->info),
+                 "aeg %s - H.264/AVC encoder (CPU, CUDA/OpenCL stages) - "
+                 "options: preset=%d rc=%s qp=%d bitrate=%d vbv=%d:%d "
+                 "keyint=%d scenecut=%d bframes=%d b-adapt=%d b-pyramid=%d "
+                 "bqp=%d iqp=%d direct=%s ref=%d weightp=%d mbtree=%d "
+                 "rc-lookahead=%d aq=%d:%d trellis=%d subme=%d range=%d "
+                 "refine-mv=%d refine-cand=%d partitions=%d cabac=%d "
+                 "8x8dct=%d deblock=%d:%d:%d slices=%d",
+                 AEG_VERSION_STRING, e->p.preset,
+                 e->rc_active ? (e->vbv_active ? "abr+vbv" : "abr") : "cqp",
+                 e->p.qp, e->p.bitrate_kbps, e->p.vbv_maxrate_kbps,
+                 e->p.vbv_bufsize_kbits, e->p.gop_size, e->p.scenecut,
+                 e->p.bframes, e->p.b_adapt, e->p.b_pyramid, e->p.b_qp_offset,
+                 e->p.i_qp_offset, e->p.direct ? "spatial" : "temporal",
+                 e->p.refs, e->p.weightp, e->p.mbtree,
+                 e->p.mbtree ? e->p.rc_lookahead : 0, e->p.aq_mode,
+                 e->p.aq_strength, e->p.trellis, e->p.subme,
+                 e->p.search_range, e->p.refine_mv, e->p.refine_cand,
+                 e->p.partitions, e->p.cabac, e->p.transform_8x8,
+                 e->p.deblock, e->p.deblock_alpha, e->p.deblock_beta,
+                 e->n_slices);
     }
     aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);

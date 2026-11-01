@@ -114,8 +114,95 @@ static int pick_level(int mb_w, int mb_h, int fps_num, int fps_den,
     return 51;
 }
 
+/* value * 2^(base + scale) >= v with the value in range: the largest
+ * scale that still represents v exactly, else round the value up */
+static void hrd_scale(double v, int base, int *scale, uint32_t *val)
+{
+    uint64_t x = (uint64_t)(v + 0.5);
+    int s = 0;
+    while (s < 15 && x && !(x & ((1ull << (base + s + 1)) - 1)))
+        s++;
+    while (s < 15 && ((x + (1ull << (base + s)) - 1) >> (base + s)) > 0xfffffffeull)
+        s++;
+    *scale = s;
+    *val = (uint32_t)((x + (1ull << (base + s)) - 1) >> (base + s));
+    if (*val < 1)
+        *val = 1;
+}
+
+int aeg_hrd_values(const aeg_params *p, double *rate_bps, double *cpb_bits)
+{
+    int rs, cs;
+    uint32_t rv, cv;
+    if (!p->nal_hrd || p->vbv_maxrate_kbps <= 0 || p->vbv_bufsize_kbits <= 0)
+        return 0;
+    hrd_scale(p->vbv_maxrate_kbps * 1000.0, 6, &rs, &rv);
+    hrd_scale(p->vbv_bufsize_kbits * 1000.0, 4, &cs, &cv);
+    if (rate_bps)
+        *rate_bps = (double)rv * (double)(1ull << (6 + rs));
+    if (cpb_bits)
+        *cpb_bits = (double)cv * (double)(1ull << (4 + cs));
+    return 1;
+}
+
+/* sei_message(): type and size as runs of 0xff, then the payload bytes */
+static void sei_message(aeg_bitwriter *bw, int type, const uint8_t *pl,
+                        size_t n)
+{
+    size_t i, s = n;
+    int t = type;
+    for (; t >= 255; t -= 255)
+        aeg_bw_put(bw, 8, 0xff);
+    aeg_bw_put(bw, 8, (uint32_t)t);
+    for (; s >= 255; s -= 255)
+        aeg_bw_put(bw, 8, 0xff);
+    aeg_bw_put(bw, 8, (uint32_t)s);
+    for (i = 0; i < n; i++)
+        aeg_bw_put(bw, 8, pl[i]);
+}
+
+size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s)
+{
+    /* this encoder's user_data_unregistered UUID */
+    static const uint8_t uuid[16] = {
+        0x5a, 0x2e, 0x8c, 0x41, 0x0b, 0x7d, 0x4f, 0x93,
+        0xa6, 0x1c, 0xe2, 0x58, 0x37, 0xd0, 0x6b, 0xf4 };
+    aeg_bitwriter bw, pb;
+    uint8_t pl[16];
+    size_t n;
+
+    aeg_bw_init(&bw, rbsp, cap, 0);
+    if (s->bp) {
+        aeg_bw_init(&pb, pl, sizeof(pl), 0);
+        aeg_bw_ue(&pb, 0);                     /* seq_parameter_set_id    */
+        aeg_bw_put(&pb, 24, s->bp_delay);      /* initial_cpb_removal_delay */
+        aeg_bw_put(&pb, 24, s->bp_offset);     /* ..._offset              */
+        if (pb.bits)                           /* payload byte alignment  */
+            aeg_bw_align_one(&pb);
+        sei_message(&bw, 0, pl, pb.len);
+    }
+    if (s->pt) {
+        aeg_bw_init(&pb, pl, sizeof(pl), 0);
+        aeg_bw_put(&pb, 24, s->cpb_delay);     /* cpb_removal_delay       */
+        aeg_bw_put(&pb, 24, s->dpb_delay);     /* dpb_output_delay        */
+        sei_message(&bw, 1, pl, pb.len);
+    }
+    if (s->info) {
+        uint8_t buf[1024];
+        n = strlen(s->info) + 1;               /* with its NUL, as x264   */
+        if (n > sizeof(buf) - 16)
+            n = sizeof(buf) - 16;
+        memcpy(buf, uuid, 16);
+        memcpy(buf + 16, s->info, n);
+        buf[16 + n - 1] = 0;
+        sei_message(&bw, 5, buf, 16 + n);
+    }
+    return aeg_bw_finish(&bw);                 /* rbsp_trailing_bits      */
+}
+
 static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
 {
+    double rate = 0, cpb = 0;
     uint32_t units = (uint32_t)(p->fps_den > 0 ? p->fps_den : 1);
     uint32_t scale = (uint32_t)(p->fps_num > 0 ? p->fps_num * 2 : 60);
 
@@ -160,8 +247,28 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
     aeg_bw_put(bw, 32, units);       /* num_units_in_tick                   */
     aeg_bw_put(bw, 32, scale);       /* time_scale (2 ticks per frame)      */
     aeg_bw_put(bw, 1, 1);            /* fixed_frame_rate_flag               */
-    aeg_bw_put(bw, 1, 0);            /* nal_hrd_parameters_present_flag     */
-    aeg_bw_put(bw, 1, 0);            /* vcl_hrd_parameters_present_flag     */
+    if (aeg_hrd_values(p, &rate, &cpb)) {
+        int rs, cs;
+        uint32_t rv, cv;
+        hrd_scale(rate, 6, &rs, &rv);
+        hrd_scale(cpb, 4, &cs, &cv);
+        aeg_bw_put(bw, 1, 1);        /* nal_hrd_parameters_present_flag     */
+        aeg_bw_ue(bw, 0);            /* cpb_cnt_minus1                      */
+        aeg_bw_put(bw, 4, (uint32_t)rs); /* bit_rate_scale                  */
+        aeg_bw_put(bw, 4, (uint32_t)cs); /* cpb_size_scale                  */
+        aeg_bw_ue(bw, rv - 1);       /* bit_rate_value_minus1[0]            */
+        aeg_bw_ue(bw, cv - 1);       /* cpb_size_value_minus1[0]            */
+        aeg_bw_put(bw, 1, 0);        /* cbr_flag[0]: VBR                    */
+        aeg_bw_put(bw, 5, 23);       /* initial_cpb_removal_delay_length-1  */
+        aeg_bw_put(bw, 5, 23);       /* cpb_removal_delay_length_minus1     */
+        aeg_bw_put(bw, 5, 23);       /* dpb_output_delay_length_minus1      */
+        aeg_bw_put(bw, 5, 24);       /* time_offset_length                  */
+        aeg_bw_put(bw, 1, 0);        /* vcl_hrd_parameters_present_flag     */
+        aeg_bw_put(bw, 1, 0);        /* low_delay_hrd_flag                  */
+    } else {
+        aeg_bw_put(bw, 1, 0);        /* nal_hrd_parameters_present_flag     */
+        aeg_bw_put(bw, 1, 0);        /* vcl_hrd_parameters_present_flag     */
+    }
     aeg_bw_put(bw, 1, 0);            /* pic_struct_present_flag             */
     aeg_bw_put(bw, 1, 1);            /* bitstream_restriction_flag          */
     aeg_bw_put(bw, 1, 1);            /* motion_vectors_over_pic_boundaries  */
@@ -187,7 +294,8 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
 
     if (level_idc <= 0)
         level_idc = pick_level(mb_w, mb_h, p->fps_num, p->fps_den,
-                               p->bitrate_kbps);
+                               p->vbv_maxrate_kbps > p->bitrate_kbps
+                                   ? p->vbv_maxrate_kbps : p->bitrate_kbps);
 
     /* High profile as soon as the 8x8 transform is on -- it is the profile that
      * introduced transform_size_8x8_flag.  CABAC without it is Main profile;

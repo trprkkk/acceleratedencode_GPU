@@ -634,6 +634,22 @@ print("   --vbv-* alone (no --bitrate): %.1f kb/s" % kbps)
 sys.exit(0 if ok else 1)
 PY2
 
+# The model signalled as the NAL HRD (--nal-hrd): hrd_parameters in the SPS,
+# buffering period + picture timing SEI.  The decoder has to reproduce the
+# reconstruction with the SEI in the stream, and the signalled times have to
+# put the pictures out in display order, across IDRs and B groups.
+run_bcase hrd 176 144 30 3 4 -q 26 --bitrate 300 --vbv-maxrate 400 \
+    --vbv-bufsize 600 --nal-hrd --info-sei -g 8
+if command -v "$FF" >/dev/null 2>&1; then
+    python3 "$(dirname "$0")/../tools/hrd_check.py" "$FF" "$TMP/hrd.264" \
+        "$TMP/hrd.order" || FAIL=1
+fi
+if grep -q "options: preset=" "$TMP/hrd.264"; then
+    echo "   info SEI present"
+else
+    echo "   info SEI missing  FAIL"; FAIL=1
+fi
+
 echo "== two-pass rate control"
 # Two-pass on a clip whose two halves have very different complexity: the point
 # of the first pass is to *measure* that difference and spend accordingly.  The

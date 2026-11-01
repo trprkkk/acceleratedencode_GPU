@@ -281,6 +281,19 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
                      int long_start_code);
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
+/* The NAL HRD the SPS signals (nal_hrd with a VBV model): the bit rate and
+ * CPB size as the hrd_parameters() represent them (bits/s, bits); 0 when
+ * there is none. */
+int aeg_hrd_values(const aeg_params *p, double *rate_bps, double *cpb_bits);
+/* One SEI NAL's payload: the messages present, in this order. */
+typedef struct aeg_sei {
+    int bp;                     /* buffering_period (D.1.1)               */
+    uint32_t bp_delay, bp_offset; /* initial_cpb_removal_delay(_offset), 90 kHz */
+    int pt;                     /* pic_timing (D.1.2)                     */
+    uint32_t cpb_delay, dpb_delay; /* in clock ticks (two per frame)      */
+    const char *info;           /* user_data_unregistered text, or NULL   */
+} aeg_sei;
+size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s);
 /* pred_weight_table() of a P slice (7.3.3.2): list 0 only, one entry per
  * active reference.  A flag of 0 means the default (unweighted) prediction. */
 /* Reference list modification and marking of one slice header (7.3.3.1,

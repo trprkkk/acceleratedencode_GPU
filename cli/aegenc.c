@@ -100,6 +100,10 @@ static void usage(void)
 "  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
 "  --vbv-maxrate <kbps>  VBV/HRD channel rate (implies ABR)\n"
 "  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
+"  --nal-hrd        signal the VBV model as the NAL HRD: hrd_parameters in\n"
+"                   the SPS, buffering period and picture timing SEI\n"
+"  --info-sei       write the encoder name and options into the stream (a\n"
+"                   user data SEI on the first picture, as x264 does)\n"
 "  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
 "                   default 10 = x264 aq-strength 1.0)\n"
 "  --slices <n>     slices per picture (0/1 = one slice; n>1 cuts the\n"
@@ -501,6 +505,8 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(a, "--fullrange")) fullrange = 1;
+        else if (!strcmp(a, "--nal-hrd")) p.nal_hrd = 1;
+        else if (!strcmp(a, "--info-sei")) p.info_sei = 1;
         else if (!strcmp(a, "--colorprim") || !strcmp(a, "--transfer") ||
                  !strcmp(a, "--colormatrix")) {
             static const char *const pn[] = { "bt709", "bt470m", "bt470bg",

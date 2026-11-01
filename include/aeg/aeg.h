@@ -104,6 +104,15 @@ typedef struct aeg_params {
     int sar_w, sar_h;
     int fullrange;
     int colorprim, transfer, colormatrix;
+    /* Supplemental information, off by default (neither changes a coding
+     * decision).  nal_hrd: with the VBV model on (vbv_maxrate/vbv_bufsize),
+     * signal it as the NAL HRD (hrd_parameters in the VUI) with a buffering
+     * period SEI on every IDR and a picture timing SEI on every picture, as
+     * broadcast and Blu-ray style receivers expect.  info_sei: a
+     * user_data_unregistered SEI on the first picture naming the encoder and
+     * the options that shaped the stream (x264 writes the same). */
+    int nal_hrd;
+    int info_sei;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
