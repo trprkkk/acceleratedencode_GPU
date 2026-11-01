@@ -410,6 +410,14 @@ run_case slices12     320 192  6 0 -q 26 --slices 12
 run_case slices_odd   320 208  4 1 -q 24 --slices 5
 run_case slices_small  64  64  6 0 -q 23 --slices 2
 run_case slices_pskip 320 192  8 3 -q 26 --slices 3
+# Sizes that are not whole macroblocks: coded rounded up, the margin repeated
+# from the edge and cropped by the SPS; the decoder's cropped output has to be
+# the encoder's visible reconstruction.
+run_case crop_p      100  72  6 1 -q 24 -p 3
+run_case crop_slices 174  94  6 4 -q 26 --slices 3 -p 1
+run_case crop_cavlc   50  38  5 1 -q 28 --no-cabac
+run_bcase crop_b     330 190 12 3 4 -q 24 -p 4
+run_bcase crop_tiny    2   2  8 3 1 -q 30 -p 2
 # The same slices coded serially (-t 1) and by two threads have to produce the
 # same bytes -- a slice's bits are a function of its own rows only, so the
 # thread count must not be visible in the bitstream.

@@ -126,6 +126,10 @@ typedef struct {
 struct aeg_encoder {
     aeg_params p;
     int w, h, cw, ch;
+    /* the picture as submitted (even, <= w x h): the coded picture is that
+     * rounded up to whole macroblocks, the rest is edge samples repeated and
+     * cropped away by the SPS (frame_cropping) */
+    int vw, vh, vcw, vch;
     int mb_w, mb_h, mb_count;
     int stride[3];
     int frame_num_bits, level_idc;
@@ -10038,7 +10042,8 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
         double sse = 0;
         int i;
         for (i = 0; i < 3; i++) {
-            int w = i ? e->cw : e->w, h = i ? e->ch : e->h;
+            /* the visible picture only: the cropped margin is not output */
+            int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
             int x, y;
             int64_t acc = 0;
             for (y = 0; y < h; y++)
@@ -10186,15 +10191,38 @@ static int in_slots(const struct aeg_encoder *e)
     return e->p.bframes + 5 + (e->la_depth ? e->la_depth + e->p.bframes + 1 : 0);
 }
 
+/* A submitted plane of vw x vh samples into a coded one of w x h: the last
+ * column and row are repeated out to the macroblock edge (what the SPS crops
+ * away; repeating them keeps the edge macroblocks as cheap as the content
+ * next to them), then the usual padding. */
+static void copy_plane_crop(uint8_t *dst, int dstride, const uint8_t *src,
+                            int vw, int vh, int w, int h)
+{
+    int y;
+    if (vw == w && vh == h) {
+        copy_plane_pad(dst, dstride, src, w, w, h);
+        return;
+    }
+    for (y = 0; y < vh; y++) {
+        memcpy(dst + y * dstride, src + (size_t)y * vw, (size_t)vw);
+        if (w > vw)
+            memset(dst + y * dstride + vw, dst[y * dstride + vw - 1],
+                   (size_t)(w - vw));
+    }
+    for (y = vh; y < h; y++)
+        memcpy(dst + y * dstride, dst + (vh - 1) * dstride, (size_t)w);
+    pad_edges(dst, dstride, w, h);
+}
+
 static void copy_yuv(const struct aeg_encoder *e, uint8_t *p[3],
                      const uint8_t *yuv420p)
 {
-    copy_plane_pad(p[0], e->stride[0], yuv420p, e->w, e->w, e->h);
-    copy_plane_pad(p[1], e->stride[1], yuv420p + (size_t)e->w * e->h,
-                   e->cw, e->cw, e->ch);
-    copy_plane_pad(p[2], e->stride[2],
-                   yuv420p + (size_t)e->w * e->h + (size_t)e->cw * e->ch,
-                   e->cw, e->cw, e->ch);
+    size_t ls = (size_t)e->vw * e->vh, cs = (size_t)e->vcw * e->vch;
+    copy_plane_crop(p[0], e->stride[0], yuv420p, e->vw, e->vh, e->w, e->h);
+    copy_plane_crop(p[1], e->stride[1], yuv420p + ls, e->vcw, e->vch,
+                    e->cw, e->ch);
+    copy_plane_crop(p[2], e->stride[2], yuv420p + ls + cs, e->vcw, e->vch,
+                    e->cw, e->ch);
 }
 
 static void bind_source(struct aeg_encoder *e, int display)
@@ -10762,7 +10790,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     struct aeg_encoder *e;
     aeg_params *pp;
 
-    if (!params || params->width < 16 || params->height < 16) {
+    if (!params || params->width < 2 || params->height < 2 ||
+        params->width > 16384 || params->height > 16384) {
         aeg_set_last_error("invalid dimensions");
         return NULL;
     }
@@ -10943,11 +10972,18 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         }
     }
 
-    e->w = params->width & ~15;
-    e->h = params->height & ~15;
-    if (e->w != params->width || e->h != params->height)
-        aeg_log(1, "aeg: dimensions rounded to %dx%d (multiples of 16)",
-                e->w, e->h);
+    /* 4:2:0 crops in units of two samples, so an odd size cannot be
+     * signalled: it is rounded down to even (as x264 refuses it) */
+    e->vw = params->width & ~1;
+    e->vh = params->height & ~1;
+    if (e->vw != params->width || e->vh != params->height)
+        aeg_log(1, "aeg: odd dimensions rounded down to %dx%d", e->vw, e->vh);
+    e->vcw = e->vw / 2;
+    e->vch = e->vh / 2;
+    pp->width = e->vw;
+    pp->height = e->vh;
+    e->w = (e->vw + 15) & ~15;
+    e->h = (e->vh + 15) & ~15;
     e->cw = (e->w + 1) / 2;
     e->ch = (e->h + 1) / 2;
     e->mb_w = e->w / 16;
@@ -11870,7 +11906,7 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
 
     if (!e || !yuv420p)
         return AEG_EINVAL;
-    need = (size_t)e->w * e->h + 2 * (size_t)e->cw * e->ch;
+    need = (size_t)e->vw * e->vh + 2 * (size_t)e->vcw * e->vch;
     if (size < need) {
         aeg_set_last_error("input buffer too small");
         return AEG_EINVAL;

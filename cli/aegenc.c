@@ -20,7 +20,8 @@ static void usage(void)
 "\n"
 "usage: aegenc -w W -h H [-i in.yuv] [-o out.264] [options]\n"
 "\n"
-"  -w, -h <int>     frame size (multiples of 16; the encoder rounds down)\n"
+"  -w, -h <int>     frame size, any even size (coded as whole macroblocks\n"
+"                   and cropped back in the SPS)\n"
 "  -i <file>        input raw I420 stream (default: stdin)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
@@ -335,6 +336,13 @@ int main(int argc, char **argv)
 
     if (!width || !height) {
         fprintf(stderr, "error: -w and -h are required\n");
+        return 2;
+    }
+    if (width < 2 || height < 2 || (width & 1) || (height & 1) ||
+        width > 16384 || height > 16384) {
+        fprintf(stderr, "error: %dx%d: the frame size must be even, 2..16384 "
+                        "(4:2:0 is cropped in units of two samples)\n",
+                width, height);
         return 2;
     }
     if (inpath) {
