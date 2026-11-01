@@ -113,6 +113,16 @@ typedef struct aeg_params {
      * the options that shaped the stream (x264 writes the same). */
     int nal_hrd;
     int info_sei;
+    /* aud: an access unit delimiter NAL before every picture (transport
+     * streams want them).  level_idc: force the level (10 * level, e.g. 41;
+     * 0 = the smallest that fits).  qp_min / qp_max: no macroblock is coded
+     * outside this range, whatever the rate control, AQ or macroblock tree
+     * ask for (defaults 0 / 51).  chroma_qp_offset: chroma_qp_index_offset,
+     * -12..12 (negative = finer chroma). */
+    int aud;
+    int level_idc;
+    int qp_min, qp_max;
+    int chroma_qp_offset;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */

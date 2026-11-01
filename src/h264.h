@@ -210,6 +210,7 @@ typedef struct aeg_picture {
     int      qp;
     int      is_idr;
     int      type;            /* 0=I, 1=P, 2=B                            */
+    int      chroma_qp_offset; /* chroma_qp_index_offset of the PPS        */
     int64_t  pts;
     int      ref_count;       /* 0 free, >0 in use                        */
     void    *priv;
@@ -316,7 +317,8 @@ typedef struct aeg_pwt {
     int lflag[2], lw[2], lo[2];
     int cflag[2], cw[2][2], co[2][2];
 } aeg_pwt;
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8,
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
+                     int transform_8x8,
                      int cabac, int weighted_pred);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header. */
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,

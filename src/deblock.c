@@ -24,11 +24,13 @@ static inline int clip3(int lo, int hi, int v)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/* slice_alpha / slice_beta are the slice header's *_div2 values: 8.7.2.2
+ * adds FilterOffsetA = slice_alpha_c0_offset_div2 << 1 (and B likewise) */
 void aeg_deblock_thresholds(int qp, int slice_alpha, int slice_beta,
                             int *alpha, int *beta, const int8_t **tc0)
 {
-    int ia = AEG_CLIP3(0, 51, qp + slice_alpha);
-    int ib = AEG_CLIP3(0, 51, qp + slice_beta);
+    int ia = AEG_CLIP3(0, 51, qp + 2 * slice_alpha);
+    int ib = AEG_CLIP3(0, 51, qp + 2 * slice_beta);
     *alpha = aeg_alpha_tab[ia];
     *beta = aeg_beta_tab[ib];
     *tc0 = aeg_tc0_tab[ia];
@@ -296,15 +298,16 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
          * edges use the quantiser of the macroblock being filtered. */
         qp = mb_edge ? (q->qp + p_mb->qp + 1) >> 1 : q->qp;
         aeg_deblock_thresholds(qp, salpha, sbeta, &alpha, &beta, &tc0);
-        if (!alpha || !beta)
-            continue;
-
-        xs = vertical ? 1 : pic->stride[0];
-        step = vertical ? pic->stride[0] : 1;
-        lx = mb_x * 16 + (vertical ? pos : 0);
-        ly = mb_y * 16 + (vertical ? 0 : pos);
-        luma_edge_filter(pic->plane[0] + ly * pic->stride[0] + lx, xs, step,
-                         alpha, beta, tc0, bs, mb_edge);
+        /* luma off (alpha or beta 0) does not mean chroma off: with a
+         * positive chroma_qp_index_offset the chroma QP is the higher one */
+        if (alpha && beta) {
+            xs = vertical ? 1 : pic->stride[0];
+            step = vertical ? pic->stride[0] : 1;
+            lx = mb_x * 16 + (vertical ? pos : 0);
+            ly = mb_y * 16 + (vertical ? 0 : pos);
+            luma_edge_filter(pic->plane[0] + ly * pic->stride[0] + lx, xs, step,
+                             alpha, beta, tc0, bs, mb_edge);
+        }
 
         /* Chroma has half the resolution: edges at chroma coordinates 0 and
          * 4, i.e. only luma edges k = 0 and k = 2. */
@@ -315,9 +318,10 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                 /* 8.7.2.2: each side's chroma QP from its own luma QP,
                  * then the average (not the chroma QP of the average luma
                  * QP, which differs once neighbouring QPs differ) */
-                int cqp = mb_edge ? (aeg_qp_chroma(q->qp, 0) +
-                                     aeg_qp_chroma(p_mb->qp, 0) + 1) >> 1
-                                  : aeg_qp_chroma(q->qp, 0);
+                const int co = pic->chroma_qp_offset;
+                int cqp = mb_edge ? (aeg_qp_chroma(q->qp, co) +
+                                     aeg_qp_chroma(p_mb->qp, co) + 1) >> 1
+                                  : aeg_qp_chroma(q->qp, co);
                 int calpha, cbeta;
                 const int8_t *ctc0;
                 int cxs = vertical ? 1 : pic->stride[plane];

@@ -418,6 +418,15 @@ run_case crop_slices 174  94  6 4 -q 26 --slices 3 -p 1
 run_case crop_cavlc   50  38  5 1 -q 28 --no-cabac
 run_bcase crop_b     330 190 12 3 4 -q 24 -p 4
 run_bcase crop_tiny    2   2  8 3 1 -q 30 -p 2
+# Deblocking offsets and the chroma QP offset (both signs; a positive offset
+# makes the chroma filter run on edges whose luma filter is off), the QP
+# range and the access unit delimiter.
+run_case dbk_offsets 176 144  6 1 -q 26 -p 3 --deblock -3:2
+run_bcase dbk_strong 176 144 12 3 4 -q 20 -p 4 --deblock 4:4
+run_bcase cqp_plus   176 144 12 3 4 -q 16 -p 2 --chroma-qp-offset 6
+run_bcase cqp_minus  176 144 12 3 1 -q 30 -p 4 --chroma-qp-offset -5 --deblock 2:-1
+run_case cqp_cavlc   176 144  5 4 -q 14 -p 1 --no-cabac --chroma-qp-offset 12
+run_bcase qp_range   176 144 12 3 4 -q 20 -p 2 --qpmin 24 --qpmax 30 --aud
 # The same slices coded serially (-t 1) and by two threads have to produce the
 # same bytes -- a slice's bits are a function of its own rows only, so the
 # thread count must not be visible in the bitstream.

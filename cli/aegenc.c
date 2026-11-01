@@ -56,6 +56,14 @@ static void usage(void)
 "  --no-8x8dct      use only 4x4 luma transforms (drops High profile)\n"
 "  --no-cabac       code the macroblock layer with CAVLC instead of CABAC\n"
 "  --no-deblock     disable the in-loop deblocking filter\n"
+"  --deblock <a:b>  deblocking strength offsets, -6..6 each (default 0:0)\n"
+"  --qpmin <n>, --qpmax <n>  no macroblock below / above this QP\n"
+"                   (defaults 0 / 51)\n"
+"  --chroma-qp-offset <n>  chroma QP relative to luma, -12..12 (default 0)\n"
+"  --aud            an access unit delimiter before every picture\n"
+"  --level <l>      force the level (4.1, 41; default: the smallest that\n"
+"                   fits)\n"
+"  --seek <n>       skip the first n input frames\n"
 "  --range <int>    integer motion search range (default: from preset)\n"
 "  --subme <int>    subpel refinement 0..2 (default 1)\n"
 "  --refine-mv <n>  0 = off, 1 = four quarter-pel neighbours of the winning\n"
@@ -457,7 +465,7 @@ int main(int argc, char **argv)
     FILE *in = stdin, *out = stdout;
     int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
     int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
-    int fullrange = 0, demux = 0;
+    int fullrange = 0, demux = 0, seek = 0;
     double fps;
     input_t inp;
     int bitrate = 0, aq = -1;
@@ -506,6 +514,35 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--fullrange")) fullrange = 1;
         else if (!strcmp(a, "--nal-hrd")) p.nal_hrd = 1;
+        else if (!strcmp(a, "--aud")) p.aud = 1;
+        else if (!strcmp(a, "--qpmin")) p.qp_min = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--qpmax")) p.qp_max = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--chroma-qp-offset"))
+            p.chroma_qp_offset = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--seek")) seek = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--deblock")) {
+            const char *v = next_arg(argc, argv, &i);
+            if (sscanf(v, "%d:%d", &p.deblock_alpha, &p.deblock_beta) != 2 &&
+                sscanf(v, "%d,%d", &p.deblock_alpha, &p.deblock_beta) != 2) {
+                fprintf(stderr, "error: bad --deblock '%s' (want a:b)\n", v);
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "--level")) {
+            const char *v = next_arg(argc, argv, &i);
+            double l = atof(v);
+            p.level_idc = strchr(v, '.') || l < 10 ? (int)(l * 10 + 0.5) : (int)l;
+            if (p.level_idc != 10 && p.level_idc != 11 && p.level_idc != 12 &&
+                p.level_idc != 13 && p.level_idc != 20 && p.level_idc != 21 &&
+                p.level_idc != 22 && p.level_idc != 30 && p.level_idc != 31 &&
+                p.level_idc != 32 && p.level_idc != 40 && p.level_idc != 41 &&
+                p.level_idc != 42 && p.level_idc != 50 && p.level_idc != 51 &&
+                p.level_idc != 52 && p.level_idc != 60 && p.level_idc != 61 &&
+                p.level_idc != 62) {
+                fprintf(stderr, "error: unknown --level '%s'\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--info-sei")) p.info_sei = 1;
         else if (!strcmp(a, "--colorprim") || !strcmp(a, "--transfer") ||
                  !strcmp(a, "--colormatrix")) {
@@ -634,6 +671,17 @@ int main(int argc, char **argv)
         bad |= range_bad("--vbv-maxrate", p.vbv_maxrate_kbps, 0, 2000000);
         bad |= range_bad("--vbv-bufsize", p.vbv_bufsize_kbits, 0, 2000000);
         bad |= range_bad("-v", verbose, 0, 3);
+        bad |= range_bad("--qpmin", p.qp_min, 0, 51);
+        bad |= range_bad("--qpmax", p.qp_max, 0, 51);
+        bad |= range_bad("--chroma-qp-offset", p.chroma_qp_offset, -12, 12);
+        bad |= range_bad("--deblock alpha", p.deblock_alpha, -6, 6);
+        bad |= range_bad("--deblock beta", p.deblock_beta, -6, 6);
+        bad |= range_bad("--seek", seek, 0, 1 << 30);
+        if (p.qp_min > p.qp_max) {
+            fprintf(stderr, "error: --qpmin %d is above --qpmax %d\n",
+                    p.qp_min, p.qp_max);
+            bad = 1;
+        }
         if (aq >= 0) bad |= range_bad("--aq", aq, 0, 30);
         if (range) bad |= range_bad("--range", range, 1, 512);
         if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
@@ -845,6 +893,16 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (seek > 0) {
+        int k;
+        for (k = 0; k < seek; k++)
+            if (in_frame(&inp, frame, fsize) != 1) {
+                fprintf(stderr, "error: --seek %d: the input has only %d "
+                                "frame(s)\n", seek, k);
+                free(frame);
+                return 1;
+            }
+    }
     enc = aeg_encoder_open(&p);
     if (!enc) {
         fprintf(stderr, "aeg_encoder_open failed: %s\n", aeg_last_error());

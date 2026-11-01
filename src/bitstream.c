@@ -354,7 +354,8 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     return aeg_bw_finish(&bw);
 }
 
-size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac,
+size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
+                     int transform_8x8, int cabac,
                      int weighted_pred)
 {
     aeg_bitwriter bw;
@@ -372,7 +373,7 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac,
     aeg_bw_put(&bw, 2, 0);      /* weighted_bipred_idc                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qp_minus26                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qs_minus26                     */
-    aeg_bw_se(&bw, 0);          /* chroma_qp_index_offset                  */
+    aeg_bw_se(&bw, chroma_qp_offset); /* chroma_qp_index_offset            */
     aeg_bw_put(&bw, 1, 1);      /* deblocking_filter_control_present_flag  */
     aeg_bw_put(&bw, 1, 0);      /* constrained_intra_pred_flag             */
     aeg_bw_put(&bw, 1, 0);      /* redundant_pic_cnt_present_flag          */
@@ -381,7 +382,7 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int transform_8x8, int cabac,
     if (transform_8x8) {
         aeg_bw_put(&bw, 1, 1);  /* transform_8x8_mode_flag                 */
         aeg_bw_put(&bw, 1, 0);  /* pic_scaling_matrix_present_flag          */
-        aeg_bw_se(&bw, 0);      /* second_chroma_qp_index_offset            */
+        aeg_bw_se(&bw, chroma_qp_offset); /* second_..._offset (Cr = Cb)   */
     }
     return aeg_bw_finish(&bw);
 }

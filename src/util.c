@@ -91,6 +91,7 @@ void aeg_params_default(aeg_params *p)
     p->fps_num = 30;
     p->fps_den = 1;
     p->colorprim = p->transfer = p->colormatrix = -1;
+    p->qp_max = 51;
     p->qp = 23;
     p->rc_mode = AEG_RC_CQP;
     p->gop_size = 250;

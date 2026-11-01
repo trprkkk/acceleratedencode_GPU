@@ -2182,7 +2182,7 @@ static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                             int inter)
 {
     static const int bxy[4][2] = { {0, 0}, {4, 0}, {0, 4}, {4, 4} };
-    int qpc = aeg_qp_chroma(c->qp, 0);
+    int qpc = aeg_qp_chroma(c->qp, e->pic.chroma_qp_offset);
     int pl, blk, i, x, y;
 
     c->cbp &= 0x0f;
@@ -7938,8 +7938,8 @@ static void mbt_apply(struct aeg_encoder *e)
 static int mb_qp_of(const struct aeg_encoder *e, int mbx, int mby)
 {
     int qp = e->cur_qp + e->mb_dqp[mby * e->mb_w + mbx];
-    if (qp < 0)  qp = 0;
-    if (qp > 51) qp = 51;
+    if (qp < e->p.qp_min) qp = e->p.qp_min;
+    if (qp > e->p.qp_max) qp = e->p.qp_max;
     return qp;
 }
 
@@ -8851,7 +8851,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->cur_poc & (max_lsb - 1), e->poc_lsb_bits,
                                    e->cur_is_ref,
                                    e->p.cabac ? e->cabac_init_idc : -1,
-                                   e->cur_qp - 26, 0, 0,
+                                   e->cur_qp - 26, e->p.deblock_alpha,
+                                   e->p.deblock_beta,
                                    e->p.deblock ? 0 : 1, first_row * e->mb_w,
                                    e->cur_l0_active, e->p.direct == 1,
                                    wp_used(e) ? &e->wp : NULL, &e->refctl);
@@ -8860,7 +8861,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
                                e->frame_num_bits, is_idr, e->idr_pic_id,
                                e->p.cabac ? e->cabac_init_idc : -1,
-                               e->cur_qp - 26, 0, 0,
+                               e->cur_qp - 26, e->p.deblock_alpha,
+                               e->p.deblock_beta,
                                e->p.deblock ? 0 : 1, first_row * e->mb_w,
                                e->cur_l0_active,
                                wp_used(e) && slice == AEG_SLICE_P ? &e->wp : NULL);
@@ -9705,6 +9707,8 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
     e->mbt_qoff = mbt_mean(e);
     if (e->vbv_active)
         vbv_clamp_qp(e);
+    if (e->cur_qp < e->p.qp_min) e->cur_qp = e->p.qp_min;
+    if (e->cur_qp > e->p.qp_max) e->cur_qp = e->p.qp_max;
 
     resolve_coef_stages(e);
     aq_compute(e);
@@ -9857,11 +9861,19 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
      * `--slices N` (or `-t N`, which uses one slice per thread) cuts the picture
      * into N row ranges, each an independently decodable NAL. */
     out_len = 0;
+    if (e->p.aud) {
+        /* access_unit_delimiter: primary_pic_type 0 = I, 1 = I/P, 2 = I/P/B */
+        uint8_t aud[2];
+        aud[0] = (uint8_t)(((e->cur_is_b ? 2 : is_p ? 1 : 0) << 5) | 0x10);
+        out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 0, 9,
+                                 aud, 1, 1);
+    }
     if (is_idr) {
         uint8_t sps[256], pps[64];
         size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                                   e->frame_num_bits, e->level_idc);
-        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8,
+        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
+                                  e->p.transform_8x8,
                                   e->p.cabac, 0);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 7,
                                  sps, sl, 1);
@@ -9870,7 +9882,8 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
         if (e->p.weightp) {
             /* PPS 1: the same with weighted_pred_flag, for the P pictures
              * that send weights (the others keep referring to PPS 0) */
-            pl = aeg_write_pps(pps, sizeof(pps), e->p.transform_8x8,
+            pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
+                               e->p.transform_8x8,
                                e->p.cabac, 1);
             out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
                                      3, 8, pps, pl, 0);
@@ -10849,6 +10862,16 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->fps_den <= 0) pp->fps_den = 1;
     if (pp->qp < 0) pp->qp = 23;
     if (pp->qp > 51) pp->qp = 51;
+    if (pp->qp_max <= 0 || pp->qp_max > 51) pp->qp_max = 51;
+    if (pp->qp_min < 0) pp->qp_min = 0;
+    if (pp->qp_min > pp->qp_max) pp->qp_min = pp->qp_max;
+    if (pp->chroma_qp_offset < -12) pp->chroma_qp_offset = -12;
+    if (pp->chroma_qp_offset > 12) pp->chroma_qp_offset = 12;
+    if (pp->level_idc < 0 || pp->level_idc > 62) pp->level_idc = 0;
+    if (pp->deblock_alpha < -6) pp->deblock_alpha = -6;
+    if (pp->deblock_alpha > 6) pp->deblock_alpha = 6;
+    if (pp->deblock_beta < -6) pp->deblock_beta = -6;
+    if (pp->deblock_beta > 6) pp->deblock_beta = 6;
     /* Presets trade search effort against speed: the integer search range and
      * whether the subpel refinement runs at all are what actually move the
      * quality/bitrate curve, so they scale with the preset unless the caller
@@ -11040,7 +11063,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         while ((1 << e->frame_num_bits) <= gop && e->frame_num_bits < 16)
             e->frame_num_bits++;
     }
-    e->level_idc = 0;
+    e->level_idc = pp->level_idc > 0 ? pp->level_idc : 0;
+    e->pic.chroma_qp_offset = pp->chroma_qp_offset;
     e->last_qp = e->cur_qp;
     e->anchor = -1;
     e->job_n = 0;
