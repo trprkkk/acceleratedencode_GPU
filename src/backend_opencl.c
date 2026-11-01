@@ -51,7 +51,7 @@ typedef intptr_t cl_context_properties;
  * building (and running on the CPU) on machines without an OpenCL loader. */
 static void ocl_load_error(const char *name)
 {
-    aeg_log(2, "aeg: OpenCL loader is missing %s", name);
+    aeg_log(AEG_LOG_DEBUG, "aeg: OpenCL loader is missing %s", name);
 }
 
 #define OCL_SYMS(X) \
@@ -640,7 +640,7 @@ static int ocl_load(void **lib)
         *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
         if (*lib)
             return AEG_OK;
-        aeg_log(1, "aeg: AEG_OPENCL_LIB=%s: %s", ev, dlerror());
+        aeg_log(AEG_LOG_WARNING, "aeg: AEG_OPENCL_LIB=%s: %s", ev, dlerror());
     }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -803,7 +803,7 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         char log[2048];
         p_clGetProgramBuildInfo(o->prog, o->device, CL_PROGRAM_BUILD_LOG,
                                 sizeof(log), log, NULL);
-        aeg_log(1, "aeg: OpenCL build failed: %s", log);
+        aeg_log(AEG_LOG_WARNING, "aeg: OpenCL build failed: %s", log);
         ocl_destroy(o);
         return AEG_EBACKEND;
     }

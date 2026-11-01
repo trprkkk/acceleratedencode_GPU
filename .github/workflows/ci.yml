@@ -56,6 +56,20 @@ jobs:
             cmp /tmp/s.264 /tmp/f.264
             echo "preset $p: frame threads identical"
           done
+      - name: library packaging (shared + static, pkg-config, exports)
+        # make install into a scratch DESTDIR; the example built against it
+        # through pkg-config, shared and static; exported symbols = AEG_API
+        run: REQUIRE_PKG_CONFIG=1 make install-check
+      - name: system install, example through pkg-config
+        run: |
+          sudo make install PREFIX=/usr/local
+          sudo ldconfig
+          cc -Wall -Wextra -Werror examples/encode.c \
+              $(pkg-config --cflags --libs aeg) -o /tmp/encode_example
+          ldd /tmp/encode_example | grep libaeg.so.0
+          ./build/genyuv 176 144 10 /tmp/ex.yuv 4
+          /tmp/encode_example /tmp/ex.yuv 176 144 /tmp/ex.264 24
+          sudo make uninstall PREFIX=/usr/local
 
   opencl-pocl:
     name: OpenCL backend on PoCL
@@ -142,7 +156,7 @@ jobs:
           grep -q "kernels compile" /tmp/nv
 
   sanitizers:
-    name: ASan + UBSan (CPU and the OpenCL host side)
+    name: ASan + UBSan (CPU and the OpenCL host side), TSan
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -179,13 +193,18 @@ jobs:
         run: |
           make -j"$(nproc)" OPENCL=1 BUILD=build-san
           make -s OPENCL=1 BUILD=build-san build-san/backend_check \
-            build-san/kernel_check build-san/coef_check build-san/genyuv
+            build-san/kernel_check build-san/coef_check build-san/genyuv \
+            build-san/api_check
       - name: unit checks
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           ./build-san/kernel_check
           ./build-san/coef_check 20000
+      - name: public API (leak detection on)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: ./build-san/api_check
       - name: backend_check on PoCL (host transfers stay inside the buffers)
         env:
           ASAN_OPTIONS: detect_leaks=0
@@ -214,3 +233,21 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           sh tools/robust_sweep.sh ./build-san/aegenc /tmp/sweep
+      - name: ThreadSanitizer (encoders in parallel threads, frame threads)
+        env:
+          CFLAGS: -O1 -g -fsanitize=thread
+          LDFLAGS: -fsanitize=thread
+          TSAN_OPTIONS: halt_on_error=1
+        # setarch -R: TSan's shadow memory cannot cope with the runner
+        # kernel's address space randomisation (vm.mmap_rnd_bits = 32)
+        run: |
+          make -s -j"$(nproc)" BUILD=build-tsan build-tsan/api_check \
+            build-tsan/aegenc build-tsan/genyuv
+          setarch -R ./build-tsan/api_check
+          ./build-tsan/genyuv 176 144 16 /tmp/ts.yuv 1
+          for p in 1 3; do
+            for t in "--frame-threads 3" "-t 2"; do
+              setarch -R ./build-tsan/aegenc -w 176 -h 144 -n 16 -q 26 -p $p \
+                -i /tmp/ts.yuv $t -v 0 -o /tmp/ts.264
+            done
+          done

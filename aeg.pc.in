@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=@EXEC_PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: aeg
+Description: H.264/AVC encoder with CUDA/OpenCL accelerated stages
+Version: @VERSION@
+Libs: -L${libdir} -laeg
+Libs.private: @LIBS_PRIVATE@
+Cflags: -I${includedir}

@@ -135,8 +135,14 @@ why every kernel is an integer operation and the reference implementation in
 make                 # CPU only (default, no OpenCL/CUDA required)
 make OPENCL=1        # + OpenCL backend, loaded with dlopen() at run time
 make CUDA=1          # + CUDA backend (driver API + NVRTC, both dlopen()ed)
-make test            # table + CAVLC + coefficient checks, then bit-exactness
-                     # of 28 clips
+make test            # API, table, CAVLC and coefficient checks, then
+                     # bit-exactness of the conformance clips
+make shared          # + libaeg.so (soname libaeg.so.0, AEG_API symbols only)
+make install         # aegenc, libaeg.a, libaeg.so, aeg/aeg.h, aeg.pc under
+                     # PREFIX (/usr/local); DESTDIR, LIBDIR, INCLUDEDIR, BINDIR
+make uninstall
+make install-check   # install into a scratch DESTDIR and build the example
+                     # against it through pkg-config, shared and static
 ```
 
 `make OPENCL=1` needs no headers or libraries at build time: the backend
@@ -232,6 +238,58 @@ as whole macroblocks, cropped in the SPS); `--fps 30000/1001`, `--sar W:H`,
 `--info-sei` (the options in a user-data SEI), `-g`, `--scenecut`.  A missing,
 malformed or out-of-range value is refused with exit status 2.
 
+## Using the library
+
+`include/aeg/aeg.h` is the whole interface; `examples/encode.c` is a complete
+program that uses nothing else.  After `make install`:
+
+```sh
+cc app.c $(pkg-config --cflags --libs aeg)            # libaeg.so
+cc app.c $(pkg-config --cflags --static --libs aeg)   # with only libaeg.a
+```
+
+```c
+aeg_params p;
+aeg_params_default(&p);
+p.width = 1920; p.height = 1080; p.fps_num = 30; p.fps_den = 1;
+p.rc_mode = AEG_RC_CRF; p.crf = 23; p.preset = AEG_PRESET_MEDIUM;
+aeg_encoder *e = aeg_encoder_open(&p);         /* NULL: aeg_last_error() */
+aeg_packet pkt;
+aeg_encoder_headers(e, &pkt);                  /* SPS/PPS for avcC */
+/* per picture: packed I420 ... */
+int rc = aeg_encoder_encode(e, i420, size, pts, &pkt);
+/* ... or three planes with their own strides (same bytes out) */
+rc = aeg_encoder_encode_planes(e, plane, stride, pts, &pkt);
+if (rc == AEG_OK) write(pkt.data, pkt.size);   /* AEG_EAGAIN: no packet yet */
+while (aeg_encoder_flush(e, &pkt) == AEG_OK) write(pkt.data, pkt.size);
+aeg_encoder_close(e);
+```
+
+* **Packets** are Annex-B access units, in decoding order, owned by the
+  encoder until the next call on it.  `pts` is the caller's; `dts` is derived
+  (the display time of the picture with that coding index, `bframes` frames
+  early, as x264 does), strictly increasing and never above `pts` for
+  constant-rate input.  `params.timebase_num/den` gives the pts unit (default:
+  one tick per frame).
+* **Parameter sets**: `aeg_encoder_headers()` returns the SPS and PPS that
+  every IDR repeats in-band, right after open, for containers that keep them
+  out of band.  `aeg_encoder_get_params()` returns the parameters the encoder
+  actually runs with: every "-1 = as the preset says" resolved, incompatible
+  options turned off (CAVLC drops B pictures), the level that was chosen.
+* **Logging**: `aeg_set_log_callback(fn, opaque)` receives every message as
+  one line with its level (`AEG_LOG_ERROR` / `WARNING` / `INFO` / `DEBUG`);
+  `aeg_set_log_level()` filters them.  The library default is `WARNING`, so a
+  clean encode prints nothing (`aegenc -v 1` shows `INFO`, `-v 2` every
+  picture).
+* **Threads**: an encoder is used by one thread at a time, but any number can
+  run in parallel threads and each produces the bytes it produces alone
+  (checked by `tests/api_check.c`, also under ThreadSanitizer in CI);
+  `aeg_last_error()` is per thread.
+* **ABI**: the shared library exports only the `AEG_API` functions (checked
+  against the header by `tests/install_check.sh`).  While the soname is
+  `libaeg.so.0` the struct layouts may still change between releases: rebuild
+  against the new header.
+
 ## What is verified, and how
 
 * `tests/synth_probe.c` writes a hand-built slice containing exactly one
@@ -290,11 +348,20 @@ malformed or out-of-range value is refused with exit status 2.
   with NVRTC for every architecture (`AEG_NVRTC_LIB=` pointing at a
   `libnvrtc`, e.g. from `pip install nvidia-cuda-nvrtc-cu12`); both are in
   `make test` and skip without a device / NVRTC.
+* `tests/api_check.c` (in `make test`) uses only the public header: log
+  callback and levels, refused arguments and the per-thread error message,
+  resolved parameters, headers equal to the first IDR's, strided planes
+  byte-identical to packed input, `dts` order, and six encoders in parallel
+  threads byte-identical to each alone.  `make install-check` installs into a
+  scratch directory and builds `examples/encode.c` against it through
+  pkg-config, shared and static, compiles the header as C99 `-pedantic` and as
+  C++, and compares the exported symbols with the header.
 * `.github/workflows/ci.yml` runs all of it on every push with no GPU: the
-  CPU suite and frame threads, the OpenCL backend on PoCL (`backend_check`,
-  the conformance suite through the device, `gpu_validate.sh`), the CUDA
-  kernels through NVRTC, and an ASan + UBSan build of the CPU and OpenCL host
-  paths.
+  CPU suite and frame threads, the packaging checks and a real `make
+  install`, the OpenCL backend on PoCL (`backend_check`, the conformance suite
+  through the device, `gpu_validate.sh`), the CUDA kernels through NVRTC, an
+  ASan + UBSan build of the CPU and OpenCL host paths, and ThreadSanitizer on
+  the parallel-encoder and frame/slice-thread paths.
 * `tests/run_tests.sh` encodes fifty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
@@ -315,6 +382,8 @@ malformed or out-of-range value is refused with exit status 2.
 
 ```
 include/aeg/aeg.h   public API
+examples/encode.c   a complete program using only the public API
+aeg.pc.in           pkg-config template (make install fills in the paths)
 src/h264.h          internal data structures and prototypes
 src/tables.c        all constant tables (quantiser, deblock, CAVLC, zigzag, QP map)
 src/transform.c     forward/inverse 4x4 transform, DC Hadamard, quantisation
@@ -331,6 +400,8 @@ src/kernels.h       the shared kernel source string (OpenCL C / CUDA C)
 tests/kernel_check.c cross-checks every GPU kernel against the CPU reference
 tests/backend_check.c every device operation end to end on a real device
 tests/nvrtc_check.c the CUDA kernels through NVRTC (no GPU needed)
+tests/api_check.c   the public API alone (see above)
+tests/install_check.sh  make install, pkg-config, exports, header as C/C++
 tools/pocl_env.sh   a real OpenCL device without a GPU (PoCL), for the above
 cli/aegenc.c        command line front end
 tests/              synthetic clip generator, single-MB probe, test runner

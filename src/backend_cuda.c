@@ -566,7 +566,7 @@ static int cuda_load(void **lib)
         *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
         if (*lib)
             return AEG_OK;
-        aeg_log(1, "aeg: AEG_CUDA_LIB=%s: %s", ev, dlerror());
+        aeg_log(AEG_LOG_WARNING, "aeg: AEG_CUDA_LIB=%s: %s", ev, dlerror());
     }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -590,7 +590,7 @@ static int nvrtc_load(void **lib)
         *lib = dlopen(ev, RTLD_NOW | RTLD_LOCAL);
         if (*lib)
             return AEG_OK;
-        aeg_log(1, "aeg: AEG_NVRTC_LIB=%s: %s", ev, dlerror());
+        aeg_log(AEG_LOG_WARNING, "aeg: AEG_NVRTC_LIB=%s: %s", ev, dlerror());
     }
     for (i = 0; names[i]; i++) {
         *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -704,13 +704,13 @@ static int cuda_build_module(cuda_ctx *o)
     if (rc == AEG_EBACKEND) {
         int fb = cuda_fallback_arch(cc);
         if (fb && fb != cc) {
-            aeg_log(1, "aeg: NVRTC cannot target compute_%d, using compute_%d",
+            aeg_log(AEG_LOG_WARNING, "aeg: NVRTC cannot target compute_%d, using compute_%d",
                     cc, fb);
             rc = cuda_compile_ptx(fb, &ptx, NULL, log, sizeof(log));
         }
     }
     if (rc != AEG_OK) {
-        aeg_log(1, "aeg: NVRTC build failed (compute_%d): %s", cc, log);
+        aeg_log(AEG_LOG_WARNING, "aeg: NVRTC build failed (compute_%d): %s", cc, log);
         return rc;
     }
     cr = p_cuModuleLoadDataEx(&o->mod, ptx, 0, NULL, NULL);
@@ -731,7 +731,7 @@ static int nvrtc_bind(void *lib_nvrtc)
 {
 #define BIND_NVRTC(ret, name, args) \
     if (!(*(void **)(&p_##name) = dlsym(lib_nvrtc, #name))) { \
-        aeg_log(2, "aeg: NVRTC is missing %s", #name); \
+        aeg_log(AEG_LOG_DEBUG, "aeg: NVRTC is missing %s", #name); \
         return AEG_EBACKEND; \
     }
     NVRTC_SYMS(BIND_NVRTC)
@@ -854,7 +854,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
 #define LOAD_CUDA(ret, name, args) do { \
         *(void **)(&p_##name) = dlsym(lib_cuda, #name); \
         if (!p_##name) { \
-            aeg_log(2, "aeg: CUDA driver is missing %s", #name); \
+            aeg_log(AEG_LOG_DEBUG, "aeg: CUDA driver is missing %s", #name); \
             dlclose(lib_cuda); \
             return AEG_EBACKEND; \
         } \
@@ -862,7 +862,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
 #define LOAD_NVRTC(ret, name, args) do { \
         *(void **)(&p_##name) = dlsym(lib_nvrtc, #name); \
         if (!p_##name) { \
-            aeg_log(2, "aeg: NVRTC is missing %s", #name); \
+            aeg_log(AEG_LOG_DEBUG, "aeg: NVRTC is missing %s", #name); \
             dlclose(lib_nvrtc); \
             dlclose(lib_cuda); \
             return AEG_EBACKEND; \

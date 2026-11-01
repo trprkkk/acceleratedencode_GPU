@@ -35,6 +35,22 @@ extern "C" {
 #define AEG_VERSION_MINOR 1
 #define AEG_VERSION_PATCH 0
 #define AEG_VERSION_STRING "0.1.0"
+/* (major << 16) | (minor << 8) | patch, comparable with aeg_version_number() */
+#define AEG_VERSION_NUMBER \
+    ((AEG_VERSION_MAJOR << 16) | (AEG_VERSION_MINOR << 8) | AEG_VERSION_PATCH)
+
+/* Every public function and object carries AEG_API.  The shared library is
+ * built with -fvisibility=hidden, so only these are exported; the encoder's
+ * internal functions stay private to it. */
+#ifndef AEG_API
+# if defined(_WIN32) && defined(AEG_BUILDING_DLL)
+#  define AEG_API __declspec(dllexport)
+# elif defined(__GNUC__) && __GNUC__ >= 4
+#  define AEG_API __attribute__((visibility("default")))
+# else
+#  define AEG_API
+# endif
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Error codes                                                         */
@@ -74,8 +90,8 @@ enum aeg_stage {
     AEG_STAGE_COUNT       = 9
 };
 
-const char *aeg_stage_name(int stage);
-const char *aeg_backend_name(aeg_backend b);
+AEG_API const char *aeg_stage_name(int stage);
+AEG_API const char *aeg_backend_name(aeg_backend b);
 
 /* ------------------------------------------------------------------ */
 /* Encoder parameters                                                  */
@@ -97,6 +113,12 @@ typedef enum aeg_rcmode {
 typedef struct aeg_params {
     int width, height;        /* luma dimensions, >= 16, any value      */
     int fps_num, fps_den;     /* frame rate (e.g. 30/1, 30000/1001)     */
+    /* The unit of the pts passed in and of the pts/dts handed back, in
+     * seconds as a fraction (e.g. 1/90000 for MPEG-TS, 1/1000 for ms).  0/0
+     * (the default) = fps_den/fps_num, i.e. the pts counts frames.  It is used
+     * only to derive the packets' dts (see aeg_packet) and changes no coding
+     * decision. */
+    int timebase_num, timebase_den;
     /* Signalled in the SPS (VUI) only; they change no coding decision.
      * sar_w:sar_h is the sample aspect ratio (0:0 = not signalled);
      * fullrange 1 = the samples use 0..255 (JPEG/"pc" range), 0 = 16..235;
@@ -236,19 +258,29 @@ typedef struct aeg_params {
     int trellis;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8, 16=8x8 split further */
     int chroma_me;            /* include chroma in motion SAD           */
-    int verbose;              /* log verbosity                          */
+    int verbose;              /* unused; see aeg_set_log_level()        */
     int force_cpu_reference;  /* also compute CPU path for validation   */
     const char *dump_stats;   /* optional per-frame CSV path            */
 } aeg_params;
 
-void aeg_params_default(aeg_params *p);
+AEG_API void aeg_params_default(aeg_params *p);
 
-/* One compressed access unit (Annex-B byte stream, no start code prefix
- * added: the buffer starts at the first NAL unit's start code). */
+/* One compressed access unit: an Annex-B byte stream (every NAL unit is
+ * preceded by a start code; the buffer starts with the first one).  The data
+ * belongs to the encoder and stays valid until the next call on the same
+ * encoder (encode, flush, headers or close); copy it to keep it.
+ *
+ * pts is the one the picture was submitted with.  dts is its decoding time in
+ * the same unit: packets come out in decoding order, and with B pictures that
+ * is not the display order, so a container (MP4, MKV) needs both.  dts
+ * increases strictly from packet to packet and never exceeds pts as long as
+ * the pts advance by one frame duration (params.timebase) per picture; it
+ * starts `bframes` frame durations before the first pts, as x264's does. */
 typedef struct aeg_packet {
     uint8_t *data;
     size_t   size;
     int64_t  pts;
+    int64_t  dts;
     int      keyframe;
     int      qp;
     int      type;     /* 0 = I, 1 = P, 2 = B, 3 = B used as a reference */
@@ -305,18 +337,50 @@ typedef struct aeg_encoder aeg_encoder;
 /* ------------------------------------------------------------------ */
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
-aeg_encoder *aeg_encoder_open(const aeg_params *params);
-int  aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p,
-                        size_t size, int64_t pts, aeg_packet *pkt);
-int  aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt);
-void aeg_packet_free(aeg_packet *pkt);
-int  aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out);
+/* Thread safety: one encoder must not be used by two threads at once, but
+ * any number of encoders can run in parallel threads, and they produce the
+ * same bytes as when they run alone (the encoder keeps no global state; its
+ * own worker threads are internal).  aeg_last_error() is per thread. */
+
+/* Returns NULL on failure; aeg_last_error() says why. */
+AEG_API aeg_encoder *aeg_encoder_open(const aeg_params *params);
+/* Encode one picture given as packed planar 4:2:0 (I420): the Y plane of
+ * width x height bytes followed by the U and V planes of
+ * ((width + 1) / 2) x ((height + 1) / 2) bytes each, without row padding.
+ * Returns AEG_OK with a packet, AEG_EAGAIN when the picture was taken but no
+ * packet is ready yet (B pictures: the encoder holds a lookahead), or an
+ * error (< 0). */
+AEG_API int  aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p,
+                                size_t size, int64_t pts, aeg_packet *pkt);
+/* The same from three separate planes with their own row strides in bytes
+ * (stride[0] >= width, stride[1..2] >= (width + 1) / 2), e.g. a decoder's
+ * frame or a padded capture buffer.  The output is byte-identical to
+ * aeg_encoder_encode() on the same samples. */
+AEG_API int  aeg_encoder_encode_planes(aeg_encoder *enc,
+                                       const uint8_t *const plane[3],
+                                       const int stride[3], int64_t pts,
+                                       aeg_packet *pkt);
+/* After the last picture: call until it returns AEG_EOF; each AEG_OK hands
+ * back one more packet. */
+AEG_API int  aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt);
+AEG_API void aeg_packet_free(aeg_packet *pkt);
+/* The stream's parameter sets: the SPS and PPS NAL units (Annex-B, with
+ * start codes) that every IDR picture repeats in-band, available right after
+ * aeg_encoder_open().  Containers that keep them out of band (MP4/MKV avcC,
+ * "global headers") take them from here.  pkt->data stays valid until the
+ * next call on the encoder; pts/dts/qp are 0, keyframe 1. */
+AEG_API int  aeg_encoder_headers(aeg_encoder *enc, aeg_packet *pkt);
+/* The parameters the encoder actually runs with: the caller's, with every
+ * "-1 = as the preset says" resolved, the options that cannot be combined
+ * turned off (e.g. CAVLC drops B pictures) and the level filled in. */
+AEG_API int  aeg_encoder_get_params(aeg_encoder *enc, aeg_params *out);
+AEG_API int  aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out);
 /* Read-only access to the reconstruction of the most recently encoded frame.
  * The pointers stay valid until the next encode call.  Used by the test tools
  * to compare the encoder's own reconstruction against an independent decoder. */
-int  aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3],
-                       int stride[3], int mb_qp[]);
-int  aeg_encoder_set_qp(aeg_encoder *enc, int qp);
+AEG_API int  aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3],
+                               int stride[3], int mb_qp[]);
+AEG_API int  aeg_encoder_set_qp(aeg_encoder *enc, int qp);
 /* Bias the QP of the pictures submitted from now on, in QP steps (positive =
  * coarser).  The bias belongs to the picture it was set for: with B pictures a
  * picture is coded later than it is submitted, and it is coded with the bias
@@ -324,7 +388,7 @@ int  aeg_encoder_set_qp(aeg_encoder *enc, int qp);
  * redistribute a fixed budget: the rate controller keeps the stream on target,
  * the bias moves bits from the pictures that are easy to the ones that are
  * hard.  It is cleared by aeg_encoder_open(). */
-int  aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset);
+AEG_API int  aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset);
 /* Second pass of a two-pass encode (ABR only, before the first picture): f[d]
  * is the first pass's measurement of the picture with display index d.  The
  * encoder plans every picture's QP from it -- x264's second pass: each
@@ -334,9 +398,37 @@ int  aeg_encoder_set_qp_offset(aeg_encoder *enc, int offset);
  * spent differ from what it expected.  Pictures past n fall back to the
  * one-pass controller.  Returns AEG_OK, or AEG_EINVAL without a bitrate
  * target or once encoding has started. */
-int  aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n);
-void aeg_encoder_close(aeg_encoder *enc);
-const char *aeg_last_error(void);
+AEG_API int  aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f,
+                                   int n);
+AEG_API void aeg_encoder_close(aeg_encoder *enc);
+/* A description of the last error of a call made by this thread ("" if
+ * none).  The string is static. */
+AEG_API const char *aeg_last_error(void);
+
+/* The library's version at run time (the macros above are the header's). */
+AEG_API const char *aeg_version(void);
+AEG_API int aeg_version_number(void);
+
+/* ------------------------------------------------------------------ */
+/* Logging                                                             */
+/* ------------------------------------------------------------------ */
+enum {
+    AEG_LOG_ERROR   = 0,
+    AEG_LOG_WARNING = 1,   /* the default threshold */
+    AEG_LOG_INFO    = 2,
+    AEG_LOG_DEBUG   = 3
+};
+/* A log message, one line without the newline.  It can be called from the
+ * encoder's worker threads and from several encoders at once, so it has to be
+ * thread-safe; msg is only valid during the call. */
+typedef void (*aeg_log_fn)(void *opaque, int level, const char *msg);
+/* Route the library's messages to fn (NULL = back to stderr, the default).
+ * Process-wide, like the level.  Change it while no encoder is running: a
+ * message already on its way may still reach the previous function. */
+AEG_API void aeg_set_log_callback(aeg_log_fn fn, void *opaque);
+/* Messages above `level` are dropped (-1 = none at all). */
+AEG_API void aeg_set_log_level(int level);
+AEG_API int  aeg_get_log_level(void);
 
 /* Compute device information (for logging / CLI --list-devices). */
 typedef struct aeg_device_info {
@@ -350,13 +442,15 @@ typedef struct aeg_device_info {
     int64_t     bytes_per_ns;       /* measured upload bandwidth        */
 } aeg_device_info;
 
-int aeg_query_devices(aeg_backend backend, aeg_device_info *out, int max);
-int aeg_calibrate(aeg_backend backend); /* measure launch overhead etc.   */
+AEG_API int aeg_query_devices(aeg_backend backend, aeg_device_info *out,
+                              int max);
+AEG_API int aeg_calibrate(aeg_backend backend); /* measure launch overhead */
 
-int64_t aeg_now_ns(void);
+AEG_API int64_t aeg_now_ns(void);
 
-/* Library log verbosity (0 = quiet, 1 = normal, 2 = debug). */
-extern int aeg_log_level;
+/* The log threshold as a variable, kept for existing callers; prefer
+ * aeg_set_log_level(). */
+AEG_API extern int aeg_log_level;
 
 #ifdef __cplusplus
 }

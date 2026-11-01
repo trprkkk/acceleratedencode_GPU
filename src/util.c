@@ -2,22 +2,76 @@
  * Allocation, logging, timing and small shared helpers.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
 #include "h264.h"
 
-int aeg_log_level = 1;
+int aeg_log_level = AEG_LOG_WARNING;
+
+/* The sink is process-wide.  Messages come from the caller's thread and from
+ * the encoder's workers, so the pair (fn, opaque) is read and written under a
+ * lock: a message never goes to a new function with the old one's opaque. */
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static aeg_log_fn g_log_fn;
+static void *g_log_opaque;
+
+void aeg_set_log_callback(aeg_log_fn fn, void *opaque)
+{
+    pthread_mutex_lock(&g_log_lock);
+    g_log_fn = fn;
+    g_log_opaque = fn ? opaque : NULL;
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+void aeg_set_log_level(int level)
+{
+    aeg_log_level = level < -1 ? -1 : level;
+}
+
+int aeg_get_log_level(void)
+{
+    return aeg_log_level;
+}
 
 void aeg_log(int level, const char *fmt, ...)
 {
+    char msg[1024];
     va_list ap;
+    size_t n;
+    aeg_log_fn fn;
+    void *opaque;
+
     if (level > aeg_log_level)
         return;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    n = strlen(msg);
+    while (n && msg[n - 1] == '\n')
+        msg[--n] = 0;
+    pthread_mutex_lock(&g_log_lock);
+    fn = g_log_fn;
+    opaque = g_log_opaque;
+    if (!fn) {
+        /* one call per line keeps lines from two threads apart */
+        fprintf(stderr, "%s\n", msg);
+        pthread_mutex_unlock(&g_log_lock);
+        return;
+    }
+    pthread_mutex_unlock(&g_log_lock);
+    fn(opaque, level, msg);
+}
+
+const char *aeg_version(void)
+{
+    return AEG_VERSION_STRING;
+}
+
+int aeg_version_number(void)
+{
+    return AEG_VERSION_NUMBER;
 }
 
 void *aeg_alloc_aligned(size_t size, size_t align)
@@ -165,7 +219,8 @@ void aeg_params_default(aeg_params *p)
 /* ------------------------------------------------------------------ */
 /* Stage/backend timing accounting shared by encoder and backends      */
 /* ------------------------------------------------------------------ */
-static const char *g_last_error = "";
+/* per thread: two encoders failing in two threads each see their own */
+static _Thread_local const char *g_last_error = "";
 
 void aeg_set_last_error(const char *msg)
 {

@@ -133,6 +133,19 @@ struct aeg_encoder {
     int mb_w, mb_h, mb_count;
     int stride[3];
     int frame_num_bits, level_idc;
+    /* the parameter sets as every IDR carries them (aeg_encoder_headers) */
+    uint8_t hdr[1024];
+    size_t  hdr_len;
+    int     level_out;        /* the level_idc the SPS signals            */
+    /* dts: the submitted pts in submission (= display) order, popped one per
+     * packet; packet k decodes at the k-th display time, `bframes` frames
+     * early.  dts_dur is one frame in the caller's pts unit. */
+    int64_t *dts_q;
+    int     dts_cap, dts_head, dts_n;
+    double  dts_dur;
+    /* AEG_LATIME: time in the scheduler, waiting for and inside the frame
+     * thread workers (per encoder: encoders may run in parallel threads) */
+    int64_t sched_ns, ft_wait_ns, ft_worker_ns;
 
     uint8_t *src_mem;
     uint8_t *srcp[3];
@@ -9875,7 +9888,7 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         is_idr = 1;
         slice = AEG_SLICE_I;
         e->scene_cuts++;
-        aeg_log(2, "aeg: scene cut at frame %d -> IDR", e->frame_count);
+        aeg_log(AEG_LOG_DEBUG, "aeg: scene cut at frame %d -> IDR", e->frame_count);
     }
     is_p = slice == AEG_SLICE_P && !is_idr && e->has_ref;
     if (is_p != e->cur_is_p) {
@@ -10001,12 +10014,12 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
     aq_compute(e);
     mbt_apply(e);
     crf_dither(e, poc);
-    if (aeg_log_level >= 2) {
+    if (aeg_log_level >= AEG_LOG_DEBUG) {
         long t = 0;
         int i;
         for (i = 0; i < e->mb_count; i++)
             t += mb_qp_of(e, i % e->mb_w, i / e->mb_w);
-        aeg_log(2, "aeg: picture %d %c qp %d, macroblock average %.2f", poc,
+        aeg_log(AEG_LOG_DEBUG, "aeg: picture %d %c qp %d, macroblock average %.2f", poc,
                 is_idr || slice == AEG_SLICE_I ? 'I' : e->cur_is_b ? 'B' : 'P',
                 e->cur_qp, (double)t / e->mb_count);
     }
@@ -10168,25 +10181,8 @@ recode:
                                  aud, 1, 1);
     }
     if (is_idr) {
-        uint8_t sps[256], pps[64];
-        size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
-                                  e->frame_num_bits, e->level_idc);
-        size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                                  e->p.transform_8x8,
-                                  e->p.cabac, 0);
-        out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 7,
-                                 sps, sl, 1);
-        out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 3, 8,
-                                 pps, pl, 0);
-        if (e->p.weightp) {
-            /* PPS 1: the same with weighted_pred_flag, for the P pictures
-             * that send weights (the others keep referring to PPS 0) */
-            pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                               e->p.transform_8x8,
-                               e->p.cabac, 1);
-            out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len,
-                                     3, 8, pps, pl, 0);
-        }
+        memcpy(e->out + out_len, e->hdr, e->hdr_len);
+        out_len += e->hdr_len;
     }
     /* SEI, before the slices: the HRD's buffering period (IDR) and picture
      * timing (every picture), and the info text on the first picture.  A
@@ -10589,15 +10585,15 @@ static int in_slots(const struct aeg_encoder *e)
  * away; repeating them keeps the edge macroblocks as cheap as the content
  * next to them), then the usual padding. */
 static void copy_plane_crop(uint8_t *dst, int dstride, const uint8_t *src,
-                            int vw, int vh, int w, int h)
+                            int sstride, int vw, int vh, int w, int h)
 {
     int y;
     if (vw == w && vh == h) {
-        copy_plane_pad(dst, dstride, src, w, w, h);
+        copy_plane_pad(dst, dstride, src, sstride, w, h);
         return;
     }
     for (y = 0; y < vh; y++) {
-        memcpy(dst + y * dstride, src + (size_t)y * vw, (size_t)vw);
+        memcpy(dst + y * dstride, src + (size_t)y * sstride, (size_t)vw);
         if (w > vw)
             memset(dst + y * dstride + vw, dst[y * dstride + vw - 1],
                    (size_t)(w - vw));
@@ -10607,15 +10603,49 @@ static void copy_plane_crop(uint8_t *dst, int dstride, const uint8_t *src,
     pad_edges(dst, dstride, w, h);
 }
 
+/* The caller's picture: three planes, each with its own row stride. */
+typedef struct aeg_src {
+    const uint8_t *plane[3];
+    int stride[3];
+} aeg_src;
+
 static void copy_yuv(const struct aeg_encoder *e, uint8_t *p[3],
-                     const uint8_t *yuv420p)
+                     const aeg_src *in)
 {
-    size_t ls = (size_t)e->vw * e->vh, cs = (size_t)e->vcw * e->vch;
-    copy_plane_crop(p[0], e->stride[0], yuv420p, e->vw, e->vh, e->w, e->h);
-    copy_plane_crop(p[1], e->stride[1], yuv420p + ls, e->vcw, e->vch,
-                    e->cw, e->ch);
-    copy_plane_crop(p[2], e->stride[2], yuv420p + ls + cs, e->vcw, e->vch,
-                    e->cw, e->ch);
+    copy_plane_crop(p[0], e->stride[0], in->plane[0], in->stride[0], e->vw,
+                    e->vh, e->w, e->h);
+    copy_plane_crop(p[1], e->stride[1], in->plane[1], in->stride[1], e->vcw,
+                    e->vch, e->cw, e->ch);
+    copy_plane_crop(p[2], e->stride[2], in->plane[2], in->stride[2], e->vcw,
+                    e->vch, e->cw, e->ch);
+}
+
+/* SPS, PPS 0 and (with weighted prediction) PPS 1, as NAL units with start
+ * codes: what every IDR picture begins with. */
+static int write_param_sets(struct aeg_encoder *e)
+{
+    uint8_t sps[256], pps[64];
+    size_t n = 0, cap = sizeof(e->hdr);
+    size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
+                              e->frame_num_bits, e->level_idc);
+    size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
+                              e->p.transform_8x8, e->p.cabac, 0);
+    /* worst case of a NAL: start code, header, and an emulation prevention
+     * byte every two payload bytes */
+    if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
+        return AEG_ERROR;
+    e->level_out = sps[2];   /* profile_idc, constraint flags, level_idc */
+    n += aeg_nal_write(e->hdr + n, cap - n, 3, 7, sps, sl, 1);
+    n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
+    if (e->p.weightp) {
+        /* PPS 1: the same with weighted_pred_flag, for the P pictures that
+         * send weights (the others keep referring to PPS 0) */
+        pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
+                           e->p.transform_8x8, e->p.cabac, 1);
+        n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
+    }
+    e->hdr_len = n;
+    return AEG_OK;
 }
 
 static void bind_source(struct aeg_encoder *e, int display)
@@ -10625,11 +10655,11 @@ static void bind_source(struct aeg_encoder *e, int display)
         e->srcp[i] = e->in_plane[slot][i];
 }
 
-static void push_input(struct aeg_encoder *e, const uint8_t *yuv420p,
+static void push_input(struct aeg_encoder *e, const aeg_src *in,
                        int64_t pts)
 {
     int slot = e->in_count % in_slots(e);
-    copy_yuv(e, e->in_plane[slot], yuv420p);
+    copy_yuv(e, e->in_plane[slot], in);
     if (e->in_low[slot].mem)
         aeg_lowres_build(&e->in_low[slot], e->in_plane[slot][0], e->stride[0],
                          e->w, e->h);
@@ -11085,12 +11115,11 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
 
 /* Fill the job queue with the next coding step, if the input has arrived. */
 static void schedule_(struct aeg_encoder *e);
-int64_t aeg_sched_ns, aeg_ft_wait_ns, aeg_ft_worker_ns;
 static void schedule(struct aeg_encoder *e)
 {
     int64_t t0 = aeg_now_ns();
     schedule_(e);
-    aeg_sched_ns += aeg_now_ns() - t0;
+    e->sched_ns += aeg_now_ns() - t0;
 }
 static void schedule_(struct aeg_encoder *e)
 {
@@ -11163,7 +11192,7 @@ static void schedule_(struct aeg_encoder *e)
             nxt = c;
             idr = 1;
             e->scene_cuts++;
-            aeg_log(2, "aeg: scene cut at frame %d -> IDR", nxt);
+            aeg_log(AEG_LOG_DEBUG, "aeg: scene cut at frame %d -> IDR", nxt);
             break;
         }
     }
@@ -11288,7 +11317,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->bframes < 0) pp->bframes = 0;
     if (pp->bframes > AEG_MAX_BFRAMES) pp->bframes = AEG_MAX_BFRAMES;
     if (pp->bframes > 0 && !pp->cabac) {
-        aeg_log(1, "aeg: B pictures need CABAC; coding without them");
+        aeg_log(AEG_LOG_WARNING, "aeg: B pictures need CABAC; coding without them");
         pp->bframes = 0;
     }
     /* A second P reference (list0[1], the anchor before the previous one).
@@ -11376,7 +11405,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (pp->bitrate_kbps <= 0)
             pp->bitrate_kbps = pp->vbv_maxrate_kbps;
         if (pp->bitrate_kbps > pp->vbv_maxrate_kbps) {
-            aeg_log(1, "aeg: bitrate clamped to the VBV maximum rate (%d kb/s)",
+            aeg_log(AEG_LOG_WARNING, "aeg: bitrate clamped to the VBV maximum rate (%d kb/s)",
                     pp->vbv_maxrate_kbps);
             pp->bitrate_kbps = pp->vbv_maxrate_kbps;
         }
@@ -11395,7 +11424,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->abr_on = 1;
         e->abr_fps = fps;
         e->abr_bpf = (double)pp->bitrate_kbps * 1000.0 / fps;
-        aeg_log(1, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
+        aeg_log(AEG_LOG_INFO, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
                 pp->bitrate_kbps, e->abr_bpf, fps, pp->qp);
     }
     if (pp->vbv_maxrate_kbps > 0 && (e->rc_active || e->crf_on)) {
@@ -11412,7 +11441,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             e->last_pic_qp = -1;
             e->last_anchor_bits = 0;
             e->last_anchor_qp = -1;
-            aeg_log(1, "aeg: VBV %d kb/s, buffer %d kbit -> level %.0f bits, "
+            aeg_log(AEG_LOG_INFO, "aeg: VBV %d kb/s, buffer %d kbit -> level %.0f bits, "
                         "%.0f bits delivered per picture",
                     pp->vbv_maxrate_kbps, pp->vbv_bufsize_kbits,
                     e->vbv_full, e->vbv_rate_bits);
@@ -11424,7 +11453,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->vw = params->width & ~1;
     e->vh = params->height & ~1;
     if (e->vw != params->width || e->vh != params->height)
-        aeg_log(1, "aeg: odd dimensions rounded down to %dx%d", e->vw, e->vh);
+        aeg_log(AEG_LOG_WARNING, "aeg: odd dimensions rounded down to %dx%d", e->vw, e->vh);
     e->vcw = e->vw / 2;
     e->vch = e->vh / 2;
     pp->width = e->vw;
@@ -11661,7 +11690,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             }
         }
         if (!e->abr_on)
-            aeg_log(1, "aeg: CRF %.2f, qcomp %.2f%s", e->p.crf,
+            aeg_log(AEG_LOG_INFO, "aeg: CRF %.2f, qcomp %.2f%s", e->p.crf,
                     e->p.qcomp / 100.0,
                     e->la_depth ? " (with the macroblock tree)" : "");
     }
@@ -11751,7 +11780,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (aeg_hrd_values(&e->p, &e->hrd_rate, &e->hrd_cpb) && e->vbv_active) {
         e->hrd_on = 1;
     } else if (e->p.nal_hrd) {
-        aeg_log(1, "aeg: nal_hrd needs the VBV model (vbv maxrate and buffer "
+        aeg_log(AEG_LOG_WARNING, "aeg: nal_hrd needs the VBV model (vbv maxrate and buffer "
                    "size); no HRD is signalled");
         e->p.nal_hrd = 0;
     }
@@ -11788,7 +11817,22 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  e->p.deblock, e->p.deblock_alpha, e->p.deblock_beta,
                  e->n_slices, crf_txt);
     }
-    aeg_log(1, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
+    if (write_param_sets(e) != AEG_OK) {
+        aeg_set_last_error("parameter sets do not fit");
+        aeg_encoder_close(e);
+        return NULL;
+    }
+    /* one frame in the caller's pts unit: (fps_den / fps_num) seconds over
+     * (tb_num / tb_den) seconds per tick */
+    if (pp->timebase_num > 0 && pp->timebase_den > 0)
+        e->dts_dur = (double)pp->fps_den * pp->timebase_den /
+                     ((double)pp->fps_num * pp->timebase_num);
+    else {
+        pp->timebase_num = pp->fps_den;
+        pp->timebase_den = pp->fps_num;
+        e->dts_dur = 1.0;
+    }
+    aeg_log(AEG_LOG_INFO, "aeg %s: %dx%d, %dx%d macroblocks, qp %d, gop %d",
             AEG_VERSION_STRING, e->w, e->h, e->mb_w, e->mb_h, e->p.qp, e->p.gop_size);
     return e;
 }
@@ -12159,11 +12203,10 @@ static int ft_join(struct aeg_encoder *e, struct ft_worker *w)
     if (!w->busy)
         return AEG_OK;
     if (w->busy == 1) {
-        extern int64_t aeg_ft_wait_ns, aeg_ft_worker_ns;
         int64_t t0 = aeg_now_ns();
         pthread_join(w->th, NULL);
-        aeg_ft_wait_ns += aeg_now_ns() - t0;
-        aeg_ft_worker_ns += w->ns;
+        e->ft_wait_ns += aeg_now_ns() - t0;
+        e->ft_worker_ns += w->ns;
     }
     w->busy = 0;
     /* buffers the coder may have grown or allocated */
@@ -12482,20 +12525,11 @@ static int ft_run(struct aeg_encoder *e, aeg_packet *pkt, int flushing)
     return AEG_OK;
 }
 
-int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
-                       int64_t pts, aeg_packet *pkt)
+static int encode_core(struct aeg_encoder *e, const aeg_src *in, int64_t pts,
+                       aeg_packet *pkt)
 {
-    struct aeg_encoder *e = (struct aeg_encoder *)enc;
-    size_t need;
     int is_idr;
 
-    if (!e || !yuv420p)
-        return AEG_EINVAL;
-    need = (size_t)e->vw * e->vh + 2 * (size_t)e->vcw * e->vch;
-    if (size < need) {
-        aeg_set_last_error("input buffer too small");
-        return AEG_EINVAL;
-    }
     if (!e->frame_count) {
         /* The reference samples of the top/left picture edge do not exist;
          * filling the padding with the mid grey keeps the prediction of the
@@ -12511,7 +12545,7 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
         }
     }
     if (!e->p.bframes) {
-        copy_yuv(e, e->srcp, yuv420p);
+        copy_yuv(e, e->srcp, in);
         is_idr = idr_due(e, e->frame_count);
         if (e->crf_low[0].mem) {
             /* CRF's complexity and the VBV's size estimate: this picture
@@ -12543,7 +12577,7 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
         if (rc != AEG_OK)
             return rc;
     }
-    push_input(e, yuv420p, pts);
+    push_input(e, in, pts);
     schedule(e);
     if (e->ft_on)
         return ft_run(e, pkt, 0);
@@ -12552,13 +12586,161 @@ int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
     return run_job(e, pkt);
 }
 
+/* A packet left the encoder: it decodes at the display time of the picture
+ * with its index in coding order, held back by the reorder depth. */
+static void set_dts(struct aeg_encoder *e, aeg_packet *pkt)
+{
+    int64_t t = pkt->pts;
+    if (e->dts_n) {
+        t = e->dts_q[e->dts_head];
+        e->dts_head = (e->dts_head + 1) % e->dts_cap;
+        e->dts_n--;
+    }
+    pkt->dts = t - (int64_t)llround(e->p.bframes * e->dts_dur);
+}
+
+static int dts_push(struct aeg_encoder *e, int64_t pts)
+{
+    if (e->dts_n == e->dts_cap) {
+        /* never more pictures in flight than the input ring holds; grow
+         * anyway rather than lose a timestamp */
+        int cap = e->dts_cap ? 2 * e->dts_cap : 64, i;
+        int64_t *q = (int64_t *)malloc(sizeof(*q) * (size_t)cap);
+        if (!q)
+            return AEG_ENOMEM;
+        for (i = 0; i < e->dts_n; i++)
+            q[i] = e->dts_q[(e->dts_head + i) % e->dts_cap];
+        free(e->dts_q);
+        e->dts_q = q;
+        e->dts_cap = cap;
+        e->dts_head = 0;
+    }
+    e->dts_q[(e->dts_head + e->dts_n) % e->dts_cap] = pts;
+    e->dts_n++;
+    return AEG_OK;
+}
+
+static int encode_src(struct aeg_encoder *e, const aeg_src *in, int64_t pts,
+                      aeg_packet *pkt)
+{
+    int rc;
+    if (dts_push(e, pts) != AEG_OK) {
+        aeg_set_last_error("out of memory");
+        return AEG_ENOMEM;
+    }
+    rc = encode_core(e, in, pts, pkt);
+    if (rc == AEG_OK && pkt && pkt->data)
+        set_dts(e, pkt);
+    else if (rc != AEG_OK && rc != AEG_EAGAIN && e->dts_n) {
+        /* the picture was refused: forget its timestamp again */
+        e->dts_n--;
+    }
+    return rc;
+}
+
+int aeg_encoder_encode(aeg_encoder *enc, const uint8_t *yuv420p, size_t size,
+                       int64_t pts, aeg_packet *pkt)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    size_t ls, cs;
+    aeg_src in;
+
+    if (!e || !yuv420p || !pkt) {
+        aeg_set_last_error("aeg_encoder_encode: NULL argument");
+        return AEG_EINVAL;
+    }
+    ls = (size_t)e->vw * e->vh;
+    cs = (size_t)e->vcw * e->vch;
+    if (size < ls + 2 * cs) {
+        aeg_set_last_error("input buffer too small");
+        return AEG_EINVAL;
+    }
+    in.plane[0] = yuv420p;
+    in.plane[1] = yuv420p + ls;
+    in.plane[2] = yuv420p + ls + cs;
+    in.stride[0] = e->vw;
+    in.stride[1] = in.stride[2] = e->vcw;
+    return encode_src(e, &in, pts, pkt);
+}
+
+int aeg_encoder_encode_planes(aeg_encoder *enc, const uint8_t *const plane[3],
+                              const int stride[3], int64_t pts,
+                              aeg_packet *pkt)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    aeg_src in;
+    int i;
+
+    if (!e || !plane || !stride || !pkt) {
+        aeg_set_last_error("aeg_encoder_encode_planes: NULL argument");
+        return AEG_EINVAL;
+    }
+    for (i = 0; i < 3; i++) {
+        if (!plane[i]) {
+            aeg_set_last_error("aeg_encoder_encode_planes: NULL plane");
+            return AEG_EINVAL;
+        }
+        if (stride[i] < (i ? e->vcw : e->vw)) {
+            aeg_set_last_error("aeg_encoder_encode_planes: stride smaller "
+                               "than the plane's width");
+            return AEG_EINVAL;
+        }
+        in.plane[i] = plane[i];
+        in.stride[i] = stride[i];
+    }
+    return encode_src(e, &in, pts, pkt);
+}
+
+int aeg_encoder_headers(aeg_encoder *enc, aeg_packet *pkt)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    if (!e || !pkt) {
+        aeg_set_last_error("aeg_encoder_headers: NULL argument");
+        return AEG_EINVAL;
+    }
+    memset(pkt, 0, sizeof(*pkt));
+    pkt->data = e->hdr;
+    pkt->size = e->hdr_len;
+    pkt->keyframe = 1;
+    return AEG_OK;
+}
+
+int aeg_encoder_get_params(aeg_encoder *enc, aeg_params *out)
+{
+    struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    if (!e || !out) {
+        aeg_set_last_error("aeg_encoder_get_params: NULL argument");
+        return AEG_EINVAL;
+    }
+    *out = e->p;
+    out->level_idc = e->level_out;
+    out->slices = e->n_slices;
+    out->frame_threads = e->ft_on ? 2 : 1;
+    return AEG_OK;
+}
+
+static int flush_core(struct aeg_encoder *e, aeg_packet *pkt);
+
 int aeg_encoder_flush(aeg_encoder *enc, aeg_packet *pkt)
 {
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
+    int rc;
+    if (!e) {
+        if (pkt)
+            pkt->data = NULL, pkt->size = 0;
+        return AEG_EOF;
+    }
+    rc = flush_core(e, pkt);
+    if (rc == AEG_OK && pkt && pkt->data)
+        set_dts(e, pkt);
+    return rc;
+}
 
+static int flush_core(struct aeg_encoder *e, aeg_packet *pkt)
+{
     if (pkt)
         pkt->data = NULL, pkt->size = 0;
-    if (!e || !e->p.bframes)
+    if (!e->p.bframes)
         return AEG_EOF;
     if (e->ft_on) {
         int rc;
@@ -12896,7 +13078,7 @@ int aeg_encoder_set_pass1(aeg_encoder *enc, const aeg_pass1_frame *f, int n)
     e->plan_n = n;
     e->plan_total = total;
     e->plan_exp_sum = 0.0;
-    aeg_log(1, "aeg: two-pass plan: %d pictures, %.1f kb/s expected "
+    aeg_log(AEG_LOG_INFO, "aeg: two-pass plan: %d pictures, %.1f kb/s expected "
                "(target %d), average QP %.2f", cnt,
             cnt ? total * e->abr_fps / cnt / 1000.0 : 0.0,
             e->p.bitrate_kbps, cnt ? qsum / cnt : 0.0);
@@ -12932,9 +13114,10 @@ void aeg_encoder_close(aeg_encoder *enc)
         return;
     if (getenv("AEG_LATIME"))
         fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms, "
-                "restarts %lld\n", aeg_sched_ns / 1e6, aeg_ft_wait_ns / 1e6,
-                aeg_ft_worker_ns / 1e6, e->fsync ? (long long)e->fsync->restarts : 0LL);
+                "restarts %lld\n", e->sched_ns / 1e6, e->ft_wait_ns / 1e6,
+                e->ft_worker_ns / 1e6, e->fsync ? (long long)e->fsync->restarts : 0LL);
     ft_free(e);
+    free(e->dts_q);
     aeg_dispatch_destroy(&e->d);
     aeg_mc_ctx_free(&e->mc);
     aeg_mc_ctx_free(&e->mc1);

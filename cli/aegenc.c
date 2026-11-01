@@ -132,7 +132,7 @@ static void usage(void)
 "                   (default 15; P_8x8 is skipped by preset 0, and so\n"
 "                   are bits 1-3 for B pictures -- 16x8 and 8x16 are\n"
 "                   the only B shapes so far)\n"
-"  -v <int>         verbosity (0 quiet, 1 normal, 2 debug)\n"
+"  -v <int>         verbosity (0 errors only, 1 normal, 2 every picture)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
 "  --calibrate      measure the accelerator launch overhead and exit\n"
 "  --bench          encode three times (auto/cpu/accelerator) and report\n"
@@ -874,7 +874,11 @@ int main(int argc, char **argv)
     }
     if (trellis >= 0) p.trellis = trellis;
     if (partitions >= 0) p.partitions = partitions;
-    aeg_log_level = verbose;
+    /* -v 0 = errors only, 1 = warnings and the encoder's summary (info),
+     * 2 and up = every picture (debug) */
+    aeg_set_log_level(verbose ? (verbose + 1 > AEG_LOG_DEBUG ? AEG_LOG_DEBUG
+                                                             : verbose + 1)
+                              : AEG_LOG_ERROR);
 
     fsize = (size_t)width * height * 3 / 2;
     frame = (uint8_t *)malloc(fsize);

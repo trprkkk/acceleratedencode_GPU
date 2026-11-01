@@ -327,7 +327,7 @@ static int guard_enter(be_lane *l)
 static int guard_leave(be_lane *l, int rc, const char *op)
 {
     if (rc != AEG_OK && !__atomic_exchange_n(&l->g->failed, 1, __ATOMIC_ACQ_REL))
-        aeg_log(1, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
+        aeg_log(AEG_LOG_WARNING, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
     pthread_mutex_unlock(&l->mu);
     return rc == AEG_OK;
 }
@@ -563,9 +563,9 @@ void aeg_be_lane(const aeg_be_ops *ops, int k, aeg_be_ops *out)
                 c.destroy(c.priv);
         }
         if (l)
-            aeg_log(2, "aeg: device lane %d: %s", k, c.desc);
+            aeg_log(AEG_LOG_DEBUG, "aeg: device lane %d: %s", k, c.desc);
         else if (l0->dev.clone)
-            aeg_log(2, "aeg: device lane %d is lane 0 (%s)", k, aeg_last_error());
+            aeg_log(AEG_LOG_DEBUG, "aeg: device lane %d is lane 0 (%s)", k, aeg_last_error());
         g->lane[k] = l ? l : l0;
     }
     l = g->lane[k];
@@ -688,7 +688,7 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
         pthread_mutex_init((pthread_mutex_t *)d->mu, NULL);
     d->launch_ns = 5 * 1000;      /* refined by aeg_backend_calibrate() */
     d->min_items_for_gpu = 256;
-    aeg_log(1, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
+    aeg_log(AEG_LOG_INFO, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
             d->ops.desc);
 }
 
@@ -881,7 +881,7 @@ static void dispatch_coef_done(aeg_dispatcher *d, int kind, int dev,
         else if (c * 100 < g * 90)
             d->coef_dev[kind] = 0;
         if (d->coef_dev[kind] != was || first)
-            aeg_log(2, "aeg: coefficient stages of %c pictures on the %s "
+            aeg_log(AEG_LOG_DEBUG, "aeg: coefficient stages of %c pictures on the %s "
                     "(%.2f us/MB on the CPU, %.2f us/MB on the device)",
                     kind == 1 ? 'P' : 'B', d->coef_dev[kind] ? "device" : "CPU",
                     c / 1000.0, g / 1000.0);
@@ -973,7 +973,7 @@ int aeg_backend_calibrate(aeg_backend b)
     if (ops.destroy)
         ops.destroy(ops.priv);
     g_launch_ns = best;
-    aeg_log(1, "aeg: %s launch+transfer overhead ~%lld us",
+    aeg_log(AEG_LOG_INFO, "aeg: %s launch+transfer overhead ~%lld us",
             aeg_backend_name(ops.backend), (long long)(best / 1000));
     return AEG_OK;
 }

@@ -6,6 +6,12 @@
 #   make CUDA=1           also build the CUDA backend (driver API + NVRTC,
 #                         both loaded with dlopen -- no toolkit needed)
 #   make test             encode a synthetic clip and verify the bitstream
+#   make shared           also build the shared library (libaeg.so)
+#   make install          install aegenc, libaeg.a, libaeg.so, aeg/aeg.h and
+#                         aeg.pc under PREFIX (default /usr/local); DESTDIR
+#                         stages it, LIBDIR/INCLUDEDIR/BINDIR override parts
+#   make uninstall        remove what install put there
+#   make examples         the example program, built against the public API
 #
 CC      ?= gcc
 NVCC    ?= nvcc
@@ -21,6 +27,23 @@ LDLIBS  += -lm -ldl -lpthread
 BUILD   := build
 BIN     := $(BUILD)/aegenc
 LIB     := $(BUILD)/libaeg.a
+
+# The shared library: the same objects compiled position-independent and with
+# every symbol hidden except the AEG_API ones (include/aeg/aeg.h).  The soname
+# carries the major version; while it is 0 the ABI (struct layouts included)
+# may change from one release to the next.
+VERSION := $(shell sed -n 's/^\#define AEG_VERSION_STRING "\(.*\)"/\1/p' include/aeg/aeg.h)
+SOMAJOR := $(firstword $(subst ., ,$(VERSION)))
+SONAME  := libaeg.so.$(SOMAJOR)
+SHLIB   := $(BUILD)/libaeg.so.$(VERSION)
+
+PREFIX     ?= /usr/local
+EXEC_PREFIX ?= $(PREFIX)
+BINDIR     ?= $(EXEC_PREFIX)/bin
+LIBDIR     ?= $(EXEC_PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
+INSTALL    ?= install
 
 SRC := src/tables.c src/transform.c src/intra.c src/mc.c src/deblock.c \
        src/bitstream.c src/cavlc.c src/cabac.c src/util.c src/backend.c \
@@ -55,6 +78,60 @@ $(BUILD)/libaeg.a: $(OBJ)
 
 $(BIN): $(BUILD)/aegenc.o $(BUILD)/libaeg.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+
+# ------------------------------------------------------------------ #
+# Shared library, pkg-config file, install                           #
+# ------------------------------------------------------------------ #
+PIC_OBJ := $(patsubst $(BUILD)/%.o,$(BUILD)/pic/%.o,$(OBJ))
+
+$(BUILD)/pic:
+	mkdir -p $(BUILD)/pic
+
+$(BUILD)/pic/%.o: src/%.c | $(BUILD)/pic
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+
+$(SHLIB): $(PIC_OBJ)
+	$(CC) -shared -Wl,-soname,$(SONAME) $(LDFLAGS) $(PIC_OBJ) -o $@ $(LDLIBS)
+	ln -sf libaeg.so.$(VERSION) $(BUILD)/$(SONAME)
+	ln -sf libaeg.so.$(VERSION) $(BUILD)/libaeg.so
+
+# The .pc file names the install paths, so `install` writes it afresh from
+# the template with the PREFIX/LIBDIR of that run; $(BUILD)/aeg.pc is the
+# same for the default paths.
+PC_SED = sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@EXEC_PREFIX@|$(EXEC_PREFIX)|' \
+	    -e 's|@LIBDIR@|$(LIBDIR)|' -e 's|@INCLUDEDIR@|$(INCLUDEDIR)|' \
+	    -e 's|@VERSION@|$(VERSION)|' -e 's|@LIBS_PRIVATE@|$(LDLIBS)|' aeg.pc.in
+
+$(BUILD)/aeg.pc: aeg.pc.in include/aeg/aeg.h Makefile | $(BUILD)
+	$(PC_SED) > $@
+
+shared: $(SHLIB)
+
+install: $(BIN) $(LIB) $(SHLIB)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) \
+	    $(DESTDIR)$(INCLUDEDIR)/aeg $(DESTDIR)$(PKGCONFIGDIR)
+	$(INSTALL) -m 755 $(BIN) $(DESTDIR)$(BINDIR)/aegenc
+	$(INSTALL) -m 644 $(LIB) $(DESTDIR)$(LIBDIR)/libaeg.a
+	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/libaeg.so.$(VERSION)
+	ln -sf libaeg.so.$(VERSION) $(DESTDIR)$(LIBDIR)/$(SONAME)
+	ln -sf libaeg.so.$(VERSION) $(DESTDIR)$(LIBDIR)/libaeg.so
+	$(INSTALL) -m 644 include/aeg/aeg.h $(DESTDIR)$(INCLUDEDIR)/aeg/aeg.h
+	$(PC_SED) > $(DESTDIR)$(PKGCONFIGDIR)/aeg.pc
+	chmod 644 $(DESTDIR)$(PKGCONFIGDIR)/aeg.pc
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/aegenc $(DESTDIR)$(LIBDIR)/libaeg.a \
+	    $(DESTDIR)$(LIBDIR)/libaeg.so.$(VERSION) \
+	    $(DESTDIR)$(LIBDIR)/$(SONAME) $(DESTDIR)$(LIBDIR)/libaeg.so \
+	    $(DESTDIR)$(INCLUDEDIR)/aeg/aeg.h $(DESTDIR)$(PKGCONFIGDIR)/aeg.pc
+	-rmdir $(DESTDIR)$(INCLUDEDIR)/aeg
+
+# The example uses nothing but include/aeg/aeg.h (tests/install_check.sh
+# builds it again against an installed copy through pkg-config).
+$(BUILD)/encode_example: examples/encode.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+examples: $(BUILD)/encode_example
 
 # ------------------------------------------------------------------ #
 # Tests                                                              #
@@ -98,12 +175,24 @@ $(BUILD)/backend_check: tests/backend_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/nvrtc_check: tests/nvrtc_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
+# The public API on its own: logging, parameters, headers, strided input,
+# timestamps, errors and encoders running in parallel threads.
+$(BUILD)/api_check: tests/api_check.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+# Install into a scratch DESTDIR, then build and run the example against it
+# through pkg-config, shared and static, and check the exported symbols.
+install-check: $(BIN) $(LIB) $(SHLIB) $(BUILD)/genyuv
+	sh tests/install_check.sh $(BUILD)
+
 # `make test` runs the table consistency check, the CAVLC round-trip check and
 # the device-kernel cross-check (none of them need external dependencies), then
 # the end-to-end clip check (needs an ffmpeg binary; set FFMPEG=... ).
 test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
       $(BUILD)/cabac_check $(BUILD)/cabac_mb_check $(BUILD)/kernel_check \
-      $(BUILD)/coef_check $(BUILD)/backend_check $(BUILD)/nvrtc_check
+      $(BUILD)/coef_check $(BUILD)/backend_check $(BUILD)/nvrtc_check \
+      $(BUILD)/api_check
+	./$(BUILD)/api_check
 	./$(BUILD)/syntax_check
 	./$(BUILD)/cavlc_check 2000
 	./$(BUILD)/cabac_check 200000 8
@@ -117,5 +206,7 @@ test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean
--include $(OBJ:.o=.d)
+.PHONY: all test clean shared install uninstall examples install-check
+# every object's header dependencies (-MMD), the CLI's and the tests' too:
+# a changed struct in aeg.h has to rebuild everything that includes it
+-include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d)

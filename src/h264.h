@@ -609,10 +609,10 @@ typedef struct aeg_me_ctx aeg_me_ctx;
 
 void aeg_log(int level, const char *fmt, ...);
 extern int aeg_log_level;
-#define AEG_LOGE(...) aeg_log(0, __VA_ARGS__)
-#define AEG_LOGW(...) aeg_log(1, __VA_ARGS__)
-#define AEG_LOGI(...) aeg_log(2, __VA_ARGS__)
-#define AEG_LOGD(...) aeg_log(3, __VA_ARGS__)
+#define AEG_LOGE(...) aeg_log(AEG_LOG_ERROR, __VA_ARGS__)
+#define AEG_LOGW(...) aeg_log(AEG_LOG_WARNING, __VA_ARGS__)
+#define AEG_LOGI(...) aeg_log(AEG_LOG_INFO, __VA_ARGS__)
+#define AEG_LOGD(...) aeg_log(AEG_LOG_DEBUG, __VA_ARGS__)
 
 /* Lookahead (lookahead.c): half-resolution source luma and the cost estimate
  * the adaptive B-picture decision is made on. */

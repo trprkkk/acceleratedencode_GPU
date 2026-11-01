@@ -4470,3 +4470,62 @@ CAVLC); ABR on the five long clips is unchanged.  Tests: all-intra ABR
 within 10 %, four refused statistics files, a pass 2 coding 30 of 60
 measured pictures within 10 %, `--qpmax 0` and `--qpmin 40 --qpmax 30`
 refused.
+
+## The library interface
+
+What an application embedding the encoder needs beyond the CLI, and what was
+wrong with the interface as it stood:
+
+* **Logging** went to stderr only, through a global `aeg_log_level`.  Now
+  `aeg_set_log_callback(fn, opaque)` takes every message as one line with its
+  level (formatted once, newline stripped; the sink is swapped under a lock,
+  the callback runs outside it so it may log itself).  The levels were also
+  mixed: "level 1" held both real warnings (a device failing over to the CPU,
+  CAVLC dropping B pictures, a clamped bitrate) and the encoder's summary
+  (backend, CRF, size).  They are now `ERROR` / `WARNING` / `INFO` / `DEBUG`;
+  the library default is `WARNING`, so a clean encode embedded in an
+  application prints nothing.  `aegenc -v N` maps onto the new levels and
+  prints exactly what it printed before (compared for `-v 0/1/2` on three
+  configurations).
+* **The last error** was one static pointer for the process; two encoders
+  failing in two threads overwrote each other's message.  Now thread-local.
+  Two other process-wide variables written on every picture (the scheduler
+  and frame-thread timers behind `AEG_LATIME`) were data races between
+  encoders in parallel threads; they are per encoder now.
+* **Parameters**: `aeg_encoder_get_params()` returns what the encoder runs
+  with -- every `-1` resolved, the level the SPS signals, slices, frame
+  threads, the timebase.
+* **Parameter sets**: `aeg_encoder_headers()` returns the SPS/PPS (with PPS 1
+  under weighted prediction) for an avcC box.  The IDR pictures now copy the
+  same buffer, written once at open, so the two cannot disagree.
+* **Input**: `aeg_encoder_encode()` took only a packed I420 buffer, so every
+  caller with a decoder frame or padded capture buffer had to repack it.
+  `aeg_encoder_encode_planes()` takes three planes with their own strides;
+  the packed call is now a wrapper of it.  Same bytes out.
+* **Timestamps**: packets carried only `pts`, which with B pictures is not
+  monotonic in decoding order, and an MP4/MKV muxer needs a `dts`.  `dts` =
+  the submitted pts in submission order, popped one per packet, minus
+  `bframes` frame durations (the reorder depth the HRD model already uses);
+  `params.timebase_num/den` says how long a frame is in pts units (default
+  one tick per frame).  Strictly increasing, never above pts for
+  constant-rate input; a variable-rate source can break the second property,
+  as with x264.
+* **Packaging**: only a static archive and no install rule.  Now `make
+  shared` (position-independent, `-fvisibility=hidden`, only the `AEG_API`
+  symbols exported -- 26 of them), `make install` / `uninstall` with `PREFIX`,
+  `DESTDIR`, `LIBDIR`, `INCLUDEDIR`, `BINDIR`, an `aeg.pc`, and a run-time
+  `aeg_version()`.  The soname is `libaeg.so.0`: `aeg_params` and
+  `aeg_packet` are plain structs the caller allocates, so a field added in a
+  later release changes the ABI; that is accepted while the major version is 0.
+* **A build bug found on the way**: the Makefile only included the
+  dependency files of the library objects, so a changed `aeg.h` did not
+  rebuild `cli/aegenc.c` -- the CLI kept the old `aeg_params` layout and read
+  garbage (`-p -1 is out of range`).  All `.d` files are included now.
+
+Checks: `tests/api_check.c` (in `make test`; also under ASan with leak
+detection and under ThreadSanitizer in CI), `tests/install_check.sh` (`make
+install-check` in CI, plus a real `sudo make install` and the example built
+with the system's pkg-config).  CQP, CRF and ABR output byte-identical to the
+previous commit: 13 configurations (presets 2-4, no B, CRF, CRF+AQ, ABR, VBV,
+HRD, CAVLC, slices, slice threads, short GOP), the CPU and OpenCL conformance
+suites.
