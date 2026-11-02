@@ -5062,3 +5062,10 @@ What is left of the gap: references beyond two (tree2 and vtest: x264's ref
 16 is worth 2.8 and 1.1-2.5 points; aegenc has two for P and one per B list,
 and the second only for 16x16), and the constant-QP tree costing cock2 3 and
 tree 1.2 points while it gains 9-11 on vtest.
+
+Speed after it (cockL, one thread, median of 3, `x264cmp.py speed`, same
+session for both encoders): aegenc p0-p4 81.0 / 31.0 / 25.3 / 12.5 / 10.8 fps;
+x264 ultrafast 1268.4, superfast 411.7, faster 127.4, fast 97.4, medium 78.1,
+slower 29.3, veryslow 15.3; x265 medium 33.8.  (`tools/real/fetch.sh` now pins
+imageio-ffmpeg 0.6.0: the current release ships FFmpeg 9, not the 7.0.2 / x264
+core 164 every number here was measured with.)

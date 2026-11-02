@@ -8,7 +8,7 @@ set -e
 REAL=${REAL:-/tmp/real}
 DL=${DL:-/tmp/dl}
 FF=$DL/ext/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2
-[ -x "$FF" ] || pip install -q --target "$DL/ext" imageio-ffmpeg numpy
+[ -x "$FF" ] || pip install -q --target "$DL/ext" "imageio-ffmpeg==0.6.0" numpy  # 0.6.0 = FFmpeg 7.0.2, x264 core 164
 mkdir -p "$REAL" "$DL/src"
 get() {  # repo path
     [ -s "$DL/src/$(basename "$2")" ] ||
