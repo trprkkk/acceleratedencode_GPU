@@ -80,7 +80,8 @@ def configs():
         c['aeg-p%d' % p] = ('aeg', p, [])
     for p in X264_PRESETS:
         c['x264-' + p] = ('x264', p, ['-tune', 'psnr'])
-    c['x264-medium-psy0'] = ('x264', 'medium', ['-x264-params', 'psy=0'])
+    # x264 turns AQ off by itself at constant QP, so the old reference
+    # (medium, psy=0) is this same encoder there -- measured identical
     for p in X265_PRESETS:
         c['x265-' + p] = ('x265', p, ['-tune', 'psnr'])
     return c

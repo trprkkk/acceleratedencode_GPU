@@ -46,13 +46,28 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > See *GPU groundwork on a real OpenCL device* in
 > [`docs/STATUS.md`](docs/STATUS.md).
 
-**Latest measurement** (preset 3 against libx264 `medium` with `psy=0`, QP
-22-37, five real clips, PSNR of the whole sequence's MSE): **-5.51 %** BD-rate
-on average against x264 at constant QP (cock -0.75, vtest -11.39, mega -11.30,
-short -6.22, tree +2.11; -6.07 % on six further validation clips); preset 4
--5.91 %; and **-1.63 %** against x264 at CRF
-with its own macroblock tree (`aq-mode=0`), the way x264 is normally run.
-Since the text above was written the encoder gained B pyramid
+**Against x264 and x265** (the final comparison, `f52e4af`; full tables and
+method under *The final comparison with x264 and x265* in `docs/STATUS.md`).
+libx264 r3191 / x265 3.5 with their assembly and `--tune psnr`, 14 real clips,
+constant QP 22-37, BD-rate by global PSNR (negative = aegenc needs fewer bits),
+speed single-threaded on 640x352 (median of 3, this 2-core sandbox):
+
+| aegenc | vs x264 medium | vs x264 veryslow | vs x265 medium | fps | x264 preset of equal quality (its fps) |
+|---|---|---|---|---|---|
+| p0 | +77.0 % | +89.5 % | +82.4 % | 76.6 | between ultrafast and superfast (414.5) |
+| p1 | +7.3 % | +14.9 % | +10.5 % | 30.5 | faster (122.2) |
+| p2 | +2.6 % | +9.8 % | +5.5 % | 25.9 | fast (95.8) |
+| p3 | **-5.9 %** | +0.8 % | -3.2 % | 13.5 | slower (28.6) |
+| p4 | -6.4 % | **+0.1 %** | **-3.8 %** | 11.5 | veryslow (13.8) |
+
+So at constant QP presets 3-4 match x264 veryslow and beat x265 medium (x265
+slow is still 4-5 % ahead), but on the CPU alone x264 reaches the same quality
+1.2x (p4) to 4x (p1) faster.  With rate control (CRF, both macroblock trees on)
+on 240-300-picture clips p4 is +1.2 % against x264 medium and +11.8 % against
+veryslow: the macroblock tree over long GOPs is the largest remaining quality
+gap.  High 10 keeps the same standing (p3 -4.9 % against x264 medium 10-bit).
+
+Since the quoted status at the top was written the encoder gained B pyramid
 (`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock
 tree over a lookahead window (`--mbtree`, `--rc-lookahead`), two P
 references, joint refinement of the bi-predictive vectors, a motion search

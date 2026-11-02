@@ -4799,3 +4799,177 @@ and thread scheduling, not a faster 10-bit encoder.)  The sampled profile of
 the one-thread run went from 975 samples at 10 bits against 407 at 8 to 496
 against about 500: what is left at 10 bits is the same work as at 8 (CABAC
 pricing, the trellis, motion search), none of it above 6 % self time.
+
+## The final comparison with x264 and x265
+
+Every preset against every x264 preset (and three x265 presets), measured the
+same way, in one sitting, on the encoder as of `f52e4af`.  This supersedes the
+scattered x264 numbers earlier in this file, which were taken at different
+stages of the encoder (several with B pictures off, some on synthetic clips or
+against x264's baseline profile).
+
+**How.**  `tools/x264cmp.py` (`run` / `report` / `speed`; the long clips come
+from `tools/real/longclips.sh`).  References: libx264 core 164 r3191 and x265
+3.5, both with their assembly (AVX2, and AVX-512 for x264) through FFmpeg
+7.0.2, with `--tune psnr` (psy-rd and AQ off) and otherwise their defaults.
+aegenc at its defaults (AQ only acts under rate control, so at constant QP
+both sides are without AQ; x264 turns AQ and mbtree off at constant QP by
+itself, which is why the old reference, medium with `psy=0`, measured identical
+to medium `--tune psnr`).  QP 22/25/28/31/34/37 (CRF 18-33 for the rate
+control table); global PSNR (MSE over every sample of all three planes of the
+whole sequence) of the decoded stream against the source, and FFmpeg's SSIM
+in dB; BD-rate over the shared span as in `tools/bdrate.py`.  **Negative =
+aegenc needs fewer bits.**  `*` = the two curves share less than half of the
+smaller span.  Quality runs single-threaded on both sides.  Clips: the five
+of `clips.txt` (30 pictures each), the six validation segments (30 each) and
+three long ones (cockL 640x352 240 pictures, vtestL 384x288 300, megaL
+352x256 240): 14 clips.
+
+### Quality at constant QP
+
+PSNR BD-rate, mean over the 14 clips:
+
+| aegenc \ ref | x264 ultrafast | superfast | veryfast | faster | fast | medium | slow | slower | veryslow | x265 fast | x265 medium | x265 slow |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| p0 | -21.3% | +37.0% | +52.3% | +64.8% | +72.5% | +77.0% | +82.5% | +88.7% | +89.5% | +77.1% | +82.4% | +97.1% |
+| p1 | -47.9% | -16.4% | -7.3% | +0.4% | +4.9% | +7.3% | +10.7% | +14.5% | +14.9% | +6.8% | +10.5% | +19.3% |
+| p2 | -49.8%* | -20.0% | -11.3% | -4.0% | +0.2% | +2.6% | +5.8% | +9.4% | +9.8% | +2.0% | +5.5% | +14.0% |
+| p3 | -54.0% | -26.7% | -18.7% | -11.9% | -8.0% | **-5.9%** | -2.9% | +0.4% | **+0.8%** | -6.4% | -3.2% | +4.7% |
+| p4 | -54.3% | -27.1% | -19.2% | -12.4% | -8.5% | -6.4% | -3.5% | -0.2% | **+0.1%** | -7.0% | **-3.8%** | +4.1% |
+
+SSIM BD-rate, same runs:
+
+| aegenc \ ref | x264 ultrafast | superfast | veryfast | faster | fast | medium | slow | slower | veryslow | x265 fast | x265 medium | x265 slow |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| p0 | -34.9% | +26.6% | +42.6% | +51.4% | +57.9% | +61.2% | +65.0% | +70.9% | +72.1% | +65.5% | +71.6% | +76.1% |
+| p1 | -55.3%* | -21.4% | -11.9% | -6.5% | -2.5% | -0.6% | +1.8% | +5.4% | +6.1% | +1.9% | +5.6% | +8.9% |
+| p2 | -57.1%* | -25.1% | -16.0% | -10.8% | -7.1% | -5.3% | -2.9% | +0.5% | +1.1% | -2.9% | +0.6% | +3.9% |
+| p3 | -59.5%* | -29.3% | -20.7% | -15.9% | -12.3% | -10.7% | -8.5% | -5.2% | -4.7% | -8.5% | -5.2% | -2.2% |
+| p4 | -59.6%* | -29.7% | -21.2% | -16.3% | -12.8% | -11.2% | -9.0% | -5.8% | -5.2% | -9.1% | -5.8% | -2.7% |
+
+The key pairs hold on each clip set separately (PSNR):
+
+| pair | main (5) | validation (6) | long (3) | all 14 |
+|---|---|---|---|---|
+| p3 vs x264 medium | -4.99% | -5.49% | -8.08% | -5.9% |
+| p3 vs x264 veryslow | +1.00% | +0.72% | +0.40% | +0.8% |
+| p4 vs x264 veryslow | +0.57% | +0.26% | -0.79% | +0.1% |
+| p4 vs x265 medium | -7.60% | -1.72% | -1.50% | -3.8% |
+| p4 vs x265 slow | +1.3% | +5.4% | +6.0% | +4.1% |
+
+The spread between clips is wider than any of these means: against x264
+veryslow, p4 is +4.9 / +7.3 / +8.9 % on the three cockatoo clips and +5.6 /
++7.7 % on the two tree clips, and -6.1 / -7.7 / -5.4 / -11.6 % on the four
+vtest clips (static camera, people walking).  Why the cockatoo and tree
+clips favour x264 has not been isolated (x264 uses three references here,
+aegenc at most two P references and one per B list).
+
+### Rate control: CRF, both with their macroblock tree
+
+aegenc `--crf N --aq 0`, x264/x265 `-crf N --tune psnr` (mbtree / cutree on,
+AQ off on all three):
+
+| PSNR BD-rate | x264 medium | x264 veryslow | x265 medium |
+|---|---|---|---|
+| p3, 11 short clips (30 pictures) | -1.5% | +5.8% | -2.5% |
+| p4, 11 short clips | -2.0% | +5.3% | -3.0% |
+| p3, 3 long clips (240-300) | **+2.5%** | +13.2% | +7.6% |
+| p4, 3 long clips | **+1.2%** | **+11.8%** | +6.2% |
+
+| SSIM BD-rate | x264 medium | x264 veryslow | x265 medium |
+|---|---|---|---|
+| p3, long clips | +0.3% | +10.9% | +11.3% |
+| p4, long clips | -1.0% | +9.4% | +9.8% |
+
+(The short-clip table has an x264 slow column too: p3 +1.5 %, p4 +1.0 %.)
+This is the largest remaining quality gap.  At constant QP p3 is 5-8 %
+ahead of x264 medium; with both trees on it is 1.5 % ahead on 30 pictures and
+2.5 % *behind* on 240-300, so x264's macroblock tree is worth about 4 (short
+clips) to 11 (long clips) points more than aegenc's (vtestL: -19.4 % at constant QP,
++5.9 % at CRF).  Against veryslow at CRF on the long clips the gap is 12 %.
+
+### High 10
+
+Both encoders get the same 10-bit source (the 8-bit clip shifted left by two,
+as yuv420p10le, so no up-conversion is part of the comparison); x264's 10-bit
+QP is ours + 12 (it counts from QP'Y).  Five main clips, PSNR at 10 bits:
+
+| aegenc \ ref | x264 medium 10-bit | x264 veryslow 10-bit |
+|---|---|---|
+| p3 | -4.9% (SSIM -9.5%) | +1.1% (SSIM -4.0%) |
+| p4 | -5.4% (SSIM -10.1%) | +0.5% (SSIM -4.6%) |
+
+The same as at 8 bits (p3 vs medium -5.0 %, p4 vs veryslow +0.6 % on these
+clips): the High 10 path keeps the 8-bit encoder's standing.
+
+### Speed
+
+`tools/x264cmp.py speed`, QP 27, median of 3, wall clock on this 2-core Xeon
+(AVX2).  For x264/x265, FFmpeg's own time (start-up and reading the raw file,
+measured with `-c:v rawvideo -f null`) is subtracted, which makes the two
+fastest x264 rows (a 240-picture encode in 0.2-0.6 s) approximate.  hd = the
+cockatoo clip scaled to 1280x720, 120 pictures.
+
+| config | 1 thread, cockL | 1 thread, hd | default threads, cockL | default threads, hd |
+|---|---|---|---|---|
+| aegenc p0 | 76.6 | 24.5 | 144.5 | 45.5 |
+| aegenc p1 | 30.5 | 7.8 | 56.1 | 14.9 |
+| aegenc p2 | 25.9 | 6.9 | 44.9 | 12.5 |
+| aegenc p3 | 13.5 | 4.0 | 24.4 | 7.3 |
+| aegenc p4 | 11.5 | 3.7 | 21.5 | 6.8 |
+| x264 ultrafast | 1381.4 | 406.5 | 2102.6 | 660.8 |
+| x264 superfast | 414.5 | 111.3 | 683.6 | 196.4 |
+| x264 veryfast | 198.9 | 66.8 | 384.6 | 120.1 |
+| x264 faster | 122.2 | 44.1 | 211.1 | 83.6 |
+| x264 fast | 95.8 | 31.5 | 168.4 | 60.0 |
+| x264 medium | 85.5 | 26.1 | 147.6 | 49.5 |
+| x264 slow | 58.0 | 18.4 | 99.3 | 33.3 |
+| x264 slower | 28.6 | 9.5 | 54.4 | 17.6 |
+| x264 veryslow | 13.8 | 4.6 | 27.9 | 9.1 |
+| x265 fast | 37.8 | 9.2 | 61.1 | 16.5 |
+| x265 medium | 32.0 | 9.4 | 50.3 | 15.3 |
+| x265 slow | 10.6 | 3.1 | 17.8 | 5.5 |
+
+(fps; default threads = aegenc's frame threads, x264/x265's own pools.)
+
+### Matched quality, matched speed
+
+Each aegenc preset against the x264 preset of the same quality (constant-QP
+PSNR BD-rate, 14 clips) and the one of the same single-thread speed (cockL):
+
+| aegenc | fps | x264 at equal quality | its fps | x264 faster by | x264 at equal speed | aegenc's BD-rate against it |
+|---|---|---|---|---|---|---|
+| p0 | 76.6 | between ultrafast (-21.3%) and superfast (+37.0%) | 414.5 (superfast) | 5.4x | medium (85.5) | +77.0% |
+| p1 | 30.5 | faster (+0.4%) | 122.2 | 4.0x | slower (28.6) | +14.5% |
+| p2 | 25.9 | fast (+0.2%) | 95.8 | 3.7x | slower (28.6) | +9.4% |
+| p3 | 13.5 | slower (+0.4%) | 28.6 | 2.1x | veryslow (13.8) | +0.8% |
+| p4 | 11.5 | veryslow (+0.1%) | 13.8 | 1.2x | veryslow (13.8) | +0.1% |
+
+### Where that leaves the encoder
+
+* **Quality at constant QP: x264-equivalent at the slow end.**  p3/p4 equal
+  x264 veryslow (+0.1 to +0.8 %, PSNR; 4.7-5.2 % fewer bits by SSIM) and are
+  3-4 % ahead of x265 medium, 4-5 % behind x265 slow.  x265-equivalence in the
+  sense of its slow presets is not reached, and an H.264 stream is not
+  expected to reach it.
+* **Rate control is the quality gap.**  With the trees on, long clips: +1.2 %
+  against x264 medium at p4, +11.8 % against veryslow.  The next quality work
+  is the macroblock tree over long GOPs, not the macroblock decision.
+* **Speed per quality: 1.2-5.4x behind x264 on the CPU**, least at p4 and most at
+  p0-p2.  p0 is not competitive at all (x264 superfast is 5x faster at 37 %
+  fewer bits).  At matched *speed* aegenc ties x264 at p3/p4 and trails it by
+  9-15 % at p1/p2.  This is the CPU-only standing; the GPU stages exist for
+  exactly this gap and still need hardware to be measured.
+
+Reproduce (a few hours on this machine, resumable: every point is cached
+in `/tmp/x264cmp.json` and re-measured only when `build/aegenc` changes):
+
+```
+bash tools/real/fetch.sh && bash tools/real/longclips.sh
+python3 tools/x264cmp.py run --clips main,val,long
+python3 tools/x264cmp.py run --clips main,val --mode crf --only '^(aeg-p3|aeg-p4|x264-medium|x264-slow|x264-veryslow|x265-medium)$'
+python3 tools/x264cmp.py run --clips long --mode crf --only '^(aeg-p3|aeg-p4|x264-medium|x264-veryslow|x265-medium)$'
+python3 tools/x264cmp.py run --clips main --mode 10 --only '^(aeg-p3|aeg-p4|x264-medium|x264-veryslow)$'
+python3 tools/x264cmp.py report --clips main,val,long [--metric ssim_db] [--detail aeg-p3:x264-medium]
+python3 tools/x264cmp.py speed --threads 1 --long cockL:/tmp/real/cockL.yuv:640:352,hd:/tmp/real/hdL.yuv:1280:720
+```
