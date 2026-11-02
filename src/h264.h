@@ -493,6 +493,21 @@ void aeg_intra_predict_4x4(pixel *pred, int stride, const pixel *top,
 void aeg_intra_predict_8x8(pixel *pred, int stride, const pixel *top,
                            const pixel *left, int topleft, int mode,
                            int top_avail, int left_avail, int topleft_avail);
+/* The same two predictors in two steps, for a mode decision: the edge (the
+ * reference samples as one line, with their 2- and 3-tap filtered versions and
+ * the DC value) is built once per block, then each mode is a gather from it.
+ * The arguments mean what they mean above. */
+typedef struct {
+    pixel a[96];
+    int   dc;
+} aeg_iedge;
+void aeg_intra4x4_edge(aeg_iedge *ed, const pixel *top, const pixel *left,
+                       int topleft, int top_avail, int left_avail);
+void aeg_intra4x4_pred(pixel *pred, int stride, const aeg_iedge *ed, int mode);
+void aeg_intra8x8_edge(aeg_iedge *ed, const pixel *top, const pixel *left,
+                       int topleft, int top_avail, int left_avail,
+                       int topleft_avail);
+void aeg_intra8x8_pred(pixel *pred, int stride, const aeg_iedge *ed, int mode);
 void aeg_intra_predict_chroma(pixel *pred, int stride, const pixel *top,
                               const pixel *left, int top_avail, int left_avail,
                               int topleft_avail, int mode);

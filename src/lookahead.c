@@ -296,8 +296,10 @@ static int intra_cost(const aeg_lowres *cur, int bx, int by)
              * the long clips, at no measurable cost (AEG_LRI8=0 restores
              * the four plane modes; docs/STATUS.md). */
             int m;
+            aeg_iedge ed;
+            aeg_intra8x8_edge(&ed, top, left8, tl, 1, 1, 1);
             for (m = 3; m < 9; m++) {
-                aeg_intra_predict_8x8(pred, 8, top, left8, tl, m, 1, 1, 1);
+                aeg_intra8x8_pred(pred, 8, &ed, m);
                 s = aeg_satd(8, 8, c, cur->stride, pred, 8);
                 if (s < best) best = s;
             }

@@ -5055,6 +5055,8 @@ static int me_lambda_on(const struct aeg_encoder *e)
     return ev ? atoi(ev) != 0 : 1;
 }
 
+static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp);
+
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     int mode, n = 0, sad_of[4];
@@ -5238,7 +5240,21 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         /* Partitioned candidates: 16x8 and 8x16, bit 1 and 2 of the mask.
          * They only pay off with the RD decision, so ultrafast stays 16x16. */
-        if (e->p.preset >= 1) {
+        if (e->p.preset >= 1 && ENV_INT("AEG_PPG", 0) > 0) {
+            /* x264's order: P_8x8 first, and the two halves only when it
+             * beats the whole macroblock (AEG_PPG percent of its cost) */
+            int ppg = ENV_INT("AEG_PPG", 0), n8 = e->mb_ncand, halves = 1;
+            if (e->p.partitions & 8) {
+                me_candidate_p8x8(e, mbx, mby);
+                if (e->mb_ncand > n8)
+                    halves = (int64_t)cand_scost(e, mbx, mby, n8, c->qp) * 100 <
+                             (int64_t)cand_scost(e, mbx, mby, 0, c->qp) * ppg;
+            }
+            if ((e->p.partitions & 2) && halves)
+                me_candidate(e, mbx, mby, AEG_MB_P16x8);
+            if ((e->p.partitions & 4) && halves)
+                me_candidate(e, mbx, mby, AEG_MB_P8x16);
+        } else if (e->p.preset >= 1) {
             if (e->p.partitions & 2)
                 me_candidate(e, mbx, mby, AEG_MB_P16x8);
             if (e->p.partitions & 4)
@@ -5674,6 +5690,13 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
     int64_t best_cost = INT64_MAX;
     int sel[9];
     const int pre = side == 4 ? ENV_INT("AEG_I4K", 0) : ENV_INT("AEG_I8K", 0);
+    aeg_iedge ied;
+
+    if (side == 4)
+        aeg_intra4x4_edge(&ied, top, left, tl, top_avail, left_avail);
+    else
+        aeg_intra8x8_edge(&ied, top, left, tl, top_avail, left_avail,
+                          top_avail && left_avail);
 
     /* Pre-selection by SATD: only the `pre` modes whose prediction looks best
      * (SATD + mode bits in the SATD domain) get the exact price. */
@@ -5684,11 +5707,9 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
         for (k = 0; k < nmodes; k++) {
             int m = modes[k];
             if (side == 4)
-                aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
-                                      left_avail, top_avail && left_avail);
+                aeg_intra4x4_pred(pred, 4, &ied, m);
             else
-                aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
-                                      left_avail, top_avail && left_avail);
+                aeg_intra8x8_pred(pred, 8, &ied, m);
             sc[k] = (side == 4 ? aeg_satd_4x4(pred, 4, sb, s)
                                : aeg_sa8d_8x8(pred, 8, sb, s)) +
                     (int64_t)(ls * (m == pmode ? 1 : 4) + 0.5);
@@ -5706,11 +5727,9 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
         int m = modes[k], d;
         pixel *pk = preds[k];
         if (side == 4)
-            aeg_intra_predict_4x4(pk, 4, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
+            aeg_intra4x4_pred(pk, 4, &ied, m);
         else
-            aeg_intra_predict_8x8(pk, 8, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
+            aeg_intra8x8_pred(pk, 8, &ied, m);
         /* Two modes that predict the same samples (flat neighbours, missing
          * ones) code the same residual: only the mode's own bits differ. */
         for (d = 0; d < k; d++)
@@ -5793,6 +5812,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         else
             tr_avail = mby > e->top_row && (bx < 12 || mbx + 1 < e->mb_w);
         pixel top[8], left[4], pred[16];
+        aeg_iedge ied;
         const pixel *sb = src + by * s + bx;
         pixel *db = dst + by * s + bx;
         int tl, nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
@@ -5817,6 +5837,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         }
         tl = (top_avail && left_avail) ? db[-s - 1] : PIXEL_MID;
 
+        aeg_intra4x4_edge(&ied, top, left, tl, top_avail, left_avail);
         pmode = intra4_pred_mode(e, mbx, mby, t->intra4, rx, ry);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
         if (e->p.preset >= 3 && e->p.cabac) {
@@ -5826,8 +5847,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         } else for (k = 0; k < nmodes; k++) {
             int cost;
             m = modes[k];
-            aeg_intra_predict_4x4(pred, 4, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
+            aeg_intra4x4_pred(pred, 4, &ied, m);
             if (e->p.preset >= 3) {
                 /* True rate-distortion choice: quantise the residual, add it
                  * back, and weigh the exact SSE against the exact bits the
@@ -5873,8 +5893,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         t->intra4[blk] = (uint8_t)best;
         mode_bits += (best == pmode) ? 1 : 4;
 
-        aeg_intra_predict_4x4(pred, 4, top, left, tl, best, top_avail,
-                              left_avail, top_avail && left_avail);
+        aeg_intra4x4_pred(pred, 4, &ied, best);
         {
             int16_t res[16];
             dctcoef coef[16];
@@ -6012,6 +6031,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         const int left_avail = mbx > 0 || bx > 0;
         pixel top[16], left[8];
         int tl, tr_avail;
+        aeg_iedge ied;
         int nmodes, modes[9], best = 2, best_cost = 1 << 30, pmode, m;
         int lev_ok = 0;
         pixel pred[64];
@@ -6052,6 +6072,8 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         tl = (top_avail && left_avail) ? (by ? dst[(by - 1) * s + bx - 1]
                                              : dst[-s + bx - 1]) : PIXEL_MID;
 
+        aeg_intra8x8_edge(&ied, top, left, tl, top_avail, left_avail,
+                          top_avail && left_avail);
         pmode = intra8_pred_mode(e, mbx, mby, t->intra8, gx, gy);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
         if (e->p.preset >= 3 && e->p.cabac) {
@@ -6061,8 +6083,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         } else for (k = 0; k < nmodes; k++) {
             int cost;
             m = modes[k];
-            aeg_intra_predict_8x8(pred, 8, top, left, tl, m, top_avail,
-                                  left_avail, top_avail && left_avail);
+            aeg_intra8x8_pred(pred, 8, &ied, m);
             cost = 2 * aeg_satd_8x8(pred, 8, src + by * s + bx, s);
             /* The mode costs one bit when it matches the predictor and four
              * otherwise, as for Intra_4x4. */
@@ -6075,8 +6096,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         t->intra8[g] = (uint8_t)best;
         mode_bits += (best == pmode) ? 1 : 4;
 
-        aeg_intra_predict_8x8(pred, 8, top, left, tl, best, top_avail,
-                              left_avail, top_avail && left_avail);
+        aeg_intra8x8_pred(pred, 8, &ied, best);
         code_luma8_block_lv(e, mbx, mby, t, g, pred, 8, 1, lev_ok);
     }
 
@@ -6698,6 +6718,18 @@ static void mvref_order(struct aeg_encoder *e, int mbx, int mby,
         for (i = j; i > 0 && c[ord[i]] < c[ord[i - 1]]; i--) {
             int t = ord[i]; ord[i] = ord[i - 1]; ord[i - 1] = t;
         }
+}
+
+/* The SATD of a candidate's luma prediction plus its header bits at the
+ * motion-search lambda: the cost the motion search ranks by (AEG_PPG). */
+static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
+{
+    const int s = e->stride[0];
+    mbenc t;
+    cand_enc(e, cand, qp, &t);
+    inter_predict_typed(e, mbx, mby, &t);
+    return aeg_satd_16x16(e->pred_l, 16, e->srcp[0] + mby * 16 * s + mbx * 16, s) +
+           e->me_lambda * inter_hdr_bits(e, &t);
 }
 
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)

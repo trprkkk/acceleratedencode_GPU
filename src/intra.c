@@ -162,12 +162,174 @@ void aeg_intra_predict_chroma(pixel *pred, int stride, const pixel *top,
 #define F1(a, b)       I8_F1(a, b)
 #define F2(a, b, c)    I8_F2(a, b, c)
 
+/* Every directional mode of the two block sizes predicts each sample from one
+ * of three things: a reference sample, the 2-tap average of two neighbouring
+ * ones (F1) or the 3-tap filter centred on one (F2), with the left column, the
+ * corner and the top row read as one line.  aeg_intra*_edge() lays that line
+ * out once -- E[] the left column bottom-up, the corner, the top row; G[k] =
+ * F2 centred on E[k]; H[k] = F1(E[k], E[k+1]) -- and the predictor of a mode
+ * is then n row copies (pred_dir; the two ends of G carry the one-sided
+ * filter of the diagonal-down-left corner and of the horizontal-up limit).  A mode decision
+ * builds the line once for all nine modes. */
+#define IE_G 32
+#define IE_H 64
+
+/* The directional modes of an n x n block (n = 4 or 8) from its edge line
+ * a[] (E at 0, the corner at E[n]; G and H at IE_G / IE_H): every row is a
+ * run of n consecutive entries of one line -- G or H themselves, or for the
+ * three modes that alternate between F1 and F2 samples a line interleaved
+ * from both -- so each mode is n row copies.  The lines follow from the
+ * equations of 8.3.1.2.x / 8.3.2.2.x with x the column and y the row. */
+static inline __attribute__((always_inline))
+void pred_dir(pixel *pred, int stride, const pixel *a, int n, int mode)
+{
+    const pixel *G = a + IE_G, *H = a + IE_H;
+    pixel w0[32], w1[32];
+    int y, i;
+
+#define ROW(y_, src_) memcpy(pred + (y_) * stride, (src_), sizeof(pixel) * (size_t)n)
+    switch (mode) {
+    case 0:                                         /* vertical */
+        for (y = 0; y < n; y++)
+            ROW(y, a + n + 1);
+        break;
+    case 1:                                         /* horizontal */
+        for (y = 0; y < n; y++)
+            aeg_pixel_fill(pred + y * stride, a[n - 1 - y], (size_t)n);
+        break;
+    case 3:                                         /* diagonal down-left */
+        for (y = 0; y < n; y++)
+            ROW(y, G + n + 2 + y);
+        break;
+    case 4:                                         /* diagonal down-right */
+        for (y = 0; y < n; y++)
+            ROW(y, G + n - y);
+        break;
+    case 5:                                         /* vertical-right */
+        /* row 2k: w0[i - k], row 2k+1: w1[i - k] (w0/w1 offset by n) */
+        for (i = -n; i < n; i++) {
+            w0[n + i] = i >= 0 ? H[n + i] : (2 * i + n + 1 >= 0 ? G[n + 1 + 2 * i] : 0);
+            w1[n + i] = i >= 1 ? G[n + i] : (2 * i + n >= 0 ? G[n + 2 * i] : 0);
+        }
+        for (y = 0; y < n; y++)
+            ROW(y, ((y & 1) ? w1 : w0) + n - (y >> 1));
+        break;
+    case 6:                                         /* horizontal-down */
+        /* row y: d[j] for j = x - 2y (d offset by 2n) */
+        for (i = -2 * (n - 1); i < n; i++) {
+            pixel v;
+            if (i >= 1)
+                v = G[n - 1 + i];
+            else if ((i & 1) == 0)
+                v = H[n - 1 + i / 2];
+            else
+                v = G[n + (i - 1) / 2];
+            w0[2 * n + i] = v;
+        }
+        for (y = 0; y < n; y++)
+            ROW(y, w0 + 2 * n - 2 * y);
+        break;
+    case 7:                                         /* vertical-left */
+        for (y = 0; y < n; y++)
+            ROW(y, (y & 1) ? G + n + 2 + (y >> 1) : H + n + 1 + (y >> 1));
+        break;
+    default:                                        /* horizontal-up */
+        /* row y: u[j] for j = x + 2y */
+        for (i = 0; i < 3 * n - 2; i++) {
+            pixel v;
+            if (i > 2 * n - 3)
+                v = a[0];
+            else if (i == 2 * n - 3)
+                v = G[0];
+            else if ((i & 1) == 0)
+                v = H[n - 2 - i / 2];
+            else
+                v = G[n - 2 - (i - 1) / 2];
+            w0[i] = v;
+        }
+        for (y = 0; y < n; y++)
+            ROW(y, w0 + 2 * y);
+        break;
+    }
+#undef ROW
+}
+
+static void edge_filters(aeg_iedge *ed, int n)
+{
+    pixel *a = ed->a;
+    int k;
+    for (k = 1; k < n - 1; k++)
+        a[IE_G + k] = (pixel)F2(a[k - 1], a[k], a[k + 1]);
+    a[IE_G] = (pixel)F2(a[1], a[0], a[0]);
+    a[IE_G + n - 1] = (pixel)F2(a[n - 2], a[n - 1], a[n - 1]);
+    for (k = 0; k < n - 1; k++)
+        a[IE_H + k] = (pixel)F1(a[k], a[k + 1]);
+}
+
+void aeg_intra8x8_edge(aeg_iedge *ed, const pixel *top, const pixel *left,
+                       int topleft, int top_avail, int left_avail,
+                       int topleft_avail)
+{
+    int rt[16], rl[8], rlt, x, y, dc;
+    pixel *z = ed->a;
+
+    for (x = 0; x < 16; x++)
+        rt[x] = top_avail ? top[x] : (left_avail ? left[0] : PIXEL_MID);
+    for (y = 0; y < 8; y++)
+        rl[y] = left_avail ? left[y] : (top_avail ? top[0] : PIXEL_MID);
+    rlt = topleft_avail ? topleft
+                        : (top_avail ? top[0] : (left_avail ? left[0] : PIXEL_MID));
+
+    /* E: zl[7..0], z'[-1,-1], zt[0..15] */
+    z[8] = (pixel)I8_F2(rt[0], rlt, rl[0]);
+    z[9] = (pixel)I8_F2(rlt, rt[0], rt[1]);
+    for (x = 1; x < 15; x++)
+        z[9 + x] = (pixel)I8_F2(rt[x - 1], rt[x], rt[x + 1]);
+    z[24] = (pixel)((rt[14] + 3 * rt[15] + 2) >> 2);
+    z[7] = (pixel)I8_F2(rlt, rl[0], rl[1]);
+    for (y = 1; y < 7; y++)
+        z[7 - y] = (pixel)I8_F2(rl[y - 1], rl[y], rl[y + 1]);
+    z[0] = (pixel)((rl[6] + 3 * rl[7] + 2) >> 2);
+    edge_filters(ed, 25);
+
+    if (top_avail && left_avail) {
+        dc = 8;
+        for (x = 0; x < 8; x++)
+            dc += z[9 + x] + z[7 - x];
+        dc >>= 4;
+    } else if (top_avail) {
+        dc = 4;
+        for (x = 0; x < 8; x++)
+            dc += z[9 + x];
+        dc >>= 3;
+    } else if (left_avail) {
+        dc = 4;
+        for (x = 0; x < 8; x++)
+            dc += z[7 - x];
+        dc >>= 3;
+    } else {
+        dc = PIXEL_MID;
+    }
+    ed->dc = dc;
+}
+
+void aeg_intra8x8_pred(pixel *pred, int stride, const aeg_iedge *ed, int mode)
+{
+    int y;
+    if (mode == 2 || mode < 0 || mode > 8) {
+        const int v = mode == 2 ? ed->dc : PIXEL_MID;
+        for (y = 0; y < 8; y++)
+            aeg_pixel_fill(pred + y * stride, v, 8);
+        return;
+    }
+    pred_dir(pred, stride, ed->a, 8, mode);
+}
+
 /* The eight-by-eight prediction modes are the same nine directions as the
  * four-by-four ones, but they read *filtered* reference samples z[]: a low-pass
  * along the neighbouring row and column (which is what stops the 1/4-sample
  * diagonal interpolation of the larger block from ringing) and, at the two
- * ends, a one-sided filter.  The prediction equations below are those of
- * 8.3.3.4.3 with z in place of p.
+ * ends, a one-sided filter (8.3.2.2.1).
  *
  * Availability: the caller substitutes an unavailable side with the first
  * sample of the other one (8.3.3.1) -- so an unavailable top-right corner,
@@ -177,621 +339,70 @@ void aeg_intra_predict_8x8(pixel *pred, int stride, const pixel *top,
                            const pixel *left, int topleft, int mode,
                            int top_avail, int left_avail, int topleft_avail)
 {
-    int rt[16], rl[8], rlt, zt[16], zl[8], zlt, x, y, i, dc;
-    pixel p[64];
-
-    for (x = 0; x < 16; x++)
-        rt[x] = top_avail ? top[x] : (left_avail ? left[0] : PIXEL_MID);
-    for (y = 0; y < 8; y++)
-        rl[y] = left_avail ? left[y] : (top_avail ? top[0] : PIXEL_MID);
-    rlt = topleft_avail ? topleft
-                        : (top_avail ? top[0] : (left_avail ? left[0] : PIXEL_MID));
-
-    zlt = I8_F2(rt[0], rlt, rl[0]);
-    zt[0] = I8_F2(rlt, rt[0], rt[1]);
-    for (x = 1; x < 7; x++)
-        zt[x] = I8_F2(rt[x - 1], rt[x], rt[x + 1]);
-    zt[7] = I8_F2(rt[6], rt[7], rt[8]);
-    for (x = 8; x < 15; x++)
-        zt[x] = I8_F2(rt[x - 1], rt[x], rt[x + 1]);
-    zt[15] = (rt[14] + 3 * rt[15] + 2) >> 2;
-    zl[0] = I8_F2(rlt, rl[0], rl[1]);
-    for (y = 1; y < 7; y++)
-        zl[y] = I8_F2(rl[y - 1], rl[y], rl[y + 1]);
-    zl[7] = (rl[6] + 3 * rl[7] + 2) >> 2;
-
-    switch (mode) {
-    case 0:                                     /* vertical */
-        for (y = 0; y < 8; y++)
-            for (x = 0; x < 8; x++)
-                p[y * 8 + x] = (pixel)zt[x];
-        break;
-    case 1:                                     /* horizontal */
-        for (y = 0; y < 8; y++)
-            for (x = 0; x < 8; x++)
-                p[y * 8 + x] = (pixel)zl[y];
-        break;
-    case 2:                                     /* DC */
-        if (top_avail && left_avail) {
-            dc = 8;
-            for (i = 0; i < 8; i++)
-                dc += zt[i] + zl[i];
-            dc >>= 4;
-        } else if (top_avail) {
-            dc = 4;
-            for (i = 0; i < 8; i++)
-                dc += zt[i];
-            dc >>= 3;
-        } else if (left_avail) {
-            dc = 4;
-            for (i = 0; i < 8; i++)
-                dc += zl[i];
-            dc >>= 3;
-        } else {
-            dc = PIXEL_MID;
-        }
-        for (i = 0; i < 64; i++)
-            p[i] = (pixel)dc;
-        break;
-    case 3:                                     /* diagonal down-left */
-    p[0] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[1] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[2] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[3] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[4] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[5] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[6] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[7] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[8] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[9] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[10] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[11] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[12] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[13] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[14] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[15] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[16] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[17] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[18] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[19] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[20] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[21] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[22] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[23] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[24] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[25] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[26] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[27] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[28] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[29] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[30] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[31] = (pixel)F2(zt[10],zt[11],zt[12]);
-    p[32] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[33] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[34] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[35] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[36] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[37] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[38] = (pixel)F2(zt[10],zt[11],zt[12]);
-    p[39] = (pixel)F2(zt[11],zt[12],zt[13]);
-    p[40] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[41] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[42] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[43] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[44] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[45] = (pixel)F2(zt[10],zt[11],zt[12]);
-    p[46] = (pixel)F2(zt[11],zt[12],zt[13]);
-    p[47] = (pixel)F2(zt[12],zt[13],zt[14]);
-    p[48] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[49] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[50] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[51] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[52] = (pixel)F2(zt[10],zt[11],zt[12]);
-    p[53] = (pixel)F2(zt[11],zt[12],zt[13]);
-    p[54] = (pixel)F2(zt[12],zt[13],zt[14]);
-    p[55] = (pixel)F2(zt[13],zt[14],zt[15]);
-    p[56] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[57] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[58] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[59] = (pixel)F2(zt[10],zt[11],zt[12]);
-    p[60] = (pixel)F2(zt[11],zt[12],zt[13]);
-    p[61] = (pixel)F2(zt[12],zt[13],zt[14]);
-    p[62] = (pixel)F2(zt[13],zt[14],zt[15]);
-    p[63] = (pixel)F2(zt[14],zt[15],zt[15]);
-    break;
-    case 4:                                     /* diagonal down-right */
-    p[0] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[1] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[2] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[3] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[4] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[5] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[6] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[7] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[8] = (pixel)F2(zl[1],zl[0],zlt);
-    p[9] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[10] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[11] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[12] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[13] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[14] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[15] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[16] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[17] = (pixel)F2(zl[1],zl[0],zlt);
-    p[18] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[19] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[20] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[21] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[22] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[23] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[24] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[25] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[26] = (pixel)F2(zl[1],zl[0],zlt);
-    p[27] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[28] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[29] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[30] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[31] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[32] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[33] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[34] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[35] = (pixel)F2(zl[1],zl[0],zlt);
-    p[36] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[37] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[38] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[39] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[40] = (pixel)F2(zl[5],zl[4],zl[3]);
-    p[41] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[42] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[43] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[44] = (pixel)F2(zl[1],zl[0],zlt);
-    p[45] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[46] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[47] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[48] = (pixel)F2(zl[6],zl[5],zl[4]);
-    p[49] = (pixel)F2(zl[5],zl[4],zl[3]);
-    p[50] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[51] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[52] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[53] = (pixel)F2(zl[1],zl[0],zlt);
-    p[54] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[55] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[56] = (pixel)F2(zl[7],zl[6],zl[5]);
-    p[57] = (pixel)F2(zl[6],zl[5],zl[4]);
-    p[58] = (pixel)F2(zl[5],zl[4],zl[3]);
-    p[59] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[60] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[61] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[62] = (pixel)F2(zl[1],zl[0],zlt);
-    p[63] = (pixel)F2(zl[0],zlt,zt[0]);
-    break;
-    case 5:                                     /* vertical-right */
-    p[0] = (pixel)F1(zlt,zt[0]);
-    p[1] = (pixel)F1(zt[0],zt[1]);
-    p[2] = (pixel)F1(zt[1],zt[2]);
-    p[3] = (pixel)F1(zt[2],zt[3]);
-    p[4] = (pixel)F1(zt[3],zt[4]);
-    p[5] = (pixel)F1(zt[4],zt[5]);
-    p[6] = (pixel)F1(zt[5],zt[6]);
-    p[7] = (pixel)F1(zt[6],zt[7]);
-    p[8] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[9] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[10] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[11] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[12] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[13] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[14] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[15] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[16] = (pixel)F2(zl[1],zl[0],zlt);
-    p[17] = (pixel)F1(zlt,zt[0]);
-    p[18] = (pixel)F1(zt[0],zt[1]);
-    p[19] = (pixel)F1(zt[1],zt[2]);
-    p[20] = (pixel)F1(zt[2],zt[3]);
-    p[21] = (pixel)F1(zt[3],zt[4]);
-    p[22] = (pixel)F1(zt[4],zt[5]);
-    p[23] = (pixel)F1(zt[5],zt[6]);
-    p[24] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[25] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[26] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[27] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[28] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[29] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[30] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[31] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[32] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[33] = (pixel)F2(zl[1],zl[0],zlt);
-    p[34] = (pixel)F1(zlt,zt[0]);
-    p[35] = (pixel)F1(zt[0],zt[1]);
-    p[36] = (pixel)F1(zt[1],zt[2]);
-    p[37] = (pixel)F1(zt[2],zt[3]);
-    p[38] = (pixel)F1(zt[3],zt[4]);
-    p[39] = (pixel)F1(zt[4],zt[5]);
-    p[40] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[41] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[42] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[43] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[44] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[45] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[46] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[47] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[48] = (pixel)F2(zl[5],zl[4],zl[3]);
-    p[49] = (pixel)F2(zl[3],zl[2],zl[1]);
-    p[50] = (pixel)F2(zl[1],zl[0],zlt);
-    p[51] = (pixel)F1(zlt,zt[0]);
-    p[52] = (pixel)F1(zt[0],zt[1]);
-    p[53] = (pixel)F1(zt[1],zt[2]);
-    p[54] = (pixel)F1(zt[2],zt[3]);
-    p[55] = (pixel)F1(zt[3],zt[4]);
-    p[56] = (pixel)F2(zl[6],zl[5],zl[4]);
-    p[57] = (pixel)F2(zl[4],zl[3],zl[2]);
-    p[58] = (pixel)F2(zl[2],zl[1],zl[0]);
-    p[59] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[60] = (pixel)F2(zlt,zt[0],zt[1]);
-    p[61] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[62] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[63] = (pixel)F2(zt[2],zt[3],zt[4]);
-    break;
-    case 6:                                     /* horizontal-down */
-    p[0] = (pixel)F1(zlt,zl[0]);
-    p[1] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[2] = (pixel)F2(zt[1],zt[0],zlt);
-    p[3] = (pixel)F2(zt[2],zt[1],zt[0]);
-    p[4] = (pixel)F2(zt[3],zt[2],zt[1]);
-    p[5] = (pixel)F2(zt[4],zt[3],zt[2]);
-    p[6] = (pixel)F2(zt[5],zt[4],zt[3]);
-    p[7] = (pixel)F2(zt[6],zt[5],zt[4]);
-    p[8] = (pixel)F1(zl[0],zl[1]);
-    p[9] = (pixel)F2(zlt,zl[0],zl[1]);
-    p[10] = (pixel)F1(zlt,zl[0]);
-    p[11] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[12] = (pixel)F2(zt[1],zt[0],zlt);
-    p[13] = (pixel)F2(zt[2],zt[1],zt[0]);
-    p[14] = (pixel)F2(zt[3],zt[2],zt[1]);
-    p[15] = (pixel)F2(zt[4],zt[3],zt[2]);
-    p[16] = (pixel)F1(zl[1],zl[2]);
-    p[17] = (pixel)F2(zl[0],zl[1],zl[2]);
-    p[18] = (pixel)F1(zl[0],zl[1]);
-    p[19] = (pixel)F2(zlt,zl[0],zl[1]);
-    p[20] = (pixel)F1(zlt,zl[0]);
-    p[21] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[22] = (pixel)F2(zt[1],zt[0],zlt);
-    p[23] = (pixel)F2(zt[2],zt[1],zt[0]);
-    p[24] = (pixel)F1(zl[2],zl[3]);
-    p[25] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[26] = (pixel)F1(zl[1],zl[2]);
-    p[27] = (pixel)F2(zl[0],zl[1],zl[2]);
-    p[28] = (pixel)F1(zl[0],zl[1]);
-    p[29] = (pixel)F2(zlt,zl[0],zl[1]);
-    p[30] = (pixel)F1(zlt,zl[0]);
-    p[31] = (pixel)F2(zl[0],zlt,zt[0]);
-    p[32] = (pixel)F1(zl[3],zl[4]);
-    p[33] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[34] = (pixel)F1(zl[2],zl[3]);
-    p[35] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[36] = (pixel)F1(zl[1],zl[2]);
-    p[37] = (pixel)F2(zl[0],zl[1],zl[2]);
-    p[38] = (pixel)F1(zl[0],zl[1]);
-    p[39] = (pixel)F2(zlt,zl[0],zl[1]);
-    p[40] = (pixel)F1(zl[4],zl[5]);
-    p[41] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[42] = (pixel)F1(zl[3],zl[4]);
-    p[43] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[44] = (pixel)F1(zl[2],zl[3]);
-    p[45] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[46] = (pixel)F1(zl[1],zl[2]);
-    p[47] = (pixel)F2(zl[0],zl[1],zl[2]);
-    p[48] = (pixel)F1(zl[5],zl[6]);
-    p[49] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[50] = (pixel)F1(zl[4],zl[5]);
-    p[51] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[52] = (pixel)F1(zl[3],zl[4]);
-    p[53] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[54] = (pixel)F1(zl[2],zl[3]);
-    p[55] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[56] = (pixel)F1(zl[6],zl[7]);
-    p[57] = (pixel)F2(zl[5],zl[6],zl[7]);
-    p[58] = (pixel)F1(zl[5],zl[6]);
-    p[59] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[60] = (pixel)F1(zl[4],zl[5]);
-    p[61] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[62] = (pixel)F1(zl[3],zl[4]);
-    p[63] = (pixel)F2(zl[2],zl[3],zl[4]);
-    break;
-    case 7:                                     /* vertical-left */
-    p[0] = (pixel)F1(zt[0],zt[1]);
-    p[1] = (pixel)F1(zt[1],zt[2]);
-    p[2] = (pixel)F1(zt[2],zt[3]);
-    p[3] = (pixel)F1(zt[3],zt[4]);
-    p[4] = (pixel)F1(zt[4],zt[5]);
-    p[5] = (pixel)F1(zt[5],zt[6]);
-    p[6] = (pixel)F1(zt[6],zt[7]);
-    p[7] = (pixel)F1(zt[7],zt[8]);
-    p[8] = (pixel)F2(zt[0],zt[1],zt[2]);
-    p[9] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[10] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[11] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[12] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[13] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[14] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[15] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[16] = (pixel)F1(zt[1],zt[2]);
-    p[17] = (pixel)F1(zt[2],zt[3]);
-    p[18] = (pixel)F1(zt[3],zt[4]);
-    p[19] = (pixel)F1(zt[4],zt[5]);
-    p[20] = (pixel)F1(zt[5],zt[6]);
-    p[21] = (pixel)F1(zt[6],zt[7]);
-    p[22] = (pixel)F1(zt[7],zt[8]);
-    p[23] = (pixel)F1(zt[8],zt[9]);
-    p[24] = (pixel)F2(zt[1],zt[2],zt[3]);
-    p[25] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[26] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[27] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[28] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[29] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[30] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[31] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[32] = (pixel)F1(zt[2],zt[3]);
-    p[33] = (pixel)F1(zt[3],zt[4]);
-    p[34] = (pixel)F1(zt[4],zt[5]);
-    p[35] = (pixel)F1(zt[5],zt[6]);
-    p[36] = (pixel)F1(zt[6],zt[7]);
-    p[37] = (pixel)F1(zt[7],zt[8]);
-    p[38] = (pixel)F1(zt[8],zt[9]);
-    p[39] = (pixel)F1(zt[9],zt[10]);
-    p[40] = (pixel)F2(zt[2],zt[3],zt[4]);
-    p[41] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[42] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[43] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[44] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[45] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[46] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[47] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[48] = (pixel)F1(zt[3],zt[4]);
-    p[49] = (pixel)F1(zt[4],zt[5]);
-    p[50] = (pixel)F1(zt[5],zt[6]);
-    p[51] = (pixel)F1(zt[6],zt[7]);
-    p[52] = (pixel)F1(zt[7],zt[8]);
-    p[53] = (pixel)F1(zt[8],zt[9]);
-    p[54] = (pixel)F1(zt[9],zt[10]);
-    p[55] = (pixel)F1(zt[10],zt[11]);
-    p[56] = (pixel)F2(zt[3],zt[4],zt[5]);
-    p[57] = (pixel)F2(zt[4],zt[5],zt[6]);
-    p[58] = (pixel)F2(zt[5],zt[6],zt[7]);
-    p[59] = (pixel)F2(zt[6],zt[7],zt[8]);
-    p[60] = (pixel)F2(zt[7],zt[8],zt[9]);
-    p[61] = (pixel)F2(zt[8],zt[9],zt[10]);
-    p[62] = (pixel)F2(zt[9],zt[10],zt[11]);
-    p[63] = (pixel)F2(zt[10],zt[11],zt[12]);
-    break;
-    case 8:                                     /* horizontal-up */
-    p[0] = (pixel)F1(zl[0],zl[1]);
-    p[1] = (pixel)F2(zl[0],zl[1],zl[2]);
-    p[2] = (pixel)F1(zl[1],zl[2]);
-    p[3] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[4] = (pixel)F1(zl[2],zl[3]);
-    p[5] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[6] = (pixel)F1(zl[3],zl[4]);
-    p[7] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[8] = (pixel)F1(zl[1],zl[2]);
-    p[9] = (pixel)F2(zl[1],zl[2],zl[3]);
-    p[10] = (pixel)F1(zl[2],zl[3]);
-    p[11] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[12] = (pixel)F1(zl[3],zl[4]);
-    p[13] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[14] = (pixel)F1(zl[4],zl[5]);
-    p[15] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[16] = (pixel)F1(zl[2],zl[3]);
-    p[17] = (pixel)F2(zl[2],zl[3],zl[4]);
-    p[18] = (pixel)F1(zl[3],zl[4]);
-    p[19] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[20] = (pixel)F1(zl[4],zl[5]);
-    p[21] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[22] = (pixel)F1(zl[5],zl[6]);
-    p[23] = (pixel)F2(zl[5],zl[6],zl[7]);
-    p[24] = (pixel)F1(zl[3],zl[4]);
-    p[25] = (pixel)F2(zl[3],zl[4],zl[5]);
-    p[26] = (pixel)F1(zl[4],zl[5]);
-    p[27] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[28] = (pixel)F1(zl[5],zl[6]);
-    p[29] = (pixel)F2(zl[5],zl[6],zl[7]);
-    p[30] = (pixel)F1(zl[6],zl[7]);
-    p[31] = (pixel)F2(zl[6],zl[7],zl[7]);
-    p[32] = (pixel)F1(zl[4],zl[5]);
-    p[33] = (pixel)F2(zl[4],zl[5],zl[6]);
-    p[34] = (pixel)F1(zl[5],zl[6]);
-    p[35] = (pixel)F2(zl[5],zl[6],zl[7]);
-    p[36] = (pixel)F1(zl[6],zl[7]);
-    p[37] = (pixel)F2(zl[6],zl[7],zl[7]);
-    p[38] = (pixel)zl[7];
-    p[39] = (pixel)zl[7];
-    p[40] = (pixel)F1(zl[5],zl[6]);
-    p[41] = (pixel)F2(zl[5],zl[6],zl[7]);
-    p[42] = (pixel)F1(zl[6],zl[7]);
-    p[43] = (pixel)F2(zl[6],zl[7],zl[7]);
-    p[44] = (pixel)zl[7];
-    p[45] = (pixel)zl[7];
-    p[46] = (pixel)zl[7];
-    p[47] = (pixel)zl[7];
-    p[48] = (pixel)F1(zl[6],zl[7]);
-    p[49] = (pixel)F2(zl[6],zl[7],zl[7]);
-    p[50] = (pixel)zl[7];
-    p[51] = (pixel)zl[7];
-    p[52] = (pixel)zl[7];
-    p[53] = (pixel)zl[7];
-    p[54] = (pixel)zl[7];
-    p[55] = (pixel)zl[7];
-    p[56] = (pixel)zl[7];
-    p[57] = (pixel)zl[7];
-    p[58] = (pixel)zl[7];
-    p[59] = (pixel)zl[7];
-    p[60] = (pixel)zl[7];
-    p[61] = (pixel)zl[7];
-    p[62] = (pixel)zl[7];
-    p[63] = (pixel)zl[7];
-    break;
-    default:
-        for (i = 0; i < 64; i++)
-            p[i] = PIXEL_MID;
-        break;
-    }
-
-    for (y = 0; y < 8; y++)
-        for (x = 0; x < 8; x++)
-            pred[y * stride + x] = p[y * 8 + x];
+    aeg_iedge ed;
+    aeg_intra8x8_edge(&ed, top, left, topleft, top_avail, left_avail,
+                      topleft_avail);
+    aeg_intra8x8_pred(pred, stride, &ed, mode);
 }
-#undef F1
-#undef F2
-#undef I8_F1
-#undef I8_F2
 
 /* ------------------------------------------------------------------ */
 /* Intra_4x4                                                           */
 /* ------------------------------------------------------------------ */
-/* `top` holds p[-1][-1] at index 0? No: top[0..7] are p[0][-1]..p[7][-1]
- * and top[-1] is p[-1][-1]; `left` holds p[-1][0..3]. */
+/* `top` holds p[0..7][-1], `left` p[-1][0..3] and `topleft` p[-1][-1]; the
+ * caller has already substituted what is unavailable (only DC looks at the
+ * flags).  E: left[3..0], the corner, top[0..7]. */
+void aeg_intra4x4_edge(aeg_iedge *ed, const pixel *top, const pixel *left,
+                       int topleft, int top_avail, int left_avail)
+{
+    pixel *a = ed->a;
+    int i, sum = 0;
+    for (i = 0; i < 4; i++)
+        a[3 - i] = left[i];
+    a[4] = (pixel)topleft;
+    for (i = 0; i < 8; i++)
+        a[5 + i] = top[i];
+    edge_filters(ed, 13);
+    if (top_avail && left_avail) {
+        for (i = 0; i < 4; i++) sum += top[i] + left[i];
+        ed->dc = (sum + 4) >> 3;
+    } else if (top_avail) {
+        for (i = 0; i < 4; i++) sum += top[i];
+        ed->dc = (sum + 2) >> 2;
+    } else if (left_avail) {
+        for (i = 0; i < 4; i++) sum += left[i];
+        ed->dc = (sum + 2) >> 2;
+    } else {
+        ed->dc = PIXEL_MID;
+    }
+}
+
+void aeg_intra4x4_pred(pixel *pred, int stride, const aeg_iedge *ed, int mode)
+{
+    int y;
+    if (mode == 2) {
+        for (y = 0; y < 4; y++)
+            aeg_pixel_fill(pred + y * stride, ed->dc, 4);
+        return;
+    }
+    if (mode < 0 || mode > 8)
+        mode = 8;               /* the old switch's default */
+    pred_dir(pred, stride, ed->a, 4, mode);
+}
+
 void aeg_intra_predict_4x4(pixel *pred, int stride, const pixel *top,
                            const pixel *left, int topleft, int mode,
                            int top_avail, int left_avail, int topleft_avail)
 {
-    /* tt[0..1] mirror the top-left sample so that negative indices used by
-     * the directional modes are well defined. */
-    int tt[10], ll[6];
-    int x, y;
-
+    aeg_iedge ed;
     (void)topleft_avail;
-    tt[0] = tt[1] = topleft;
-    ll[0] = ll[1] = topleft;
-    for (x = 0; x < 8; x++) tt[2 + x] = top[x];
-    for (y = 0; y < 4; y++) ll[2 + y] = left[y];
-#define T(i) tt[2 + (i)]
-#define L(i) ll[2 + (i)]
-
-    switch (mode) {
-    case 0: /* vertical */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) pred[y * stride + x] = (pixel)T(x);
-        break;
-    case 1: /* horizontal */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) pred[y * stride + x] = (pixel)L(y);
-        break;
-    case 2: { /* DC */
-        int sum = 0, dc;
-        if (top_avail && left_avail) {
-            for (x = 0; x < 4; x++) sum += top[x];
-            for (y = 0; y < 4; y++) sum += left[y];
-            dc = (sum + 4) >> 3;
-        } else if (top_avail) {
-            for (x = 0; x < 4; x++) sum += top[x];
-            dc = (sum + 2) >> 2;
-        } else if (left_avail) {
-            for (y = 0; y < 4; y++) sum += left[y];
-            dc = (sum + 2) >> 2;
-        } else {
-            dc = PIXEL_MID;
-        }
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) pred[y * stride + x] = (pixel)dc;
-        break;
-    }
-    case 3: /* diagonal down-left */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int z = x + y, v;
-                if (z == 6)
-                    v = (T(6) + 3 * T(7) + 2) >> 2;
-                else
-                    v = (T(z) + 2 * T(z + 1) + T(z + 2) + 2) >> 2;
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    case 4: /* diagonal down-right: the spec indexes the top row two samples
-             * to the left of the block, so for x > y the taps are
-             * x-y-2, x-y-1 and x-y (8.3.3.4). */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int v;
-                if (x > y)
-                    v = (T(x - y - 2) + 2 * T(x - y - 1) + T(x - y) + 2) >> 2;
-                else if (x == y)
-                    v = (L(0) + 2 * topleft + T(0) + 2) >> 2;
-                else if (x == y - 1)
-                    v = (topleft + 2 * L(0) + L(1) + 2) >> 2;
-                else if (x == y - 2)
-                    v = (L(0) + 2 * L(1) + L(2) + 2) >> 2;
-                else
-                    v = (L(1) + 2 * L(2) + L(3) + 2) >> 2;
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    case 5: /* vertical right */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int z = 2 * x - y, v;
-                if ((z & 1) == 0 && z >= 0) {
-                    int i = z >> 1;
-                    v = (T(i - 1) + T(i) + 1) >> 1;
-                } else if (z > 0) {
-                    int i = (z + 1) >> 1;
-                    v = (T(i - 2) + 2 * T(i - 1) + T(i) + 2) >> 2;
-                } else if (z == -1) {
-                    v = (L(0) + 2 * topleft + T(0) + 2) >> 2;
-                } else {
-                    int i = y;
-                    v = (L(i - 1) + 2 * L(i - 2) + L(i - 3) + 2) >> 2;
-                }
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    case 6: /* horizontal down */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int z = 2 * y - x, v;
-                if ((z & 1) == 0 && z >= 0) {
-                    int i = z >> 1;
-                    v = (L(i - 1) + L(i) + 1) >> 1;
-                } else if (z > 0) {
-                    int i = (z + 1) >> 1;
-                    v = (L(i - 2) + 2 * L(i - 1) + L(i) + 2) >> 2;
-                } else if (z == -1) {
-                    v = (T(0) + 2 * topleft + L(0) + 2) >> 2;
-                } else {
-                    v = (T(x - 1) + 2 * T(x - 2) + T(x - 3) + 2) >> 2;
-                }
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    case 7: /* vertical-left */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int i = x + (y >> 1), v;
-                if ((y & 1) == 0)
-                    v = (T(i) + T(i + 1) + 1) >> 1;
-                else
-                    v = (T(i) + 2 * T(i + 1) + T(i + 2) + 2) >> 2;
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    default: /* 8: horizontal-up */
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++) {
-                int z = x + 2 * y, v;
-                if (z <= 4 && (z & 1) == 0)
-                    v = (L(z >> 1) + L((z >> 1) + 1) + 1) >> 1;
-                else if (z < 5)
-                    v = (L((z - 1) >> 1) + 2 * L(((z - 1) >> 1) + 1) +
-                         L(((z - 1) >> 1) + 2) + 2) >> 2;
-                else if (z == 5)
-                    v = (L(2) + 3 * L(3) + 2) >> 2;
-                else
-                    v = L(3);
-                pred[y * stride + x] = (pixel)v;
-            }
-        break;
-    }
-#undef T
-#undef L
+    aeg_intra4x4_edge(&ed, top, left, topleft, top_avail, left_avail);
+    aeg_intra4x4_pred(pred, stride, &ed, mode);
 }
+
+#undef F1
+#undef F2
+#undef I8_F1
+#undef I8_F2
 
 int aeg_intra4x4_pred_mode(const aeg_mb *mb_grid, int mb_stride, int mb_x,
                            int mb_y, int blk, int *available)
