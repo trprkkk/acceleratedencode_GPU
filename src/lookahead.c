@@ -230,6 +230,16 @@ static int block_search(const aeg_lowres *cur, const aeg_lowres *ref,
     return best;
 }
 
+static int la_i8(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_LRI8");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 static int intra_cost(const aeg_lowres *cur, int bx, int by)
 {
     const uint8_t *c = cur->plane + (size_t)by * cur->stride + bx;
@@ -238,9 +248,10 @@ static int intra_cost(const aeg_lowres *cur, int bx, int by)
     int left[8], i, x, y, best, s;
     int has_t = by > 0, has_l = bx > 0;
     int sum = 0, n = 0, dc;
+    uint8_t left8[8];
 
     for (i = 0; i < 8; i++)
-        left[i] = c[(ptrdiff_t)i * cur->stride - 1];
+        left8[i] = (uint8_t)(left[i] = c[(ptrdiff_t)i * cur->stride - 1]);
     if (has_t) for (i = 0; i < 8; i++) sum += top[i], n++;
     if (has_l) for (i = 0; i < 8; i++) sum += left[i], n++;
     dc = n ? (sum + n / 2) / n : 128;
@@ -275,6 +286,22 @@ static int intra_cost(const aeg_lowres *cur, int bx, int by)
                     (a + b * (x - 3) + cc * (y - 3) + 16) >> 5, 0, 255);
         s = aeg_satd(8, 8, c, cur->stride, pred, 8);
         if (s < best) best = s;
+        if (la_i8()) {
+            /* x264 (subme > 1): the six directional Intra_8x8 modes on
+             * filtered edges as well.  top[8..15] is the top-right, which
+             * at the right edge reads the padding.  Without them the
+             * estimate of textured blocks with a direction (feathers,
+             * branches) is too high, so the macroblock tree propagated too
+             * much through them: -0.15% at constant QP, -0.5% at CRF on
+             * the long clips, at no measurable cost (AEG_LRI8=0 restores
+             * the four plane modes; docs/STATUS.md). */
+            int m;
+            for (m = 3; m < 9; m++) {
+                aeg_intra_predict_8x8(pred, 8, top, left8, tl, m, 1, 1, 1);
+                s = aeg_satd(8, 8, c, cur->stride, pred, 8);
+                if (s < best) best = s;
+            }
+        }
     }
     return best + LA_INTRA_PENALTY;
 }

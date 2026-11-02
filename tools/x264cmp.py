@@ -375,7 +375,9 @@ def main():
     ap.add_argument('--qp', type=int, default=27)
     ap.add_argument('--long', default='')
     a = ap.parse_args()
-    AEG_ID = sha(AEG)
+    # AEGENC_ID: reuse the cache of another build whose output is known to be
+    # identical (e.g. one that only adds an environment knob, default off)
+    AEG_ID = os.environ.get('AEGENC_ID') or sha(AEG)
     {'run': cmd_run, 'report': cmd_report, 'speed': cmd_speed}[a.cmd](a)
 
 

@@ -11198,7 +11198,13 @@ static double mbt_strength(void)
     static _Atomic double v = -1.0;
     if (v < 0.0) {
         const char *ev = getenv("AEG_MBTS");
-        v = ev ? atoi(ev) / 10.0 : 1.3;
+        /* 1.6 since the lowres intra estimate has x264's directional 8x8
+         * modes (lookahead.c): 1.3 was the best at constant QP on the short
+         * clips before, 1.6 is now level with it there (-0.37 against
+         * -0.40% vs x264 veryslow) and 1.5 points ahead at CRF on the long
+         * clips, where x264's own 2.0 would be 1.3 more but costs cock and
+         * tree 1-3 points at constant QP (docs/STATUS.md). */
+        v = ev ? atoi(ev) / 10.0 : 1.6;
     }
     return v;
 }

@@ -33,6 +33,15 @@ SETS['ct'] = [_by[t] for t in ('cock', 'cock2', 'tree', 'tree2')]
 SETS['vt'] = [_by[t] for t in ('vtest', 'vtest2', 'vtest3')]
 
 
+MODE = 'qp'
+
+
+def points():
+    """QP 22-37, or with --mode crf CRF 18-33 (both encoders then run their
+    macroblock tree; aegenc with --aq 0, x264 with --tune psnr)."""
+    return X.CRFS if MODE == 'crf' else X.QPS
+
+
 def clips(names):
     out = []
     for s in names.split(','):
@@ -55,7 +64,8 @@ def parse(spec):
 
 def key(spec, cfg, clip, v):
     st = os.stat(clip)
-    k = '%s|%s|%d|%d|qp|%s' % (spec, os.path.abspath(clip), st.st_size, int(st.st_mtime), v)
+    k = '%s|%s|%d|%d|%s|%s' % (spec, os.path.abspath(clip), st.st_size, int(st.st_mtime),
+                               MODE, v)
     if cfg[0] == 'aeg':
         k += '|' + X.AEG_ID
     return k
@@ -78,7 +88,7 @@ def measure_env(cfg, clip, w, h, n, v):
     old = {kk: os.environ.get(kk) for kk in env}
     os.environ.update(env)
     try:
-        return X.measure(cfg, clip, w, h, n, 'qp', v)
+        return X.measure(cfg, clip, w, h, n, MODE, v)
     finally:
         for kk, vv in old.items():
             if vv is None:
@@ -93,7 +103,7 @@ def cmd_run(a):
         name, cfg, s = parse(spec)
         for tag, clip, w, h in clips(a.clips):
             n = X.nframes(clip, w, h, False)
-            for v in X.QPS:
+            for v in points():
                 k = key(s, cfg, clip, v)
                 if k in cache:
                     continue
@@ -114,7 +124,7 @@ def cmd_report(a):
         out = {}
         for tag, clip, w, h in cl:
             out[tag] = [(cache[key(s, cfg, clip, v)]['kbps'], cache[key(s, cfg, clip, v)][a.metric])
-                        for v in X.QPS]
+                        for v in points()]
         return name, out
 
     bname, base = curve(a.configs[0])
@@ -129,7 +139,7 @@ def cmd_report(a):
             continue
         _, cfg, s = parse(spec)
         r = [X.bd(c[t], base[t]) for t in tags]
-        cpu = sum(cache[key(s, cfg, clip, v)]['cpu'] for _, clip, _, _ in cl for v in X.QPS)
+        cpu = sum(cache[key(s, cfg, clip, v)]['cpu'] for _, clip, _, _ in cl for v in points())
         print('| %s | %s | %+.2f%% | %.0f |' % (
             name, ' | '.join('%+.2f%s' % (x[0], '*' if x[1] < 0.5 else '') for x in r),
             statistics.mean(x[0] for x in r), cpu), flush=True)
@@ -140,9 +150,12 @@ def main():
     ap.add_argument('cmd', choices=['run', 'report'])
     ap.add_argument('configs', nargs='+')
     ap.add_argument('--clips', default='ct,vt')
+    ap.add_argument('--mode', default='qp', choices=['qp', 'crf'])
     ap.add_argument('--metric', default='psnr', choices=['psnr', 'psnr_y', 'ssim_db'])
     a = ap.parse_args()
-    X.AEG_ID = X.sha(X.AEG)
+    global MODE
+    MODE = a.mode
+    X.AEG_ID = os.environ.get('AEGENC_ID') or X.sha(X.AEG)
     {'run': cmd_run, 'report': cmd_report}[a.cmd](a)
 
 

@@ -5069,3 +5069,69 @@ x264 ultrafast 1268.4, superfast 411.7, faster 127.4, fast 97.4, medium 78.1,
 slower 29.3, veryslow 15.3; x265 medium 33.8.  (`tools/real/fetch.sh` now pins
 imageio-ffmpeg 0.6.0: the current release ships FFmpeg 9, not the 7.0.2 / x264
 core 164 every number here was measured with.)
+
+## CRF on the long clips: where the gap to x264 veryslow is
+
+Before: at CRF on the long clips (cockL, vtestL, megaL; aegenc `--crf N --aq
+0`, x264 `-crf N --tune psnr`, CRF 18-33) p4 was +10.69 % against x264
+veryslow and +0.22 against medium.  `tools/x264abl.py` now takes `--mode crf`
+(and `AEGENC_ID=<id>` reuses the cache of a build known to give identical
+output, e.g. one that only adds an environment knob that is off).  Ablations
+(BD-rate against x264 veryslow; PSNR):
+
+| long clips | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| CRF: p4 | +9.85 | +15.90 | +6.32 | +10.69 |
+| CRF: p4, no tree (`--mbtree 0`) | +10.22 | +37.28 | +14.74 | +20.75 |
+| CRF: x264 veryslow, `mbtree=0` | +2.06 | +23.30 | +8.99 | +11.45 |
+| CRF: x264 veryslow, `rc-lookahead=40` | +0.22 | +2.20 | -0.01 | +0.81 |
+| CQP: p4 (its tree on) | +7.59 | -12.01 | -0.91 | -1.78 |
+| CQP: p4, no tree | +6.40 | +8.48 | +3.59 | +6.16 |
+| CQP: x264 veryslow `ref=2` | -0.41 | +6.71 | +1.86 | +2.72 |
+| CQP: x264 veryslow `bframes=3` | -0.14 | +0.71 | +1.00 | +0.52 |
+| CQP: x264 veryslow `ref=2:bframes=3` | -0.55 | +8.01 | +3.06 | +3.51 |
+
+(x264 never runs its tree at constant QP; aegenc does, which is why the CQP
+comparisons elsewhere in this file favour aegenc on static content.)  So of
+the 10.7 points the tree itself is only about 1.3 (it is worth 10.1 to aegenc
+and 11.4 to x264); with neither tree aegenc trails by 6.2 at CQP, of which
+x264's 16 references are 2.7-3.5 (vtestL, megaL) and cockL's 6.4 is the
+coding itself (the cock gap of the section above, larger on the long clip).
+x264's longer lookahead (60 against 40) is 0.8; its B offset of 0 under the
+tree (pb_factor 1) is wrong for aegenc (`--bqp 0`: +2.6), and without the
+tree `--bqp 2` is +3.9 against the default 4.
+
+The tree's strength trades clips against each other (CRF long: 1.3 / 1.6 /
+2.0 / 2.5 = +10.69 / +9.36 / +8.48 / +8.65, vtestL gaining 11 points and cockL
+losing 4; CQP main + val: 1.6 / 2.0 = +0.18 / +0.70 against 1.3, cock, tree
+and their second halves losing 1-3 points each).  One reason the tree
+over-propagates on those clips: the lowres intra estimate had only DC, H, V
+and plane, where x264's (subme > 1) adds the six directional Intra_8x8 modes,
+so a textured block with a direction looked dearer to code anew than it is.
+`lookahead.c` now tries them too (`AEG_LRI8=0` restores the four), and with
+it the default strength goes from 1.3 to 1.6 (`AEG_MBTS`, tenths):
+
+| BD-rate against x264 veryslow | before | 8x8 modes | + strength 1.6 | (+ strength 2.0) |
+|---|---|---|---|---|
+| CRF, long clips, p4 | +10.69 | +10.15 | **+8.65** | +7.39 |
+| CRF, long clips, p3 | +12.05 | | **+9.88** | |
+| CRF, main + val, p4 | +4.70 | | **+4.31** | |
+| CQP, main + val, p4 | -0.25 | -0.40 | **-0.37** | -0.02 |
+
+| CQP, main + val, against x264 medium | before | after |
+|---|---|---|
+| p1 | +7.25 | **+7.09** |
+| p2 | +2.47 | **+2.34** |
+| p3 | -5.95 | **-6.04** |
+| p4 | -6.30 | **-6.40** |
+
+x264's own 2.0 would take another 1.3 points at CRF on the long clips but
+gives back 0.35 at constant QP, all of it on cock and tree; 1.6 makes no clip
+set worse.  The extra six SATDs per lowres block cost nothing measurable
+(p1 cockL 7.84 / 7.69 s, p3 19.90 / 19.77 s user time, before / after); frame
+threads stay byte-identical and every conformance case holds.
+
+What remains of the CRF gap, largest first: the core coding of cockL (about 6
+points; the cock gap), references beyond two (about 3 on vtestL and megaL;
+next), strength beyond 1.6 on static content (about 1.3) and the lookahead
+length (0.8).
