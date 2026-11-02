@@ -5204,3 +5204,26 @@ reappearing).  Time, user seconds, single thread, minimum of three
 7.89 / 4.93.  More references cost little because most macroblocks skip or
 stop at reference 0, and the older references' 16x16 search starts from the
 neighbours' vectors.
+
+The defaults are now `--ref 8` at preset 4 and `--ref 4` at preset 3 (with
+the pruned partition search; below preset 3 one reference as before).  On
+the target of this step, CRF on the long clips against x264 veryslow:
+
+| CRF, long clips, vs x264 veryslow | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| p4 before (two references) | +9.93 | +10.30 | +5.70 | +8.65 |
+| **p4 now (eight)** | +9.76 | +3.27 | +3.66 | **+5.56** |
+| p3 before (two) | | | | +9.88 |
+| **p3 now (four)** | +11.33 | +6.87 | +4.94 | **+7.71** |
+
+vtestL's gap is down from 10 points to 3; what remains is mostly cockL's
+core coding (the cock gap, about 6 points beyond the 3-4 every clip shares
+with x264 at CRF), then the tree strength on static content and the
+lookahead length.  B pictures still predict from one picture per list.
+
+With `--ref 2` or fewer the slices are byte-identical to before; only the
+SPS changed (`max_dec_frame_buffering`, and the level where the buffer
+did not fit).  Frame threads and slices stay byte-identical to the serial
+encode at every reference count, and every new conformance case
+(`ref4_p` ... `bpyr_ref6ft`: CAVLC, slices, GOP, frame threads, weighted
+prediction, pyramid) decodes bit-exact.
