@@ -146,6 +146,9 @@ struct aeg_encoder {
     /* use_t8()'s answer while code_mb() tries the other transform size of
      * the winner: 0 = decide, 1 = 4x4, 2 = 8x8 (see t8_rd_on()) */
     int t8_force;
+    /* The SATD me_partition_ref() measured for the vector it returned, when it
+     * measured one (the fractional-offset test), else -1. */
+    int me_last_satd;
     int stride[3];
     int frame_num_bits, level_idc;
     /* the parameter sets as every IDR carries them (aeg_encoder_headers) */
@@ -3623,16 +3626,24 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                  refine ? e->p.subme : 0, pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
                  mvx, mvy, sad);
+    /* Sub-pixel alignment: the integer search leaves the vector on an integer
+     * pel.  Rather than repeating the whole quarter-pel search for a small
+     * partition, apply the fractional offset the macroblock's 16x16 search
+     * found -- objects move as a whole, so within one macroblock the offset is
+     * usually the same -- and keep it when it improves the match. */
+    e->me_last_satd = -1;
     if (!refine && e->p.subme > 0) {
         int fx = e->mb_frac[0], fy = e->mb_frac[1];
         int qx = (*mvx & ~3) + fx, qy = (*mvy & ~3) + fy;
         if (fx || fy) {
             int c_int = part_satd_ref(e, mbx, mby, geo, *mvx, *mvy, ref);
             int c_frac = part_satd_ref(e, mbx, mby, geo, qx, qy, ref);
+            e->me_last_satd = c_int;
             if (c_frac < c_int) {
                 *mvx = qx;
                 *mvy = qy;
                 *sad = c_frac;
+                e->me_last_satd = c_frac;
             }
         }
     }
@@ -3642,26 +3653,10 @@ static void me_partition(struct aeg_encoder *e, int mbx, int mby, int type,
                          int p, const int geo[4], int pmvx, int pmvy,
                          int *mvx, int *mvy, int *sad, int refine)
 {
+    /* (me_partition_ref() already applies the 16x16 search's fractional
+     * offset where it improves the match: a second pass over the same vector
+     * could only compare it with itself) */
     me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, 0, mvx, mvy, sad, refine);
-    /* Sub-pixel alignment: the integer search leaves the vector on an integer
-     * pel.  Rather than repeating the whole quarter-pel search for a 4x4
-     * partition, apply the fractional offset the macroblock's 16x16 search
-     * found -- objects move as a whole, so within one macroblock the offset is
-     * usually the same -- and keep it when it improves the match. */
-    if (!refine && e->p.subme > 0) {
-        int fx = e->mb_frac[0], fy = e->mb_frac[1];
-        int qx = (*mvx & ~3) + fx, qy = (*mvy & ~3) + fy;
-        if (fx || fy) {
-            int c_int = part_satd(e, mbx, mby, geo, *mvx, *mvy);
-            int c_frac = part_satd(e, mbx, mby, geo, qx, qy);
-            if (c_frac < c_int) {
-                *mvx = qx;
-                *mvy = qy;
-                *sad = c_frac;
-            }
-        }
-    }
-    (void)type; (void)p;
 }
 
 /* Motion search for one partitioned candidate (16x8 or 8x16): every partition
@@ -3829,6 +3824,7 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                      pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
                      &mv[l][0], &mv[l][1],
                      &sad);
+        satd[l] = -1;
         if (e->p.subme > 0 && part_subpel(e) < 2) {
             int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
             int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
@@ -3838,13 +3834,16 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                 int c_int = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
                 int c_frac = b_part_satd(e, mbx, mby, geo, qx, qy, l);
 
+                satd[l] = c_int;
                 if (c_frac < c_int) {
                     mv[l][0] = qx;
                     mv[l][1] = qy;
+                    satd[l] = c_frac;
                 }
             }
         }
-        satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+        if (satd[l] < 0)
+            satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
         bits[l] = aeg_mvd_bits(mv[l][0] - pmv[l][0], mv[l][1] - pmv[l][1]);
     }
     {
@@ -3987,19 +3986,25 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
                          pmv[l][0], pmv[l][1],
                          seed, NULL, 0, e->me_lambda, mc, &mv[l][0],
                          &mv[l][1], &sad);
+            satd[l] = -1;
             if (e->p.subme > 0 && !b8_sub) {
                 int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
                 int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
                 int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
 
-                if ((fx || fy) &&
-                    b_part_satd(e, mbx, mby, geo, qx, qy, l) <
-                        b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l)) {
-                    mv[l][0] = qx;
-                    mv[l][1] = qy;
+                if (fx || fy) {
+                    int c_frac = b_part_satd(e, mbx, mby, geo, qx, qy, l);
+                    int c_int = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+                    satd[l] = c_int;
+                    if (c_frac < c_int) {
+                        mv[l][0] = qx;
+                        mv[l][1] = qy;
+                        satd[l] = c_frac;
+                    }
                 }
             }
-            satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
+            if (satd[l] < 0)
+                satd[l] = b_part_satd(e, mbx, mby, geo, mv[l][0], mv[l][1], l);
             bits[l] = aeg_mvd_bits(mv[l][0] - pmv[l][0],
                                    mv[l][1] - pmv[l][1]);
         }
@@ -4161,7 +4166,8 @@ static void me_candidate(struct aeg_encoder *e, int mbx, int mby, int type)
                 predict_mv_at_ref(e, mbx, mby, (const int16_t (*)[2])cur, cur_ref, avail, type, p,
                                   geo[0] / 4, geo[1] / 4, geo[2] / 4, 0, ref, &pmvx, &pmvy);
                 me_partition_ref(e, mbx, mby, type, p, geo, pmvx, pmvy, ref, &mvx, &mvy, &sad, part_subpel(e));
-                satd = part_satd_ref(e, mbx, mby, geo, mvx, mvy, ref);
+                satd = e->me_last_satd >= 0 ? e->me_last_satd
+                                            : part_satd_ref(e, mbx, mby, geo, mvx, mvy, ref);
                 bits = aeg_mvd_bits(mvx - pmvx, mvy - pmvy) + ref_te_bits(e, ref);
                 cost = satd + 8 * bits;
                 if (cost < best_cost) {
@@ -4249,7 +4255,8 @@ static void me_candidate_p8x8_mref(struct aeg_encoder *e, int mbx, int mby)
                                   g8[2] / 4, 0, ref, &px, &py);
                 me_part_r(e, mbx, mby, AEG_MB_P8x8, 0, g8, px, py, ref,
                           &mx, &my, &sd, 0);
-                c = part_satd_ref(e, mbx, mby, g8, mx, my, ref) +
+                c = (e->me_last_satd >= 0 ? e->me_last_satd
+                                          : part_satd_ref(e, mbx, mby, g8, mx, my, ref)) +
                     8 * (aeg_mvd_bits(mx - px, my - py) + ref_te_bits(e, ref));
                 if (c < bc) {
                     bc = c;
@@ -4277,7 +4284,9 @@ static void me_candidate_p8x8_mref(struct aeg_encoder *e, int mbx, int mby)
                                   geo[k][1] / 4, geo[k][2] / 4, 0, sref, &px, &py);
                 me_part_r(e, mbx, mby, AEG_MB_P8x8, k, geo[k], px, py, sref,
                           &mv[k][0], &mv[k][1], &sad, 0);
-                satd_sum += part_satd_ref(e, mbx, mby, geo[k], mv[k][0], mv[k][1], sref);
+                satd_sum += e->me_last_satd >= 0
+                                ? e->me_last_satd
+                                : part_satd_ref(e, mbx, mby, geo[k], mv[k][0], mv[k][1], sref);
                 me_publish(trial, geo[k], mv[k][0], mv[k][1]);
                 avail_publish(tavail, geo[k]);
                 ref_publish(tref, geo[k], sref);
@@ -4387,7 +4396,8 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                         /* Note: predictor ref-unaware here keeps 1-ref behaviour for p8x8 trial;
                          * full ref-aware would need cur_ref plumbing. */
                         me_partition_ref(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmvx, pmvy, ref, &mvx, &mvy, &sd, 0);
-                        sd_satd = part_satd_ref(e, mbx, mby, geo[k], mvx, mvy, ref);
+                        sd_satd = e->me_last_satd >= 0 ? e->me_last_satd
+                                  : part_satd_ref(e, mbx, mby, geo[k], mvx, mvy, ref);
                         bts = aeg_mvd_bits(mvx - pmvx, mvy - pmvy) + ref_te_bits(e, ref);
                         cst = sd_satd + 8 * bts;
                         if (cst < best_c) { best_c = cst; cand_ref = ref; cand_mv[0][0]=mvx; cand_mv[0][1]=mvy; cand_pmv[0][0]=pmvx; cand_pmv[0][1]=pmvy; cand_satd = sd_satd; (void)sd; }
@@ -4406,7 +4416,9 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
                                   &pmv[k][1]);
                     me_partition(e, mbx, mby, AEG_MB_P8x8, k, geo[k], pmv[k][0],
                                  pmv[k][1], &mv[k][0], &mv[k][1], &sad, 0);
-                    satd_sum += part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
+                    satd_sum += e->me_last_satd >= 0
+                                    ? e->me_last_satd
+                                    : part_satd(e, mbx, mby, geo[k], mv[k][0], mv[k][1]);
                     me_publish(trial, geo[k], mv[k][0], mv[k][1]);
                     avail_publish(tavail, geo[k]);
                     bits += aeg_mvd_bits(mv[k][0] - pmv[k][0],
@@ -6722,6 +6734,14 @@ static void mvref_order(struct aeg_encoder *e, int mbx, int mby,
 
 /* The SATD of a candidate's luma prediction plus its header bits at the
  * motion-search lambda: the cost the motion search ranks by (AEG_PPG). */
+/* AEG_TRELF=1: the trellis (when on) prices the winner only, as x264's
+ * --trellis 1 does, instead of every candidate. */
+static int trel_final_on(const struct aeg_encoder *e)
+{
+    (void)e;
+    return ENV_INT("AEG_TRELF", 0) > 0;
+}
+
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
 {
     const int s = e->stride[0];
@@ -6791,6 +6811,13 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
      * 3 for -5 % time, +0.01 / +0.07 % at preset 4 for -3 / -4.5 %; ranking
      * the modes by SATD instead of SAD helped neither two nor one. */
     CM_T0();
+    /* Level selection on the winner only (trel_final_on): the decision runs
+     * with the plain quantiser, the trellis comes back for the re-code of
+     * the luma winner below and for the chroma. */
+    const int trel_final = e->p.trellis > 0 && e->p.cabac && trel_final_on(e);
+    const int trel_saved = e->p.trellis;
+    if (trel_final)
+        e->p.trellis = 0;
     int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
     {
         /* one mode below preset 4 (re-measured once the Intra_16x16 AC
@@ -7131,6 +7158,44 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         c->qp = mb_qp;
         e->mb_cand[0] = save;
         restore_luma(e, mbx, mby, snap_l);
+    }
+
+    if (trel_final) {
+        const int mb_qp = c->qp;
+        e->p.trellis = trel_saved;
+        if (inter) {
+            mbcand save = e->mb_cand[0];
+            int b;
+            e->mb_cand[0].type = best.type;
+            e->mb_cand[0].nparts = best.nparts;
+            memcpy(e->mb_cand[0].sub_type, best.sub_type, sizeof(best.sub_type));
+            memcpy(e->mb_cand[0].blist, best.blist, sizeof(best.blist));
+            for (b = 0; b < 16; b++) {
+                e->mb_cand[0].mv[b][0] = best.mv[b][0];
+                e->mb_cand[0].mv[b][1] = best.mv[b][1];
+                e->mb_cand[0].mv1[b][0] = best.mv1[b][0];
+                e->mb_cand[0].mv1[b][1] = best.mv1[b][1];
+                e->mb_cand[0].pmv[b][0] = best.pmv[b][0];
+                e->mb_cand[0].pmv[b][1] = best.pmv[b][1];
+                e->mb_cand[0].pmv1[b][0] = best.pmv1[b][0];
+                e->mb_cand[0].pmv1[b][1] = best.pmv1[b][1];
+                e->mb_cand[0].ref[b] = best.ref[b];
+            }
+            e->t8_force = best.t8 ? 2 : 1;
+            rd_luma(e, mbx, mby, &t, mb_qp, best.type, 0, lambda, 0);
+            e->t8_force = 0;
+            e->mb_cand[0] = save;
+        } else if (best.type == AEG_MB_I16x16) {
+            rd_luma(e, mbx, mby, &t, mb_qp, AEG_MB_I16x16, best.i16_mode, lambda, -1);
+        } else if (best.type == AEG_MB_I4x4) {
+            rd_luma_i4x4(e, mbx, mby, &t, mb_qp, lambda);
+        } else {
+            rd_luma_i8x8(e, mbx, mby, &t, mb_qp, lambda);
+        }
+        t.chroma_mode = best.chroma_mode;
+        best = t;
+        c->qp = mb_qp;
+        snap_luma(e, mbx, mby, snap_l);
     }
 
     CM_LAP(e, 4);
