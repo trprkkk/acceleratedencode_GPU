@@ -5135,3 +5135,72 @@ What remains of the CRF gap, largest first: the core coding of cockL (about 6
 points; the cock gap), references beyond two (about 3 on vtestL and megaL;
 next), strength beyond 1.6 on static content (about 1.3) and the lookahead
 length (0.8).
+
+## More than two P references
+
+`--ref` now goes to 8 (it stopped at 2).  The reference handling was the
+part built for two: `refp`/`ref2p` and two motion-compensation contexts,
+masks of `& 1` on every `ref_idx`, a one-bit `te(v)` in CAVLC and two bins
+in CABAC, and memory-management operations that keep the pyramid's buffer
+at three pictures.  With three or more references:
+
+- the buffer is a plain sliding window of `max_refs` = refs (+1 with a B
+  pyramid) pictures, no marking operations, and the SPS says so
+  (`aeg_sps_max_refs`, shared by the encoder and the header writer);
+- list0 is the newest anchor, then every other picture by decreasing POC
+  (`set_refs_multi`), sent as a `ref_pic_list_modification` whenever the
+  default order (decreasing frame_num) differs; the slice's
+  `num_ref_idx_l0_active` drops to the highest index any partition used;
+- `ref_idx` is `ue(v)` in CAVLC and the full unary in CABAC (bin 0 on
+  ctxIdxInc 0-3 from the neighbours, bin 1 on 4, the rest on 5), and the
+  bit estimates follow (`ref_te_bits`);
+- references past the second borrow their buffer's sub-pel planes instead
+  of owning a context (their `stride` was once left at 0: a small, silent
+  drift that only showed when a block chose such a reference);
+- the 16x16 candidate on an older reference searches every one of them and
+  keeps the best by SATD + bits; the 16x8 / 8x16 halves search all
+  references; P_8x8 picks a reference per 8x8 first and then its sub-shape
+  on it (`me_candidate_p8x8_mref`, x264's mixed references), and x264's
+  early termination applies: when reference 0 is the best whole-macroblock
+  match, the partitions look no further back than the neighbours did
+  (`AEG_PREF`: 0 off, 1 all references, 2 pruned = default).
+
+B pictures keep one reference per list.
+
+**The level now covers the decoded picture buffer.**  `max_dec_frame_buffering`
+was `max_refs + bframes` with B pictures (above level 4.0's four frames at
+1080p even with the old defaults) and 1 without them (below
+`max_num_ref_frames` with `--ref 2`).  It is now the larger of
+`max_num_ref_frames` and the reorder count (x264's rule: non-reference
+pictures leave the buffer as they are decoded), the automatic level is the
+smallest whose MaxDpbMbs holds it (`pick_level`), and an explicit `--level`
+lowers `--ref` until it fits, with a warning, as x264 does.  At 1080p:
+p3 stays level 4.0, p4 (`--ref 8`, pyramid) is level 5.0 as x264 veryslow
+is.
+
+Constant QP 22-37, the long, main and val clips, BD-rate against p4 with two
+references (x264 veryslow with fewer references in the second table; it
+uses 16):
+
+| config | cockL | vtestL | megaL | mean of 14 |
+|---|---|---|---|---|
+| `--ref 3`, partitions on ref 0 | -0.07 | -1.25 | -0.37 | -0.34 |
+| `--ref 4`, partitions on ref 0 | -0.15 | -2.17 | -0.51 | -0.55 |
+| `--ref 6`, partitions on ref 0 | -0.13 | -3.22 | -0.70 | -0.74 |
+| `--ref 4`, partitions search all | -0.21 | -4.20 | -1.26 | -1.11 |
+| `--ref 4`, pruned | -0.24 | -3.83 | -1.08 | -1.03 |
+| `--ref 6`, pruned | -0.27 | -5.03 | -1.33 | -1.27 |
+| `--ref 8`, pruned | -0.30 | -5.59 | -1.77 | -1.45 |
+
+| x264 veryslow, refs | 1 | 2 | 3 | 4 | 6 | (16) |
+|---|---|---|---|---|---|---|
+| BD-rate against 16 | +1.44 | +1.18 | +0.84 | +0.80 | +0.30 | 0 |
+
+So aegenc gets more out of references 3-8 than x264 does (x264 2 -> 6 is
+-0.9, aegenc 2 -> 6 is -1.3), most of it on vtestL (static camera, things
+reappearing).  Time, user seconds, single thread, minimum of three
+(cockL 120 frames / vtestL 200): p4 9.02 / 5.71, `--ref 4` pruned 9.70 /
+5.29, `--ref 8` pruned 9.65 / 5.41; p3 6.71 / 4.84, p3 `--ref 4` pruned
+7.89 / 4.93.  More references cost little because most macroblocks skip or
+stop at reference 0, and the older references' 16x16 search starts from the
+neighbours' vectors.

@@ -253,10 +253,14 @@ typedef struct aeg_params {
      * Costs about a third of the encode time at preset 4 for 0.1-0.6 points of
      * BD-rate (see docs/STATUS.md, "Refining every candidate"). */
     int refine_cand;
-    /* P-picture reference pictures: 1 or 2.  -1 = as the preset says (2 from
-     * preset 3 up on streams without B pictures, 1 otherwise).  The second
-     * reference is the anchor before the previous one; a whole-macroblock
-     * 16x16 candidate on it competes in the rate-distortion decision. */
+    /* P-picture reference pictures: 1..8.  -1 = as the preset says (8 at
+     * preset 4, 4 at preset 3, 1 below).  The
+     * second reference is the anchor before the previous one (with a B
+     * pyramid the reference B just coded); a whole-macroblock 16x16
+     * candidate on it competes in the rate-distortion decision.  With three
+     * or more, list0 holds the newest anchor and then the other pictures in
+     * the buffer by decreasing display order, each older one gets its own
+     * 16x16 search and the best of them is the extra candidate. */
     int refs;
     /* Explicit weighted prediction of P pictures (fades): 0 = off, 1 = a
      * weight and offset per picture for luma and chroma, chosen by a small

@@ -88,10 +88,49 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
 /* ------------------------------------------------------------------ */
 /* SPS / PPS                                                           */
 /* ------------------------------------------------------------------ */
-/* Pick the smallest level that satisfies the frame size, frame rate and
- * bit rate of the stream (Table A-1). */
+/* max_num_ref_frames: what the encoder keeps (its max_refs).  With three or
+ * more P references a plain sliding window of that many, plus the pyramid's
+ * reference B; below, the anchors B pictures need and the pyramid's
+ * reference B. */
+int aeg_sps_max_refs(const aeg_params *p)
+{
+    return p->refs >= 3 ? p->refs + (p->bframes > 0 && p->b_pyramid) :
+           (p->bframes > 0 && p->b_pyramid) ? 3 :
+           ((p->bframes > 0 || p->refs >= 2) ? 2 : 1);
+}
+
+/* max_dec_frame_buffering (E.2.1): at least max_num_ref_frames and at least
+ * max_num_reorder_frames (which is sent as the B count).  Every non-reference
+ * picture is next in output order when it is decoded and goes out without
+ * being stored (C.4.5.3), and a reference picture the window drops has been
+ * output, so the reference pictures are all the buffer has to hold. */
+int aeg_dpb_frames(const aeg_params *p)
+{
+    int n = aeg_sps_max_refs(p);
+    return p->bframes > n ? p->bframes : n;
+}
+
+/* MaxDpbMbs of Table A-1 (0 for an unknown level_idc) */
+int aeg_level_dpb_mbs(int level_idc)
+{
+    static const int tab[][2] = {
+        { 9, 396 }, { 10, 396 }, { 11, 900 }, { 12, 2376 }, { 13, 2376 },
+        { 20, 2376 }, { 21, 4752 }, { 22, 8100 }, { 30, 8100 }, { 31, 18000 },
+        { 32, 20480 }, { 40, 32768 }, { 41, 32768 }, { 42, 34816 },
+        { 50, 110400 }, { 51, 184320 }, { 52, 184320 }, { 60, 696320 },
+        { 61, 696320 }, { 62, 696320 },
+    };
+    size_t i;
+    for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
+        if (tab[i][0] == level_idc)
+            return tab[i][1];
+    return 0;
+}
+
+/* Pick the smallest level that satisfies the frame size, frame rate, bit
+ * rate and decoded picture buffer of the stream (Table A-1). */
 static int pick_level(int mb_w, int mb_h, int fps_num, int fps_den,
-                      int bitrate_kbps, int interlaced)
+                      int bitrate_kbps, int interlaced, int dpb_frames)
 {
     /* [level_idc][MaxFS][MaxMBPS][MaxBR(kbit/s)] for Baseline/Main/High, and
      * whether the level requires frame_mbs_only_flag = 1 (Table A-4: only
@@ -107,16 +146,18 @@ static int pick_level(int mb_w, int mb_h, int fps_num, int fps_den,
         { 51, 36864, 983040, 240000, 1 },
     };
     int fs = mb_w * mb_h;
+    int64_t dpb = (int64_t)fs * dpb_frames;
     int64_t mbs = (int64_t)fs * fps_num / fps_den;
     int br = bitrate_kbps > 0 ? bitrate_kbps : 20000;
     size_t i;
     if (interlaced)     /* the smallest that fits and allows it, if any */
         for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
             if (!tab[i].frame_only && fs <= tab[i].fs && mbs <= tab[i].mbs &&
-                br <= tab[i].br)
+                br <= tab[i].br && dpb <= aeg_level_dpb_mbs(tab[i].idc))
                 return tab[i].idc;
     for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
-        if (fs <= tab[i].fs && mbs <= tab[i].mbs && br <= tab[i].br)
+        if (fs <= tab[i].fs && mbs <= tab[i].mbs && br <= tab[i].br &&
+            dpb <= aeg_level_dpb_mbs(tab[i].idc))
             return tab[i].idc;
     }
     return 51;
@@ -303,7 +344,8 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
      * numbers are 0 and 1 as before, so the SPS of a stream without them is
      * byte for byte what it was. */
     aeg_bw_ue(bw, (uint32_t)(p->bframes > 0 ? p->bframes : 0));
-    aeg_bw_ue(bw, (uint32_t)(p->bframes > 0 ? max_refs + p->bframes : 1));
+    aeg_bw_ue(bw, (uint32_t)aeg_dpb_frames(p));
+    (void)max_refs;
 }
 
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
@@ -321,7 +363,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
         level_idc = pick_level(mb_w, mb_h, p->fps_num, p->fps_den,
                                p->vbv_maxrate_kbps > p->bitrate_kbps
                                    ? p->vbv_maxrate_kbps : p->bitrate_kbps,
-                               p->interlaced);
+                               p->interlaced, aeg_dpb_frames(p));
 
     /* High profile as soon as the 8x8 transform is on -- it is the profile that
      * introduced transform_size_8x8_flag.  CABAC without it is Main profile;
@@ -349,8 +391,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     /* pic_order_cnt_type 2 derives the picture order count from frame_num,
      * which counts *decoding* order: with B pictures the two orders differ, so
      * the count has to be sent explicitly (type 0, an 8-bit lsb per slice). */
-    const int nrefs = (p->bframes > 0 && p->b_pyramid) ? 3 :
-                      ((p->bframes > 0 || p->refs >= 2) ? 2 : 1);
+    const int nrefs = aeg_sps_max_refs(p);
     if (p->bframes > 0) {
         aeg_bw_ue(&bw, 0);               /* pic_order_cnt_type = 0          */
         aeg_bw_ue(&bw, 4);               /* log2_max_pic_order_cnt_lsb_minus4 */
@@ -533,7 +574,11 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         }
         if (nos == 0 && rc &&
             (num_ref_idx_l0_active > 1 ? rc->n_mod : rc->n_mod_1ref) > 0) {
+            /* no more operations than active entries (7.4.3.1): a slice
+             * that kept only the first entries writes only theirs */
             int k, n = num_ref_idx_l0_active > 1 ? rc->n_mod : rc->n_mod_1ref;
+            if (num_ref_idx_l0_active > 1 && n > num_ref_idx_l0_active)
+                n = num_ref_idx_l0_active;
             aeg_bw_put(bw, 1, 1);     /* ref_pic_list_modification_flag_l0  */
             for (k = 0; k < n; k++) {
                 aeg_bw_ue(bw, (uint32_t)rc->mod_idc[k]); /* 0: -, 1: +      */

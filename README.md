@@ -205,10 +205,11 @@ of BD-rate for about 40 % more time at preset 4; off by default, see
 *Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1` controls rate-distortion
 level selection on the luma residual (priced by the CABAC coder; on from preset
 3 up, where it is worth 0.15-2.2 points for 12-14 % of the encode time, see
-*Rate-distortion level selection* in `docs/STATUS.md`), `--ref 1|2` gives P
-pictures a second reference picture (on from preset 3 up: -1.4 % mean BD-rate
-for about 15 % more time without B pictures, -0.18 % for 3 % with them, see
-*Two P references* in `docs/STATUS.md`),
+*Rate-distortion level selection* in `docs/STATUS.md`), `--ref 1..8` gives P
+pictures more reference pictures (8 at preset 4, 4 at preset 3: -1.45 / -0.97 %
+BD-rate against two for a few per cent of time, the partitions choosing
+their own reference as x264's mixed references do; see *Two P references*
+and *More than two P references* in `docs/STATUS.md`),
 from preset 2 up the inter winner's transform size is chosen by rate and
 distortion (re-coded with the other size) and from preset 3 up every
 candidate's distortion is measured after deblocking its internal edges --

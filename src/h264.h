@@ -282,6 +282,9 @@ size_t aeg_bw_finish(aeg_bitwriter *bw);
 size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
                      int nal_type, const uint8_t *rbsp, size_t rbsp_len,
                      int long_start_code);
+int aeg_sps_max_refs(const aeg_params *p);
+int aeg_dpb_frames(const aeg_params *p);
+int aeg_level_dpb_mbs(int level_idc);
 size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
                      int mb_w, int mb_h, int frame_num_bits, int level_idc);
 /* The NAL HRD the SPS signals (nal_hrd with a VBV model): the bit rate and
@@ -311,15 +314,17 @@ typedef struct aeg_refctl {
     int n_mod;
     int n_mod_1ref;     /* entries to write when the slice ends up with one
                          * active reference (0 or 1: the first is the same) */
-    int mod_idc[2], mod_abs[2];
+    int mod_idc[16], mod_abs[16];   /* up to 16 active list0 entries */
     int n_mmco;
-    int mmco_diff[3];
-    int mmco_slot[3];   /* encoder bookkeeping, not written */
+    int mmco_diff[17];
+    int mmco_slot[17];  /* encoder bookkeeping, not written */
 } aeg_refctl;
 typedef struct aeg_pwt {
     int luma_denom, chroma_denom;
-    int lflag[2], lw[2], lo[2];
-    int cflag[2], cw[2][2], co[2][2];
+    /* one entry per active list0 reference (16 at most); only entry 0 is
+     * ever weighted, the others keep flag 0 */
+    int lflag[16], lw[16], lo[16];
+    int cflag[16], cw[16][2], co[16][2];
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8,

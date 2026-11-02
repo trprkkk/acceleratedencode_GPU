@@ -415,6 +415,22 @@ run_case ref2_cavlc    320 192 16 4 -q 34 -p 3 --ref 2 --no-cabac
 run_case ref2_slices   320 192 16 4 -q 34 -p 3 --ref 2 --slices 3 -t 2
 run_case ref2_gop      320 192 12 1 -q 28 -p 3 --ref 2 -g 5
 run_bcase bframes_ref2 320 192 13 3 1 -q 20 --scenecut 0 -p 4 --ref 2
+# Three to eight P references (set_refs_multi): no marking operations, a
+# sliding window of max_refs pictures (refs, plus the pyramid's reference B)
+# that the SPS has to announce, list0 reordered to the newest anchor first and
+# the rest by decreasing POC, ref_idx as ue(v) in CAVLC and the long unary
+# (ctxIdxInc 4, then 5) in CABAC, per-slice num_ref_idx_active down to the
+# highest index used, and the borrowed sub-pel planes of the references past
+# the second (their stride once read as 0: small, silent drift).
+run_case ref4_p        320 192 16 4 -q 34 -p 4 --ref 4
+run_case ref6_cavlc    320 192 16 4 -q 34 -p 4 --ref 6 --no-cabac
+run_case ref8_slices   320 192 16 4 -q 34 -p 4 --ref 8 --slices 3 -t 2
+run_case ref5_gop      320 192 14 1 -q 28 -p 3 --ref 5 -g 6
+run_case ref4_ft       320 192 16 4 -q 30 -p 4 --ref 4 --frame-threads 2
+run_case weightp_ref4  320 192 10 5 -q 26 -p 4 --scenecut 0 --ref 4
+run_bcase bframes_ref4 320 192 13 3 1 -q 20 --scenecut 0 -p 4 --ref 4 --b-pyramid 0
+run_bcase bpyr_ref4    320 192 24 3 4 -q 26 -p 4 --ref 4 --scenecut 0
+run_bcase bpyr_ref6ft  320 192 24 3 4 -q 26 -p 4 --ref 6 --scenecut 0 --frame-threads 2
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in
@@ -889,7 +905,7 @@ else
 fi
 bad=0
 for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
-            "-w 96 -h 64 --bframes 4" "-w 96 -h 64 --ref 3" "-w 96 -h 64 -p 5" \
+            "-w 96 -h 64 --bframes 4" "-w 96 -h 64 --ref 9" "-w 96 -h 64 -p 5" \
             "-w 96 -h 64 --fps 0" "-w 96 -h 64 --sar 4" "-w 96 -h 64 --direct x" \
             "-w 96 -h 64 --colorprim nope" "-w 64 -h 64 --demuxer y4m" \
             "-w 96 -h 64 --qpmax 0" "-w 96 -h 64 --qpmin 40 --qpmax 30" \

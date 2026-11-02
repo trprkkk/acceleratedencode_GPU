@@ -96,8 +96,8 @@ static void usage(void)
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 2)\n"
-"  --ref <n>        reference pictures for P pictures, 1 or 2 (default 2 from\n"
-"                   preset 3 up, otherwise 1)\n"
+"  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
+"                   preset 4, 4 at preset 3, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"
@@ -865,7 +865,7 @@ int main(int argc, char **argv)
         if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
         if (refine_mv >= 0) bad |= range_bad("--refine-mv", refine_mv, 0, 3);
         if (refine_cand >= 0) bad |= range_bad("--refine-cand", refine_cand, 0, 1);
-        if (refs >= 0) bad |= range_bad("--ref", refs, 1, 2);
+        if (refs >= 0) bad |= range_bad("--ref", refs, 1, 8);
         if (weightp >= 0) bad |= range_bad("--weightp", weightp, 0, 1);
         if (bpyramid >= 0) bad |= range_bad("--b-pyramid", bpyramid, 0, 1);
         if (mbtree >= 0) bad |= range_bad("--mbtree", mbtree, 0, 1);
