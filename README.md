@@ -209,6 +209,12 @@ level selection on the luma residual (priced by the CABAC coder; on from preset
 pictures a second reference picture (on from preset 3 up: -1.4 % mean BD-rate
 for about 15 % more time without B pictures, -0.18 % for 3 % with them, see
 *Two P references* in `docs/STATUS.md`),
+from preset 2 up the inter winner's transform size is chosen by rate and
+distortion (re-coded with the other size) and from preset 3 up every
+candidate's distortion is measured after deblocking its internal edges --
+x264's subme 8/9 tools, -0.4 to -0.65 and another -0.3 % BD-rate (see *The
+cockatoo / tree gap* in `docs/STATUS.md`; `AEG_T8RD=0` / `AEG_DBRDO=0` turn
+them off),
 `--partitions`
 selects which inter partition shapes may be used (`1` = 16x16 only, `7` =
 16x16 + 16x8 + 8x16, `8` = P_8x8 only, `15` = everything, which is the

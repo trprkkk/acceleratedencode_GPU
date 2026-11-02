@@ -4973,3 +4973,92 @@ python3 tools/x264cmp.py run --clips main --mode 10 --only '^(aeg-p3|aeg-p4|x264
 python3 tools/x264cmp.py report --clips main,val,long [--metric ssim_db] [--detail aeg-p3:x264-medium]
 python3 tools/x264cmp.py speed --threads 1 --long cockL:/tmp/real/cockL.yuv:640:352,hd:/tmp/real/hdL.yuv:1280:720
 ```
+
+## The cockatoo / tree gap against x264 veryslow
+
+The final comparison left p4 +4.9 / +7.3 % behind x264 veryslow on the two
+cockatoo clips and +5.6 / +7.7 % on the two tree clips, while 5-12 % ahead on
+vtest.  `tools/x264abl.py` (same measurement as `x264cmp.py`: constant QP
+22-37, global PSNR, one thread; `NAME=aeg:P[:args]`, `NAME=x264:PRESET[:x264
+params]`, an aegenc token `VAR=value` is an environment variable) took both
+encoders apart one tool at a time on those four clips plus the three vtest
+clips.
+
+**The gap is not clip-specific; the vtest lead is.**  The constant-QP
+macroblock tree, which x264 does not run at constant QP, is worth 7-11 points
+on vtest and nothing on cock / tree (p4 `--mbtree 0`: cock +0.06, cock2 -2.97,
+tree -1.19, tree2 +3.71, vtest +11.31 / +10.71 / +6.94).  Without it aegenc
+trails veryslow on every clip (+0.3 to +11.1).
+
+**With the same tools, aegenc is not behind.**  x264 veryslow cut down to
+aegenc's toolset (`ref=2:partitions=p8x8,b8x8,i8x8,i4x4:subme=7:trellis=1:
+bframes=3:b-adapt=0`) against p4 with the same fixed B structure and no tree
+(`--b-adapt 0 --mbtree 0 --bqp 2`): cock -1.50, cock2 -0.61, tree +0.35,
+tree2 +3.90, vtest -0.73 / -2.36 / -2.56.  The B-picture coding is fine; the
+trellis-off pair (P only) even has aegenc 3.8-5.2 % ahead on cock.
+
+**What veryslow adds over that toolset** (x264 against itself, b-adapt 2):
+
+| x264 change | cock | cock2 | tree | tree2 | vtest | vtest2 | vtest3 | mean |
+|---|---|---|---|---|---|---|---|---|
+| subme 7 -> 9 | -2.05 | -2.48 | -1.16 | -1.10 | -2.06 | -1.69 | -1.91 | -1.78 |
+| trellis 1 -> 2 | -1.45 | -1.39 | -0.75 | -1.42 | -0.60 | -0.51 | -0.61 | -0.96 |
+| ref 2 -> 3 | +0.29 | -0.08 | -0.05 | -0.80 | -1.08 | -0.65 | -0.31 | -0.38 |
+| ref 2 -> 16 | +0.04 | +0.36 | -0.46 | -2.77 | -2.53 | -2.38 | -1.14 | -1.27 |
+| all of veryslow | -3.68 | -4.62 | -3.77 | -3.72 | -5.82 | -6.71 | -4.44 | -4.68 |
+
+aegenc's trellis already runs inside the decision (x264's trellis 2) and its
+`--refine-mv` is the quarter-pel RD refinement of subme 8, but that refinement
+is worth 0.63 here (p4 `--refine-mv 0`: cock +1.67, vtest +0.13) against
+x264's 1.8.  x264's subme >= 8 does two more things (`encoder/analyse.c`):
+`mb_analyse_transform_rd` re-codes the winner with the other transform size,
+and from subme 9 `b_deblock_rdo` measures every candidate's distortion after
+deblocking the macroblock's internal edges (`rdo.c`).  Both are now in:
+
+* **Transform size by RD** (`AEG_T8RD`, from preset 2): use_t8() picks 4x4 /
+  8x8 by the SATD / SA8D of the residual; code_mb() codes the inter winner
+  once more with the other size (`t8_force`) and keeps the cheaper price.
+* **Deblock RDO** (`AEG_DBRDO`, from preset 3, with deblocking on):
+  full_price() deblocks a copy of the candidate's luma over its internal
+  edges (`aeg_deblock_mb_internal_luma()`: edges 4/8/12, or 8 with the 8x8
+  transform, the macroblock's own QP and bS) and adds the change in SSE.
+  Every candidate, intra included, is priced that way.
+
+BD-rate against the encoder without them (negative = better):
+
+| | cock | cock2 | tree | tree2 | vtest | vtest2 | vtest3 | mean |
+|---|---|---|---|---|---|---|---|---|
+| p4 + transform RD | -0.46 | -0.33 | +0.01 | +0.02 | -0.31 | -0.35 | -0.07 | -0.21 |
+| p4 + deblock RDO | -0.47 | -0.61 | +0.07 | -0.17 | -0.07 | -0.13 | -0.15 | -0.22 |
+| p4 + both | -1.01 | -1.18 | +0.04 | -0.34 | -0.33 | -0.52 | -0.26 | -0.51 |
+
+| main + val (11 clips) | transform RD | both | time (cock, 1 thread, median of 5) |
+|---|---|---|---|
+| p2 | **-0.65** | -0.93 | +5.5 % / +19.8 % |
+| p3 | -0.41 | **-0.71** | -1.0 % / +8.1 % |
+| p4 | | **-0.66** | +1.8 % / +11.0 % |
+
+Deblock RDO is not on at preset 2: there it adds -0.28 for another 14 %.
+Frame / slice thread identity and every conformance case hold (the decision
+only reads the macroblock itself).
+
+Against x264 now (main + val, 11 clips, PSNR BD-rate):
+
+| | x264 medium before / after | x264 veryslow before / after |
+|---|---|---|
+| p2 | +3.13 / **+2.47** | |
+| p3 | -5.27 / **-5.95** | +0.85 / **+0.12** |
+| p4 | -5.68 / **-6.30** | +0.40 / **-0.25** |
+
+Tried and not kept (p4, ct + vt clips): iterating the RD refinement while the
+vector moves (`AEG_RMIT=4`, -0.07), trying the predicted vector as well
+(x264 does; 0.00), a 10 / 20 % penalty on intra candidates in P / B pictures
+(aegenc picks intra for 12 % of tree's P macroblocks against x264's 2-6 %,
+but it is RD-correct: +0.08 / +0.75), the inter trellis lambda at 1.0x / 0.6x
+(+0.17 / +0.04), `--subme 2` (0.00).  Chroma AC level selection is already on
+(`AEG_TCHROMA`; the *Rate-distortion level selection* paragraph predates it).
+
+What is left of the gap: references beyond two (tree2 and vtest: x264's ref
+16 is worth 2.8 and 1.1-2.5 points; aegenc has two for P and one per B list,
+and the second only for 16x16), and the constant-QP tree costing cock2 3 and
+tree 1.2 points while it gains 9-11 on vtest.

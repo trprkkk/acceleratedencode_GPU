@@ -339,6 +339,37 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
     }
 }
 
+/* The internal luma edges of one macroblock, `q`, whose reconstruction is
+ * the 16x16 block at `pix` (stride `s`): the vertical edges at 4, 8 and 12,
+ * then the horizontal ones, with the macroblock's own QP -- what the loop
+ * filter will do inside the macroblock whatever its neighbours turn out to
+ * be.  For the rate-distortion decision (x264's deblock RDO, subme 9 and up):
+ * the distortion the decoder sees is that of the filtered picture.  Returns
+ * whether any edge was filtered. */
+int aeg_deblock_mb_internal_luma(pixel *pix, int s, const aeg_mb *q,
+                                 int salpha, int sbeta)
+{
+    int alpha, beta, dir, k, any = 0;
+    const int8_t *tc0;
+
+    aeg_deblock_thresholds(q->qp, salpha, sbeta, &alpha, &beta, &tc0);
+    if (!alpha || !beta)
+        return 0;
+    for (dir = 1; dir >= 0; dir--)
+        for (k = 1; k < 4; k++) {
+            int bs[4];
+            if (q->t8 && (k & 1))
+                continue;
+            edge_bs(q, q, dir, k, 0, bs);
+            if (!bs[0] && !bs[1] && !bs[2] && !bs[3])
+                continue;
+            luma_edge_filter(pix + (dir ? k * 4 : k * 4 * s), dir ? 1 : s,
+                             dir ? s : 1, alpha, beta, tc0, bs, 0);
+            any = 1;
+        }
+    return any;
+}
+
 void aeg_deblock_mb(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                     int mb_x, int mb_y, int slice_alpha, int slice_beta)
 {

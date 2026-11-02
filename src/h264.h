@@ -598,6 +598,8 @@ void aeg_deblock_mb(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                     int mb_x, int mb_y, int slice_alpha, int slice_beta);
 void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                         int mb_x, int mb_y, int salpha, int sbeta, int vertical);
+int  aeg_deblock_mb_internal_luma(pixel *pix, int s, const aeg_mb *q,
+                                  int salpha, int sbeta);
 
 /* Deblocking thresholds (shared with the verification decoder) */
 void aeg_deblock_thresholds(int qp, int slice_alpha, int slice_beta,

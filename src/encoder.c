@@ -138,6 +138,9 @@ struct aeg_encoder {
      * cropped away by the SPS (frame_cropping) */
     int vw, vh, vcw, vch;
     int mb_w, mb_h, mb_count;
+    /* use_t8()'s answer while code_mb() tries the other transform size of
+     * the winner: 0 = decide, 1 = 4x4, 2 = 8x8 (see t8_rd_on()) */
+    int t8_force;
     int stride[3];
     int frame_num_bits, level_idc;
     /* the parameter sets as every IDR carries them (aeg_encoder_headers) */
@@ -2086,6 +2089,8 @@ static int use_t8(const struct aeg_encoder *e, int mbx, int mby, const mbenc *c)
 
     if (!t8_allowed(e, c))
         return 0;
+    if (e->t8_force)
+        return e->t8_force == 2;
     for (g = 0; g < 4; g++) {
         const int bx = (g & 1) * 8, by = (g >> 1) * 8;
         cost8 += aeg_sa8d_8x8(src + by * s + bx, s, e->pred_l + by * 16 + bx,
@@ -5839,6 +5844,9 @@ static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
 static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
                           const mbenc *t, int64_t est, int cmode, double lambda,
                           int64_t bound);
+static int64_t full_price_inner(struct aeg_encoder *e, int mbx, int mby,
+                                const mbenc *t, int64_t est, int cmode,
+                                double lambda, int64_t bound);
 static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
                         int qp, double lambda);
 
@@ -6106,9 +6114,86 @@ static int chroma_decide_on(const struct aeg_encoder *e)
     return v >= 0 ? v : e->p.preset >= 2;
 }
 
+/* Whether code_mb() tries the inter winner's other transform size by rate
+ * and distortion.  AEG_T8RD=0/1 overrides. */
+static int t8_rd_on(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_T8RD");
+        v = ev ? atoi(ev) != 0 : -1;
+    }
+    return v >= 0 ? v : e->p.preset >= 2;
+}
+
+/* Deblock RDO: whether the decision measures a candidate's luma distortion
+ * after the loop filter has run over the macroblock's internal edges.
+ * AEG_DBRDO=0/1 overrides. */
+static int dbrdo_on(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_DBRDO");
+        v = ev ? atoi(ev) != 0 : -1;
+    }
+    return e->p.deblock && (v >= 0 ? v : e->p.preset >= 3);
+}
+
+/* How much the internal-edge filtering changes the luma SSE of the candidate
+ * `t`, whose reconstruction is in the picture. */
+static int64_t dbrdo_delta(struct aeg_encoder *e, int mbx, int mby,
+                           const mbenc *t)
+{
+    pixel blk[256];
+    aeg_mb q;
+    const int s = e->stride[0];
+    const pixel *rec = e->recp[0] + mby * 16 * s + mbx * 16;
+    const pixel *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    int i, y;
+
+    /* only what the filter reads (aeg_mb also carries the levels: no memset) */
+    q.type = (uint8_t)t->type;
+    q.t8 = (uint8_t)(t->type == AEG_MB_I8x8 ||
+                     (is_inter_type(t->type) && mb_t8_coded(e, t, 0)));
+    q.cbp = (uint8_t)t->cbp;
+    q.qp = (int8_t)t->qp;
+    memcpy(q.mv, t->mv, sizeof(q.mv));
+    if (is_b_type(t->type))
+        memcpy(q.mv1, t->mv1, sizeof(q.mv1));
+    memcpy(q.blist, t->blist, sizeof(q.blist));
+    memcpy(q.ref_idx, t->ref, sizeof(q.ref_idx));
+    for (i = 0; i < AEG_BLK_COUNT; i++)
+        q.nz[i] = (int8_t)(t->nz[i] != 0);
+    for (i = 0; i < 4; i++)
+        q.nz8[i] = (int8_t)(t->nz8[i] != 0);
+    for (y = 0; y < 16; y++)
+        memcpy(blk + y * 16, rec + y * s, 16 * sizeof(pixel));
+    if (!aeg_deblock_mb_internal_luma(blk, 16, &q, e->p.deblock_alpha,
+                                      e->p.deblock_beta))
+        return 0;
+    return aeg_ssd(16, 16, blk, 16, src, s) - aeg_ssd(16, 16, rec, s, src, s);
+}
+
 static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
                           const mbenc *t, int64_t est, int cmode, double lambda,
                           int64_t bound)
+{
+    mbenc f;
+
+    if (dbrdo_on(e)) {
+        /* the filtered distortion stands in for the plain one (the price is
+         * the distortion plus lambda times the rate, so the change adds) */
+        int64_t dd = dbrdo_delta(e, mbx, mby, t);
+        f = *t;
+        f.sse += dd;
+        return full_price_inner(e, mbx, mby, &f, est + dd, cmode, lambda, bound);
+    }
+    return full_price_inner(e, mbx, mby, t, est, cmode, lambda, bound);
+}
+
+static int64_t full_price_inner(struct aeg_encoder *e, int mbx, int mby,
+                                const mbenc *t, int64_t est, int cmode,
+                                double lambda, int64_t bound)
 {
     mbenc f;
     int64_t dc;
@@ -6367,7 +6452,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 int64_t cost = rd_luma(e, mbx, mby, &t, c->qp, AEG_MB_I16x16,
                                        e->mb_modes[i], lambda, -1);
                 cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
-                if (cost < j16)
+                        if (cost < j16)
                     j16 = cost;
                 if (cost < best_cost) {
                     best_cost = cost;
@@ -6442,7 +6527,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         if (e->p.transform_8x8) {
             cost = rd_luma_i8x8(e, mbx, mby, &t, c->qp, lambda);
             cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
-            if (cost < best_cost) {
+                if (cost < best_cost) {
                 best_cost = cost;
                 best = t;
                 snap_luma(e, mbx, mby, snap_l);
@@ -6637,6 +6722,45 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         restore_luma(e, mbx, mby, snap_l);
         refresh_pmvs(e, mbx, mby, &best);
         c->qp = mb_qp;
+    }
+
+    /* The transform size of an inter winner by rate and distortion: use_t8()
+     * picks 4x4 or 8x8 from the SATD / SA8D of the residual; this codes the
+     * winner once more with the other size and keeps whichever the full price
+     * prefers (x264's analyse_transform_rd, subme 8 and up). */
+    if (inter && t8_rd_on(e) && t8_allowed(e, &best)) {
+        mbcand save = e->mb_cand[0];
+        const int mb_qp = c->qp;
+        int b;
+        int64_t cost;
+
+        e->mb_cand[0].type = best.type;
+        e->mb_cand[0].nparts = best.nparts;
+        memcpy(e->mb_cand[0].sub_type, best.sub_type, sizeof(best.sub_type));
+        memcpy(e->mb_cand[0].blist, best.blist, sizeof(best.blist));
+        for (b = 0; b < 16; b++) {
+            e->mb_cand[0].mv[b][0] = best.mv[b][0];
+            e->mb_cand[0].mv[b][1] = best.mv[b][1];
+            e->mb_cand[0].mv1[b][0] = best.mv1[b][0];
+            e->mb_cand[0].mv1[b][1] = best.mv1[b][1];
+            e->mb_cand[0].pmv[b][0] = best.pmv[b][0];
+            e->mb_cand[0].pmv[b][1] = best.pmv[b][1];
+            e->mb_cand[0].pmv1[b][0] = best.pmv1[b][0];
+            e->mb_cand[0].pmv1[b][1] = best.pmv1[b][1];
+            e->mb_cand[0].ref[b] = best.ref[b];
+        }
+        e->t8_force = best.t8 ? 1 : 2;
+        cost = rd_luma(e, mbx, mby, &t, mb_qp, best.type, 0, lambda, 0);
+        cost = full_price(e, mbx, mby, &t, cost, c->chroma_mode, lambda, best_cost);
+        e->t8_force = 0;
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
+        c->qp = mb_qp;
+        e->mb_cand[0] = save;
+        restore_luma(e, mbx, mby, snap_l);
     }
 
     CM_LAP(e, 4);
