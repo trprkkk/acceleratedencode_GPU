@@ -95,7 +95,7 @@ static void usage(void)
 "  --b-pyramid <n>  1 = the middle B picture of a group is a reference for\n"
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
-"                   0 = off, 1 = on (default from preset 2)\n"
+"                   0 = off, 1 = on (default from preset 1)\n"
 "  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
 "                   preset 4, 4 at preset 3, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
@@ -115,16 +115,16 @@ static void usage(void)
 "                   pictures predict from (default on from preset 1; needs\n"
 "                   B pictures)\n"
 "  --rc-lookahead <n> pictures the macroblock tree looks past the group\n"
-"                   being coded (default 10/20/30/40 at presets 1-4, max 60)\n"
+"                   being coded (default 20/20/30/40 at presets 1-4, max 60)\n"
 "  --iqp <n>        QP subtracted from I pictures at constant QP (default 3,\n"
 "                   x264's ipratio 1.4)\n"
 "  --direct <mode>  B direct prediction: spatial (default) or temporal\n"
 "  --dump-recon <f> write the reconstruction (coding order, I420; 16-bit\n"
 "                   little-endian samples at --bit-depth 10)\n"
 "  --dump-order <f> write each packet's display index, one per line\n"
-"  --trellis <n>    rate-distortion level selection on the luma residual:\n"
-"                   0 = off, 1 = on (the default from preset 3 up: 0.15-2.4\n"
-"                   points of BD-rate for 12-14%% of the encode time)\n"
+"  --trellis <n>    rate-distortion level selection (x264's meaning): 0 = off,\n"
+"                   1 = the winning macroblock only (presets 1-2), 2 = every\n"
+"                   candidate of the decision as well (presets 3-4)\n"
 "  --bitrate <kbps> average-bitrate rate control (ABR) instead of constant QP\n"
 "  --vbv-maxrate <kbps>  VBV/HRD channel rate (implies ABR)\n"
 "  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
@@ -874,7 +874,7 @@ int main(int argc, char **argv)
         if (badapt >= 0) bad |= range_bad("--b-adapt", badapt, 0, 2);
         if (bqp > -1000) bad |= range_bad("--bqp", bqp, -51, 51);
         if (iqp > -1000) bad |= range_bad("--iqp", iqp, -51, 51);
-        if (trellis >= 0) bad |= range_bad("--trellis", trellis, 0, 1);
+        if (trellis >= 0) bad |= range_bad("--trellis", trellis, 0, 2);
         if (partitions >= 0) bad |= range_bad("--partitions", partitions, 0, 31);
         if (in_depth >= 0) bad |= range_bad("--input-depth", in_depth, 8, 16);
         if (bad)

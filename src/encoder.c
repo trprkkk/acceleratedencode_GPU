@@ -5069,6 +5069,18 @@ static int me_lambda_on(const struct aeg_encoder *e)
 
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp);
 
+/* x264's partition order for P macroblocks: P_8x8 is searched first, and
+ * 16x8 / 8x16 only when it beats 16x16 by SATD plus vector bits (the value is
+ * the percentage of the 16x16 cost P_8x8 has to come in under; 0 = always
+ * search them).  Preset 1: +0.10 % on the main and validation clips for
+ * -8 % of the time; preset 2 +0.55-0.64 %, so not there.  AEG_PPG
+ * overrides. */
+static int part_gate_pct(const struct aeg_encoder *e)
+{
+    const int v = ENV_INT("AEG_PPG", -1);
+    return v >= 0 ? v : e->p.preset == 1 ? 100 : 0;
+}
+
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     int mode, n = 0, sad_of[4];
@@ -5252,10 +5264,10 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         /* Partitioned candidates: 16x8 and 8x16, bit 1 and 2 of the mask.
          * They only pay off with the RD decision, so ultrafast stays 16x16. */
-        if (e->p.preset >= 1 && ENV_INT("AEG_PPG", 0) > 0) {
+        if (e->p.preset >= 1 && part_gate_pct(e) > 0) {
             /* x264's order: P_8x8 first, and the two halves only when it
-             * beats the whole macroblock (AEG_PPG percent of its cost) */
-            int ppg = ENV_INT("AEG_PPG", 0), n8 = e->mb_ncand, halves = 1;
+             * beats the whole macroblock (part_gate_pct percent of its cost) */
+            int ppg = part_gate_pct(e), n8 = e->mb_ncand, halves = 1;
             if (e->p.partitions & 8) {
                 me_candidate_p8x8(e, mbx, mby);
                 if (e->mb_ncand > n8)
@@ -6734,12 +6746,12 @@ static void mvref_order(struct aeg_encoder *e, int mbx, int mby,
 
 /* The SATD of a candidate's luma prediction plus its header bits at the
  * motion-search lambda: the cost the motion search ranks by (AEG_PPG). */
-/* AEG_TRELF=1: the trellis (when on) prices the winner only, as x264's
- * --trellis 1 does, instead of every candidate. */
+/* --trellis 1 (x264's meaning): level selection for the winner only -- the
+ * decision compares candidates quantised plainly, and the winner's luma and
+ * the chroma are coded with it.  2 runs it inside every candidate. */
 static int trel_final_on(const struct aeg_encoder *e)
 {
-    (void)e;
-    return ENV_INT("AEG_TRELF", 0) > 0;
+    return e->p.trellis == 1;
 }
 
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
@@ -7163,6 +7175,7 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     if (trel_final) {
         const int mb_qp = c->qp;
         e->p.trellis = trel_saved;
+        e->cmemo_gen++;     /* the decision's chroma was coded without it */
         if (inter) {
             mbcand save = e->mb_cand[0];
             int b;
@@ -11938,12 +11951,16 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->refine_cand < 0)
         pp->refine_cand = 0;
     /* Level selection is a large amount of work (a price and an inverse
-     * transform per candidate level) that measured 0.15-2.4 points of BD-rate
-     * for 12-14 % of the encode time, i.e. a better exchange rate than the
-     * candidate refinement, so it follows the preset: presets 3 and 4 run it,
-     * below them it is off (see "Rate-distortion level selection"). */
+     * transform per candidate level), so presets 3 and 4 run it inside every
+     * candidate (2: 0.15-2.4 points of BD-rate for 12-14 % of the encode time
+     * when it was added) and presets 1 and 2 on the winner only (1, x264's
+     * --trellis 1: -4.1 / -3.7 % on the main and validation clips for 6-8 % of
+     * the time, against -4.4 / -4.1 % for 26 % in every candidate; see
+     * "Presets 1 and 2"). */
     if (pp->trellis < 0)
-        pp->trellis = pp->preset >= 3 ? 1 : 0;
+        pp->trellis = pp->preset >= 3 ? 2 : pp->preset >= 1 ? 1 : 0;
+    if (pp->trellis > 2)
+        pp->trellis = 2;
     if (pp->gop_size < 0) pp->gop_size = 250;
     /* B pictures: three between two anchors at most (AEG_MAX_BFRAMES), and none
      * at all without CABAC -- the B macroblock layer is only implemented for the
@@ -11984,8 +12001,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * also switches to the trellis at its slow preset. */
     if (pp->b_adapt < 0 || pp->b_adapt > 2)
         pp->b_adapt = pp->preset >= 3 ? 2 : 1;
+    /* (preset 1 too since the p1/p2 retune: -0.16 % on the main and
+     * validation clips -- short, which fades, -1.8 -- at no measurable time) */
     if (pp->weightp < 0)
-        pp->weightp = pp->preset >= 2;
+        pp->weightp = pp->preset >= 1;
     if (pp->refs < 1)
         pp->refs = 1;
     if (pp->refs > AEG_MAX_REFS)
@@ -12014,7 +12033,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->mbtree = 0;
     pp->mbtree = pp->mbtree ? 1 : 0;
     if (pp->rc_lookahead < 0) {
-        static const int la[5] = { 0, 10, 20, 30, 40 };
+        /* preset 1 was 10; 20 measured -0.45 % there at no measurable time
+         * (30: another -0.13 % for up to 3 %, and nothing at preset 2) */
+        static const int la[5] = { 0, 20, 20, 30, 40 };
         pp->rc_lookahead = la[pp->preset];
     }
     if (pp->rc_lookahead > AEG_MAX_LOOKAHEAD)

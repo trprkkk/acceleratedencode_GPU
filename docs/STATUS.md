@@ -5227,3 +5227,100 @@ did not fit).  Frame threads and slices stay byte-identical to the serial
 encode at every reference count, and every new conformance case
 (`ref4_p` ... `bpyr_ref6ft`: CAVLC, slices, GOP, frame threads, weighted
 prediction, pyramid) decodes bit-exact.
+
+## Presets 1 and 2
+
+The target: presets 1 and 2 were 3-4 times slower than x264 at the same
+quality (p1 +7.09 % BD-rate against x264 medium on the main and validation
+clips, about where x264 faster is at +6.14 %; p2 +2.34 %, x264 fast +1.98 %).
+Two halves: exact speed-ups first, then a retune of what the two presets
+run, measured as exchange rate (BD-rate per per cent of time; going from
+p1 to p2 buys about 0.2 % per 1 % of time, so a tool at p1 has to beat that).
+
+**Exact speed-ups.**
+
+* Intra prediction as row copies (`36483fd`): every 4x4 / 8x8 mode builds
+  its block from the edge by copying or shifting whole rows instead of
+  per-pixel table walks.  Byte-identical; microbenchmark 8x8 276 -> 127 ns
+  and 4x4 128 -> 72 ns for all nine modes.
+* Motion search without repeated SATDs (`c2ad632`): the partition search
+  measured the fractional offset twice (once in me_partition_ref(), again in
+  me_partition()), and the P_8x8 / multi-reference candidate paths measured
+  the winning offset's SATD a third time; it is now kept from the search
+  (`me_last_satd`), and the B partition paths keep theirs per list.
+  Byte-identical at presets 1-4, 10-bit, CAVLC, `--ref 4`, no B pictures.
+
+Together 3-5 % (cockL QP 28, single thread: p1 1.24 -> 1.20 s, p2 1.53 ->
+1.48, p3 3.58 -> 3.39).  A profile of p1 is flat after that (code_mb 54 %,
+analyse_mb 28 %, the largest single function under 7 %), and the cycle
+counter puts a P macroblock at about 59 k cycles against x264 faster's 20 k
+for everything; the gap is the amount of RD rather than any one kernel.
+
+**What did not pay.**
+
+* Skipping a candidate's RD when its SATD is far behind (`AEG_RDK`): the
+  inter prediction plus SATD costs about as much as the CABAC RD it saves.
+* x264's early skip (probe the P_Skip residual, stop when it quantises to
+  zero).  Before the motion search: -0.12 dB on mega at p1 and -0.14 dB on
+  cock at p2 at the same rate, i.e. 2-3 % there; only where the 16x16
+  search returns the skip vector (x264 at subme >= 3): neutral, but 3-5 %
+  faster even on vtest with 86 % skipped macroblocks -- the skipped
+  macroblocks were already cheap and most of them are in B pictures.
+* Knobs in either direction at p1/p2 (vs own preset, main + validation):
+  `--b-adapt 2` +0.01 / -0.03, `--ref 2` -0.29 / -0.28 for 9-15 % time,
+  `--refine-mv 1` -0.78 at p1 for about 15 % (0.05 % per %, below the
+  curve), `--partitions 1` +4.4, `--range 8` +3.7 (cock +22.7).
+
+**Level selection on the winner only.**  The trellis (`--trellis`) was
+worth -4.35 / -4.14 % at p1 / p2 but cost 26 %, because it ran inside every
+candidate of the decision.  x264's `--trellis 1` runs it on the winner only;
+aegenc now does the same: the decision compares plainly quantised
+candidates (luma and the chroma of `AEG_CDECIDE`), and the winner is coded
+again with level selection on (the chroma memo is invalidated for that, or
+the final chroma would be the decision's).  `--trellis` takes x264's values:
+0 off, 1 winner only, 2 inside every candidate (presets 3-4, unchanged).
+
+| vs own preset, main + validation | p1 | time | p2 | time |
+|---|---|---|---|---|
+| trellis in every candidate (2) | -4.35 | +26 % | -4.14 | +26 % |
+| trellis on the winner (1) | -4.06 | +6 % | -3.65 | +8 % |
+
+**The retune** (asked for and approved): preset 1 gets the winner-only
+trellis, `--rc-lookahead 20` (was 10: -0.45 % at no measurable time; 30
+adds -0.13 % for up to 3 %), weighted P prediction (-0.16 %, short -1.8 %,
+no measurable time) and x264's partition order (P_8x8 first, 16x8 / 8x16
+only when it beats 16x16: +0.10 % for -6..-8 % time; at p2 it costs
++0.55 %, so not there).  Preset 2 gets the winner-only trellis.  Presets 0,
+3 and 4 are byte-identical to before.
+
+| BD-rate vs x264 medium, main + validation (QP) | before | **now** |
+|---|---|---|
+| preset 1 | +7.09 | **+2.44** |
+| preset 2 | +2.34 | **-1.31** |
+| x264 faster / fast | +6.14 / +1.98 | |
+
+| CRF, long clips, vs the old preset 1 | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| preset 1 now | -2.39 | -9.27 | -1.94 | -4.53 |
+| preset 2 before | -8.43 | -8.94 | -5.63 | -7.66 |
+| preset 2 now | -10.40 | -12.59 | -6.62 | -9.87 |
+
+Time, user seconds, single thread, interleaved minimum of five (cockL 60
+pictures / vtestL 100, QP 28): preset 1 1.28 -> 1.30 / 0.81 -> 0.81,
+preset 2 1.54 -> 1.65 / 0.98 -> 1.07.  So preset 1 now codes at the old
+preset 2's quality (+2.44 against +2.34) in 17-20 % less time, and about
+where x264 fast is; at that quality aegenc is about 3.4 times x264's time
+(it was 3.7).  Preset 2 now beats x264 medium.  The remaining gap is the
+amount of RD per macroblock (every candidate of the decision priced by the
+CABAC coder, where x264 fast decides by SATD and prices only the winner at
+subme 6); the cockatoo and tree clips, where p1/p2 are still 6-17 points
+behind x264, are the next place to look.
+
+Frame threads and slices stay byte-identical to the serial encode, every
+conformance case (new: `trellis_win` at p2, `trellis_win8` at p4 with the
+8x8 transform) decodes bit-exact, and 10-bit streams decode to the
+reconstruction.  The `--vbv-*`-alone test pins `--trellis 0`: on its
+synthetic picture level selection takes the QP down to 12-13 and the
+one-pass rate control is still walking there at picture 120 (10 % under);
+on real content ABR and VBV land as before (cockL 800 kb/s: 882 / 861
+against 886 / 863).

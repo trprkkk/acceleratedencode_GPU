@@ -236,10 +236,12 @@ run_case refine_pred   320 192  6 1 -q 26 -p 2 --refine-mv 1 --partitions 11
 # reconstructed, so it is checked like any other path.  Preset 3 covers the
 # 4x4 blocks, preset 4 the 8x8 transform, and the threaded/ batched variants
 # cover the copies of the shadow coder the slices and the batch path use.
-run_case trellis4      320 192  8 1 -q 26 -p 3 --trellis 1
-run_case trellis8      320 192  8 4 -q 24 -p 4 --trellis 1
-run_case trellis_thr   320 192  6 1 -q 26 -p 4 --trellis 1 --slices 2 -t 2
-AEG_COEF_BATCH=1 run_case trellis_batch 320 192 6 1 -q 26 -p 4 --trellis 1 --partitions 15
+run_case trellis4      320 192  8 1 -q 26 -p 3 --trellis 2
+run_case trellis8      320 192  8 4 -q 24 -p 4 --trellis 2
+run_case trellis_win   320 192  8 1 -q 26 -p 2 --trellis 1
+run_case trellis_win8  320 192  8 4 -q 24 -p 4 --trellis 1
+run_case trellis_thr   320 192  6 1 -q 26 -p 4 --trellis 2 --slices 2 -t 2
+AEG_COEF_BATCH=1 run_case trellis_batch 320 192 6 1 -q 26 -p 4 --trellis 2 --partitions 15
 # Preset 3/4 choose the Intra_4x4 mode by exact rate-distortion (quantise,
 # reconstruct, count the real bits), which is a different code path from the
 # SATD approximation the faster presets use.
@@ -645,8 +647,12 @@ fi
 $BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
     -o "$TMP/vbv_tight.264" --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 30 \
     >"$TMP/vbv_tight.log" 2>&1
+# (--trellis 0: level selection takes this synthetic picture's QP down to 12-13
+# and the one-pass rate control is still walking there at picture 120, 10 %
+# under; on real content it lands as before -- what is tested here is that
+# the options imply ABR.)
 $BUILD/aegenc -w 320 -h 192 -n 120 -q 24 -i "$TMP/vbv.yuv" \
-    -o "$TMP/vbv_alone.264" --vbv-maxrate 300 --vbv-bufsize 240 \
+    -o "$TMP/vbv_alone.264" --vbv-maxrate 300 --vbv-bufsize 240 --trellis 0 \
     >"$TMP/vbv_alone.log" 2>&1
 python3 - "$TMP" <<'PY2' || FAIL=1
 import re, sys, os

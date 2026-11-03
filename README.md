@@ -202,10 +202,11 @@ points there, see `docs/STATUS.md`), `--refine-cand 0|1`
 refines *every* inter candidate's vectors rather than only the winner's, so a
 candidate that lost on a quarter-pel error gets a second chance (0.3-0.6 points
 of BD-rate for about 40 % more time at preset 4; off by default, see
-*Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1` controls rate-distortion
-level selection on the luma residual (priced by the CABAC coder; on from preset
-3 up, where it is worth 0.15-2.2 points for 12-14 % of the encode time, see
-*Rate-distortion level selection* in `docs/STATUS.md`), `--ref 1..8` gives P
+*Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1|2` controls rate-distortion
+level selection (priced by the CABAC coder; x264's values: 1 codes only the
+winning macroblock with it, which presets 1-2 do for -4 / -3.7 % BD-rate at
+6-8 % of the time, 2 runs it inside every candidate too, as presets 3-4 do, see
+*Rate-distortion level selection* and *Presets 1 and 2* in `docs/STATUS.md`), `--ref 1..8` gives P
 pictures more reference pictures (8 at preset 4, 4 at preset 3: -1.45 / -0.97 %
 BD-rate against two for a few per cent of time, the partitions choosing
 their own reference as x264's mixed references do; see *Two P references*
