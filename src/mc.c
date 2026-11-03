@@ -1018,6 +1018,23 @@ int aeg_me_block_l(const pixel *ref, int rstride, const pixel *cur,
                    const int (*extra)[2], int nextra, int lambda,
                    const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out)
 {
+    return aeg_me_block_t(ref, rstride, cur, cstride, bw, bh, range, subme,
+                          pred_x, pred_y, seed, extra, nextra, lambda, mc,
+                          mvx, mvy, sad_out, NULL);
+}
+
+/* aeg_me_block_l() with x264's p_halfpel_thresh: when `hpt` is given, the
+ * integer-pel cost (SAD + vector bits) of the searches of one macroblock's
+ * references, made in order, is compared with the best of them so far; one
+ * more than 8/7 of it returns -1 before the sub-pel stage (the vector is the
+ * integer one), otherwise *hpt keeps the minimum. */
+int aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
+                   int cstride, int bw, int bh, int range, int subme,
+                   int pred_x, int pred_y, const int seed[2],
+                   const int (*extra)[2], int nextra, int lambda,
+                   const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
+                   int *hpt)
+{
     int best_cost = 1 << 30, best_sad = 1 << 30, bx = 0, by = 0;
     me_rate rt;
 
@@ -1101,6 +1118,15 @@ int aeg_me_block_l(const pixel *ref, int rstride, const pixel *cur,
     }
     hex_search(ref, rstride, cur, cstride, bw, bh, range, &rt, best_cost,
                &bx, &by, &best_sad);
+    if (hpt) {
+        const int ic = best_sad + me_mv_cost(&rt, bx * 4, by * 4);
+        if (((int64_t)ic * 7 >> 3) > *hpt) {
+            *mvx = bx * 4; *mvy = by * 4; *sad_out = best_sad;
+            return -1;
+        }
+        if (ic < *hpt)
+            *hpt = ic;
+    }
 
     if (subme <= 0) {
         *mvx = bx * 4; *mvy = by * 4; *sad_out = best_sad;

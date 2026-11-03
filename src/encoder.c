@@ -252,6 +252,10 @@ struct aeg_encoder {
     int mb_modes[4];
     int mb_nmodes;
     int mb_inter_ok;
+    /* x264's p_halfpel_thresh over one macroblock's 16x16 reference searches
+     * (hpt_on): the best integer-pel cost so far, and whether the last
+     * me_partition_ref() stopped before its sub-pel stage */
+    int me_hpt, me_hpt_on, me_pruned;
     int mb_sad;
     int mb_inter_sad;
     int mb_mv[2];
@@ -3617,7 +3621,8 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
         seed[1] = e->lr_mv[1][(mby * e->mb_w + mbx) * 2 + 1];
         sp = seed;
     }
-    aeg_me_block_l(rp,
+    e->me_pruned =
+        aeg_me_block_t(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
@@ -3625,7 +3630,7 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                  e->p.search_range ? e->p.search_range : 16,
                  refine ? e->p.subme : 0, pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
-                 mvx, mvy, sad);
+                 mvx, mvy, sad, e->me_hpt_on ? &e->me_hpt : NULL) < 0;
     /* Sub-pixel alignment: the integer search leaves the vector on an integer
      * pel.  Rather than repeating the whole quarter-pel search for a small
      * partition, apply the fractional offset the macroblock's 16x16 search
@@ -3751,7 +3756,9 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
  * 16x8/8x16 won 83 of 1500 P macroblocks on cock against x264's ~1 in 4.  On
  * the five real clips (docs/STATUS.md) the P search is worth -2.3% of BD-rate
  * P-only and -1.55% with B pictures, the B one a further -0.65%, for 6% of
- * the time each.  From preset 2 up; AEG_PSUB overrides. */
+ * the time each.  From preset 2 up; AEG_PSUB overrides.  Preset 1 too
+ * since the search range went to 48: there -1.33 % on the main and
+ * validation clips, -2.00 % with T8RD, for +2 % (cockL) / +11 % (vtestL). */
 static int part_subpel(const struct aeg_encoder *e)
 {
     static _Atomic int v = -2;
@@ -3761,7 +3768,7 @@ static int part_subpel(const struct aeg_encoder *e)
     }
     if (v >= 0)
         return v;
-    return e->p.preset >= 2 ? 2 : 0;
+    return e->p.preset >= 1 ? 2 : 0;
 }
 
 static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
@@ -5069,6 +5076,17 @@ static int me_lambda_on(const struct aeg_encoder *e)
 
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp);
 
+/* x264's p_halfpel_thresh for the older references' whole-macroblock search
+ * (aeg_me_block_t): a reference whose integer-pel cost is more than 8/7 of
+ * the best so far (reference 0's first) gets no sub-pel stage and no
+ * candidate.  Preset 3 +0.07 %, preset 4 +0.04 % on the main and validation
+ * clips for -3 / -4 % of the time.  AEG_HPT=0 turns it off. */
+static int hpt_on(const struct aeg_encoder *e)
+{
+    (void)e;
+    return ENV_INT("AEG_HPT", 1) > 0;
+}
+
 /* x264's partition order for P macroblocks: P_8x8 is searched first, and
  * 16x8 / 8x16 only when it beats 16x16 by SATD plus vector bits (the value is
  * the percentage of the 16x16 cost P_8x8 has to come in under; 0 = always
@@ -5150,14 +5168,15 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 seed[1] = e->lr_mv[0][(mby * e->mb_w + mbx) * 2 + 1];
             }
             nnb = me_neighbour_cands(e, mbx, mby, 0, nb);
-            aeg_me_block_l(e->refpl[0][0] + mby * 16 * e->stride[0] + mbx * 16,
+            e->me_hpt = 1 << 30;
+            aeg_me_block_t(e->refpl[0][0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0],
                          e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0], 16, 16,
                          e->p.search_range ? e->p.search_range : 16,
                          e->p.subme, e->mb_pmv[0], e->mb_pmv[1], seed,
                          (const int (*)[2])nb, nnb, e->me_lambda, &e->mcr[0],
-                         &mvx, &mvy, &sad);
+                         &mvx, &mvy, &sad, &e->me_hpt);
         }
         e->mb_mv[0] = mvx;
         e->mb_mv[1] = mvy;
@@ -5216,14 +5235,20 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             static const int geo16[4] = { 0, 0, 16, 16 };
             mbcand *rc = &e->mb_cand[e->mb_ncand];
             int px, py, rx, ry, rsad, b, rr = 1;
+            /* (the threshold only exists when reference 0's search ran here,
+             * not with the frame-wide batch) */
+            e->me_hpt_on = hpt_on(e) && !e->par_valid;
             pred16_ref(e, mbx, mby, 1, &px, &py);
             me_partition_ref(e, mbx, mby, AEG_MB_P16x16, 0, geo16, px, py, 1,
                              &rx, &ry, &rsad, 1);
+            if (e->me_pruned)
+                rr = -1;
             /* With three or more references every older one gets its own
              * search; the best by SATD plus the vector and index bits becomes
              * the one candidate the RD pass prices. */
             if (e->cur_l0_active > 2) {
-                int best = part_satd_ref(e, mbx, mby, geo16, rx, ry, 1) +
+                int best = rr < 0 ? 1 << 30 :
+                           part_satd_ref(e, mbx, mby, geo16, rx, ry, 1) +
                            8 * (aeg_mvd_bits(rx - px, ry - py) + ref_te_bits(e, 1));
                 int k;
                 for (k = 2; k < e->cur_l0_active; k++) {
@@ -5231,6 +5256,8 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                     pred16_ref(e, mbx, mby, k, &qx, &qy);
                     me_partition_ref(e, mbx, mby, AEG_MB_P16x16, 0, geo16, qx, qy, k,
                                      &kx, &ky, &ks, 1);
+                    if (e->me_pruned)
+                        continue;
                     cost = part_satd_ref(e, mbx, mby, geo16, kx, ky, k) +
                            8 * (aeg_mvd_bits(kx - qx, ky - qy) + ref_te_bits(e, k));
                     if (cost < best) {
@@ -5250,6 +5277,8 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                         e->mb_maxref = nb_maxref(e, mbx, mby);
                 }
             }
+            e->me_hpt_on = 0;
+            if (rr >= 0) {
             memset(rc, 0, sizeof(*rc));
             rc->type = AEG_MB_P16x16;
             rc->nparts = 1;
@@ -5261,6 +5290,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             rc->pmv[0][0] = px;
             rc->pmv[0][1] = py;
             e->mb_ncand++;
+            }
         }
         /* Partitioned candidates: 16x8 and 8x16, bit 1 and 2 of the mask.
          * They only pay off with the RD decision, so ultrafast stays 16x16. */
@@ -6506,7 +6536,8 @@ static int chroma_decide_on(const struct aeg_encoder *e)
 }
 
 /* Whether code_mb() tries the inter winner's other transform size by rate
- * and distortion.  AEG_T8RD=0/1 overrides. */
+ * and distortion.  From preset 1 (there -0.70 % on the main and validation
+ * clips alone, see part_subpel()).  AEG_T8RD=0/1 overrides. */
 static int t8_rd_on(const struct aeg_encoder *e)
 {
     static _Atomic int v = -2;
@@ -6514,7 +6545,7 @@ static int t8_rd_on(const struct aeg_encoder *e)
         const char *ev = getenv("AEG_T8RD");
         v = ev ? atoi(ev) != 0 : -1;
     }
-    return v >= 0 ? v : e->p.preset >= 2;
+    return v >= 0 ? v : e->p.preset >= 1;
 }
 
 /* Deblock RDO: whether the decision measures a candidate's luma distortion

@@ -5379,3 +5379,56 @@ p2):
   p1, +11 % / +10 % at p2; partitions on reference 0 only (`AEG_PREF=0`)
   +14 % / +6 %.  Two references: -0.31 / -0.22 %.  The gate at preset 3:
   +0.06 % and no time saved.
+
+**What the tree clips need.**  x264 medium's own ablation on the four
+clips (each tool off, BD-rate vs medium, QP): cock / cock2 lose most without
+sub-pel refinement (subme 2: +18 / +18 %), partitions (+11 / +11) and the
+8x8 transform (+6 / +10) -- all of which aegenc has -- while tree2 spreads
+over B pictures (+6.9), one reference (+4.4), subme (+4.0), partitions (+3.5)
+and trellis (+3.1); weightp, fast-pskip and the macroblock tree (at constant
+QP) are flat.  Without B pictures on either side p2 is still +9.65 % behind
+on tree2 (p3 +1.29 %): it is P-picture coding, and the references are about
+four of those points (tree2 is foliage with a hand moving in front of it,
+uncovering what an older picture still has).  `--subme 2` is identical to 1
+in the encoder.
+
+**x264's sub-pel threshold for the references** (`p_halfpel_thresh`): the
+16x16 searches of a macroblock's references run in order, and one whose
+integer-pel cost is more than 8/7 of the best so far stops before its
+sub-pel stage and adds no candidate (aeg_me_block_t, `AEG_HPT`).  Preset 3
++0.07 %, preset 4 +0.04 % on the main and validation clips for -3 / -4 % of
+the time: on by default (it only acts with more than one reference).  It
+does not make more references pay below preset 3: p1 `--ref 3` is still
++11-17 % of time, p2 `--ref 3` (partitions on reference 0) -0.40 %.  The
+remaining cost is the older references' integer search and their lowres
+pre-search, about 7 k cycles per macroblock and reference.
+
+**Preset 1 gets the partition sub-pel search and T8RD** (they were preset 2
+and up; re-measured with the wider range): `AEG_PSUB=2` -1.33 %, T8RD -0.70
+%, both -2.00 % on the main and validation clips, for +2 % (cockL) / +11 %
+(vtestL) -- 0.3 % per % of time.  Chroma in the decision on top: -0.25 %
+for another +10 %, not taken.
+
+**Result** (this step against `4962b79`; the old presets reproduced
+byte-identically with `--range 16 AEG_PSUB=0 AEG_T8RD=0` / `--range 24`):
+
+| BD-rate vs x264 medium, main + validation (QP) | cock | cock2 | tree | tree2 | mean |
+|---|---|---|---|---|---|
+| p1 before | +17.34 | +11.75 | +5.43 | +15.72 | +2.44 |
+| **p1 now** | +2.94 | +5.06 | +5.18 | +14.42 | **-1.01** |
+| p2 before | +5.64 | +5.03 | +5.28 | +13.88 | -1.31 |
+| **p2 now** | +1.63 | +3.24 | +5.28 | +13.86 | **-1.83** |
+| x264 fast | +3.69 | +2.97 | +0.09 | +1.64 | +1.98 |
+
+CRF on the long clips, against the old preset 1: p1 -4.89 %, p2 -6.06 %
+(old p2 -5.53 %).  Time, single thread, interleaved minimum of five (cockL
+60 / vtestL 100 pictures, QP 28): p1 1.61 -> 1.67 / 0.99 -> 1.15 s, p2 2.02
+-> 2.04 / 1.31 -> 1.33.  So preset 1 now codes better than x264 medium did
+and better than the old preset 2, 12-17 % faster than that one.
+
+Against x264 at the same settings (ffmpeg's libx264, one thread, QP 28,
+`--tune psnr`): medium 0.56 / 0.21 s, fast 0.51 / 0.20 s.  At x264
+medium's quality aegenc preset 1 takes 3.0 times x264's time on cockL and
+5.3 times on vtestL, where 86 % of the macroblocks are skipped: x264 is
+cheapest exactly where little changes, and that is where to look next.
+Trees (tree +5.2, tree2 +14.4 % at p1) stay behind on the references.
