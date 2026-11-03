@@ -5324,3 +5324,58 @@ synthetic picture level selection takes the QP down to 12-13 and the
 one-pass rate control is still walking there at picture 120 (10 % under);
 on real content ABR and VBV land as before (cockL 800 kb/s: 882 / 861
 against 886 / 863).
+
+## The cockatoo / tree gap at presets 1 and 2
+
+After the retune, p1 / p2 were still +17.3 / +5.6 % behind x264 medium on
+cock, +11.8 / +5.0 on cock2, +5.4 / +5.3 on tree and +15.7 / +13.9 on tree2.
+Adding each preset-3 tool to p2 alone on those four clips (BD-rate vs p2):
+
+| added to p2 | cock | cock2 | tree | tree2 | mean | cpu |
+|---|---|---|---|---|---|---|
+| `--range 32` (was 24) | -3.14 | -1.12 | +0.00 | -0.01 | -1.07 | +-0 |
+| exact-RD Intra_4x4/8x8 modes (`AEG_IRD=1`) | -1.22 | -2.25 | -1.18 | -0.18 | -1.21 | +30 % |
+| `--ref 4` | -0.36 | -0.32 | +0.04 | -3.86 | -1.13 | +10 % |
+| `--refine-mv 2` | -1.19 | -1.06 | -0.00 | -0.53 | -0.69 | +5 % |
+| `--trellis 2` | -0.58 | -0.75 | -0.38 | -0.46 | -0.54 | +10 % |
+| DBRDO | -0.26 | -0.86 | -0.02 | -0.13 | -0.32 | |
+| BIDIR + BIDIRP | -0.59 | -0.14 | +0.00 | -0.54 | -0.32 | |
+| `--b-adapt 2` | +0.95 | +2.83 | +0.16 | -2.73 | +0.30 | |
+
+and on p1: `--range 24` (was 16) -5.61 / -2.98 on cock / cock2, chroma in
+the decision -0.23, T8RD -0.49, `AEG_PSUB=2` -1.00, exact-RD intra -1.42.
+
+**The search range.**  The motion search bounds every vector, predictors
+included, by a box of +-range around the zero vector (x264's merange is a
+window around the prediction).  With three B pictures a P vector spans four
+picture intervals, and cockatoo's motion does not fit 16 or 24 samples.
+The search walks patterns, so the box size costs nothing by itself:
+
+| range, vs own preset (main + validation) | cock | cock2 | mean |
+|---|---|---|---|
+| p0 8 -> 48 | -22.28 | -8.51 | -3.05 |
+| p1 16 -> 24 / 32 / 48 | -5.61 / -8.42 / -8.95 | -2.98 / -3.77 / -4.00 | -0.80 / -1.12 / -1.20 |
+| p2 24 -> 32 / 48 | -3.14 / -3.59 | -1.12 / -1.61 | -0.39 / -0.47 |
+| p3 32 -> 48 | -0.42 | -0.66 | -0.11 |
+
+Time (interleaved minimum, single thread): cockL p1 1.57 -> 1.51 s, p2
+1.92 -> 1.97, p3 4.03 -> 4.10, p0 (120 pictures) 1.18 -> 1.13; vtestL p2
+1.17 / 1.17 (seven runs); p0 with two frame threads 1.37-1.38 s wall either
+way (the wavefront waits range + 24 rows below the block, and from preset 1
+the lowres pre-search already waits 63).  The default is now 48 at every
+preset (the padding allows 56; 48 is where the gain stops).  Against x264
+medium on the main and validation clips: p1 +2.44 -> **+0.99 %** (cock
++17.3 -> +6.4), p2 -1.31 -> **-1.83 %**.
+
+**Not adopted** (exchange rate below the 0.2 % per % of time between p1 and
+p2):
+
+* Exact-RD intra modes: p1 -1.37 % for about +36 %, p2 -1.32 % for +24 %;
+  with the SATD pre-selection of the best two modes (`AEG_I4K/I8K=2`) -0.99
+  / -1.02 % for +16 %.
+* Three references with a gate that only lets the older reference into the
+  RD pass when its SATD + vector + index cost beats reference 0's: p1 -0.72
+  %, p2 -0.85 % (tree2 -3.0 / -3.3), for +22 % (cockL) / +6 % (vtestL) at
+  p1, +11 % / +10 % at p2; partitions on reference 0 only (`AEG_PREF=0`)
+  +14 % / +6 %.  Two references: -0.31 / -0.22 %.  The gate at preset 3:
+  +0.06 % and no time saved.

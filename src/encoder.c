@@ -5802,6 +5802,15 @@ static int intra_rd_modes(struct aeg_encoder *e, int mbx, int mby,
     return best;
 }
 
+/* Intra_4x4 / Intra_8x8 modes chosen by exact rate-distortion (quantise,
+ * reconstruct, count the CABAC bits) rather than SATD + mode bits: presets
+ * 3-4.  AEG_IRD overrides. */
+static int intra_rd_on(const struct aeg_encoder *e)
+{
+    const int v = ENV_INT("AEG_IRD", -1);
+    return e->p.cabac && (v >= 0 ? v > 0 : e->p.preset >= 3);
+}
+
 static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                            double lambda)
 {
@@ -5864,7 +5873,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         aeg_intra4x4_edge(&ied, top, left, tl, top_avail, left_avail);
         pmode = intra4_pred_mode(e, mbx, mby, t->intra4, rx, ry);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
-        if (e->p.preset >= 3 && e->p.cabac) {
+        if (intra_rd_on(e)) {
             best = intra_rd_modes(e, mbx, mby, t, 4, rb, sb, s, top, left, tl,
                                   top_avail, left_avail, modes, nmodes, pmode,
                                   lambda, t->level[rb], &lev_ok);
@@ -6100,7 +6109,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                           top_avail && left_avail);
         pmode = intra8_pred_mode(e, mbx, mby, t->intra8, gx, gy);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
-        if (e->p.preset >= 3 && e->p.cabac) {
+        if (intra_rd_on(e)) {
             best = intra_rd_modes(e, mbx, mby, t, 8, 0, src + by * s + bx, s,
                                   top, left, tl, top_avail, left_avail, modes,
                                   nmodes, pmode, lambda, t->level8[g], &lev_ok);
@@ -11923,7 +11932,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->preset < 0) pp->preset = 0;
     if (pp->preset > 4) pp->preset = 4;
     if (pp->search_range <= 0) {
-        static const int rng[5] = { 8, 16, 24, 32, 48 };
+        /* The bound is a box of +-range around the zero vector (not around
+         * the prediction, as x264's merange is), and the search walks a
+         * pattern rather than the box, so a wide box costs nothing measurable;
+         * what a narrow one does is cut off real motion: at preset 1, 16 -> 48
+         * was -8.95 % on cock and -4.00 % on cock2 (P vectors span four
+         * pictures with three B pictures), -1.20 % on the main and validation
+         * clips; preset 2 (24) -0.47 %, preset 3 (32) -0.11 %, preset 0 (8)
+         * -3.05 % (cock -22 %) and no slower, also with frame threads (the
+         * wavefront waits range + 24 rows below the block; from preset 1 the
+         * lowres pre-search already waits 63). */
+        static const int rng[5] = { 48, 48, 48, 48, 48 };
         pp->search_range = rng[pp->preset];
     }
     /* The search does not know where the picture ends: it only bounds the
