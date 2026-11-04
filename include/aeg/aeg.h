@@ -152,6 +152,16 @@ typedef struct aeg_params {
      * Blu-ray, with the field order of --tff/--bff.  The height must be a
      * multiple of 4; the levels that allow it are 2.1 to 4.1. */
     int interlaced;
+    /* How interlaced material is coded (with `interlaced` 1 or 2; 0 there
+     * and field_coding > 0 means top field first):
+     *   0 = as frames (the default, x264 --fake-interlaced, above);
+     *   1 = as field pictures (PAFF): every frame is two pictures, one per
+     *       field, each predicted from the fields before it -- the second
+     *       from the first -- which follows motion between the fields
+     *       instead of coding the combing it leaves in a frame.
+     * Field pictures code with one frame thread, without weighted
+     * prediction, the B pyramid or temporal direct (all turned off). */
+    int field_coding;
     /* Bits per coded sample: 8 (the default; 0 also means 8) or 10 (High 10
      * profile, as x264's 10-bit build: the library holds both, compiled
      * twice, and picks one per encoder).  The rate controls, qp, crf, qp_min,

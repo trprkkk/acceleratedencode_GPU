@@ -4581,9 +4581,10 @@ this does the same, in the library (`aeg_encoder_encode_image()`, `aeg_image`,
 
 **Interlace**: `--tff` / `--bff` (`params.interlaced` 1 / 2), or a `.y4m`
 header's `It` / `Ib` (`Im`, mixed, is warned about and coded as progressive).
-The pictures are coded as frames -- no field pictures (PAFF) and no
-field macroblock pairs (MBAFF) -- and signalled as interlaced, what x264
-calls `--fake-interlaced`:
+By default the pictures are coded as frames -- `--field` codes field
+pictures instead (*Field pictures (PAFF)* below; no field macroblock pairs,
+MBAFF, yet) -- and signalled as interlaced, what x264 calls
+`--fake-interlaced`:
 
 * SPS `frame_mbs_only_flag` 0 with `mb_adaptive_frame_field_flag` 0, the
   height in macroblock-row pairs (the coded height is rounded up to 32, the
@@ -5524,3 +5525,51 @@ Against `96fa945` (interleaved minimum, single thread, QP 28): vtestL p1
 is now flat -- CABAC residual pricing 7 %, the SATD kernels 5 % each, the
 UMH search 3 % -- so what remains is the number of candidates priced, not
 one hot spot.
+
+## Field pictures (PAFF)
+
+`--field` (`params.field_coding` 1; implies `--tff` unless `--bff`) codes
+every frame as two field pictures, first field in display order first:
+
+* Each field is an access unit (delimiter, picture timing SEI with
+  `pic_struct` 1 / 2, slices with `field_pic_flag` 1 and `bottom_field_flag`),
+  both with the frame's `frame_num` and `nal_ref_idc`; POC type 0 with
+  `delta_pic_order_cnt_bottom` absent, the fields' counts 2n and 2n+1.  The
+  second field of an I frame is a P field predicting from the first (the
+  first of an IDR frame is the IDR picture).
+* The field is every other row of the frame's buffers (offset by its parity,
+  stride doubled), so the lookahead, rate control, macroblock tree and
+  packets stay per frame; the tree's and AQ's offsets average the two frame
+  rows a field row covers.
+* Reference lists by 8.2.4.2.2 / .2.4 / .2.5: frames by `frame_num` (P) or
+  POC (B), then their fields alternately starting with the current parity.
+  A P field uses `2 * --ref` fields (the second field of a frame reads its
+  first), a B field one per list; marking is the sliding window only, with
+  `max_num_ref_frames` one above the frame-coding value.
+* Field coding tools: the field scans (4x4 and 8x8, CAVLC's interleave), the
+  CABAC field contexts (significance / last of all categories, the field 8x8
+  significance map), the chroma vector offset between fields of opposite
+  parity (8.4.1.4), the deblocking filter's field rules (bS 3 on horizontal
+  intra edges, vertical vector limit 2 quarter-rows), half-pel planes and
+  padding built per field.
+* Turned off with field pictures: frame threads, weighted prediction, the B
+  pyramid, temporal direct, chroma ME, `--nal-hrd`.
+
+Every stream decodes bit-exactly in ffmpeg (tff and bff, I/P/B, CABAC and
+CAVLC, slices, 1..8 refs, CQP / CRF / ABR / VBV, mid-stream and scene-cut
+IDRs, 10-bit; `tests/run_tests.sh` cases `fld_*`, `h10_field`), and ffmpeg
+reports the field order on every frame.
+
+PSNR BD-rate of `--field` against frame coding (`--tff`), preset 3, QP
+22..37, 60 frames woven from progressive clips by ffmpeg's `interlace`
+filter: cockatoo (fast motion) **-47.0 %**, vtest (mostly static) +4.3 %.
+Which one wins depends on the motion, so the next step is the per-picture
+frame/field decision, then MBAFF.  CPU time per frame is lower (fewer
+intra macroblocks); wall time is higher for now because frame threads are
+off.
+
+Fixed on the way: with B pictures the slice header's POC lsb was the
+absolute display index, so after a mid-stream IDR the IDR's POC was not 0
+(decoders rebase it; ffmpeg's output was identical) -- it is now counted
+from the last IDR.  Only multi-GOP streams with B pictures change.
+

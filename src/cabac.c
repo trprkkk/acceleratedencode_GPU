@@ -513,13 +513,22 @@ size_t aeg_cabac_flush(aeg_cabac *c)
  * offsets each, and the coded_block_flag base (Table 9-40). */
 #define cab_cat_ctx aeg_cab_cat_ctx
 #define cab_cat aeg_cab_cat
-const struct cab_cat_ctx cab_cat[6] = {
-    { 105, 166, 227 },  /* 0: Intra_16x16 luma DC */
-    { 120, 181, 237 },  /* 1: Intra_16x16 luma AC */
-    { 134, 195, 247 },  /* 2: luma 4x4            */
-    { 149, 210, 257 },  /* 3: chroma DC           */
-    { 152, 213, 266 },  /* 4: chroma AC           */
-    { 402, 417, 426 }   /* 5: luma 8x8            */
+const struct cab_cat_ctx cab_cat[12] = {
+    { 105, 166, 227, aeg_cabac_sig8 },  /* 0: Intra_16x16 luma DC */
+    { 120, 181, 237, aeg_cabac_sig8 },  /* 1: Intra_16x16 luma AC */
+    { 134, 195, 247, aeg_cabac_sig8 },  /* 2: luma 4x4            */
+    { 149, 210, 257, aeg_cabac_sig8 },  /* 3: chroma DC           */
+    { 152, 213, 266, aeg_cabac_sig8 },  /* 4: chroma AC           */
+    { 402, 417, 426, aeg_cabac_sig8 },  /* 5: luma 8x8            */
+    /* 6..11: the same categories in a field macroblock, whose significance
+     * and last maps have contexts of their own (Table 9-34: 277..337 and
+     * 436..459); the levels share the frame ones */
+    { 277, 338, 227, aeg_cabac_sig8 },
+    { 292, 353, 237, aeg_cabac_sig8 },
+    { 306, 367, 247, aeg_cabac_sig8 },
+    { 321, 382, 257, aeg_cabac_sig8 },
+    { 324, 385, 266, aeg_cabac_sig8 },
+    { 436, 451, 426, aeg_cabac_sig8f }
 };
 
 /* The level state machine of 9.3.2.2: from the "node" the previous coefficient
@@ -602,7 +611,7 @@ int64_t aeg_cabac_residual_price(const aeg_cabac *st, const dctcoef *coef,
         memcpy(sig, state + k->sig, 15);
         memcpy(lst, state + k->last, 9);
         for (i = 0; i < 63; i++) {
-            int nz = coef[i] != 0, x = aeg_cabac_sig8[i], y;
+            int nz = coef[i] != 0, x = k->sig8[i], y;
             c += BIN_COST(sig[x], nz);
             sig[x] = BIN_NEXT(sig[x], nz);
             if (!nz)
@@ -683,7 +692,7 @@ static int residual_cost(aeg_cabac *cb, const dctcoef *coef, int n,
     if (n == 64) {
         for (i = 0; i < 63; i++) {
             int nz = coef[i] != 0;
-            DEC(k->sig + aeg_cabac_sig8[i], nz);
+            DEC(k->sig + k->sig8[i], nz);
             if (!nz)
                 continue;
             DEC(k->last + aeg_cabac_last8[i], i == last);
@@ -759,7 +768,7 @@ int aeg_cabac_residual(aeg_cabac *cb, const dctcoef *coef, int n, int cat,
     if (n == 64) {
         for (i = 0; i < 63; i++) {
             int nz = coef[i] != 0;
-            aeg_cabac_decision(cb, k->sig + aeg_cabac_sig8[i], nz);
+            aeg_cabac_decision(cb, k->sig + k->sig8[i], nz);
             if (!nz)
                 continue;
             aeg_cabac_decision(cb, k->last + aeg_cabac_last8[i], i == last);

@@ -150,10 +150,13 @@ size_t aeg_cabac_flush(aeg_cabac *c);
  * position (Table 9-42; the last-coefficient map is 9.3.2.3). */
 extern const uint8_t aeg_cabac_sig8[63];
 extern const uint8_t aeg_cabac_last8[63];
+extern const uint8_t aeg_cabac_sig8f[63];   /* field macroblock */
 
-/* Context offsets of the residual categories (sig, last, level). */
-struct aeg_cab_cat_ctx { uint16_t sig, last, level; };
-extern const struct aeg_cab_cat_ctx aeg_cab_cat[6];
+/* Context offsets of the residual categories (sig, last, level) and the
+ * significance map of an 8x8 block.  Categories 6..11 are 0..5 in a field
+ * macroblock: cat + 6 * field. */
+struct aeg_cab_cat_ctx { uint16_t sig, last, level; const uint8_t *sig8; };
+extern const struct aeg_cab_cat_ctx aeg_cab_cat[12];
 
 /* aeg_cabac_coef_price(), inline for the level search (see cabac.c): the
  * level contexts are those of the state machine's first node (1 and 5). */
@@ -171,7 +174,7 @@ static inline int64_t aeg_cabac_coef_price_inl(const aeg_cabac *st, int cat,
     uint32_t c = 0;
 
     if (with_sig && flags)
-        c += aeg_cabac_bin_cost[state[k->sig + (sig_last ? aeg_cabac_sig8[pos] : pos)]]
+        c += aeg_cabac_bin_cost[state[k->sig + (sig_last ? k->sig8[pos] : pos)]]
                                [abs != 0];
     if (abs) {
         if (flags)

@@ -953,7 +953,14 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_case  bff_cavlc 176 144 8 4 -q 26 -p 2 --bff --no-cabac --no-8x8dct
     run_bcase tff_hrd  176 144 16 2 4 -p 2 --tff --bitrate 300 \
         --vbv-maxrate 300 --vbv-bufsize 600 --nal-hrd
-    for fo in tff:T bff:B tff_hrd:T; do
+    # field pictures (PAFF): every frame two field pictures, the second
+    # predicting from the first; mid-stream IDRs, B fields (direct from the
+    # co-located field of either parity), slices, CAVLC, refs, CRF
+    run_bcase fld_p    176 144 12 0 4 -q 24 -p 3 --field -g 5
+    run_bcase fld_b    176 144 12 2 4 -q 26 -p 3 --field --bff --slices 2
+    run_bcase fld_cavlc 176 144 12 1 1 -q 28 -p 4 --field --no-cabac --ref 3
+    run_bcase fld_crf  176 144 12 3 4 -p 2 --field --crf 24
+    for fo in tff:T bff:B tff_hrd:T fld_p:T fld_b:B; do
         nm=${fo%%:*}; want=${fo#*:}
         got=$("$FF" -i "$TMP/$nm.264" -vf showinfo -f null - 2>&1 |
               grep -o 'i:[A-Z?]' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
@@ -1002,6 +1009,7 @@ else
     run_bcase h10_crfneg  176 144 12 3 4 -p 3 --crf -6 --bit-depth 10
     run_bcase h10_cavlc   176 144 12 0 4 -q 26 -p 2 --no-cabac --bit-depth 10
     run_bcase h10_slices  176 144 12 2 6 -q 26 -p 3 --slices 3 --tff --bit-depth 10
+    run_bcase h10_field   176 144 12 2 4 -q 26 -p 3 --field --bit-depth 10
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
     run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10

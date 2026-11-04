@@ -17,6 +17,8 @@ static const uint8_t scan_dc[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
  * with TRANSPOSE(zigzag), i.e. it walks the block column-major, so the scan
  * index of a position is the transpose of the usual zig-zag position. */
 static const uint8_t scan_dcT[16] = {0,4,1,2,5,8,12,9,6,3,7,10,13,14,11,15};
+/* ... and the field scan of a field macroblock, in the same layout */
+static const uint8_t scan_fldT[16] = {0,1,4,2,3,5,6,7,8,9,10,11,12,13,14,15};
 
 static inline int nc_bucket(int nC)
 {
@@ -179,22 +181,19 @@ level_done:
 void aeg_cavlc_write_block(aeg_bitwriter *bw, const dctcoef *coef, int nC,
                            int kind)
 {
-    uint8_t ac_scan[15];
-    int i;
-    switch (kind) {
+    const uint8_t *sc = kind & AEG_CAVLC_FIELD ? scan_fldT : scan_dcT;
+    switch (kind & ~AEG_CAVLC_FIELD) {
     case 1:
-        write_block(bw, coef, scan_dcT, 16, nC, 16, 0);
+        write_block(bw, coef, sc, 16, nC, 16, 0);
         break;
     case 2:
         write_block(bw, coef, scan_dc, 4, nC, 4, 1);
         break;
     case 3:
-        for (i = 0; i < 15; i++)
-            ac_scan[i] = scan_dcT[i + 1];
-        write_block(bw, coef, ac_scan, 15, nC, 15, 0);
+        write_block(bw, coef, sc + 1, 15, nC, 15, 0);
         break;
     default:
-        write_block(bw, coef, scan_dcT, 16, nC, 16, 0);
+        write_block(bw, coef, sc, 16, nC, 16, 0);
         break;
     }
 }
@@ -217,9 +216,11 @@ void aeg_cavlc_write_block8(aeg_bitwriter *bw, const dctcoef *coef, int sub,
                             int nC)
 {
     dctcoef list[16];
+    const uint8_t *zz = sub & AEG_CAVLC_FIELD8 ? aeg_field_scan8x8 : aeg_zigzag8x8;
     int n;
+    sub &= 3;
     for (n = 0; n < 16; n++)
-        list[n] = coef[aeg_zigzag8x8[sub + 4 * n]];
+        list[n] = coef[zz[sub + 4 * n]];
     write_block(bw, list, scan_dc, 16, nC, 16, 0);
 }
 
@@ -227,9 +228,11 @@ void aeg_cavlc_write_block8(aeg_bitwriter *bw, const dctcoef *coef, int sub,
  * TotalCoeff), which is what the neighbouring lists use as their context. */
 int aeg_cavlc_nz8(const dctcoef *coef, int sub)
 {
+    const uint8_t *zz = sub & AEG_CAVLC_FIELD8 ? aeg_field_scan8x8 : aeg_zigzag8x8;
     int n = 0, i;
+    sub &= 3;
     for (i = 0; i < 16; i++)
-        n += coef[aeg_zigzag8x8[sub + 4 * i]] != 0;
+        n += coef[zz[sub + 4 * i]] != 0;
     return n;
 }
 

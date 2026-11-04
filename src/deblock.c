@@ -137,13 +137,20 @@ static inline int nz8_group(int blk)
 /* bS for the luma edge between block `pa` of MB p and block `qa` of MB q,
  * where both blocks are 4x4 luma blocks addressed in raster order. */
 static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
-                             int mb_edge, int is_chroma)
+                             int mb_edge, int is_chroma, int vertical)
 {
     int pi = is_intra(p), qi = is_intra(q);
     int nzp, nzq, dx, dy;
+    /* a field macroblock's vertical vectors are in field lines: a step of 4
+     * quarter frame samples is 2 of them (8.7.2.1) */
+    const int my = q->fld ? 2 : 4;
 
+    /* An intra macroblock edge is filtered at full strength between two frame
+     * macroblocks; a horizontal one with a field macroblock on either side
+     * (every macroblock of a field picture) only at 3, its rows being two
+     * frame lines apart. */
     if (pi || qi)
-        return mb_edge ? 4 : 3;
+        return mb_edge && (vertical || (!p->fld && !q->fld)) ? 4 : 3;
 
     if (is_chroma) {
         nzp = (p->cbp >> 4) & 3;
@@ -168,10 +175,10 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
         if ((lp & 1) != (lq & 1) || (lp & 2) != (lq & 2))
             return 1;
         if ((lp & 1) && (abs(p->mv[pa][0] - q->mv[qa][0]) >= 4 ||
-                         abs(p->mv[pa][1] - q->mv[qa][1]) >= 4))
+                         abs(p->mv[pa][1] - q->mv[qa][1]) >= my))
             return 1;
         if ((lp & 2) && (abs(p->mv1[pa][0] - q->mv1[qa][0]) >= 4 ||
-                         abs(p->mv1[pa][1] - q->mv1[qa][1]) >= 4))
+                         abs(p->mv1[pa][1] - q->mv1[qa][1]) >= my))
             return 1;
         return 0;
     }
@@ -181,7 +188,7 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
         return 1;
     dx = abs(p->mv[pa][0] - q->mv[qa][0]);
     dy = abs(p->mv[pa][1] - q->mv[qa][1]);
-    if (dx >= 4 || dy >= 4)
+    if (dx >= 4 || dy >= my)
         return 1;
     return 0;
 }
@@ -209,7 +216,7 @@ static void edge_bs(const aeg_mb *p, const aeg_mb *q, int vertical, int k,
             pa = (mb_edge ? 3 : k - 1) * 4 + j;
             qa = k * 4 + j;
         }
-        bs[j] = boundary_strength(pp, pa, q, qa, mb_edge, 0);
+        bs[j] = boundary_strength(pp, pa, q, qa, mb_edge, 0, vertical);
     }
 }
 

@@ -94,6 +94,10 @@ extern const uint8_t aeg_scan4x4[16];
 /* 8x8 coefficient scan (High profile): scan position -> raster position of the
  * 8x8 block, i.e. aeg_zigzag8x8[i] = y * 8 + x. */
 extern const uint8_t aeg_zigzag8x8[64];
+/* The field scans of a field macroblock (Tables 8-13, 8-14), in the same
+ * layouts as aeg_scan4x4 (the stored, transposed block) and aeg_zigzag8x8. */
+extern const uint8_t aeg_field_scan4x4[16];
+extern const uint8_t aeg_field_scan8x8[64];
 
 /* Constant tables (tables.c) */
 extern const uint16_t aeg_quant_mf[6][3];
@@ -158,6 +162,10 @@ typedef struct aeg_mb {
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     uint8_t  skip;            /* P slice: coded as a skip run / flag      */
+    /* A field macroblock: every macroblock of a field picture (PAFF), or
+     * one of an MBAFF field pair.  The loop filter's bS and vertical vector
+     * limit depend on it (8.7.2.1). */
+    uint8_t  fld;
     /* The motion vector difference actually sent, per 4x4 block and per
      * prediction list: the CABAC context of a difference is derived from the
      * neighbouring differences *of the same list*, so a B picture needs both. */
@@ -336,6 +344,11 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
  * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an
  * interlaced stream coded as frames), so the header carries field_pic_flag. */
 #define AEG_SH_FIELD 0x100
+/* ... | AEG_SH_FPIC: a field picture (field_pic_flag 1), with
+ * bottom_field_flag = (AEG_SH_BOTTOM set).  Its header always overrides the
+ * active reference counts (for a field the PPS defaults count double). */
+#define AEG_SH_FPIC   0x200
+#define AEG_SH_BOTTOM 0x400
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int cabac_init_idc, int slice_qp_delta,
@@ -357,7 +370,10 @@ void   aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type,
 void   aeg_set_last_error(const char *msg);
 
 /* CAVLC residual coding (cavlc.c); kind: 0 = 4x4, 1 = luma DC, 2 = chroma
- * DC, 3 = Intra_16x16 AC block. */
+ * DC, 3 = Intra_16x16 AC block; | AEG_CAVLC_FIELD for the field scan of a
+ * field macroblock.  The 8x8 functions take sub | AEG_CAVLC_FIELD8. */
+#define AEG_CAVLC_FIELD  16
+#define AEG_CAVLC_FIELD8 4
 void aeg_cavlc_write_block(aeg_bitwriter *bw, const dctcoef *coef, int nC, int kind);
 int  aeg_cavlc_block_cost(const dctcoef *coef, int nC, int kind);
 /* 8x8 luma residual: four interleaved 4x4 lists, written one at a time
@@ -543,6 +559,9 @@ typedef struct aeg_mc_ctx {
     pixel       *buf;
     int            stride;
     int            ready;
+    /* rows of padding above and below (AEG_PAD, or 2 * AEG_PAD for a
+     * picture whose fields are also read as pictures; 0 = AEG_PAD) */
+    int            vpad;
     /* Chroma in the sub-pel cost (x264's chroma-me): when `chroma` is set,
      * the quarter-pel refinement adds the SATD of both chroma planes,
      * predicted from cref[] against cur_c[], to the luma SATD.  cur_y is the
@@ -561,6 +580,8 @@ typedef struct aeg_mc_ctx {
 } aeg_mc_ctx;
 
 void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride);
+/* The same with `vpad` rows of padding (aeg_mc_ctx_init: AEG_PAD). */
+void aeg_mc_ctx_init_pad(aeg_mc_ctx *mc, int w, int h, int stride, int vpad);
 void aeg_mc_ctx_free(aeg_mc_ctx *mc);
 /* Recompute the fractional planes from the reference picture `ref` (padded,
  * origin and stride as `mc->stride`).  Called once per picture, right after the

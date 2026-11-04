@@ -516,6 +516,22 @@ const uint8_t aeg_zigzag8x8[64] = {
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63
 };
 
+/* The field scans (Tables 8-13 and 8-14, "field scan"): a field
+ * macroblock's rows are twice as far apart, so its energy runs down the
+ * columns and the scan follows them.  aeg_field_scan4x4 is in the stored
+ * (transposed) layout of aeg_scan4x4 -- the decoder's x + 4y table
+ * transposed -- and aeg_field_scan8x8 in the raster layout of aeg_zigzag8x8. */
+const uint8_t aeg_field_scan4x4[16] = {
+     0,  1,  4,  2,  3,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15
+};
+
+const uint8_t aeg_field_scan8x8[64] = {
+     0,  8, 16,  1,  9, 24, 32, 17,  2, 25, 40, 48, 56, 33, 10,  3,
+    18, 41, 49, 57, 26, 11,  4, 19, 34, 42, 50, 58, 27, 12,  5, 20,
+    35, 43, 51, 59, 28, 13,  6, 21, 36, 44, 52, 60, 29, 14, 22, 37,
+    45, 53, 61, 30,  7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63
+};
+
 /* ------------------------------------------------------------------ */
 /* CABAC context initialization (Table 9-5 for I slices, Tables 9-12   */
 /* to 9-33 for P/B at each cabac_init_idc)                             */
@@ -864,6 +880,14 @@ const uint8_t aeg_cabac_sig8[63] = {
      4,  4,  4,  4,  3,  3,  6,  7,  7,  7,  8,  9, 10,  9,  8,  7,
      7,  6, 11, 12, 13, 11,  6,  7,  8,  9, 14, 10,  9,  8,  6, 11,
     12, 13, 11,  6,  9, 14, 10,  9, 11, 12, 13, 11, 14, 10, 12
+};
+/* the significance contexts of a field macroblock's 8x8 block (Table 9-43,
+ * the frame-coded column is aeg_cabac_sig8; the last map is shared) */
+const uint8_t aeg_cabac_sig8f[63] = {
+     0,  1,  1,  2,  2,  3,  3,  4,  5,  6,  7,  7,  7,  8,  4,  5,
+     6,  9, 10, 10,  8, 11, 12, 11,  9,  9, 10, 10,  8, 11, 12, 11,
+     9,  9, 10, 10,  8, 11, 12, 11,  9,  9, 10, 10,  8, 13, 13,  9,
+     9, 10, 10,  8, 13, 13,  9,  9, 10, 10, 14, 14, 14, 14, 14
 };
 const uint8_t aeg_cabac_last8[63] = {
      0,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,

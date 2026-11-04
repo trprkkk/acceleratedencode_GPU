@@ -119,10 +119,16 @@ void aeg_mc_luma(pixel *dst, int dstride, const pixel *src, int sstride,
 
 void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
 {
-    size_t rows = (size_t)h + 2 * AEG_PAD;
+    aeg_mc_ctx_init_pad(mc, w, h, stride, AEG_PAD);
+}
+
+void aeg_mc_ctx_init_pad(aeg_mc_ctx *mc, int w, int h, int stride, int vpad)
+{
+    size_t rows = (size_t)h + 2 * vpad;
     int i;
     (void)w;
     mc->stride = stride;
+    mc->vpad = vpad;
     mc->buf = aeg_alloc(3 * (size_t)stride * rows * sizeof(pixel));
     mc->base[0] = NULL;
     mc->ready = 0;
@@ -131,17 +137,18 @@ void aeg_mc_ctx_init(aeg_mc_ctx *mc, int w, int h, int stride)
     mc->umh_et = 0;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * stride * rows +
-                                (size_t)AEG_PAD * stride + AEG_PAD
+                                (size_t)vpad * stride + AEG_PAD
                               : NULL;
 }
 
 void aeg_mc_ctx_own(aeg_mc_ctx *mc, int h)
 {
-    size_t rows = (size_t)h + 2 * AEG_PAD;
+    int vpad = mc->vpad ? mc->vpad : AEG_PAD;
+    size_t rows = (size_t)h + 2 * vpad;
     int i;
     for (i = 1; i < 4; i++)
         mc->base[i] = mc->buf ? mc->buf + (size_t)(i - 1) * mc->stride * rows +
-                                (size_t)AEG_PAD * mc->stride + AEG_PAD
+                                (size_t)vpad * mc->stride + AEG_PAD
                               : NULL;
 }
 

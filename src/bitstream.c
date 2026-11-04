@@ -94,9 +94,13 @@ size_t aeg_nal_write(uint8_t *out, size_t out_cap, int nal_ref_idc,
  * reference B. */
 int aeg_sps_max_refs(const aeg_params *p)
 {
-    return p->refs >= 3 ? p->refs + (p->bframes > 0 && p->b_pyramid) :
-           (p->bframes > 0 && p->b_pyramid) ? 3 :
-           ((p->bframes > 0 || p->refs >= 2) ? 2 : 1);
+    /* field pictures: one more, the frame whose first field the second one
+     * predicts from (the first field's marking would otherwise drop the
+     * oldest frame the second field still reads) */
+    return (p->refs >= 3 ? p->refs + (p->bframes > 0 && p->b_pyramid) :
+            (p->bframes > 0 && p->b_pyramid) ? 3 :
+            ((p->bframes > 0 || p->refs >= 2) ? 2 : 1)) +
+           (p->field_coding > 0);
 }
 
 /* max_dec_frame_buffering (E.2.1): at least max_num_ref_frames and at least
@@ -392,7 +396,9 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
      * which counts *decoding* order: with B pictures the two orders differ, so
      * the count has to be sent explicitly (type 0, an 8-bit lsb per slice). */
     const int nrefs = aeg_sps_max_refs(p);
-    if (p->bframes > 0) {
+    /* (type 2 gives both fields of a frame the same count: field pictures
+     * send theirs too) */
+    if (p->bframes > 0 || p->field_coding > 0) {
         aeg_bw_ue(&bw, 0);               /* pic_order_cnt_type = 0          */
         aeg_bw_ue(&bw, 4);               /* log2_max_pic_order_cnt_lsb_minus4 */
     } else {
@@ -553,8 +559,12 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
     aeg_bw_ue(bw, (uint32_t)slice_type_in);
     aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
     aeg_bw_put(bw, frame_num_bits & 0xff, (uint32_t)frame_num);
-    if (frame_num_bits & AEG_SH_FIELD)
+    if (frame_num_bits & AEG_SH_FPIC) {
+        aeg_bw_put(bw, 1, 1);         /* field_pic_flag: a field            */
+        aeg_bw_put(bw, 1, frame_num_bits & AEG_SH_BOTTOM ? 1u : 0u);
+    } else if (frame_num_bits & AEG_SH_FIELD) {
         aeg_bw_put(bw, 1, 0);         /* field_pic_flag: a frame            */
+    }
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);
@@ -565,8 +575,18 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
      * predicts them from the neighbours (8.4.1.2.2, b_direct_spatial). */
     if (nos == 1)
         aeg_bw_put(bw, 1, direct_spatial ? 1u : 0u); /* direct_spatial_mv_pred_flag */
+    if ((nos == 0 || nos == 1) && (frame_num_bits & AEG_SH_FPIC)) {
+        /* a field's default counts are 2 * default + 1 entries (7.4.3):
+         * always say how many */
+        aeg_bw_put(bw, 1, 1);         /* num_ref_idx_active_override_flag   */
+        aeg_bw_ue(bw, (uint32_t)(nos == 0 ? num_ref_idx_l0_active - 1 : 0));
+        if (nos == 1)
+            aeg_bw_ue(bw, 0);         /* num_ref_idx_l1_active_minus1       */
+    }
     if (nos == 0 || nos == 1) {
-        if (nos == 0 && num_ref_idx_l0_active > 1) {
+        if (frame_num_bits & AEG_SH_FPIC) {
+            /* (written above) */
+        } else if (nos == 0 && num_ref_idx_l0_active > 1) {
             aeg_bw_put(bw, 1, 1);     /* num_ref_idx_active_override_flag   */
             aeg_bw_ue(bw, (uint32_t)(num_ref_idx_l0_active - 1));
         } else {

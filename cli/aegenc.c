@@ -80,6 +80,8 @@ static void usage(void)
 "  --tff, --bff     interlaced material, top / bottom field first: coded as\n"
 "                   frames, signalled as interlaced with that field order\n"
 "                   (x264 --fake-interlaced; height a multiple of 4)\n"
+"  --field          code interlaced material as field pictures (PAFF): two\n"
+"                   pictures per frame, one per field (--tff unless --bff)\n"
 "  --level <l>      force the level (4.1, 41; default: the smallest that\n"
 "                   fits)\n"
 "  --seek <n>       skip the first n input frames\n"
@@ -599,7 +601,7 @@ int main(int argc, char **argv)
     FILE *in = stdin, *out = stdout;
     int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
     int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
-    int fullrange = 0, demux = 0, seek = 0, interlaced = -1;
+    int fullrange = 0, demux = 0, seek = 0, interlaced = -1, field_coding = 0;
     int in_csp = -1, in_depth = -1;
     aeg_image layout;
     size_t poff[3];
@@ -672,6 +674,7 @@ int main(int argc, char **argv)
             bit_depth = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--tff")) interlaced = 1;
         else if (!strcmp(a, "--bff")) interlaced = 2;
+        else if (!strcmp(a, "--field") || !strcmp(a, "--paff")) field_coding = 1;
         else if (!strcmp(a, "--qpmin")) p.qp_min = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--qpmax")) p.qp_max = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--chroma-qp-offset"))
@@ -1036,6 +1039,9 @@ int main(int argc, char **argv)
     p.sar_h = sar_h;
     p.fullrange = fullrange;
     p.interlaced = interlaced >= 0 ? interlaced : inp.interlaced;
+    p.field_coding = field_coding;
+    if (field_coding && !p.interlaced)
+        p.interlaced = 1;
     p.gop_size = gop;
     p.bitrate_kbps = bitrate;
     if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
