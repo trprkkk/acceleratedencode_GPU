@@ -1451,14 +1451,19 @@ static const uint8_t group_blk[4][4] = {
 static void luma_inter_gather(const struct aeg_encoder *e, const pixel *src,
                               const pixel *pred, int16_t *res)
 {
-    int blk, x, y;
-    for (blk = 0; blk < 16; blk++) {
-        int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
-        int16_t *r = res + 16 * blk;
-        for (y = 0; y < 4; y++)
-            for (x = 0; x < 4; x++)
-                r[y * 4 + x] = (int16_t)((int)src[(by + y) * e->stride[0] + bx + x] -
-                                         (int)pred[(by + y) * 16 + bx + x]);
+    /* row by row, sixteen differences at a time (this vectorises; the
+     * per-block loop did not), each row then dealt out to its four blocks */
+    const int stride = e->stride[0];
+    int x, y;
+    for (y = 0; y < 16; y++) {
+        int16_t row[16];
+        int16_t *r = res + 64 * (y >> 2) + 4 * (y & 3);
+        for (x = 0; x < 16; x++)
+            row[x] = (int16_t)((int)src[y * stride + x] - (int)pred[y * 16 + x]);
+        memcpy(r, row, 8);
+        memcpy(r + 16, row + 4, 8);
+        memcpy(r + 32, row + 8, 8);
+        memcpy(r + 48, row + 12, 8);
     }
 }
 
@@ -3778,6 +3783,8 @@ static int bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
                             const int geo[4], const int pmv[2][2],
                             int mv[2][2]);
 
+static int brdg_g(const struct aeg_encoder *e);
+
 /* The same for the B pictures' 16x8 / 8x16 searches (AEG_PSUBB overrides). */
 static int part_subpel_b(const struct aeg_encoder *e)
 {
@@ -3789,7 +3796,6 @@ static int part_subpel_b(const struct aeg_encoder *e)
     return v >= 0 ? v : part_subpel(e);
 }
 
-static int brdg_g(void);
 static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t);
 
 static int bidir_part_on(const struct aeg_encoder *e)
@@ -3891,7 +3897,7 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
         }
     }
     lists = best == 0 ? 1 : (best == 1 ? 2 : 3);
-    if (brdg_g() > 0) {
+    if (brdg_g(e) > 0) {
         int pb = best == 2
                  ? aeg_mvd_bits(mv[0][0] - pmv[0][0], mv[0][1] - pmv[0][1]) +
                    aeg_mvd_bits(mv[1][0] - pmv[1][0], mv[1][1] - pmv[1][1])
@@ -4940,23 +4946,38 @@ static int bidir_refine(struct aeg_encoder *e, int mbx, int mby,
     return bidir_refine_geo(e, mbx, mby, geo, pmv, mv);
 }
 
-/* AEG_BRDG=G: x264's B early termination (mb_analyse_b_rd).  Only the
- * candidates whose search cost is within G/16 of the best one -- the direct
- * prediction's SATD included -- go on to the rate-distortion pass; direct
- * itself always does.  0 = off. */
-static int brdg_g(void)
+/* x264's B early termination (mb_analyse_b_rd): only the candidates whose
+ * search cost is within G/16 of the best one -- the direct prediction's SATD
+ * included -- go on to the rate-distortion pass; direct itself always does.
+ * Against the full pass on main + validation (CQP, BD-rate / encode time):
+ *
+ *            G = 20                    G = 17 (x264's)
+ *   p1      +0.01 %   no change        -
+ *   p2      +0.01 %   no change        +0.05 %   no change
+ *   p3      -0.00 %   -2.8 %           +0.08 %   -5.6 %
+ *   p4      -0.01 %   -5.2 %           +0.08 %   -4.2 %
+ *
+ * The cheaper presets have fewer candidates left to drop.  On static content
+ * the candidates' SATD costs lie close together (vtest: 5.3 candidates, 0.3
+ * dropped at G = 17), which is why this does little there.  G = 20 from
+ * preset 3 up; AEG_BRDG=G overrides, 0 = off. */
+static int brdg_g_env(void)
 {
     static _Atomic int v = -2;
     if (v == -2) {
         const char *ev = getenv("AEG_BRDG");
-        v = ev ? atoi(ev) : 0;
+        v = ev ? atoi(ev) : -1;
     }
     return v;
+}
+static int brdg_g(const struct aeg_encoder *e)
+{
+    return brdg_g_env() >= 0 ? brdg_g_env() : e->p.preset >= 3 ? 20 : 0;
 }
 
 static void b_rd_gate(struct aeg_encoder *e, int mbx, int mby)
 {
-    const int g = brdg_g();
+    const int g = brdg_g(e);
     int k, n = 0, best = 1 << 30;
     int64_t thr;
 
