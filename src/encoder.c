@@ -132,6 +132,9 @@ typedef struct {
     uint8_t blist[4];
     /* P list0 reference index per 4x4 block (0 or 1).  B pictures keep 0. */
     uint8_t ref[16];
+    /* the motion search's cost (SATD + lambda * mvd bits) plus one;
+     * 0 = not known (see b_rd_gate) */
+    int     scost;
 } mbcand;
 
 struct aeg_encoder {
@@ -3771,9 +3774,23 @@ static int part_subpel(const struct aeg_encoder *e)
     return e->p.preset >= 1 ? 2 : 0;
 }
 
-static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
-                             const int geo[4], const int pmv[2][2],
-                             int mv[2][2]);
+static int bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
+                            const int geo[4], const int pmv[2][2],
+                            int mv[2][2]);
+
+/* The same for the B pictures' 16x8 / 8x16 searches (AEG_PSUBB overrides). */
+static int part_subpel_b(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_PSUBB");
+        v = ev ? atoi(ev) : -1;
+    }
+    return v >= 0 ? v : part_subpel(e);
+}
+
+static int brdg_g(void);
+static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t);
 
 static int bidir_part_on(const struct aeg_encoder *e)
 {
@@ -3827,12 +3844,13 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                      e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                          mbx * 16 + geo[0],
                      e->stride[0], geo[2], geo[3], range,
-                     part_subpel(e) >= 2 ? e->p.subme : 0,
+                     part_subpel_b(e) >= 2 ? e->p.subme : 0,
                      pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
                      &mv[l][0], &mv[l][1],
                      &sad);
-        satd[l] = -1;
-        if (e->p.subme > 0 && part_subpel(e) < 2) {
+        /* with the fractional stage the search returns the SATD itself */
+        satd[l] = e->p.subme > 0 && part_subpel_b(e) >= 2 ? sad : -1;
+        if (e->p.subme > 0 && part_subpel_b(e) < 2) {
             int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
             int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
             int qx = (mv[l][0] & ~3) + fx, qy = (mv[l][1] & ~3) + fy;
@@ -3873,6 +3891,13 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
         }
     }
     lists = best == 0 ? 1 : (best == 1 ? 2 : 3);
+    if (brdg_g() > 0) {
+        int pb = best == 2
+                 ? aeg_mvd_bits(mv[0][0] - pmv[0][0], mv[0][1] - pmv[0][1]) +
+                   aeg_mvd_bits(mv[1][0] - pmv[1][0], mv[1][1] - pmv[1][1])
+                 : bits[best];
+        cd->scost += (p == 0) + satd[best] + e->me_lambda * pb;
+    }
     cd->blist[p] = (uint8_t)lists;
     cd->pmv[b0][0] = (int16_t)pmv[0][0];
     cd->pmv[b0][1] = (int16_t)pmv[0][1];
@@ -3993,7 +4018,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
                          pmv[l][0], pmv[l][1],
                          seed, NULL, 0, e->me_lambda, mc, &mv[l][0],
                          &mv[l][1], &sad);
-            satd[l] = -1;
+            satd[l] = e->p.subme > 0 && b8_sub ? sad : -1;
             if (e->p.subme > 0 && !b8_sub) {
                 int fx = l ? e->mb_frac1[0] : e->mb_frac[0];
                 int fy = l ? e->mb_frac1[1] : e->mb_frac[1];
@@ -4854,9 +4879,9 @@ static void b_part_pred(struct aeg_encoder *e, int mbx, int mby,
  * mvd bits do not change while the other walks, so both are kept instead of
  * being recomputed per neighbour (the same costs, in the same order, as
  * b_part_satd_bi() per candidate). */
-static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
-                             const int geo[4], const int pmv[2][2],
-                             int mv[2][2])
+static int bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
+                            const int geo[4], const int pmv[2][2],
+                            int mv[2][2])
 {
     static const int8_t offs[8][2] = {
         {-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
@@ -4905,19 +4930,68 @@ static void bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
             }
         }
     }
+    return best;
 }
 
-static void bidir_refine(struct aeg_encoder *e, int mbx, int mby,
-                         const int pmv[2][2], int mv[2][2])
+static int bidir_refine(struct aeg_encoder *e, int mbx, int mby,
+                        const int pmv[2][2], int mv[2][2])
 {
     static const int geo[4] = { 0, 0, 16, 16 };
-    bidir_refine_geo(e, mbx, mby, geo, pmv, mv);
+    return bidir_refine_geo(e, mbx, mby, geo, pmv, mv);
+}
+
+/* AEG_BRDG=G: x264's B early termination (mb_analyse_b_rd).  Only the
+ * candidates whose search cost is within G/16 of the best one -- the direct
+ * prediction's SATD included -- go on to the rate-distortion pass; direct
+ * itself always does.  0 = off. */
+static int brdg_g(void)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_BRDG");
+        v = ev ? atoi(ev) : 0;
+    }
+    return v;
+}
+
+static void b_rd_gate(struct aeg_encoder *e, int mbx, int mby)
+{
+    const int g = brdg_g();
+    int k, n = 0, best = 1 << 30;
+    int64_t thr;
+
+    if (g <= 0)
+        return;
+    for (k = 0; k < e->mb_ncand; k++) {
+        mbcand *cd = &e->mb_cand[k];
+        if (cd->type == AEG_MB_B_DIRECT && !cd->scost) {
+            const int s = e->stride[0];
+            mbenc t;
+            cand_enc(e, k, QP_MIN, &t);
+            inter_predict_typed(e, mbx, mby, &t);
+            cd->scost = 1 + e->me_lambda +
+                        aeg_satd_16x16(e->pred_l, 16,
+                                       e->srcp[0] + mby * 16 * s + mbx * 16, s);
+        }
+        if (cd->scost && cd->scost - 1 < best)
+            best = cd->scost - 1;
+    }
+    thr = (int64_t)best * g / 16 + 1;
+    for (k = 0; k < e->mb_ncand; k++) {
+        const mbcand *cd = &e->mb_cand[k];
+        if (cd->type == AEG_MB_B_DIRECT || !cd->scost || cd->scost - 1 < thr) {
+            if (n != k)
+                e->mb_cand[n] = *cd;
+            n++;
+        }
+    }
+    e->mb_ncand = n;
 }
 
 static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
 {
     const pixel *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
-    int pmv[2][2], mv[2][2], mvbi[2][2], sad[2], list, b;
+    int pmv[2][2], mv[2][2], mvbi[2][2], sad[2], list, b, bicost;
     int range = e->p.search_range ? e->p.search_range : 16;
 
     b_mv_predict(e, mbx, mby, 0, &pmv[0][0], &pmv[0][1]);
@@ -4978,8 +5052,9 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
      * rate of the vector that moves, alternating until neither moves. */
     {
         int bi[2][2] = { { mv[0][0], mv[0][1] }, { mv[1][0], mv[1][1] } };
+        bicost = 0;
         if (bidir_on(e))
-            bidir_refine(e, mbx, mby, pmv, bi);
+            bicost = 1 + bidir_refine(e, mbx, mby, pmv, bi);
         mvbi[0][0] = bi[0][0]; mvbi[0][1] = bi[0][1];
         mvbi[1][0] = bi[1][0]; mvbi[1][1] = bi[1][1];
     }
@@ -5003,6 +5078,10 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         cd->pmv[0][1] = (int16_t)pmv[0][1];
         cd->pmv1[0][0] = (int16_t)pmv[1][0];
         cd->pmv1[0][1] = (int16_t)pmv[1][1];
+        cd->scost = list == 2 ? bicost
+                    : 1 + sad[list] + e->me_lambda *
+                          aeg_mvd_bits(mv[list][0] - pmv[list][0],
+                                       mv[list][1] - pmv[list][1]);
         e->mb_ncand++;
     }
     /* The partitioned shapes.  Like the P path they only pay off with the RD
@@ -5062,6 +5141,7 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
         cd->blist[0] = cd->blist[1] = cd->blist[2] = cd->blist[3] = (uint8_t)dl;
         e->mb_ncand++;
     }
+    b_rd_gate(e, mbx, mby);
     return e->mb_ncand > 0;
 }
 
@@ -7216,7 +7296,21 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         const int mb_qp = c->qp;
         e->p.trellis = trel_saved;
         e->cmemo_gen++;     /* the decision's chroma was coded without it */
-        if (inter) {
+        /* Level selection only shrinks or removes levels the quantiser set
+         * (trel_descent_ex() never touches a zero), so a winner whose luma
+         * quantised to nothing would come out of it unchanged: the skip
+         * vectors of static content, most of what a B picture codes. */
+        int lz = inter;
+        for (int b = 0; b < 16 && lz; b++)
+            lz = !best.nz[b];
+        for (int g = 0; g < 4 && lz && best.t8; g++)
+            lz = !best.nz8[g];
+        if (lz) {
+            /* (the picture and snap_l already hold the winner's luma; the
+             * coding would have stamped the macroblock's own QP, where the
+             * decision may have left a residual-free winner at another) */
+            best.qp = mb_qp;
+        } else if (inter) {
             mbcand save = e->mb_cand[0];
             int b;
             e->mb_cand[0].type = best.type;
@@ -7245,10 +7339,12 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         } else {
             rd_luma_i8x8(e, mbx, mby, &t, mb_qp, lambda);
         }
-        t.chroma_mode = best.chroma_mode;
-        best = t;
+        if (!lz) {
+            t.chroma_mode = best.chroma_mode;
+            best = t;
+            snap_luma(e, mbx, mby, snap_l);
+        }
         c->qp = mb_qp;
-        snap_luma(e, mbx, mby, snap_l);
     }
 
     CM_LAP(e, 4);
