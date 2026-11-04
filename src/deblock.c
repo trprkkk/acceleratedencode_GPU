@@ -163,6 +163,11 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
     }
     if (nzp || nzq)
         return 2;
+    /* a horizontal macroblock edge between a frame and a field macroblock of
+     * an MBAFF frame: at least 1, whatever the vectors (8.7.2.1,
+     * mixedModeEdgeFlag) */
+    if (mb_edge && !vertical && p->fld != q->fld)
+        return 1;
 
     /* A B picture compares the vectors of *both* lists, and the filter is on as
      * soon as the two blocks do not predict from the same lists: a macroblock
@@ -268,14 +273,17 @@ static void chroma_edge_filter(pixel *pix, int xs, int step, int alpha,
     }
 }
 
-/* Applies the four vertical (or horizontal) edges of one macroblock. */
-void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
-                        int mb_x, int mb_y, int salpha, int sbeta, int vertical)
+/* The four vertical (or horizontal) edges of macroblock `q`, whose samples
+ * are seen through a view: luma at Y with line stride ys, chroma at C[0..1]
+ * with stride cs (a field macroblock of an MBAFF frame sees every other
+ * line).  `p_mb` is the macroblock across edge 0, NULL when that edge is not
+ * filtered (picture or pair edge without a neighbour, or one filtered
+ * separately).  `ki` is the first edge to filter (1: the macroblock edge is
+ * done elsewhere). */
+static void dbk_dir(const aeg_picture *pic, pixel *Y, pixel *C[2], int ys,
+                    int cs, const aeg_mb *q, const aeg_mb *p_mb, int salpha,
+                    int sbeta, int vertical)
 {
-    const aeg_mb *q = &mbs[mb_y * mb_stride + mb_x];
-    const aeg_mb *left = mb_x > 0 ? q - 1 : q;
-    const aeg_mb *above = mb_y > 0 ? q - mb_stride : q;
-    const aeg_mb *p_mb = vertical ? left : above;
     int k;
 
     for (k = 0; k < 4; k++) {
@@ -283,9 +291,9 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         int mb_edge = (k == 0);
         int bs[4], alpha, beta;
         const int8_t *tc0;
-        int qp, xs, step, lx, ly;
+        int qp;
 
-        if (mb_edge && ((vertical && mb_x == 0) || (!vertical && mb_y == 0)))
+        if (mb_edge && !p_mb)
             continue;
         /* A macroblock whose luma was coded with the 8x8 transform has no
          * transform boundary at 4 or 12, so only the internal edge at 8 is a
@@ -296,7 +304,7 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         if (q->t8 && (k & 1))
             continue;
 
-        edge_bs(p_mb, q, vertical, k, mb_edge, bs);
+        edge_bs(mb_edge ? p_mb : q, q, vertical, k, mb_edge, bs);
         if (!bs[0] && !bs[1] && !bs[2] && !bs[3])
             continue;
 
@@ -306,14 +314,10 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         aeg_deblock_thresholds(qp, salpha, sbeta, &alpha, &beta, &tc0);
         /* luma off (alpha or beta 0) does not mean chroma off: with a
          * positive chroma_qp_index_offset the chroma QP is the higher one */
-        if (alpha && beta) {
-            xs = vertical ? 1 : pic->stride[0];
-            step = vertical ? pic->stride[0] : 1;
-            lx = mb_x * 16 + (vertical ? pos : 0);
-            ly = mb_y * 16 + (vertical ? 0 : pos);
-            luma_edge_filter(pic->plane[0] + ly * pic->stride[0] + lx, xs, step,
+        if (alpha && beta)
+            luma_edge_filter(Y + (vertical ? pos : pos * ys),
+                             vertical ? 1 : ys, vertical ? ys : 1,
                              alpha, beta, tc0, bs, mb_edge);
-        }
 
         /* Chroma has half the resolution: edges at chroma coordinates 0 and
          * 4, i.e. only luma edges k = 0 and k = 2. */
@@ -330,20 +334,200 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                                   : aeg_qp_chroma(q->qp, co);
                 int calpha, cbeta;
                 const int8_t *ctc0;
-                int cxs = vertical ? 1 : pic->stride[plane];
-                int cstep = vertical ? pic->stride[plane] : 1;
-                int cx = mb_x * 8 + (vertical ? cpos : 0);
-                int cy = mb_y * 8 + (vertical ? 0 : cpos);
 
                 aeg_deblock_thresholds(cqp, salpha, sbeta, &calpha, &cbeta,
                                        &ctc0);
                 if (!calpha || !cbeta)
                     continue;
-                chroma_edge_filter(pic->plane[plane] + cy * pic->stride[plane] + cx,
-                                   cxs, cstep, calpha, cbeta, ctc0, bs, mb_edge);
+                chroma_edge_filter(C[plane - 1] + (vertical ? cpos : cpos * cs),
+                                   vertical ? 1 : cs, vertical ? cs : 1,
+                                   calpha, cbeta, ctc0, bs, mb_edge);
             }
         }
     }
+}
+
+/* Applies the four vertical (or horizontal) edges of one macroblock. */
+void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                        int mb_x, int mb_y, int salpha, int sbeta, int vertical)
+{
+    const aeg_mb *q = &mbs[mb_y * mb_stride + mb_x];
+    const aeg_mb *p_mb = vertical ? (mb_x > 0 ? q - 1 : NULL)
+                                  : (mb_y > 0 ? q - mb_stride : NULL);
+    pixel *C[2];
+
+    C[0] = pic->plane[1] + mb_y * 8 * pic->stride[1] + mb_x * 8;
+    C[1] = pic->plane[2] + mb_y * 8 * pic->stride[2] + mb_x * 8;
+    dbk_dir(pic, pic->plane[0] + mb_y * 16 * pic->stride[0] + mb_x * 16, C,
+            pic->stride[0], pic->stride[1], q, p_mb, salpha, sbeta, vertical);
+}
+
+/* non-zero coefficients in luma 4x4 block `blk` of m, as the filter sees them
+ * (with the 8x8 transform, per 8x8 group) */
+static inline int nz_blk(const aeg_mb *m, int blk)
+{
+    return m->t8 ? m->nz8[nz8_group(blk)] != 0 : m->nz[blk] != 0;
+}
+
+/* MBAFF: the left macroblock edge of q where the left pair is the other kind
+ * (frame beside field or field beside frame).  Each side's lines meet lines
+ * of both left macroblocks, so there are eight bS values and two QPs, one per
+ * left macroblock (8.7.2, mixedModeEdgeFlag; FFmpeg's filter_mb_mbaff_edgev).
+ * The view is q's own. */
+static void dbk_left_mixed(const aeg_picture *pic, pixel *Y, pixel *C[2],
+                           int ys, int cs, const aeg_mb *q, const aeg_mb *l0,
+                           const aeg_mb *l1, int bot, int salpha, int sbeta)
+{
+    const int fld = q->fld, co = pic->chroma_qp_offset;
+    int bs[8], i, half;
+
+    for (i = 0; i < 8; i++) {
+        /* field q: lines 0-7 meet the top left macroblock, 8-15 the bottom;
+         * frame q: its even lines meet the top (field) one, odd the bottom */
+        const aeg_mb *n = (fld ? i >> 2 : i & 1) ? l1 : l0;
+        int nrow = fld ? (i & 3) : (bot ? 2 : 0) + (i >> 2);
+        if (is_intra(q) || is_intra(n))
+            bs[i] = 4;
+        else
+            bs[i] = 1 + (nz_blk(q, (i >> 1) * 4) || nz_blk(n, nrow * 4 + 3));
+    }
+    /* half 0 against l0, half 1 against l1 */
+    for (half = 0; half < 2; half++) {
+        const aeg_mb *n = half ? l1 : l0;
+        int alpha, beta, pl, r;
+        const int8_t *tc0;
+        /* the eight luma lines of this half and their bS: field q -- lines
+         * 8 half + r (stride ys), bS[4 half + r / 2]; frame q -- lines
+         * 2 r + half (stride 2 ys), bS[2 (r / 2) + half] */
+        pixel *y0 = fld ? Y + 8 * half * ys : Y + half * ys;
+        int ls = fld ? ys : 2 * ys;
+        const int *b = fld ? bs + 4 * half : bs + half;
+        int bstep = fld ? 1 : 2;
+
+        aeg_deblock_thresholds((q->qp + n->qp + 1) >> 1, salpha, sbeta,
+                               &alpha, &beta, &tc0);
+        if (alpha && beta) {
+            if (b[0] == 4) {
+                for (r = 0; r < 8; r++)
+                    filter_luma_intra_edge(y0 + r * ls, 1, alpha, beta);
+            } else {
+                for (r = 0; r < 8; r++) {
+                    int tc = tc0[b[(r >> 1) * bstep]];
+                    if (tc >= 0)
+                        filter_luma_edge(y0 + r * ls, 1, alpha, beta,
+                                         tc << (BIT_DEPTH - 8));
+                }
+            }
+        }
+        for (pl = 0; pl < 2; pl++) {
+            int cqp = (aeg_qp_chroma(q->qp, co) + aeg_qp_chroma(n->qp, co) +
+                       1) >> 1;
+            int calpha, cbeta;
+            const int8_t *ctc0;
+            /* four chroma lines, one bS each */
+            pixel *c0 = fld ? C[pl] + 4 * half * cs : C[pl] + half * cs;
+            int cls = fld ? cs : 2 * cs;
+
+            aeg_deblock_thresholds(cqp, salpha, sbeta, &calpha, &cbeta, &ctc0);
+            if (!calpha || !cbeta)
+                continue;
+            if (b[0] == 4) {
+                for (r = 0; r < 4; r++)
+                    filter_chroma_intra_edge(c0 + r * cls, 1, calpha, cbeta);
+            } else {
+                for (r = 0; r < 4; r++) {
+                    int tc = ctc0[b[r * bstep]];
+                    if (tc >= 0)
+                        filter_chroma_edge(c0 + r * cls, 1, calpha, cbeta,
+                                           (tc << (BIT_DEPTH - 8)) + 1);
+                }
+            }
+        }
+    }
+}
+
+/* MBAFF: the top edge of a frame top macroblock under a field pair is
+ * filtered twice, once per field: q's even lines against the top field
+ * macroblock above, its odd lines against the bottom one, each in field
+ * lines -- and at bS 3 at most (FFmpeg's "special case in the norm"). */
+static void dbk_top_fields(const aeg_picture *pic, pixel *Y, pixel *C[2],
+                           int ys, int cs, const aeg_mb *q, const aeg_mb *a0,
+                           int mb_stride, int salpha, int sbeta)
+{
+    const int co = pic->chroma_qp_offset;
+    int j;
+
+    for (j = 0; j < 2; j++) {
+        const aeg_mb *n = a0 + j * mb_stride;
+        int bs[4], i, alpha, beta, pl;
+        const int8_t *tc0;
+
+        for (i = 0; i < 4; i++)
+            bs[i] = (is_intra(q) || is_intra(n)) ? 3
+                    : 1 + (nz_blk(q, i) || nz_blk(n, 12 + i));
+        aeg_deblock_thresholds((q->qp + n->qp + 1) >> 1, salpha, sbeta,
+                               &alpha, &beta, &tc0);
+        if (alpha && beta)
+            luma_edge_filter(Y + j * ys, 2 * ys, 1, alpha, beta, tc0, bs, 0);
+        for (pl = 0; pl < 2; pl++) {
+            int cqp = (aeg_qp_chroma(q->qp, co) + aeg_qp_chroma(n->qp, co) +
+                       1) >> 1;
+            int calpha, cbeta;
+            const int8_t *ctc0;
+            aeg_deblock_thresholds(cqp, salpha, sbeta, &calpha, &cbeta, &ctc0);
+            if (calpha && cbeta)
+                chroma_edge_filter(C[pl] + j * cs, 2 * cs, 1, calpha, cbeta,
+                                   ctc0, bs, 0);
+        }
+    }
+}
+
+/* One macroblock of an MBAFF frame (8.7 with MbaffFrameFlag): the view of a
+ * field macroblock is its field's lines; the left edge beside the other kind
+ * of pair and the top edge of a frame macroblock under a field pair have
+ * their own rules; the rest is the frame filter in the view. */
+void aeg_deblock_mb_mbaff(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                          int mb_x, int mb_y, int salpha, int sbeta)
+{
+    const aeg_mb *q = &mbs[mb_y * mb_stride + mb_x];
+    const int fld = q->fld, bot = mb_y & 1, py = mb_y >> 1;
+    const int s0 = pic->stride[0], s1 = pic->stride[1];
+    const int ys = fld ? 2 * s0 : s0, cs = fld ? 2 * s1 : s1;
+    const int yl = fld ? 32 * py + bot : 16 * mb_y;       /* first line */
+    const int cl = fld ? 16 * py + bot : 8 * mb_y;
+    pixel *Y = pic->plane[0] + yl * s0 + 16 * mb_x;
+    pixel *C[2];
+    const aeg_mb *l0 = mb_x > 0 ? &mbs[2 * py * mb_stride + mb_x - 1] : NULL;
+    const aeg_mb *top = NULL;
+
+    C[0] = pic->plane[1] + cl * s1 + 8 * mb_x;
+    C[1] = pic->plane[2] + cl * s1 + 8 * mb_x;
+
+    /* vertical edges */
+    if (l0 && l0->fld != fld) {
+        dbk_left_mixed(pic, Y, C, ys, cs, q, l0, l0 + mb_stride, bot, salpha,
+                       sbeta);
+        dbk_dir(pic, Y, C, ys, cs, q, NULL, salpha, sbeta, 1);
+    } else {
+        dbk_dir(pic, Y, C, ys, cs, q, l0 ? q - 1 : NULL, salpha, sbeta, 1);
+    }
+
+    /* horizontal edges */
+    if (!fld && bot) {
+        top = q - mb_stride;                    /* the pair's top macroblock */
+    } else if (py > 0) {
+        const aeg_mb *a0 = &mbs[(2 * py - 2) * mb_stride + mb_x];
+        if (!fld && a0->fld) {
+            dbk_top_fields(pic, Y, C, ys, cs, q, a0, mb_stride, salpha, sbeta);
+        } else if (fld) {
+            /* a field macroblock: the same field of a field pair above, or
+             * the bottom macroblock of a frame pair */
+            top = (!bot && a0->fld) ? a0 : a0 + mb_stride;
+        } else {
+            top = a0 + mb_stride;
+        }
+    }
+    dbk_dir(pic, Y, C, ys, cs, q, top, salpha, sbeta, 0);
 }
 
 /* The internal luma edges of one macroblock, `q`, whose reconstruction is
@@ -390,10 +574,10 @@ void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
 {
     int x;
     for (x = 0; x < pic->mb_w; x++) {
-        aeg_deblock_mb(pic, mbs, mb_stride, x, 2 * pair_y, slice_alpha,
-                       slice_beta);
-        aeg_deblock_mb(pic, mbs, mb_stride, x, 2 * pair_y + 1, slice_alpha,
-                       slice_beta);
+        aeg_deblock_mb_mbaff(pic, mbs, mb_stride, x, 2 * pair_y, slice_alpha,
+                             slice_beta);
+        aeg_deblock_mb_mbaff(pic, mbs, mb_stride, x, 2 * pair_y + 1,
+                             slice_alpha, slice_beta);
     }
 }
 

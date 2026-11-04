@@ -5636,3 +5636,79 @@ Every combination decodes bit-exactly in ffmpeg: forced switch patterns
 CABAC / CAVLC, 1..8 refs, bff, weighted prediction on a fade, slices, CRF /
 VBV, presets 0..4, 10-bit (`tests/run_tests.sh` `paff_*`, `h10_paff`).
 
+## Macroblock-adaptive frame/field (MBAFF, `--mbaff`, `params.field_coding` 3)
+
+Built in stages. Each stage decodes bit-exactly in ffmpeg before the next
+one starts:
+
+1. **Pair order (done).** The SPS has `mb_adaptive_frame_field_flag`. Slices
+   start on pair boundaries (`first_mb_in_slice` counts pairs), and every
+   pass walks the macroblocks pair by pair: top, bottom, then the next
+   pair. Field pairs are not used yet, but the frame-pair rules are already
+   in place:
+   * `mb_field_decoding_flag` is written for a top macroblock, and for a
+     bottom one whose top was skipped. Its CABAC context comes from the
+     left and above pairs. A skipped pair infers its flag from those
+     neighbours.
+   * `end_of_slice_flag` is written only after a bottom macroblock.
+   * A bottom macroblock has no above-right neighbour.
+   * Motion vectors are predicted through the pair-aware neighbour lookup.
+   * Deblocking runs pair by pair.
+2. **Field pairs in I slices (done).** A field macroblock sees only its
+   field's lines (`mbf_enter`: the top macroblock gets the even lines of
+   the pair, the bottom one the odd lines, at twice the stride). It uses
+   the field scans and the field CABAC contexts for significance and last.
+   Each neighbour (A/B/C/D, 4x4 block, sample row) is derived through
+   Table 6-4 (`nb_left`, `nb_mbB`, `nb_top_ok`) for:
+   * nC and coded_block_flag;
+   * the intra-mode predictors;
+   * the CABAC cbp, chroma-mode, transform-8x8 and mb_type contexts;
+   * intra availability.
+
+   For a frame macroblock beside a field pair, the left 4x4 blocks
+   alternate between the two left macroblocks.
+
+   Intra prediction samples always come from the current view, one row or
+   column outside the macroblock.
+
+   Deblocking (`aeg_deblock_mb_mbaff`) filters a field macroblock in its
+   own view. Two edges get special treatment:
+   * **Left edge beside the other kind of pair.** It gets eight bS values
+     and one averaged QP per left macroblock. A field macroblock's lines
+     0-7 meet the top left macroblock and lines 8-15 the bottom one. A
+     frame macroblock's even lines meet the top one and its odd lines the
+     bottom one.
+   * **Top edge of a frame top macroblock under a field pair.** It is
+     filtered twice, once per field. The even lines go against the top
+     field macroblock and the odd lines against the bottom one. bS is at
+     most 3.
+
+   Elsewhere, a frame/field edge gets bS ≥ 1, intra edges get bS 4 only
+   between two frame macroblocks, and the vertical motion-vector limit is
+   2 inside field macroblocks.
+
+   Field pairs are only chosen when `AEG_MBFORCE` sets a test pattern:
+   `all`, or a number that seeds a pseudo-random pattern per pair and
+   picture. This applies to I slices only.
+3. P slices (to do): field reference lists (refIdx >> 1 with parity),
+   scaled neighbour motion vectors, P_Skip and the mvd contexts across
+   frame/field pairs.
+4. B slices (to do): spatial and temporal direct with the co-located pair
+   mapping of Table 8-6.
+5. The frame/field decision per pair (to do).
+
+Under the forced patterns, ffmpeg decodes bit-exactly in every
+combination tested (`tests/run_tests.sh` `mbaff_*`, `h10_mbaff*`):
+* entropy coding: CABAC and CAVLC;
+* field pairs: all of them, or seeded mixed patterns;
+* presets 0..4;
+* slices and slice threads;
+* tff and bff;
+* rate control: CQP, CRF and VBV;
+* deblocking: offsets, QP up to 45, and off;
+* 10-bit;
+* P/B pictures referencing I pictures with field pairs;
+* real clips (short, vtest, megamind, cockatoo, fade).
+
+Progressive streams are unchanged, and MBAFF without forcing is
+byte-identical to stage 1.

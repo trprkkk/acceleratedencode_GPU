@@ -655,6 +655,8 @@ void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc);
 void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                           int pair_y, int slice_alpha, int slice_beta);
+void aeg_deblock_mb_mbaff(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                          int mb_x, int mb_y, int slice_alpha, int slice_beta);
 void aeg_deblock_mb(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                     int mb_x, int mb_y, int slice_alpha, int slice_beta);
 void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,

@@ -465,6 +465,15 @@ struct aeg_encoder {
      * pair (aeg_mb.fld) */
     int mbaff;
     int mbaff_ff;     /* mb_field_decoding_flag to write, -1 none (bitstream) */
+    /* the macroblock being coded is a field macroblock of an MBAFF frame:
+     * mbf_enter() has pointed srcp/recp/stride at its field's lines and the
+     * scans and contexts at the field ones (mbf_save: what it replaced) */
+    int cfld;
+    int pair_fld;     /* the decision for the current pair (decision pass) */
+    struct {
+        pixel *srcp[3], *recp[3];
+        int stride[3];
+    } mbf_save;
     int ref_par[AEG_MAX_REFS];  /* parity of the field refpl[k] views     */
     int fld_cofs[AEG_MAX_REFS]; /* its chroma vertical offset (8.4.1.4)   */
     int vpad;                   /* rows of padding above/below a picture  */
@@ -1287,25 +1296,178 @@ static void pad_edges(pixel *p, int stride, int w, int h)
 }
 
 /* ------------------------------------------------------------------ */
+/* Neighbouring macroblocks                                            */
+/* ------------------------------------------------------------------ */
+/* Which macroblock holds a neighbouring sample (6.4.12).  Without MBAFF it is
+ * the raster neighbour.  In an MBAFF frame it is Table 6-4: it depends on
+ * whether the current macroblock (e->cfld) and the neighbouring pair are
+ * frame or field macroblocks, and the row inside the neighbour changes with
+ * it.  The left pair of (mbx, mby) is always decoded; the pair above exists
+ * from the second pair row of the slice on, and the bottom macroblock of a
+ * frame pair has its own top macroblock above it. */
+static inline int nb_top_ok(const struct aeg_encoder *e, int mby)
+{
+    if (!e->mbaff)
+        return mby > e->top_row;
+    return (!e->cfld && (mby & 1)) || (mby & ~1) > e->top_row;
+}
+
+/* The macroblock holding sample row -1 (neighbour B; valid with nb_top_ok):
+ * its last block row is the one above. */
+static inline const aeg_mb *nb_mbB(const struct aeg_encoder *e, int mbx,
+                                   int mby)
+{
+    const int w = e->mb_w;
+    int t;
+
+    if (!e->mbaff || (!e->cfld && (mby & 1)))
+        return &e->mbs[(mby - 1) * w + mbx];
+    t = mby & ~1;                          /* top macroblock of this pair */
+    /* a field top macroblock sees the top field macroblock of a field pair
+     * above, every other case the bottom macroblock of the pair above */
+    if (e->cfld && !(mby & 1) && e->mbs[(t - 2) * w + mbx].fld)
+        return &e->mbs[(t - 2) * w + mbx];
+    return &e->mbs[(t - 1) * w + mbx];
+}
+
+/* The macroblock holding the sample left of row yN (0..maxH-1; maxH 16 for
+ * luma, 8 for chroma) and that sample's row in it (*yM).  mbx > 0. */
+static inline const aeg_mb *nb_left(const struct aeg_encoder *e, int mbx,
+                                    int mby, int yN, int maxH, int *yM)
+{
+    const aeg_mb *l0, *l1;
+
+    if (!e->mbaff) {
+        *yM = yN;
+        return &e->mbs[mby * e->mb_w + mbx - 1];
+    }
+    l0 = &e->mbs[(mby & ~1) * e->mb_w + mbx - 1];   /* the left pair */
+    l1 = l0 + e->mb_w;
+    if (!e->cfld) {
+        if (!l0->fld) {                 /* frame beside frame */
+            *yM = yN;
+            return (mby & 1) ? l1 : l0;
+        }
+        /* frame beside field: the frame row's parity picks the field */
+        *yM = ((mby & 1) ? yN + maxH : yN) >> 1;
+        return (yN & 1) ? l1 : l0;
+    }
+    if (l0->fld) {                      /* field beside field */
+        *yM = yN;
+        return (mby & 1) ? l1 : l0;
+    }
+    /* field beside frame: field row yN is frame row 2 yN (+1) of the pair */
+    *yM = 2 * yN + (mby & 1);
+    if (*yM >= maxH) {
+        *yM -= maxH;
+        return l1;
+    }
+    return l0;
+}
+
+/* The macroblock left of the macroblock as a whole (row 0: the neighbour A
+ * of the macroblock-level contexts). */
+static inline const aeg_mb *nb_mbA(const struct aeg_encoder *e, int mbx,
+                                   int mby)
+{
+    int yM;
+    return nb_left(e, mbx, mby, 0, 16, &yM);
+}
+
+/* A field macroblock of an MBAFF frame: the planes as seen through its field
+ * (its sixteen lines, every other frame line, at the pair's position), so
+ * that everything addressing the picture by (mbx, mby) -- base + 16 mby rows
+ * of `stride` -- lands on them; and the field scans and contexts. */
+static void mbf_enter(struct aeg_encoder *e, int mby)
+{
+    const int py = mby >> 1, bot = mby & 1;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        int s = e->stride[i];
+        /* field line 0 of this macroblock is frame line 32 py + bot (luma)
+         * of the pair; base' + (16 mby) 2s must be that line */
+        ptrdiff_t back = i ? (ptrdiff_t)(16 * py + 15 * bot) * s
+                           : (ptrdiff_t)(32 * py + 31 * bot) * s;
+        e->mbf_save.srcp[i] = e->srcp[i];
+        e->mbf_save.recp[i] = e->recp[i];
+        e->mbf_save.stride[i] = s;
+        e->srcp[i] -= back;
+        e->recp[i] -= back;
+        e->stride[i] = 2 * s;
+    }
+    e->cfld = 1;
+    e->scan4 = aeg_field_scan4x4;
+    e->scan8 = aeg_field_scan8x8;
+    e->fcat = 6;
+    e->fscan = AEG_CAVLC_FIELD;
+    e->fscan8 = AEG_CAVLC_FIELD8;
+}
+
+static void mbf_leave(struct aeg_encoder *e)
+{
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        e->srcp[i] = e->mbf_save.srcp[i];
+        e->recp[i] = e->mbf_save.recp[i];
+        e->stride[i] = e->mbf_save.stride[i];
+    }
+    e->cfld = 0;
+    e->scan4 = aeg_scan4x4;
+    e->scan8 = aeg_zigzag8x8;
+    e->fcat = e->fscan = e->fscan8 = 0;
+}
+
+/* Field macroblock state for the bitstream passes (no planes needed). */
+static void mbf_syntax(struct aeg_encoder *e, int fld)
+{
+    e->cfld = fld;
+    e->scan4 = fld ? aeg_field_scan4x4 : aeg_scan4x4;
+    e->scan8 = fld ? aeg_field_scan8x8 : aeg_zigzag8x8;
+    e->fcat = fld ? 6 : 0;
+    e->fscan = fld ? AEG_CAVLC_FIELD : 0;
+    e->fscan8 = fld ? AEG_CAVLC_FIELD8 : 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Neighbour nC                                                        */
 /* ------------------------------------------------------------------ */
-static int left_nz(struct aeg_encoder *e, int mbx, int mby, int blk)
+/* non-zero count of the block left of luma block row `by` / chroma block
+ * row `by` of plane `pl` */
+static int left_nz_luma(struct aeg_encoder *e, int mbx, int mby, int by)
 {
-    return mbx ? e->mbs[mby * e->mb_w + mbx - 1].nz[blk] : 0;
+    int yM;
+    const aeg_mb *m;
+    if (!mbx)
+        return 0;
+    m = nb_left(e, mbx, mby, 4 * by, 16, &yM);
+    return m->nz[(yM >> 2) * 4 + 3];
+}
+
+static int left_nz_chroma(struct aeg_encoder *e, int mbx, int mby, int pl,
+                          int by)
+{
+    int yM;
+    const aeg_mb *m;
+    if (!mbx)
+        return 0;
+    m = nb_left(e, mbx, mby, 4 * by, 8, &yM);
+    return m->nz[AEG_BLK_CHROMA_CB + pl * 4 + (yM >> 2) * 2 + 1];
 }
 
 static int top_nz(struct aeg_encoder *e, int mbx, int mby, int blk)
 {
-    return mby > e->top_row ? e->mbs[(mby - 1) * e->mb_w + mbx].nz[blk] : 0;
+    return nb_top_ok(e, mby) ? nb_mbB(e, mbx, mby)->nz[blk] : 0;
 }
 
 static int luma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c, int blk)
 {
     int bx = blk & 3, by = blk >> 2;
-    int a = bx ? c->nz[blk - 1] : left_nz(e, mbx, mby, blk + 3);
+    int a = bx ? c->nz[blk - 1] : left_nz_luma(e, mbx, mby, by);
     int b = by ? c->nz[blk - 4] : top_nz(e, mbx, mby, blk + 12);
     return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
-                       mby > e->top_row || by > 0);
+                       nb_top_ok(e, mby) || by > 0);
 }
 
 static int chroma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
@@ -1313,10 +1475,10 @@ static int chroma_nc(struct aeg_encoder *e, int mbx, int mby, const mbenc *c,
 {
     int base = AEG_BLK_CHROMA_CB + pl * 4;
     int bx = blk & 1, by = blk >> 1;
-    int a = bx ? c->nz[base + blk - 1] : left_nz(e, mbx, mby, base + blk + 1);
+    int a = bx ? c->nz[base + blk - 1] : left_nz_chroma(e, mbx, mby, pl, by);
     int b = by ? c->nz[base + blk - 2] : top_nz(e, mbx, mby, base + blk + 2);
     return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
-                       mby > e->top_row || by > 0);
+                       nb_top_ok(e, mby) || by > 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1337,13 +1499,13 @@ static int luma_ac_nc(struct aeg_encoder *e, int mbx, int mby,
     if (bx)
         a = c->nz[blk - 1];
     else
-        a = left_nz(e, mbx, mby, 4 * by + 3);
+        a = left_nz_luma(e, mbx, mby, by);
     if (by)
         b = c->nz[blk - 4];
     else
         b = top_nz(e, mbx, mby, 12 + bx);
     return aeg_cavlc_nc(a, b, mbx > 0 || bx > 0,
-                       mby > e->top_row || by > 0);
+                       nb_top_ok(e, mby) || by > 0);
 }
 
 static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
@@ -2322,7 +2484,7 @@ static void code_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     int bits0;
 
     if (!inter) {
-        int avail_l = mbx > 0, avail_t = mby > e->top_row;
+        int avail_l = mbx > 0, avail_t = nb_top_ok(e, mby);
         /* both predictions first: each reads only the neighbours of its own
          * plane, which the other plane's reconstruction does not touch */
         for (pl = 0; pl < 2; pl++) {
@@ -2566,8 +2728,8 @@ static int intra16_sad(struct aeg_encoder *e, int mbx, int mby, int mode)
     for (y = 0; y < 16; y++)
         left[y] = p[-1 + y * e->stride[0]];
     aeg_intra_predict_16x16(e->pred_l, 16, p - e->stride[0], left,
-                            mby > e->top_row, mbx > 0,
-                            mby > e->top_row && mbx > 0, mode);
+                            nb_top_ok(e, mby), mbx > 0,
+                            nb_top_ok(e, mby) && mbx > 0, mode);
     return aeg_sad(16, 16, e->pred_l, 16, src, e->stride[0]);
 }
 
@@ -2580,8 +2742,8 @@ static int chroma_sad(struct aeg_encoder *e, int mbx, int mby, int pl, int mode)
     for (y = 0; y < 8; y++)
         left[y] = p[-1 + y * e->stride[1]];
     aeg_intra_predict_chroma(e->pred_c[pl], 8, p - e->stride[1], left,
-                             mby > e->top_row, mbx > 0,
-                             mby > e->top_row && mbx > 0, mode);
+                             nb_top_ok(e, mby), mbx > 0,
+                             nb_top_ok(e, mby) && mbx > 0, mode);
     return aeg_sad(8, 8, e->pred_c[pl], 8, src, e->stride[1]);
 }
 
@@ -2904,12 +3066,13 @@ static void nb_set_r(nb_mv *n, int ref, int mvx, int mvy, int ref_idx)
 }
 
 /* Whether the macroblock above-right of (mbx, mby) -- neighbour C -- can be
- * decoded before it, the row above being in the slice: not in the last
- * column, and in an MBAFF frame not for the bottom macroblock of a pair
- * (its above-right neighbour is the top macroblock of the next pair). */
+ * decoded before it, the row above being in the slice (nb_top_ok): not in
+ * the last column, and in an MBAFF frame not for the bottom macroblock of a
+ * frame pair (its above-right neighbour is the top macroblock of the next
+ * pair; a bottom field macroblock's is the next pair above's bottom one). */
 static inline int c_right_ok(const struct aeg_encoder *e, int mbx, int mby)
 {
-    return mbx + 1 < e->mb_w && !(e->mbaff && (mby & 1));
+    return mbx + 1 < e->mb_w && !(e->mbaff && !e->cfld && (mby & 1));
 }
 
 /* Fill `n` from macroblock `m` (NULL when the neighbour does not exist) for
@@ -3010,7 +3173,7 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
     /* B: the block above the partition (inside this macroblock when by > 0). */
     if (by > 0) {
         NB_CUR(B, bx, by - 1);
-    } else if (mby > e->top_row) {
+    } else if (nb_top_ok(e, mby)) {
         nb_from_mb(&B, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx, list);
     } else {
         nb_from_mb(&B, NULL, 0, list);
@@ -3031,12 +3194,12 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
         } else if (cy >= 0) {
             nb_set(&C, NB_UNAVAIL, 0, 0);
         } else if (cx <= 3) {
-            if (mby > e->top_row)
+            if (nb_top_ok(e, mby))
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + cx, list);
             else
                 nb_from_mb(&C, NULL, 0, list);
         } else {
-            if (mby > e->top_row && c_right_ok(e, mbx, mby))
+            if (nb_top_ok(e, mby) && c_right_ok(e, mbx, mby))
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx + 1], 12, list);
             else
                 nb_from_mb(&C, NULL, 0, list);
@@ -3053,9 +3216,9 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
                                ((by - 1) << 2) + 3, list);
                 else
                     nb_from_mb(&C, NULL, 0, list);
-            } else if (bx > 0 && mby > e->top_row) {
+            } else if (bx > 0 && nb_top_ok(e, mby)) {
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx - 1, list);
-            } else if (mby > e->top_row && mbx > 0) {
+            } else if (nb_top_ok(e, mby) && mbx > 0) {
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx - 1], 15, list);
             } else {
                 nb_from_mb(&C, NULL, 0, list);
@@ -3138,7 +3301,7 @@ static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
     int refa = -1, refb = -1, refc = -1, match;
 
     *mvx = *mvy = 0;
-    if (mbx <= 0 || mby <= e->top_row)
+    if (mbx <= 0 || !nb_top_ok(e, mby))
         return;
     m = &e->mbs[mby * e->mb_w + mbx - 1];          /* A: left */
     if (is_inter_type(m->type)) {
@@ -3201,7 +3364,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
             ay = list ? m->mv1[3][1] : m->mv[3][1];
         }
     }
-    if (mby > e->top_row) {
+    if (nb_top_ok(e, mby)) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         if (!is_intra_type(m->type) &&
             (aeg_mb_block_lists(m, 12) & (1 << list))) {
@@ -3210,7 +3373,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
             by = list ? m->mv1[12][1] : m->mv[12][1];
         }
     }
-    if (mby > e->top_row && c_right_ok(e, mbx, mby)) {
+    if (nb_top_ok(e, mby) && c_right_ok(e, mbx, mby)) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
         if (!is_intra_type(m->type) &&
             (aeg_mb_block_lists(m, 12) & (1 << list))) {
@@ -3218,7 +3381,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
             cx = list ? m->mv1[12][0] : m->mv[12][0];
             cy = list ? m->mv1[12][1] : m->mv[12][1];
         }
-    } else if (mby > e->top_row && mbx > 0) {
+    } else if (nb_top_ok(e, mby) && mbx > 0) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
         if (!is_intra_type(m->type) &&
             (aeg_mb_block_lists(m, 15) & (1 << list))) {
@@ -3364,7 +3527,7 @@ static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
             u |= !is_intra_type(m->type) &&
                  (aeg_mb_block_lists(m, 3) & (1 << list));
         }
-        if (mby > e->top_row) {
+        if (nb_top_ok(e, mby)) {
             m = &e->mbs[(mby - 1) * e->mb_w + mbx];
             u |= !is_intra_type(m->type) &&
                  (aeg_mb_block_lists(m, 12) & (1 << list));
@@ -3445,14 +3608,14 @@ static int chroma_mode_ok(const struct aeg_encoder *e, int cm, int mbx, int mby)
 {
     if ((cm == 1 || cm == 3) && mbx == 0)
         return 0;
-    if ((cm == 2 || cm == 3) && mby <= e->top_row)
+    if ((cm == 2 || cm == 3) && !nb_top_ok(e, mby))
         return 0;
     return 1;
 }
 
 static int luma_mode_ok(const struct aeg_encoder *e, int mode, int mbx, int mby)
 {
-    if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && mby <= e->top_row)
+    if ((mode == AEG_MB_I_V || mode == AEG_MB_I_P) && !nb_top_ok(e, mby))
         return 0;
     if ((mode == AEG_MB_I_H || mode == AEG_MB_I_P) && mbx == 0)
         return 0;
@@ -3618,7 +3781,7 @@ static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
         m = &e->mbs[mby * e->mb_w + mbx - 1];
         NB_ADD(m, 3);
     }
-    if (mby > e->top_row) {
+    if (nb_top_ok(e, mby)) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         NB_ADD(m, 12);
         if (c_right_ok(e, mbx, mby)) {
@@ -5806,16 +5969,18 @@ static int intra4_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
     if (bx > 0) {
         a = cur[intra4_idx(bx - 1, by)];
     } else if (mbx > 0) {
-        const aeg_mb *m = &e->mbs[mby * e->mb_w + mbx - 1];
+        int yM, ny;
+        const aeg_mb *m = nb_left(e, mbx, mby, 4 * by, 16, &yM);
+        ny = yM >> 2;                   /* (the neighbour's block row) */
         if (m->type == AEG_MB_I4x4)
-            a = m->intra4[intra4_idx(3, by)];
+            a = m->intra4[intra4_idx(3, ny)];
         else if (m->type == AEG_MB_I8x8)
             /* An Intra_8x8 macroblock has no 4x4 modes, but a decoder keeps
              * its four prediction modes in the 4x4 mode cache, one per 2x2
              * group of blocks.  The neighbour of this macroblock's block row
              * is therefore the 8x8 group of the same block row in the group
              * column on the right, not the DC fallback. */
-            a = m->intra8[(by >> 1) * 2 + 1];
+            a = m->intra8[(ny >> 1) * 2 + 1];
         else
             a = 2;
     } else {
@@ -5823,8 +5988,8 @@ static int intra4_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
     }
     if (by > 0) {
         b = cur[intra4_idx(bx, by - 1)];
-    } else if (mby > e->top_row) {
-        const aeg_mb *m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+    } else if (nb_top_ok(e, mby)) {
+        const aeg_mb *m = nb_mbB(e, mbx, mby);
         if (m->type == AEG_MB_I4x4)
             b = m->intra4[intra4_idx(bx, 3)];
         else if (m->type == AEG_MB_I8x8)
@@ -6109,7 +6274,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         int ry = ((blk >> 3) & 1) * 2 + ((blk >> 1) & 1);
         int bx = rx * 4, by = ry * 4;
         int rb = ry * 4 + rx;           /* raster index of the block */
-        int top_avail = mby > e->top_row || by > 0;
+        int top_avail = nb_top_ok(e, mby) || by > 0;
         int left_avail = mbx > 0 || bx > 0;
         /* The four samples p[4..7][-1] continue to the right of the block.
          * Inside the macroblock they belong to the block one column right in
@@ -6123,7 +6288,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         if (by)
             tr_avail = bx < 12 && !((rx & 1) && (ry & 1));
         else
-            tr_avail = mby > e->top_row && (bx < 12 || c_right_ok(e, mbx, mby));
+            tr_avail = nb_top_ok(e, mby) && (bx < 12 || c_right_ok(e, mbx, mby));
         pixel top[8], left[4], pred[16];
         aeg_iedge ied;
         const pixel *sb = src + by * s + bx;
@@ -6285,15 +6450,16 @@ static int intra8_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
     if (gx > 0) {
         a = cur[gy * 2 + gx - 1];
     } else if (mbx > 0) {
-        const aeg_mb *m = &e->mbs[mby * e->mb_w + mbx - 1];
+        int yM;
+        const aeg_mb *m = nb_left(e, mbx, mby, 8 * gy, 16, &yM);
         if (m->type == AEG_MB_I8x8)
-            a = m->intra8[gy * 2 + 1];
+            a = m->intra8[(yM >> 3) * 2 + 1];
         else if (m->type == AEG_MB_I4x4)
             /* A decoder keeps one prediction mode per 4x4 block, so the
              * neighbour of an 8x8 group is the 4x4 mode of the block at the
              * same block row in the column to the left (see the note above
              * intra4_pred_mode). */
-            a = m->intra4[intra4_idx(3, gy * 2)];
+            a = m->intra4[intra4_idx(3, yM >> 2)];
         else
             a = 2;
     } else {
@@ -6301,8 +6467,8 @@ static int intra8_pred_mode(const struct aeg_encoder *e, int mbx, int mby,
     }
     if (gy > 0) {
         b = cur[(gy - 1) * 2 + gx];
-    } else if (mby > e->top_row) {
-        const aeg_mb *m = &e->mbs[(mby - 1) * e->mb_w + mbx];
+    } else if (nb_top_ok(e, mby)) {
+        const aeg_mb *m = nb_mbB(e, mbx, mby);
         if (m->type == AEG_MB_I8x8)
             b = m->intra8[2 + gx];
         else if (m->type == AEG_MB_I4x4)
@@ -6340,7 +6506,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
     for (g = 0; g < 4; g++) {
         const int gx = g & 1, gy = g >> 1;
         const int bx = gx * 8, by = gy * 8;
-        const int top_avail = mby > e->top_row || by > 0;
+        const int top_avail = nb_top_ok(e, mby) || by > 0;
         const int left_avail = mbx > 0 || bx > 0;
         pixel top[16], left[8];
         int tl, tr_avail;
@@ -6923,7 +7089,7 @@ static int64_t dbrdo_delta(struct aeg_encoder *e, int mbx, int mby,
 
     /* only what the filter reads (aeg_mb also carries the levels: no memset) */
     q.type = (uint8_t)t->type;
-    q.fld = (uint8_t)e->fld;
+    q.fld = (uint8_t)(e->fld | e->cfld);
     q.t8 = (uint8_t)(t->type == AEG_MB_I8x8 ||
                      (is_inter_type(t->type) && mb_t8_coded(e, t, 0)));
     q.cbp = (uint8_t)t->cbp;
@@ -7068,8 +7234,8 @@ static int i16_satd(struct aeg_encoder *e, int mbx, int mby)
     for (y = 0; y < 16; y++)
         left[y] = p[-1 + y * e->stride[0]];
     aeg_intra_predict_16x16(buf, 16, p - e->stride[0], left,
-                            mby > e->top_row, mbx > 0,
-                            mby > e->top_row && mbx > 0, e->mb_modes[0]);
+                            nb_top_ok(e, mby), mbx > 0,
+                            nb_top_ok(e, mby) && mbx > 0, e->mb_modes[0]);
     return aeg_satd(16, 16, buf, 16, src, e->stride[0]);
 }
 /* How many of the eight quarter-pel neighbours the rate-distortion vector
@@ -8026,12 +8192,12 @@ static void cab_nz4_luma(struct aeg_encoder *e, int mbx, int mby, const mbenc *c
 
     if (bx) { *a = c->nz[blk - 1]; *va = 1; }
     else if (mbx) {
-        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[4 * by + 3];
+        *a = left_nz_luma(e, mbx, mby, by);
         *va = 1;
     } else { *a = 0; *va = 0; }
     if (by) { *b = c->nz[blk - 4]; *vb = 1; }
-    else if (mby > e->top_row) {
-        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[12 + bx];
+    else if (nb_top_ok(e, mby)) {
+        *b = nb_mbB(e, mbx, mby)->nz[12 + bx];
         *vb = 1;
     } else { *b = 0; *vb = 0; }
 }
@@ -8046,12 +8212,12 @@ static void cab_nz4_chroma(struct aeg_encoder *e, int mbx, int mby,
 
     if (bx) { *a = c->nz[base + k - 1]; *va = 1; }
     else if (mbx) {
-        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[base + k + 1];
+        *a = left_nz_chroma(e, mbx, mby, pl, by);
         *va = 1;
     } else { *a = 0; *va = 0; }
     if (by) { *b = c->nz[base + k - 2]; *vb = 1; }
-    else if (mby > e->top_row) {
-        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[base + k + 2];
+    else if (nb_top_ok(e, mby)) {
+        *b = nb_mbB(e, mbx, mby)->nz[base + k + 2];
         *vb = 1;
     } else { *b = 0; *vb = 0; }
 }
@@ -8061,11 +8227,11 @@ static void cab_nz_mb(struct aeg_encoder *e, int mbx, int mby, int blk,
                       int *a, int *b, int *va, int *vb)
 {
     if (mbx) {
-        *a = e->mbs[mby * e->mb_w + mbx - 1].nz[blk];
+        *a = nb_mbA(e, mbx, mby)->nz[blk];
         *va = 1;
     } else { *a = 0; *va = 0; }
-    if (mby > e->top_row) {
-        *b = e->mbs[(mby - 1) * e->mb_w + mbx].nz[blk];
+    if (nb_top_ok(e, mby)) {
+        *b = nb_mbB(e, mbx, mby)->nz[blk];
         *vb = 1;
     } else { *b = 0; *vb = 0; }
 }
@@ -8113,13 +8279,12 @@ static void cabac_chroma_mode(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                               int mby, const mbenc *c)
 {
     int ctx = 0, m = c->chroma_mode;
-    int idx = mby * e->mb_w + mbx;
+    const aeg_mb *na = mbx ? nb_mbA(e, mbx, mby) : NULL;
+    const aeg_mb *nb = nb_top_ok(e, mby) ? nb_mbB(e, mbx, mby) : NULL;
 
-    if (mbx && is_intra_type(e->mbs[idx - 1].type) &&
-        e->mbs[idx - 1].chroma_mode != 0)
+    if (na && is_intra_type(na->type) && na->chroma_mode != 0)
         ctx++;
-    if (mby > e->top_row && is_intra_type(e->mbs[idx - e->mb_w].type) &&
-        e->mbs[idx - e->mb_w].chroma_mode != 0)
+    if (nb && is_intra_type(nb->type) && nb->chroma_mode != 0)
         ctx += 1;
     aeg_cabac_decision(cb, CAB_CHROMA_PRED + ctx, m != 0);
     if (m != 0) {
@@ -8133,11 +8298,11 @@ static void cabac_chroma_mode(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
  * transform, one each (9.3.3.1.1.13). */
 static int cab_t8_ctx(struct aeg_encoder *e, int mbx, int mby)
 {
-    int idx = mby * e->mb_w + mbx, ctx = 0;
+    int ctx = 0;
 
-    if (mbx && e->mbs[idx - 1].t8)
+    if (mbx && nb_mbA(e, mbx, mby)->t8)
         ctx++;
-    if (mby > e->top_row && e->mbs[idx - e->mb_w].t8)
+    if (nb_top_ok(e, mby) && nb_mbB(e, mbx, mby)->t8)
         ctx++;
     return CAB_T8 + ctx;
 }
@@ -8223,7 +8388,7 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
         if (by) {
             tx = mvd[(by - 1) * 4 + bx][0];
             ty = mvd[(by - 1) * 4 + bx][1];
-        } else if (mby > e->top_row) {
+        } else if (nb_top_ok(e, mby)) {
             tx = e->mbs[idx - e->mb_w].mvd[list][12 + bx][0];
             ty = e->mbs[idx - e->mb_w].mvd[list][12 + bx][1];
         }
@@ -8280,7 +8445,7 @@ static void cabac_mb_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
         /* top: inside MB or top MB */
         if (y0 > 0) {
             refb = cur_ref[(y0 - 1) * 4 + x0];
-        } else if (mby > e->top_row) {
+        } else if (nb_top_ok(e, mby)) {
             const aeg_mb *tm = &e->mbs[idx - e->mb_w];
             if (!is_intra_type(tm->type))
                 refb = tm->ref_idx[12 + x0];
@@ -8315,15 +8480,24 @@ static void cabac_mb_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
 static void cabac_cbp_luma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                            int mby, const mbenc *c)
 {
-    int idx = mby * e->mb_w + mbx;
-    int a = mbx ? e->mbs[idx - 1].cbp : 0;
-    int b = (mby > e->top_row) ? e->mbs[idx - e->mb_w].cbp : 0;
+    int a = 0, b = nb_top_ok(e, mby) ? nb_mbB(e, mbx, mby)->cbp : 0;
     int cbp = c->cbp & 15;
 
+    /* the left 8x8 groups beside group rows 0 and 1 (bits 1 and 3 are the
+     * ones read): in an MBAFF frame they may sit in either macroblock of the
+     * left pair, in either of its group rows */
+    if (mbx) {
+        int r;
+        for (r = 0; r < 2; r++) {
+            int yM;
+            const aeg_mb *m = nb_left(e, mbx, mby, 8 * r, 16, &yM);
+            a |= ((m->cbp >> (1 + 2 * (yM >> 3))) & 1) << (1 + 2 * r);
+        }
+    }
     /* A neighbour outside the slice counts as "all four groups coded" (its
      * low nibble is 0x0f) whichever kind of macroblock this is. */
     if (!mbx) a = 0x0f;
-    if (mby <= e->top_row) b = 0x0f;
+    if (!nb_top_ok(e, mby)) b = 0x0f;
     /* Each bin's context reads the groups decoded *so far* on this side, not
      * the finished pattern (9.3.3.1.1.9): the decoder only knows the lower
      * groups when it has to pick the context. */
@@ -8347,18 +8521,15 @@ static void cabac_cbp_luma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
 static void cabac_cbp_chroma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                              int mby, const mbenc *c)
 {
-    int idx = mby * e->mb_w + mbx;
     /* The neighbours' cbp is stored as two bits (chroma DC, chroma AC), while
      * the context derivation wants the syntax element's value 0..2. */
-    int a = mbx ? packed_chroma_cbp(e->mbs[idx - 1].cbp) : 0;
-    int b = (mby > e->top_row) ? packed_chroma_cbp(e->mbs[idx - e->mb_w].cbp) : 0;
+    int a = mbx ? packed_chroma_cbp(nb_mbA(e, mbx, mby)->cbp) : 0;
+    int b = nb_top_ok(e, mby) ? packed_chroma_cbp(nb_mbB(e, mbx, mby)->cbp) : 0;
     int cc = chroma_cbp(c);
 
     /* A neighbour outside the slice counts as having cbp_chroma = 0: the
      * decoder's stand-in for an unavailable neighbour is 0x7CF (or 0x00F),
      * whose chroma bits are both clear. */
-    if (!mbx) a = 0;
-    if (mby <= e->top_row) b = 0;
     aeg_cabac_decision(cb, CAB_CBP_CHROMA + (a > 0) + 2 * (b > 0), cc != 0);
     if (cc)
         aeg_cabac_decision(cb, CAB_CBP_CHROMA + 4 + (a == 2) + 2 * (b == 2),
@@ -8577,7 +8748,7 @@ static void code_b_mb_type(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
      * only a neighbour that *is* there and is not direct increments the
      * context. */
     int ld = !mbx || e->mbs[idx - 1].type == AEG_MB_B_DIRECT;
-    int td = mby <= e->top_row || e->mbs[idx - e->mb_w].type == AEG_MB_B_DIRECT;
+    int td = !nb_top_ok(e, mby) || e->mbs[idx - e->mb_w].type == AEG_MB_B_DIRECT;
     int ctx = !ld + !td;
     int fourbit, fifth = 0, i;
 
@@ -8646,11 +8817,11 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
              * counts as skipped -- on top of the B slice's own block of
              * contexts thirteen entries further along (Table 9-34). */
             ls = mbx ? e->mbs[idx - 1].skip : 1;
-            ts = (mby > e->top_row) ? e->mbs[idx - e->mb_w].skip : 1;
+            ts = (nb_top_ok(e, mby)) ? e->mbs[idx - e->mb_w].skip : 1;
             base += !ls + !ts;
         } else {
             ls = mbx ? e->mbs[idx - 1].skip : 1;
-            ts = (mby > e->top_row) ? e->mbs[idx - e->mb_w].skip : 1;
+            ts = (nb_top_ok(e, mby)) ? e->mbs[idx - e->mb_w].skip : 1;
             base += !ls + !ts;
         }
         aeg_cabac_decision(cb, base, skip);
@@ -8741,11 +8912,11 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
     } else {
         int cond = 0;
         if (mbx) {
-            int t = e->mbs[idx - 1].type;
+            int t = nb_mbA(e, mbx, mby)->type;
             cond += (t == AEG_MB_I16x16 || t == AEG_MB_IPCM);
         }
-        if (mby > e->top_row) {
-            int t = e->mbs[idx - e->mb_w].type;
+        if (nb_top_ok(e, mby)) {
+            int t = nb_mbB(e, mbx, mby)->type;
             cond += (t == AEG_MB_I16x16 || t == AEG_MB_IPCM);
         }
         cabac_type_intra(cb, cab_i16_ctx_i, cond, c);
@@ -9679,6 +9850,8 @@ static void rowpost_finalize_mb(struct aeg_encoder *e, int mbx, int mby,
         int qp = t->qp;
 
         memcpy(d, &e->mbs[idx], sizeof(*d));
+        if (e->mbaff)
+            e->cfld = d->fld;           /* (pskip_mv reads the neighbours) */
         if (e->p.cabac) {
             int skipped = 0;
             if (t->cbp == 0 && t->type != AEG_MB_I16x16)
@@ -9705,6 +9878,7 @@ static void rowpost_finalize_mb(struct aeg_encoder *e, int mbx, int mby,
         }
         d->qp = (int8_t)qp;
         e->rp_qp = qp;
+        e->cfld = 0;
     }
 }
 
@@ -10064,6 +10238,32 @@ static int ft_wp_check(struct aeg_encoder *e, int wait)
     return 0;
 }
 
+/* MBAFF: is the macroblock pair (mbx, py) coded as a field pair?  So far
+ * only in I slices, and only as a forced test pattern (AEG_MBFORCE: "all",
+ * or a number seeding a pseudo-random pattern per pair and picture). */
+static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
+                            int py)
+{
+    static const char *force;
+    static int once;
+    unsigned h;
+
+    if (!once) {
+        force = getenv("AEG_MBFORCE");
+        once = 1;
+    }
+    if (!force || slice != AEG_SLICE_I)
+        return 0;
+    if (!strcmp(force, "all"))
+        return 1;
+    h = (unsigned)atoi(force) * 2654435761u ^ (unsigned)mbx * 40503u ^
+        (unsigned)py * 9973u ^ (unsigned)e->cur_poc * 6151u;
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15;
+    return (h >> 7) & 1;
+}
+
 /* One slice of the current picture: macroblock rows `first_row` to `last_row`
  * (inclusive), written as a complete NAL payload (RBSP) of its own.
  *
@@ -10127,6 +10327,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             idx = mby * e->mb_w + mbx;
             tmp = &e->mb_encs[idx];
             m = &e->mbs[idx];
+            if (e->mbaff) {
+                if (!(mby & 1))
+                    e->pair_fld = mbaff_pair_field(e, slice, mbx, mby >> 1);
+                if (e->pair_fld)
+                    mbf_enter(e, mby);
+            }
 
             reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
             {
@@ -10143,7 +10349,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             /* store the decisions for the neighbour queries of the following
              * macroblocks (and for the deblocking filter) */
             memset(m, 0, sizeof(*m));
-            m->fld = (uint8_t)e->fld;
+            m->fld = (uint8_t)(e->fld | e->cfld);
             m->type = (uint8_t)tmp->type;
             m->i16_mode = (uint8_t)tmp->i16_mode;
             m->t8 = (uint8_t)mb_t8_coded(e, tmp, 0);
@@ -10176,6 +10382,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 m->ref_idx[i] = tmp->ref[i];
             }
             m->cost = (int32_t)tmp->sse;
+            if (e->cfld)
+                mbf_leave(e);
         }
         if (e->mbaff)
             rowpost_pair(e, ry >> 1, slice);
@@ -10353,7 +10561,11 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     fprintf(stderr, "\n");
                 }
                 e->mbaff_ff = mbaff_flag_coded(e, mbx, mby, skipped);
+                if (e->mbaff)
+                    mbf_syntax(e, m->fld);
                 write_mb_cabac(e, &cab, mbx, mby, tmp, slice, skipped);
+                if (e->mbaff)
+                    mbf_syntax(e, 0);
                 e->mbaff_ff = -1;
                 /* (no end_of_slice_flag after the top macroblock of a pair) */
                 if (!e->mbaff || (mby & 1))
@@ -10439,7 +10651,11 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                         flush_skip_run(&bw, &skip_run);
                     if (ff >= 0)                /* mb_field_decoding_flag */
                         aeg_bw_put(&bw, 1, (uint32_t)ff);
+                    if (e->mbaff)
+                        mbf_syntax(e, e->mbs[idx].fld);
                     write_mb(e, &bw, mbx, mby, tmp, slice == AEG_SLICE_P);
+                    if (e->mbaff)
+                        mbf_syntax(e, 0);
                 }
             }
             e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
