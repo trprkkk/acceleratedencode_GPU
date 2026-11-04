@@ -384,6 +384,19 @@ void aeg_deblock_mb(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
     aeg_deblock_mb_dir(pic, mbs, mb_stride, mb_x, mb_y, slice_alpha, slice_beta, 0);
 }
 
+/* One row of macroblock pairs of an MBAFF frame, in decoding order. */
+void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                          int pair_y, int slice_alpha, int slice_beta)
+{
+    int x;
+    for (x = 0; x < pic->mb_w; x++) {
+        aeg_deblock_mb(pic, mbs, mb_stride, x, 2 * pair_y, slice_alpha,
+                       slice_beta);
+        aeg_deblock_mb(pic, mbs, mb_stride, x, 2 * pair_y + 1, slice_alpha,
+                       slice_beta);
+    }
+}
+
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc)
 {
@@ -398,7 +411,14 @@ void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
      * macroblock to the upper right has already modified, so macroblock
      * diagonals (or two frame-wide passes) are not equivalent.  Keeping the
      * normative order here is what makes the reconstructed picture match the
-     * decoder bit-exactly. */
+     * decoder bit-exactly.  In an MBAFF frame that order is the macroblock
+     * address order: pair by pair, top then bottom. */
+    if (pic->mbaff) {
+        for (y = 0; y < pic->mb_h; y += 2)
+            aeg_deblock_pair_row(pic, mbs, mb_stride, y >> 1, slice_alpha,
+                                 slice_beta);
+        return;
+    }
     for (y = 0; y < pic->mb_h; y++)
         for (x = 0; x < pic->mb_w; x++)
             aeg_deblock_mb(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta);

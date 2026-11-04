@@ -218,6 +218,7 @@ typedef struct aeg_picture {
     int      w[3], h[3];      /* visible dimensions per plane             */
     int      stride[3];
     int      mb_w, mb_h;
+    int      mbaff;           /* an MBAFF frame: deblocked pair by pair   */
     int      poc;             /* picture order count                      */
     int      frame_num;
     int      qp;
@@ -652,6 +653,8 @@ typedef struct aeg_deblock_info {
  * 1=internal horizontal, 2=MB left, 3=MB top. */
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc);
+void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                          int pair_y, int slice_alpha, int slice_beta);
 void aeg_deblock_mb(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                     int mb_x, int mb_y, int slice_alpha, int slice_beta);
 void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,

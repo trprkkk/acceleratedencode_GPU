@@ -163,6 +163,10 @@ typedef struct aeg_params {
      *       I/P frame goes to fields when a quick estimate of its
      *       prediction cost as two fields beats the cost as a frame by 12 %,
      *       the B frames before it follow it.
+     *   3 = MBAFF frames (macroblock-adaptive frame/field): every frame
+     *       one picture whose macroblocks are coded in vertical pairs, each
+     *       pair as two frame macroblocks or as one per field (so far every
+     *       pair is coded as frame macroblocks); the NAL HRD stays.
      * Field coding runs with one frame thread, without the B pyramid,
      * temporal direct or the NAL HRD; field pictures also without weighted
      * prediction and chroma ME (with 1 turned off; with 2 the frame

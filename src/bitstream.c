@@ -100,7 +100,7 @@ int aeg_sps_max_refs(const aeg_params *p)
     return (p->refs >= 3 ? p->refs + (p->bframes > 0 && p->b_pyramid) :
             (p->bframes > 0 && p->b_pyramid) ? 3 :
             ((p->bframes > 0 || p->refs >= 2) ? 2 : 1)) +
-           (p->field_coding > 0);
+           (p->field_coding == 1 || p->field_coding == 2);
 }
 
 /* max_dec_frame_buffering (E.2.1): at least max_num_ref_frames and at least
@@ -416,7 +416,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     aeg_bw_ue(&bw, (uint32_t)(fmo ? mb_h - 1 : mb_h / 2 - 1));
     aeg_bw_put(&bw, 1, (uint32_t)fmo);   /* frame_mbs_only_flag             */
     if (!fmo)
-        aeg_bw_put(&bw, 1, 0);           /* mb_adaptive_frame_field_flag    */
+        aeg_bw_put(&bw, 1, p->field_coding == 3 ? 1u : 0u); /* mb_adaptive_frame_field_flag */
     aeg_bw_put(&bw, 1, 1);               /* direct_8x8_inference_flag       */
     if (crop_r || crop_b) {
         aeg_bw_put(&bw, 1, 1);           /* frame_cropping_flag             */

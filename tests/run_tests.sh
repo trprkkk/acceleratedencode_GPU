@@ -969,6 +969,12 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase paff_mixp 176 144 14 0 1 -q 26 -p 4 --paff --bff --no-cabac
     unset AEG_FLDFORCE
     run_bcase paff_auto 176 144 12 3 4 -q 26 -p 2 --paff --slices 2
+    # MBAFF frames (--mbaff): macroblock pairs in decoding order, the
+    # mb_field_decoding_flag and its skipped-pair rules, no above-right
+    # neighbour for a bottom macroblock, deblocking pair by pair
+    run_bcase mbaff_b   176 144 12 2 4 -q 26 -p 3 --mbaff --slices 2
+    run_bcase mbaff_cavlc 176 144 12 0 1 -q 28 -p 4 --mbaff --no-cabac --ref 3
+    run_bcase mbaff_crf 176 144 12 3 4 -p 2 --mbaff --crf 24 --bff
     for fo in tff:T bff:B tff_hrd:T fld_p:T fld_b:B; do
         nm=${fo%%:*}; want=${fo#*:}
         got=$("$FF" -i "$TMP/$nm.264" -vf showinfo -f null - 2>&1 |
@@ -1022,6 +1028,7 @@ else
     export AEG_FLDFORCE=011
     run_bcase h10_paff    176 144 12 2 4 -q 26 -p 3 --paff --bit-depth 10
     unset AEG_FLDFORCE
+    run_bcase h10_mbaff   176 144 12 2 4 -q 26 -p 3 --mbaff --bit-depth 10
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
     run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10

@@ -460,6 +460,11 @@ struct aeg_encoder {
      * buffers.  fld: a field is being coded; fld_idx: first (0) or second
      * (1) in decoding order; fld_par: its parity (0 top, 1 bottom). */
     int fld, fld_idx, fld_par;
+    /* p.field_coding 3: every picture an MBAFF frame -- macroblocks in
+     * pairs (top, bottom; then the next pair), each pair a frame or a field
+     * pair (aeg_mb.fld) */
+    int mbaff;
+    int mbaff_ff;     /* mb_field_decoding_flag to write, -1 none (bitstream) */
     int ref_par[AEG_MAX_REFS];  /* parity of the field refpl[k] views     */
     int fld_cofs[AEG_MAX_REFS]; /* its chroma vertical offset (8.4.1.4)   */
     int vpad;                   /* rows of padding above/below a picture  */
@@ -2898,6 +2903,15 @@ static void nb_set_r(nb_mv *n, int ref, int mvx, int mvy, int ref_idx)
     n->ref_idx = ref_idx;
 }
 
+/* Whether the macroblock above-right of (mbx, mby) -- neighbour C -- can be
+ * decoded before it, the row above being in the slice: not in the last
+ * column, and in an MBAFF frame not for the bottom macroblock of a pair
+ * (its above-right neighbour is the top macroblock of the next pair). */
+static inline int c_right_ok(const struct aeg_encoder *e, int mbx, int mby)
+{
+    return mbx + 1 < e->mb_w && !(e->mbaff && (mby & 1));
+}
+
 /* Fill `n` from macroblock `m` (NULL when the neighbour does not exist) for
  * prediction list `list`.  A neighbour only contributes to a list it actually
  * predicts from: a B macroblock whose partitions are all list 1 is "not used"
@@ -3022,7 +3036,7 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
             else
                 nb_from_mb(&C, NULL, 0, list);
         } else {
-            if (mby > e->top_row && mbx + 1 < e->mb_w)
+            if (mby > e->top_row && c_right_ok(e, mbx, mby))
                 nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx + 1], 12, list);
             else
                 nb_from_mb(&C, NULL, 0, list);
@@ -3140,7 +3154,7 @@ static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
         if (refb == 0 && bx == 0 && by == 0)
             return;
     }
-    if (mbx + 1 < e->mb_w) {                       /* C: above-right */
+    if (c_right_ok(e, mbx, mby)) {                       /* C: above-right */
         m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
         if (is_inter_type(m->type)) {
             cx = m->mv[12][0]; cy = m->mv[12][1]; refc = m->ref_idx[12];
@@ -3196,7 +3210,7 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
             by = list ? m->mv1[12][1] : m->mv[12][1];
         }
     }
-    if (mby > e->top_row && mbx + 1 < e->mb_w) {
+    if (mby > e->top_row && c_right_ok(e, mbx, mby)) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
         if (!is_intra_type(m->type) &&
             (aeg_mb_block_lists(m, 12) & (1 << list))) {
@@ -3354,7 +3368,7 @@ static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
             m = &e->mbs[(mby - 1) * e->mb_w + mbx];
             u |= !is_intra_type(m->type) &&
                  (aeg_mb_block_lists(m, 12) & (1 << list));
-            if (mbx + 1 < e->mb_w) {
+            if (c_right_ok(e, mbx, mby)) {
                 m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
                 u |= !is_intra_type(m->type) &&
                      (aeg_mb_block_lists(m, 12) & (1 << list));
@@ -3607,7 +3621,7 @@ static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
     if (mby > e->top_row) {
         m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         NB_ADD(m, 12);
-        if (mbx + 1 < e->mb_w) {
+        if (c_right_ok(e, mbx, mby)) {
             m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
             NB_ADD(m, 12);
         }
@@ -5381,8 +5395,9 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         /* With two references the neighbours may sit on the older picture,
          * and the predictor then follows the reference-matching rule of
          * 8.4.1.3.1 (a lone neighbour on the same reference wins), which the
-         * single-reference shortcut above cannot express. */
-        if (e->cur_l0_active > 1)
+         * single-reference shortcut above cannot express (nor the neighbours of
+         * an MBAFF frame's macroblock pairs). */
+        if (e->cur_l0_active > 1 || e->mbaff)
             pred16_ref(e, mbx, mby, 0, &e->mb_pmv[0], &e->mb_pmv[1]);
         /* The block to match is the *source* macroblock.  recp still holds the
          * previous picture at this position (nothing has been reconstructed
@@ -6108,7 +6123,7 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         if (by)
             tr_avail = bx < 12 && !((rx & 1) && (ry & 1));
         else
-            tr_avail = mby > e->top_row && (bx < 12 || mbx + 1 < e->mb_w);
+            tr_avail = mby > e->top_row && (bx < 12 || c_right_ok(e, mbx, mby));
         pixel top[8], left[4], pred[16];
         aeg_iedge ied;
         const pixel *sb = src + by * s + bx;
@@ -6351,7 +6366,7 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
              * and for the bottom-right block it is in the macroblock to the
              * right, which comes later in raster order and is therefore not
              * available. */
-            tr_avail = (bx == 0) || (by == 0 && mbx + 1 < e->mb_w);
+            tr_avail = (bx == 0) || (by == 0 && c_right_ok(e, mbx, mby));
             for (k = 0; k < 8; k++)
                 top[k] = tr[k];
             for (k = 8; k < 16; k++)
@@ -6708,6 +6723,38 @@ static int64_t rd_chroma(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
 }
 
 
+
+/* MBAFF: the mb_field_decoding_flag the bitstream carries for macroblock
+ * (mbx, mby), or -1 when it has none (7.3.4): the top macroblock of a pair
+ * carries it unless it is skipped, the bottom one only when the top one was
+ * skipped and it is not.  A pair with both skipped carries none -- the
+ * decoder infers it from the neighbouring pairs, which the decisions have to
+ * agree with. */
+static int mbaff_flag_coded(const struct aeg_encoder *e, int mbx, int mby,
+                            int skipped)
+{
+    const aeg_mb *top;
+
+    if (!e->mbaff || skipped)
+        return -1;
+    top = &e->mbs[(mby & ~1) * e->mb_w + mbx];
+    if ((mby & 1) && !top->skip)
+        return -1;
+    return top->fld;
+}
+
+/* ctxIdx of mb_field_decoding_flag: 70 + the field pairs among the left and
+ * the above pair (9.3.3.1.1.2) */
+static int mbaff_ff_ctx(const struct aeg_encoder *e, int mbx, int mby)
+{
+    int top = mby & ~1, inc = 0;
+
+    if (mbx > 0 && e->mbs[top * e->mb_w + mbx - 1].fld)
+        inc++;
+    if (top - 2 >= e->top_row && e->mbs[(top - 2) * e->mb_w + mbx].fld)
+        inc++;
+    return 70 + inc;
+}
 
 static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                            int mby, mbenc *c, int is_p, int skip);
@@ -8615,6 +8662,10 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
             return;
         }
     }
+    /* mb_field_decoding_flag (contexts 70..72: one per neighbouring pair,
+     * left and above, that is a field pair -- 9.3.3.1.1.2) */
+    if (e->mbaff_ff >= 0)
+        aeg_cabac_decision(cb, mbaff_ff_ctx(e, mbx, mby), e->mbaff_ff);
     if (slice == AEG_SLICE_B) {
         if (intra) {
             int cond = 0;
@@ -9617,11 +9668,11 @@ static int ref_wait(struct aeg_encoder *e, int s, int rows)
  * bitstream pass runs after the whole decision pass, so rowpost_finalize
  * applies the same rules to a copy as the rows come (the decision pass of
  * the following rows must keep reading the decision values). */
-static void rowpost_finalize(struct aeg_encoder *e, int mby, int slice)
+static void rowpost_finalize_mb(struct aeg_encoder *e, int mbx, int mby,
+                                int slice)
 {
-    int mbx, i;
-
-    for (mbx = 0; mbx < e->mb_w; mbx++) {
+    int i;
+    {
         int idx = mby * e->mb_w + mbx;
         const mbenc *t = &e->mb_encs[idx];
         aeg_mb *d = &e->rp_mbs[idx];
@@ -9655,6 +9706,13 @@ static void rowpost_finalize(struct aeg_encoder *e, int mby, int slice)
         d->qp = (int8_t)qp;
         e->rp_qp = qp;
     }
+}
+
+static void rowpost_finalize(struct aeg_encoder *e, int mby, int slice)
+{
+    int mbx;
+    for (mbx = 0; mbx < e->mb_w; mbx++)
+        rowpost_finalize_mb(e, mbx, mby, slice);
 }
 
 /* Left/right padding of macroblock row b (all three planes), the rows above
@@ -9928,6 +9986,31 @@ static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
     e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
 }
 
+/* rowpost_row for the MBAFF frame's row of pairs `py`: the decoder's QP and
+ * skip state in pair order, and the deblocking one pair row behind (the
+ * pair row below predicts from the unfiltered bottom rows of this one). */
+static void rowpost_pair(struct aeg_encoder *e, int py, int slice)
+{
+    int64_t t0;
+    int mbx;
+
+    if (!e->rp_on)
+        return;
+    t0 = aeg_now_ns();
+    for (mbx = 0; mbx < e->mb_w; mbx++) {
+        rowpost_finalize_mb(e, mbx, 2 * py, slice);
+        rowpost_finalize_mb(e, mbx, 2 * py + 1, slice);
+    }
+    if (py >= 1) {
+        if (e->p.deblock)
+            aeg_deblock_pair_row(&e->pic, e->rp_mbs, e->mb_w, py - 1,
+                                 e->p.deblock_alpha, e->p.deblock_beta);
+        e->rp_dbk = 2 * py;
+        rowpost_bands(e, 2 * py - 1);
+    }
+    e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
+}
+
 static void wp_analyse(struct aeg_encoder *e);
 
 /* Would the analysis find weights?  The same analysis on the reference's
@@ -9993,7 +10076,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                       int first_row, int last_row, int slice, int is_idr,
                       size_t *rbsp_len)
 {
-    int mbx, mby;
+    int mbx, mby, ry;
     int skip_run = 0;
     int l0_saved;
     aeg_bitwriter bw;
@@ -10019,20 +10102,31 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
      * the reconstruction written into the picture.  Nothing here writes to the
      * bitstream, so the macroblocks only have to be processed in an order that
      * respects their neighbours (see the note above aeg_encoder_encode). */
-    for (mby = first_row; mby <= last_row; mby++) {
-        if (ref_rows_ensure(e, mby) || (e->fsync && (e->ft_abort ||
-                                                      ft_refs_changed(e) ||
-                                                      ft_wp_check(e, 0))))
-            return FT_RESTART;   /* the worker starts the picture again */
-        /* the pre-search vectors this row reads (its own and the row below) */
-        if (e->lr_valid && e->lr_rows <= mby + 1)
-            lr_seed_rows(e, mby + 1);
-        for (mbx = 0; mbx < e->mb_w; mbx++) {
-            int idx = mby * e->mb_w + mbx;
-            mbenc *tmp = &e->mb_encs[idx];
-            aeg_mb *m = &e->mbs[idx];
+    /* (MBAFF: a row of macroblock pairs at a time, in pair order) */
+    for (ry = first_row; ry <= last_row; ry += 1 + e->mbaff) {
+        int rr, k, nk = e->mb_w << e->mbaff;
+        for (rr = ry; rr <= ry + e->mbaff; rr++) {
+            if (ref_rows_ensure(e, rr) || (e->fsync && (e->ft_abort ||
+                                                         ft_refs_changed(e) ||
+                                                         ft_wp_check(e, 0))))
+                return FT_RESTART;   /* the worker starts the picture again */
+            /* the pre-search vectors this row reads (its own and the row
+             * below) */
+            if (e->lr_valid && e->lr_rows <= rr + 1)
+                lr_seed_rows(e, rr + 1);
+        }
+        for (k = 0; k < nk; k++) {
+            int idx;
+            mbenc *tmp;
+            aeg_mb *m;
             int i;
             int64_t t0 = aeg_now_ns();
+
+            mbx = k >> e->mbaff;
+            mby = ry + (k & e->mbaff);
+            idx = mby * e->mb_w + mbx;
+            tmp = &e->mb_encs[idx];
+            m = &e->mbs[idx];
 
             reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
             {
@@ -10083,7 +10177,10 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
             }
             m->cost = (int32_t)tmp->sse;
         }
-        rowpost_row(e, mby, slice);
+        if (e->mbaff)
+            rowpost_pair(e, ry >> 1, slice);
+        else
+            rowpost_row(e, ry, slice);
     }
 
     /* The slice header is written after the decision pass, because one of
@@ -10141,7 +10238,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    e->p.cabac ? e->cabac_init_idc : -1,
                                    e->cur_qp - 26, e->p.deblock_alpha,
                                    e->p.deblock_beta,
-                                   e->p.deblock ? 0 : 1, first_row * e->mb_w,
+                                   e->p.deblock ? 0 : 1,
+                                   (e->mbaff ? first_row / 2 : first_row) * e->mb_w,
                                    e->cur_l0_active, e->p.direct == 1,
                                    wp_used(e) ? &e->wp : NULL, &e->refctl);
     } else {
@@ -10153,7 +10251,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                e->p.cabac ? e->cabac_init_idc : -1,
                                e->cur_qp - 26, e->p.deblock_alpha,
                                e->p.deblock_beta,
-                               e->p.deblock ? 0 : 1, first_row * e->mb_w,
+                               e->p.deblock ? 0 : 1,
+                                   (e->mbaff ? first_row / 2 : first_row) * e->mb_w,
                                e->cur_l0_active,
                                wp_used(e) && slice == AEG_SLICE_P ? &e->wp : NULL);
     }
@@ -10183,13 +10282,20 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                e->cabac_init_idc);
         e->last_dqp = 0;
 
-        for (mby = first_row; mby <= last_row; mby++) {
-            for (mbx = 0; mbx < e->mb_w; mbx++) {
-                int idx = mby * e->mb_w + mbx;
-                mbenc *tmp = &e->mb_encs[idx];
-                aeg_mb *m = &e->mbs[idx];
+        for (ry = first_row; ry <= last_row; ry += 1 + e->mbaff) {
+            int k, nk = e->mb_w << e->mbaff;
+            for (k = 0; k < nk; k++) {
+                int idx;
+                mbenc *tmp;
+                aeg_mb *m;
                 int skipped = 0, last = 0, i;
                 int64_t t0 = aeg_now_ns();
+
+                mbx = k >> e->mbaff;
+                mby = ry + (k & e->mbaff);
+                idx = mby * e->mb_w + mbx;
+                tmp = &e->mb_encs[idx];
+                m = &e->mbs[idx];
 
                 /* A macroblock without a coded block pattern carries no
                  * mb_qp_delta, so the decoder keeps the QP it has.  The
@@ -10246,8 +10352,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                         fprintf(stderr, " %d", tmp->nz[k]);
                     fprintf(stderr, "\n");
                 }
+                e->mbaff_ff = mbaff_flag_coded(e, mbx, mby, skipped);
                 write_mb_cabac(e, &cab, mbx, mby, tmp, slice, skipped);
-                aeg_cabac_terminate(&cab, last);
+                e->mbaff_ff = -1;
+                /* (no end_of_slice_flag after the top macroblock of a pair) */
+                if (!e->mbaff || (mby & 1))
+                    aeg_cabac_terminate(&cab, last);
 
                 /* the decisions the following macroblocks' contexts read */
                 m->t8 = (uint8_t)mb_t8_coded(e, tmp, skipped);
@@ -10281,11 +10391,17 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
         e->cur_l0_active = l0_saved;
         return AEG_EINVAL;
     }
-    for (mby = first_row; mby <= last_row; mby++) {
-        for (mbx = 0; mbx < e->mb_w; mbx++) {
-            int idx = mby * e->mb_w + mbx;
-            mbenc *tmp = &e->mb_encs[idx];
+    for (ry = first_row; ry <= last_row; ry += 1 + e->mbaff) {
+        int k, nk = e->mb_w << e->mbaff;
+        for (k = 0; k < nk; k++) {
+            int idx;
+            mbenc *tmp;
             int64_t t0 = aeg_now_ns();
+
+            mbx = k >> e->mbaff;
+            mby = ry + (k & e->mbaff);
+            idx = mby * e->mb_w + mbx;
+            tmp = &e->mb_encs[idx];
 
             /* A macroblock without any coded residual does not carry an
              * mb_qp_delta (H.264 7.3.5), so the decoder keeps the previous QP
@@ -10313,11 +10429,16 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 e->stat_mbs++;
                 e->stat_skipped += skipped;
                 e->stat_type[skipped ? AEG_MB_SKIP : (int)tmp->type]++;
+                if (e->mbaff)
+                    e->mbs[idx].skip = (uint8_t)skipped;
                 if (skipped)
                     skip_run++;
                 else {
+                    int ff = mbaff_flag_coded(e, mbx, mby, 0);
                     if (slice == AEG_SLICE_P)
                         flush_skip_run(&bw, &skip_run);
+                    if (ff >= 0)                /* mb_field_decoding_flag */
+                        aeg_bw_put(&bw, 1, (uint32_t)ff);
                     write_mb(e, &bw, mbx, mby, tmp, slice == AEG_SLICE_P);
                 }
             }
@@ -11932,7 +12053,12 @@ recode:
         e->pic.plane[2] = e->recp[2];
         if (e->rp_on) {
             int y;
-            if (e->p.deblock)
+            if (e->p.deblock && e->mbaff)
+                for (y = e->rp_dbk; y < e->mb_h; y += 2)
+                    aeg_deblock_pair_row(&e->pic, e->rp_mbs, e->mb_w, y >> 1,
+                                         e->p.deblock_alpha,
+                                         e->p.deblock_beta);
+            else if (e->p.deblock)
                 for (y = e->rp_dbk; y < e->mb_h; y++)
                     rowpost_deblock_row(e, e->rp_mbs, y);
         } else if (e->p.deblock) {
@@ -13101,7 +13227,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->chroma_qp_offset > 12) pp->chroma_qp_offset = 12;
     if (pp->level_idc < 0 || pp->level_idc > 62) pp->level_idc = 0;
     if (pp->interlaced < 0 || pp->interlaced > 2) pp->interlaced = 0;
-    if (pp->field_coding < 0 || pp->field_coding > 2) pp->field_coding = 0;
+    if (pp->field_coding < 0 || pp->field_coding > 3) pp->field_coding = 0;
     if (pp->field_coding && !pp->interlaced) pp->interlaced = 1;
     /* frame_mbs_only_flag 0 crops in units of 4 rows (as x264 refuses) */
     if (pp->interlaced && (pp->height & 3)) {
@@ -13231,13 +13357,14 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * temporal direct (the co-located field's vectors), and chroma stays out
      * of the motion search (its field offset is not in the cost). */
     if (pp->field_coding) {
-        if (pp->nal_hrd)
+        if (pp->nal_hrd && pp->field_coding != 3)
             aeg_log(AEG_LOG_WARNING, "aeg: no NAL HRD with field pictures (yet)");
-        pp->nal_hrd = 0;
+        if (pp->field_coding != 3)
+            pp->nal_hrd = 0;
         pp->b_pyramid = 0;
         pp->direct = 1;
         /* (field pictures do without; frame pictures among them keep them) */
-        if (pp->field_coding == 1) {
+        if (pp->field_coding == 1 || pp->field_coding == 3) {
             pp->weightp = 0;
             pp->chroma_me = 0;
         }
@@ -13381,6 +13508,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * read the same field. */
     e->poc_lsb_bits = 8;
     e->vpad = pp->field_coding ? 2 * AEG_PAD : AEG_PAD;
+    e->mbaff = pp->field_coding == 3;
+    e->mbaff_ff = -1;
     e->scan4 = aeg_scan4x4;
     e->scan8 = aeg_zigzag8x8;
 
@@ -13428,6 +13557,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (want > AEG_MAX_SLICES) want = AEG_MAX_SLICES;
         if (want > e->mb_h) want = e->mb_h;
         e->slice_rows = (e->mb_h + want - 1) / want;
+        /* MBAFF: a slice holds whole macroblock pairs */
+        if (pp->field_coding == 3)
+            e->slice_rows += e->slice_rows & 1;
         e->n_slices = (e->mb_h + e->slice_rows - 1) / e->slice_rows;
 
         /* threads: 0 = auto (the CPUs there are, capped at the slice count) */
@@ -13635,6 +13767,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->pic.h[1] = e->pic.h[2] = e->ch;
     e->pic.mb_w = e->mb_w;
     e->pic.mb_h = e->mb_h;
+    e->pic.mbaff = e->mbaff;
     e->pic.stride[0] = e->stride[0];
     e->pic.stride[1] = e->pic.stride[2] = e->stride[1];
     e->pic.plane[0] = e->recp[0];
