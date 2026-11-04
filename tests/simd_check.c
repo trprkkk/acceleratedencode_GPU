@@ -184,6 +184,13 @@ static void check_metrics(int iters)
                 e = aeg_sa8d_8x8_c(A, sa, B, sb);
                 CHECK(r == e, "sa8d mode %d: %d, expected %d", mode, r, e);
             }
+            if (w == 16 && h == 16) {
+                r = aeg_sa8d_16x16(A, sa, B, sb);
+                e = aeg_sa8d_8x8_c(A, sa, B, sb) + aeg_sa8d_8x8_c(A + 8, sa, B + 8, sb) +
+                    aeg_sa8d_8x8_c(A + 8 * sa, sa, B + 8 * sb, sb) +
+                    aeg_sa8d_8x8_c(A + 8 * sa + 8, sa, B + 8 * sb + 8, sb);
+                CHECK(r == e, "sa8d 16x16 mode %d: %d, expected %d", mode, r, e);
+            }
         }
     }
 }

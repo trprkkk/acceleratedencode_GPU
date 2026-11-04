@@ -648,6 +648,7 @@ static inline int me_se_bits(int v)
 typedef struct me_rate {
     int lambda;          /* 0 = distortion only                         */
     int px, py;          /* predictor, quarter-pel                      */
+    int dia;             /* sub-pel steps on the 4-point diamond        */
 } me_rate;
 
 static inline int me_mv_cost(const me_rate *r, int qx, int qy)
@@ -941,7 +942,7 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
             improved = 0;
             /* the next round skips what this one measures (hex_search()) */
             pcx = cx; pcy = cy; pstep = step;
-            for (i = 1; i < 9; i++) {
+            for (i = 1; i < (rt->dia ? 5 : 9); i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;
                 int ix = nx >> 2, iy = ny >> 2, cost, d;
                 if (ix < -range || ix > range || iy < -range || iy > range)
@@ -950,7 +951,8 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
                     continue;
                 /* measured by the previous round of this pass: its centre
                  * and the eight around it */
-                if (pst == step && abs(nx - pvx) <= step && abs(ny - pvy) <= step &&
+                if (pst == step && (rt->dia ? abs(nx - pvx) + abs(ny - pvy) <= step
+                                            : abs(nx - pvx) <= step && abs(ny - pvy) <= step) &&
                     (nx - pvx) % step == 0 && (ny - pvy) % step == 0)
                     continue;
                 if (mc && mc->ready && mc->stride == rstride &&
@@ -1041,6 +1043,8 @@ int aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
     rt.lambda = lambda;
     rt.px = pred_x;
     rt.py = pred_y;
+    rt.dia = !!(subme & AEG_ME_DIA);
+    subme &= ~AEG_ME_DIA;
 
     /* Candidate starts: predicted MV, zero, and the integer-rounded
      * predicted MV -- plus `seed`, the best vector a batched search over the

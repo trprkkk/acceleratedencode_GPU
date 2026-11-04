@@ -1506,7 +1506,14 @@ static void luma_inter_finish(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                                              src, e->stride[0]);
     } else {
         for (blk = 0; blk < 16; blk++) {
-            int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+            int bx = (blk & 3) * 4, by = (blk >> 2) * 4, y;
+            if (!c->nz[blk]) {
+                /* no levels: the reconstruction is the prediction */
+                for (y = 0; y < 4; y++)
+                    memcpy(dst + (by + y) * e->stride[0] + bx,
+                           pred + (by + y) * 16 + bx, 4 * sizeof(pixel));
+                continue;
+            }
             aeg_idct_add_block(dst + by * e->stride[0] + bx, e->stride[0],
                                c->level[blk], qp, pred + by * 16 + bx, 16,
                                NULL);
@@ -2114,8 +2121,15 @@ static void code_luma8_block_lv(struct aeg_encoder *e, int mbx, int mby, mbenc *
         c->nz8[g] = aeg_nz_last(c->level8[g], 64, &dummy) != 0;
     }
 
-    aeg_idct_8x8_add(dst + by * s + bx, s, c->level8[g], c->qp, pred,
-                     pred_stride);
+    if (c->nz8[g]) {
+        aeg_idct_8x8_add(dst + by * s + bx, s, c->level8[g], c->qp, pred,
+                         pred_stride);
+    } else {
+        /* no levels: the reconstruction is the prediction */
+        for (y = 0; y < 8; y++)
+            memcpy(dst + (by + y) * s + bx, pred + y * pred_stride,
+                   8 * sizeof(pixel));
+    }
     c->sse += aeg_ssd(8, 8, dst + by * s + bx, s, src + by * s + bx, s);
 }
 
@@ -2221,21 +2235,16 @@ static int use_t8(const struct aeg_encoder *e, int mbx, int mby, const mbenc *c)
 {
     const int s = e->stride[0];
     const pixel *src = e->srcp[0] + mby * 16 * s + mbx * 16;
-    int g, x, y, cost4 = 0, cost8 = 0;
+    int cost4, cost8;
 
     if (!t8_allowed(e, c))
         return 0;
     if (e->t8_force)
         return e->t8_force == 2;
-    for (g = 0; g < 4; g++) {
-        const int bx = (g & 1) * 8, by = (g >> 1) * 8;
-        cost8 += aeg_sa8d_8x8(src + by * s + bx, s, e->pred_l + by * 16 + bx,
-                              16);
-        for (y = 0; y < 8; y += 4)
-            for (x = 0; x < 8; x += 4)
-                cost4 += aeg_satd_4x4(src + (by + y) * s + bx + x, s,
-                                      e->pred_l + (by + y) * 16 + bx + x, 16);
-    }
+    /* (aeg_satd is the sum of the sixteen 4x4 SATDs, and aeg_sa8d_16x16
+     * the sum of the four 8x8 ones) */
+    cost8 = aeg_sa8d_16x16(src, s, e->pred_l, 16);
+    cost4 = aeg_satd(16, 16, src, s, e->pred_l, 16);
     return cost8 < cost4;
 }
 
@@ -2734,11 +2743,21 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
 {
     int g, x, y, pl;
     const int lists = c->blist[0] ? c->blist[0] : 3;
+    /* The groups' vectors usually agree (they differ only through colZero);
+     * then one 16x16 motion compensation per list gives the same samples as
+     * four 8x8 ones -- the interpolation only depends on the position. */
+    const int b0s[4] = { 0, 2, 8, 10 };
+    int uni = 1, sz, ng;
 
+    for (g = 1; g < 4 && uni; g++)
+        uni = c->mv[b0s[g]][0] == c->mv[0][0] && c->mv[b0s[g]][1] == c->mv[0][1] &&
+              c->mv1[b0s[g]][0] == c->mv1[0][0] && c->mv1[b0s[g]][1] == c->mv1[0][1];
+    sz = uni ? 16 : 8;
+    ng = uni ? 1 : 4;
     if (lists != 3) {
         /* spatial direct on one list: an ordinary single-list prediction
          * per 8x8 group (the groups' vectors differ only through colZero) */
-        for (g = 0; g < 4; g++) {
+        for (g = 0; g < ng; g++) {
             int x0 = (g & 1) * 8, y0 = (g >> 1) * 8;
             int b0 = (y0 >> 2) * 4 + (x0 >> 2);
             int l = lists == 2;
@@ -2746,12 +2765,12 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
             int my = l ? c->mv1[b0][1] : c->mv[b0][1];
             pixel *d0[2] = { e->pred_c[0], e->pred_c[1] };
 
-            mc_rect_luma_to(e, l, e->pred_l, mbx, mby, x0, y0, 8, 8, mx, my);
-            mc_rect_chroma_to(e, l, d0, mbx, mby, x0 / 2, y0 / 2, 4, 4, mx, my);
+            mc_rect_luma_to(e, l, e->pred_l, mbx, mby, x0, y0, sz, sz, mx, my);
+            mc_rect_chroma_to(e, l, d0, mbx, mby, x0 / 2, y0 / 2, sz / 2, sz / 2, mx, my);
         }
         return;
     }
-    for (g = 0; g < 4; g++) {
+    for (g = 0; g < ng; g++) {
         int x0 = (g & 1) * 8, y0 = (g >> 1) * 8;
         /* Index of the 8x8 group's first 4x4 block: the group is two blocks
          * wide, so the row stride is four blocks, not sixteen. */
@@ -2759,22 +2778,22 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
         pixel *d0[2] = { e->pred_c[0], e->pred_c[1] };
         pixel *d1[2] = { e->pred_c2[0], e->pred_c2[1] };
 
-        mc_rect_luma_to(e, 0, e->pred_l, mbx, mby, x0, y0, 8, 8,
+        mc_rect_luma_to(e, 0, e->pred_l, mbx, mby, x0, y0, sz, sz,
                         c->mv[b0][0], c->mv[b0][1]);
-        mc_rect_luma_to(e, 1, e->pred_l2, mbx, mby, x0, y0, 8, 8,
+        mc_rect_luma_to(e, 1, e->pred_l2, mbx, mby, x0, y0, sz, sz,
                         c->mv1[b0][0], c->mv1[b0][1]);
-        for (y = 0; y < 8; y++)
-            for (x = 0; x < 8; x++) {
+        for (y = 0; y < sz; y++)
+            for (x = 0; x < sz; x++) {
                 int o = (y0 + y) * 16 + x0 + x;
                 e->pred_l[o] = (pixel)((e->pred_l[o] + e->pred_l2[o] + 1) >> 1);
             }
-        mc_rect_chroma_to(e, 0, d0, mbx, mby, x0 / 2, y0 / 2, 4, 4,
+        mc_rect_chroma_to(e, 0, d0, mbx, mby, x0 / 2, y0 / 2, sz / 2, sz / 2,
                           c->mv[b0][0], c->mv[b0][1]);
-        mc_rect_chroma_to(e, 1, d1, mbx, mby, x0 / 2, y0 / 2, 4, 4,
+        mc_rect_chroma_to(e, 1, d1, mbx, mby, x0 / 2, y0 / 2, sz / 2, sz / 2,
                           c->mv1[b0][0], c->mv1[b0][1]);
         for (pl = 0; pl < 2; pl++)
-            for (y = 0; y < 4; y++)
-                for (x = 0; x < 4; x++) {
+            for (y = 0; y < sz / 2; y++)
+                for (x = 0; x < sz / 2; x++) {
                     int o = (y0 / 2 + y) * 8 + x0 / 2 + x;
                     e->pred_c[pl][o] =
                         (pixel)((e->pred_c[pl][o] + e->pred_c2[pl][o] + 1) >> 1);
@@ -3602,6 +3621,21 @@ static int ref1_cands_on(void)
     return v;
 }
 
+/* x264's 4-point sub-pel diamond (AEG_ME_DIA) per search class, a mask:
+ * 1 = B 16x8 / 8x16 / 8x8, 2 = P partitions, 4 = B 16x16, 8 = P 16x16 (every
+ * reference).  AEG_SPDIA overrides. */
+static int spdia_mask(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_SPDIA");
+        v = ev ? atoi(ev) : -1;
+    }
+    (void)e;
+    return v >= 0 ? v : 0;
+}
+#define SUBME_F(e, cls) ((e)->p.subme | (spdia_mask(e) & (cls) ? AEG_ME_DIA : 0))
+
 static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                          int p, const int geo[4], int pmvx, int pmvy, int ref,
                          int *mvx, int *mvy, int *sad, int refine)
@@ -3636,7 +3670,8 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                      mbx * 16 + geo[0],
                  e->stride[0], geo[2], geo[3],
                  e->p.search_range ? e->p.search_range : 16,
-                 refine ? e->p.subme : 0, pmvx, pmvy, sp,
+                 refine ? SUBME_F(e, geo[2] == 16 && geo[3] == 16 ? 8 : 2) : 0,
+                 pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
                  mvx, mvy, sad, e->me_hpt_on ? &e->me_hpt : NULL) < 0;
     /* Sub-pixel alignment: the integer search leaves the vector on an integer
@@ -3850,7 +3885,7 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                      e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                          mbx * 16 + geo[0],
                      e->stride[0], geo[2], geo[3], range,
-                     part_subpel_b(e) >= 2 ? e->p.subme : 0,
+                     part_subpel_b(e) >= 2 ? SUBME_F(e, 1) : 0,
                      pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
                      &mv[l][0], &mv[l][1],
                      &sad);
@@ -4020,7 +4055,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
                          e->stride[0],
                          e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                              mbx * 16 + geo[0],
-                         e->stride[0], 8, 8, range, b8_sub ? e->p.subme : 0,
+                         e->stride[0], 8, 8, range, b8_sub ? SUBME_F(e, 1) : 0,
                          pmv[l][0], pmv[l][1],
                          seed, NULL, 0, e->me_lambda, mc, &mv[l][0],
                          &mv[l][1], &sad);
@@ -5046,7 +5081,7 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
             seed[1] = e->lr_mv[list][(mby * e->mb_w + mbx) * 2 + 1];
         }
         aeg_me_block_l(ref, e->stride[0], src, e->stride[0], 16, 16, range,
-                     e->p.subme, pmv[list][0], pmv[list][1], seed,
+                     SUBME_F(e, 4), pmv[list][0], pmv[list][1], seed,
                      (const int (*)[2])nb, nnb, e->me_lambda, mc,
                      &mv[list][0], &mv[list][1], &sad[list]);
         if (!list) {
@@ -5275,7 +5310,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                          e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0], 16, 16,
                          e->p.search_range ? e->p.search_range : 16,
-                         e->p.subme, e->mb_pmv[0], e->mb_pmv[1], seed,
+                         SUBME_F(e, 8), e->mb_pmv[0], e->mb_pmv[1], seed,
                          (const int (*)[2])nb, nnb, e->me_lambda, &e->mcr[0],
                          &mvx, &mvy, &sad, &e->me_hpt);
         }
@@ -8116,6 +8151,24 @@ static void cabac_cbp_chroma(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                            cc == 2);
 }
 
+/* Whether a 4x4 block has a level at raster position `from` or later (0: the
+ * whole block, 1: the AC part -- every position but the DC). */
+static inline int blk_any(const dctcoef *p, int from)
+{
+    dctcoef o = 0;
+    int i;
+    for (i = from; i < 16; i++)
+        o |= p[i];
+    return o != 0;
+}
+
+/* aeg_cabac_residual() of a block without levels: its coded_block_flag. */
+static inline int cab_residual_zero(aeg_cabac *cb, int cbf_ctx)
+{
+    aeg_cabac_decision(cb, cbf_ctx, 0);
+    return 0;
+}
+
 /* The residual of one macroblock, in the order the spec decodes it: luma
  * (DC then AC, or 8x8 groups, or 4x4 groups), then chroma DC, then chroma
  * AC. */
@@ -8137,6 +8190,11 @@ static void cabac_mb_residual(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
             for (k = 0; k < 16; k++) {
                 int nb = ac_ord[k];
                 cab_nz4_luma(e, mbx, mby, c, nb, &a, &b, &va, &vb);
+                if (!blk_any(c->level[nb], 1)) {
+                    c->nz[nb] = (int8_t)cab_residual_zero(
+                        cb, cab_cbf_ctx(1, a, b, va, vb, intra));
+                    continue;
+                }
                 for (i = 0; i < 15; i++)
                     blk[i] = c->level[nb][aeg_scan4x4[i + 1]];
                 c->nz[nb] = (int8_t)aeg_cabac_residual(
@@ -8167,6 +8225,11 @@ static void cabac_mb_residual(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
             for (k = 0; k < 4; k++) {
                 int nb = group_blk[g][k], a, b, va, vb;
                 cab_nz4_luma(e, mbx, mby, c, nb, &a, &b, &va, &vb);
+                if (!blk_any(c->level[nb], 0)) {
+                    c->nz[nb] = (int8_t)cab_residual_zero(
+                        cb, cab_cbf_ctx(2, a, b, va, vb, intra));
+                    continue;
+                }
                 for (i = 0; i < 16; i++)
                     blk[i] = c->level[nb][aeg_scan4x4[i]];
                 c->nz[nb] = (int8_t)aeg_cabac_residual(
@@ -8189,6 +8252,11 @@ static void cabac_mb_residual(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                     int nb = AEG_BLK_CHROMA_CB + pl * 4 + k;
                     cab_nz4_chroma(e, mbx, mby, c, pl, k,
                                    &a, &b, &va, &vb);
+                    if (!blk_any(c->level[nb], 1)) {
+                        c->nz[nb] = (int8_t)cab_residual_zero(
+                            cb, cab_cbf_ctx(4, a, b, va, vb, intra));
+                        continue;
+                    }
                     for (i = 0; i < 15; i++)
                         blk[i] = c->level[nb][aeg_scan4x4[i + 1]];
                     c->nz[nb] = (int8_t)aeg_cabac_residual(

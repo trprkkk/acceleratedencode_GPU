@@ -2982,6 +2982,72 @@ static int satd_w8_avx2(int h, const pixel *a, int sa, const pixel *b, int sb)
 #endif
 #endif
 
+#if defined(AEG_HAVE_AVX2_SATD) && BIT_DEPTH == 8
+/* aeg_sa8d_8x8() of the two 8x8 blocks of a 16x8 strip at once, one per
+ * 128-bit lane (the unpacks of the transpose stay within their lane), each
+ * rounded on its own.  8 bits only: the int16 range argument of the SSE2
+ * form carries over unchanged. */
+__attribute__((target("avx2")))
+static int sa8d_16x8_avx2(const pixel *a, int sa, const pixel *b, int sb)
+{
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i r[8], acc = _mm256_setzero_si256();
+    int k, step, i, j, s0, s1;
+    __m128i l0, l1;
+#define H8() for (step = 1; step < 8; step <<= 1)                         \
+        for (i = 0; i < 8; i += 2 * step)                                 \
+            for (j = i; j < i + step; j++) {                              \
+                __m256i x_ = r[j], y_ = r[j + step];                      \
+                r[j] = _mm256_add_epi16(x_, y_);                          \
+                r[j + step] = _mm256_sub_epi16(x_, y_);                   \
+            }
+    for (k = 0; k < 8; k++)
+        r[k] = _mm256_sub_epi16(ld_px16_avx2(a + (size_t)k * sa),
+                                ld_px16_avx2(b + (size_t)k * sb));
+    H8();
+    {
+        __m256i a0 = _mm256_unpacklo_epi16(r[0], r[1]), a1 = _mm256_unpackhi_epi16(r[0], r[1]);
+        __m256i a2 = _mm256_unpacklo_epi16(r[2], r[3]), a3 = _mm256_unpackhi_epi16(r[2], r[3]);
+        __m256i a4 = _mm256_unpacklo_epi16(r[4], r[5]), a5 = _mm256_unpackhi_epi16(r[4], r[5]);
+        __m256i a6 = _mm256_unpacklo_epi16(r[6], r[7]), a7 = _mm256_unpackhi_epi16(r[6], r[7]);
+        __m256i b0 = _mm256_unpacklo_epi32(a0, a2), b1 = _mm256_unpackhi_epi32(a0, a2);
+        __m256i b2 = _mm256_unpacklo_epi32(a1, a3), b3 = _mm256_unpackhi_epi32(a1, a3);
+        __m256i b4 = _mm256_unpacklo_epi32(a4, a6), b5 = _mm256_unpackhi_epi32(a4, a6);
+        __m256i b6 = _mm256_unpacklo_epi32(a5, a7), b7 = _mm256_unpackhi_epi32(a5, a7);
+        r[0] = _mm256_unpacklo_epi64(b0, b4); r[1] = _mm256_unpackhi_epi64(b0, b4);
+        r[2] = _mm256_unpacklo_epi64(b1, b5); r[3] = _mm256_unpackhi_epi64(b1, b5);
+        r[4] = _mm256_unpacklo_epi64(b2, b6); r[5] = _mm256_unpackhi_epi64(b2, b6);
+        r[6] = _mm256_unpacklo_epi64(b3, b7); r[7] = _mm256_unpackhi_epi64(b3, b7);
+    }
+    H8();
+#undef H8
+    for (k = 0; k < 8; k++)
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_abs_epi16(r[k]), ones));
+    l0 = _mm256_castsi256_si128(acc);
+    l1 = _mm256_extracti128_si256(acc, 1);
+    l0 = _mm_add_epi32(l0, _mm_shuffle_epi32(l0, _MM_SHUFFLE(1, 0, 3, 2)));
+    l0 = _mm_add_epi32(l0, _mm_shuffle_epi32(l0, _MM_SHUFFLE(2, 3, 0, 1)));
+    l1 = _mm_add_epi32(l1, _mm_shuffle_epi32(l1, _MM_SHUFFLE(1, 0, 3, 2)));
+    l1 = _mm_add_epi32(l1, _mm_shuffle_epi32(l1, _MM_SHUFFLE(2, 3, 0, 1)));
+    s0 = _mm_cvtsi128_si32(l0);
+    s1 = _mm_cvtsi128_si32(l1);
+    return ((s0 + 2) >> 2) + ((s1 + 2) >> 2);
+}
+#endif
+
+/* The sum of aeg_sa8d_8x8() over the four 8x8 blocks of a 16x16 block. */
+int aeg_sa8d_16x16(const pixel *a, int sa, const pixel *b, int sb)
+{
+#if defined(AEG_HAVE_AVX2_SATD) && BIT_DEPTH == 8
+    if (cpu_avx2())
+        return sa8d_16x8_avx2(a, sa, b, sb) +
+               sa8d_16x8_avx2(a + 8 * (size_t)sa, sa, b + 8 * (size_t)sb, sb);
+#endif
+    return aeg_sa8d_8x8(a, sa, b, sb) + aeg_sa8d_8x8(a + 8, sa, b + 8, sb) +
+           aeg_sa8d_8x8(a + 8 * (size_t)sa, sa, b + 8 * (size_t)sb, sb) +
+           aeg_sa8d_8x8(a + 8 * (size_t)sa + 8, sa, b + 8 * (size_t)sb + 8, sb);
+}
+
 #if defined(AEG_HAVE_AVX2_SATD)
 /* satd_w16_avx2()/satd_w8_avx2() of the rounded average of two blocks
  * (both with stride sr) against `a`: the average is pavgb, exactly. */

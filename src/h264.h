@@ -25,6 +25,9 @@
  * step is a local decision, not a rate-distortion one).  Four it is -- it was
  * never worse than three and cost nothing measurable (77.2 against 77.3 fps
  * median over five runs). */
+/* or'ed into the motion search's `subme`: the sub-pel walk steps on the
+ * 4-point diamond instead of the 8-point square (x264's refine_subpel) */
+#define AEG_ME_DIA 0x100
 #ifndef AEG_SUBPEL_ITERS
 #define AEG_SUBPEL_ITERS 4
 #endif
@@ -475,6 +478,7 @@ int  aeg_satd_16x16(const pixel *a, int sa, const pixel *b, int sb);
 /* 8x8 Hadamard SA8D, scaled to be comparable with aeg_satd_4x4 (see
  * transform.c); the transform-size decision compares the two. */
 int  aeg_sa8d_8x8(const pixel *a, int sa, const pixel *b, int sb);
+int  aeg_sa8d_16x16(const pixel *a, int sa, const pixel *b, int sb);
 int  aeg_satd_8x8(const pixel *a, int sa, const pixel *b, int sb);
 
 /* ------------------------------------------------------------------ */
