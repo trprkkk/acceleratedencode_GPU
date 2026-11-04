@@ -5483,3 +5483,44 @@ removing them costs 3.5 % of the bits.  The gate on the best 16x16 cost
 partitions without their own sub-pel search (`AEG_PSUBB=0`) +1.8 % bits on
 vtestL.  What is left is per-operation cost (x264's RD and searches are
 hand-written assembly) and the number of candidates priced.
+
+### Cheaper candidates: exact work, then the B partitions' searches
+
+**Exact (byte-identical at every preset, 10-bit, slices, frame threads,
+CAVLC, temporal direct):**
+
+* The 8x8-transform choice (`use_t8`) measured the four 8x8 SA8Ds one call
+  each; one 16x16 SA8D (AVX2 does two blocks per pass) gives the same sum.
+* A 4x4 / 8x8 block without levels costs only its coded_block_flag in the
+  CABAC price, and reconstructs to exactly its prediction (copied, no
+  inverse transform).
+* B direct predicts the whole macroblock in one motion compensation when the
+  four 8x8 groups carry the same vectors.
+* **Luma memo** (`AEG_LMEMO`, on): candidates that predict the same pixels
+  code the same luma -- the residual coding reads only the source, the
+  prediction, the QP, whether the 8x8 transform may (or must) be used and the
+  trellis switch.  Static content's partitions mostly find the 16x16 vector
+  and the direct vector is often the searched one: 37 % of the inter luma
+  codings of vtestL repeat an earlier candidate of the same macroblock (8 % on
+  cockatoo).  The result and the reconstruction are replayed; the header bits
+  are priced anew.  vtestL p1 0.82 -> 0.75 s, p3 2.16 -> 1.84 s.
+
+**The B partitions' sub-pel search, x264-style (BD-rate, main + validation):**
+
+* x264's 4-point diamond instead of the 8-point square for the B 16x8 /
+  8x16 / 8x8 searches (`AEG_SPDIA`, mask 1): p1 / p2 +0.04 %, p3 +0.06 %,
+  p4 +0.04 %; on at presets 1 and 2 (B analysis 430 -> 389 Mcyc).  Also on the
+  P partitions or the 16x16 searches: +0.33 % / +0.58 % at p1 -- out.
+* Seeding the partitions' sub-pel stage with the macroblock's own quarter-pel
+  vector (`AEG_BPFS`): when the integer search lands where that vector rounds
+  to (92 % of the time on vtestL), skip the half-pel pass and refine at
+  quarter pel only.  p1 +0.02 %, p2 +0.02 % for B analysis 367 -> 321 Mcyc
+  (-2.7 % time); on at presets 1 and 2.  The same for the P partitions
+  (`AEG_PPFS`) is -1.4 % for +0.09 % at p1 and +0.11 % together with the B
+  one at p2: off.  At p3 / p4 neither shows in the time.
+
+Against `96fa945` (interleaved minimum, single thread, QP 28): vtestL p1
+-15 %, p2 -15 %, p3 -9 %; cockL p1 -7 %, p2 -6 %, p3 -6 %.  The profile
+is now flat -- CABAC residual pricing 7 %, the SATD kernels 5 % each, the
+UMH search 3 % -- so what remains is the number of candidates priced, not
+one hot spot.

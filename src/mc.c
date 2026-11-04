@@ -649,6 +649,8 @@ typedef struct me_rate {
     int lambda;          /* 0 = distortion only                         */
     int px, py;          /* predictor, quarter-pel                      */
     int dia;             /* sub-pel steps on the 4-point diamond        */
+    int qonly;           /* start at a fractional vector, quarter-pel
+                          * steps only (aeg_me_block_fs)                 */
 } me_rate;
 
 static inline int me_mv_cost(const me_rate *r, int qx, int qy)
@@ -898,8 +900,17 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
      * step of every pass. */
     const int cme = mc && mc->chroma && bw >= 8 && bh >= 8 && cstride == rstride;
 
-    bd = aeg_satd(bw, bh, cur, cstride,
-                  ref + (cy >> 2) * rstride + (cx >> 2), rstride);
+    if (rt->qonly && ((cx | cy) & 3)) {
+        const pixel *r0 = ref + (cy >> 2) * rstride + (cx >> 2);
+        if (mc && mc->ready)
+            aeg_mc_luma_p(buf, bw, mc, r0, bw, bh, cx & 3, cy & 3);
+        else
+            aeg_mc_luma(buf, bw, r0, rstride, bw, bh, cx & 3, cy & 3);
+        bd = aeg_satd(bw, bh, buf, bw, cur, cstride);
+    } else {
+        bd = aeg_satd(bw, bh, cur, cstride,
+                      ref + (cy >> 2) * rstride + (cx >> 2), rstride);
+    }
     if (cme)
         bd += me_chroma_satd(mc, cur, rstride, bw, bh, cx, cy);
     best = bd + me_mv_cost(rt, cx, cy);
@@ -933,7 +944,7 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
      * search has almost always converged (the vectors it would still find move
      * by a quarter pel more and change the SATD by less than the mvd they
      * cost), and every step is a full motion compensation. */
-    for (pass = 0; pass < 2; pass++) {
+    for (pass = rt->qonly ? 1 : 0; pass < 2; pass++) {
         int step = pass ? 1 : 2;
         int improved = 1, iters = 0;
         int pcx = 0, pcy = 0, pstep = 0;
@@ -1030,12 +1041,47 @@ int aeg_me_block_l(const pixel *ref, int rstride, const pixel *cur,
  * references, made in order, is compared with the best of them so far; one
  * more than 8/7 of it returns -1 before the sub-pel stage (the vector is the
  * integer one), otherwise *hpt keeps the minimum. */
+static int me_block_inner(const pixel *ref, int rstride, const pixel *cur,
+                          int cstride, int bw, int bh, int range, int subme,
+                          int pred_x, int pred_y, const int seed[2],
+                          const int (*extra)[2], int nextra, int lambda,
+                          const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                          int *sad_out, int *hpt, const int fseed[2]);
+
 int aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
                    int cstride, int bw, int bh, int range, int subme,
                    int pred_x, int pred_y, const int seed[2],
                    const int (*extra)[2], int nextra, int lambda,
                    const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
                    int *hpt)
+{
+    return me_block_inner(ref, rstride, cur, cstride, bw, bh, range, subme,
+                          pred_x, pred_y, seed, extra, nextra, lambda, mc,
+                          mvx, mvy, sad_out, hpt, NULL);
+}
+
+/* aeg_me_block_t() with a quarter-pel vector known to be good (a partition's
+ * own macroblock vector): when the integer search ends on its integer
+ * position, the fractional stage starts from it and takes quarter-pel steps
+ * only. */
+int aeg_me_block_fs(const pixel *ref, int rstride, const pixel *cur,
+                    int cstride, int bw, int bh, int range, int subme,
+                    int pred_x, int pred_y, const int seed[2],
+                    const int (*extra)[2], int nextra, int lambda,
+                    const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
+                    int *hpt, const int fseed[2])
+{
+    return me_block_inner(ref, rstride, cur, cstride, bw, bh, range, subme,
+                          pred_x, pred_y, seed, extra, nextra, lambda, mc,
+                          mvx, mvy, sad_out, hpt, fseed);
+}
+
+static int me_block_inner(const pixel *ref, int rstride, const pixel *cur,
+                          int cstride, int bw, int bh, int range, int subme,
+                          int pred_x, int pred_y, const int seed[2],
+                          const int (*extra)[2], int nextra, int lambda,
+                          const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                          int *sad_out, int *hpt, const int fseed[2])
 {
     int best_cost = 1 << 30, best_sad = 1 << 30, bx = 0, by = 0;
     me_rate rt;
@@ -1044,6 +1090,7 @@ int aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
     rt.px = pred_x;
     rt.py = pred_y;
     rt.dia = !!(subme & AEG_ME_DIA);
+    rt.qonly = 0;
     subme &= ~AEG_ME_DIA;
 
     /* Candidate starts: predicted MV, zero, and the integer-rounded
@@ -1139,6 +1186,11 @@ int aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
 
     {
         int qx = bx * 4, qy = by * 4;
+        if (fseed && fseed[0] >> 2 == bx && fseed[1] >> 2 == by) {
+            qx = fseed[0];
+            qy = fseed[1];
+            rt.qonly = 1;
+        }
         subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc, &rt,
                       &qx, &qy, &best_sad);
         *mvx = qx; *mvy = qy;

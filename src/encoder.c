@@ -328,6 +328,17 @@ struct aeg_encoder {
     unsigned cmemo_gen;
     int cmemo_next;
 
+    /* The same for the luma of the inter candidates (see rd_luma()): keyed by
+     * the prediction and the few settings the residual coding reads, valid for
+     * one code_mb() call (lmemo_n is reset there). */
+    struct lmemo {
+        int qp, t8ok, t8force, trellis;
+        pixel pred[256];
+        pixel rec[256];
+        mbenc t;                    /* before the header bits */
+    } lmemo[8];
+    int lmemo_n, lmemo_next;
+
     /* One RBSP buffer per slice: a slice is its own NAL unit, and with slice
      * threads the slices are written by different threads at the same time.
      * They are all allocated before the threads start, because the pointers
@@ -3645,6 +3656,40 @@ static int spdia_mask(const struct aeg_encoder *e)
 }
 #define SUBME_F(e, cls) ((e)->p.subme | (spdia_mask(e) & (cls) ? AEG_ME_DIA : 0))
 
+/* A partition's sub-pel stage seeded with the macroblock's own quarter-pel
+ * vector (aeg_me_block_fs()): when the partition's integer search lands on
+ * the pel that vector rounds to -- 92 % of the B partitions of static content,
+ * and the exact quarter-pel position in 86 % -- the half-pel pass is skipped
+ * and the quarter-pel one starts from it.  BD-rate, main + validation:
+ *
+ *            B (AEG_BPFS)   P (AEG_PPFS)   both
+ *   p1       +0.02 %        +0.09 %        +0.12 %
+ *   p2       +0.02 %                       +0.11 %
+ *   p3                                     +0.04 %
+ *   p4                                     +0.01 %
+ *
+ * The B one is about -2.7 % of the time at preset 1 (vtestL: B analysis
+ * 367 -> 321 Mcyc) and on by default at presets 1 and 2; the P one is -1.4 %
+ * for +0.09 %, and at presets 3 and 4 neither shows in the time. */
+static int bpfs_on(const struct aeg_encoder *e)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_BPFS");
+        v = ev ? atoi(ev) != 0 : -1;
+    }
+    return v >= 0 ? v : e->p.preset <= 2;
+}
+static int ppfs_on(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_PPFS");
+        v = ev ? atoi(ev) != 0 : 0;
+    }
+    return v;
+}
+
 static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                          int p, const int geo[4], int pmvx, int pmvy, int ref,
                          int *mvx, int *mvy, int *sad, int refine)
@@ -3672,8 +3717,11 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
         seed[1] = e->lr_mv[1][(mby * e->mb_w + mbx) * 2 + 1];
         sp = seed;
     }
+    const int fs16[2] = { e->mb_mv[0], e->mb_mv[1] };
+    const int use_fs = !ref && e->mb_inter_ok && !(geo[2] == 16 && geo[3] == 16) &&
+                       ppfs_on();
     e->me_pruned =
-        aeg_me_block_t(rp,
+        aeg_me_block_fs(rp,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
@@ -3682,7 +3730,8 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                  refine ? SUBME_F(e, geo[2] == 16 && geo[3] == 16 ? 8 : 2) : 0,
                  pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
-                 mvx, mvy, sad, e->me_hpt_on ? &e->me_hpt : NULL) < 0;
+                 mvx, mvy, sad, e->me_hpt_on ? &e->me_hpt : NULL,
+                 use_fs ? fs16 : NULL) < 0;
     /* Sub-pixel alignment: the integer search leaves the vector on an integer
      * pel.  Rather than repeating the whole quarter-pel search for a small
      * partition, apply the fractional offset the macroblock's 16x16 search
@@ -3888,16 +3937,16 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                       geo[1] / 4, geo[2] / 4, l, &pmv[l][0], &pmv[l][1]);
         seed[0] = mv16[l][0] / 4;
         seed[1] = mv16[l][1] / 4;
-        aeg_me_block_l(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
-                         geo[0],
-                     e->stride[0],
-                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
-                         mbx * 16 + geo[0],
-                     e->stride[0], geo[2], geo[3], range,
-                     part_subpel_b(e) >= 2 ? SUBME_F(e, 1) : 0,
-                     pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
-                     &mv[l][0], &mv[l][1],
-                     &sad);
+        aeg_me_block_fs(ref + (mby * 16 + geo[1]) * e->stride[0] + mbx * 16 +
+                          geo[0],
+                      e->stride[0],
+                      e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                          mbx * 16 + geo[0],
+                      e->stride[0], geo[2], geo[3], range,
+                      part_subpel_b(e) >= 2 ? SUBME_F(e, 1) : 0,
+                      pmv[l][0], pmv[l][1], seed, NULL, 0, e->me_lambda, mc,
+                      &mv[l][0], &mv[l][1], &sad, NULL,
+                      bpfs_on(e) ? mv16[l] : NULL);
         /* with the fractional stage the search returns the SATD itself */
         satd[l] = e->p.subme > 0 && part_subpel_b(e) >= 2 ? sad : -1;
         if (e->p.subme > 0 && part_subpel_b(e) < 2) {
@@ -6321,6 +6370,16 @@ static int64_t rd_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
     return t->cost;
 }
 
+static int lmemo_on(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_LMEMO");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 /* Code the luma part of one candidate into `t` and return its RD cost.  The
  * reconstruction is left in the picture buffer, so the caller snapshots it.
  * `cand` selects one of the inter candidates gathered by analyse_mb(); it is
@@ -6348,7 +6407,63 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
             t->ref[b] = e->mb_cand[cand].ref[b];
         }
         inter_predict_typed(e, mbx, mby, t);
-        if (use_t8(e, mbx, mby, t))
+        if (lmemo_on() && !e->coef_batch) {
+            /* Candidates that predict the same pixels code the same luma: the
+             * partitions of static content mostly find the 16x16 vector, and
+             * the direct vector is often the searched one.  The residual
+             * coding reads the source, the prediction, the QP, whether the
+             * 8x8 transform may (or must) be used and the trellis switch --
+             * nothing of the candidate's shape or vectors -- so its result is
+             * replayed, reconstruction included, and only the header bits are
+             * priced anew. */
+            const int t8ok = t8_allowed(e, t), tr = e->p.trellis;
+            const int s = e->stride[0];
+            pixel *dst = e->recp[0] + mby * 16 * s + mbx * 16;
+            int k, y;
+            for (k = 0; k < e->lmemo_n; k++) {
+                const struct lmemo *m = &e->lmemo[k];
+                if (m->qp == qp && m->t8ok == t8ok && m->t8force == e->t8_force &&
+                    m->trellis == tr &&
+                    !memcmp(m->pred, e->pred_l, sizeof(m->pred)))
+                    break;
+            }
+            if (k < e->lmemo_n) {
+                const struct lmemo *m = &e->lmemo[k];
+                mbenc keep = *t;
+                *t = m->t;
+                t->type = keep.type;
+                t->i16_mode = keep.i16_mode;
+                t->nparts = keep.nparts;
+                memcpy(t->sub_type, keep.sub_type, sizeof(t->sub_type));
+                memcpy(t->blist, keep.blist, sizeof(t->blist));
+                memcpy(t->mv, keep.mv, sizeof(t->mv));
+                memcpy(t->mv1, keep.mv1, sizeof(t->mv1));
+                memcpy(t->pmv, keep.pmv, sizeof(t->pmv));
+                memcpy(t->pmv1, keep.pmv1, sizeof(t->pmv1));
+                memcpy(t->ref, keep.ref, sizeof(t->ref));
+                for (y = 0; y < 16; y++)
+                    memcpy(dst + y * s, m->rec + y * 16, 16 * sizeof(pixel));
+            } else {
+                struct lmemo *m;
+                if (use_t8(e, mbx, mby, t))
+                    code_luma_inter8(e, mbx, mby, t);
+                else
+                    code_luma_inter(e, mbx, mby, t);
+                if (e->lmemo_n < 8)
+                    k = e->lmemo_n++;
+                else
+                    k = e->lmemo_next++ & 7;
+                m = &e->lmemo[k];
+                m->qp = qp;
+                m->t8ok = t8ok;
+                m->t8force = e->t8_force;
+                m->trellis = tr;
+                memcpy(m->pred, e->pred_l, sizeof(m->pred));
+                for (y = 0; y < 16; y++)
+                    memcpy(m->rec + y * 16, dst + y * s, 16 * sizeof(pixel));
+                m->t = *t;
+            }
+        } else if (use_t8(e, mbx, mby, t))
             code_luma_inter8(e, mbx, mby, t);
         else
             code_luma_inter(e, mbx, mby, t);
@@ -6952,6 +7067,7 @@ static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     e->cmemo_gen++;             /* code_chroma()'s results are per macroblock */
+    e->lmemo_n = 0;             /* and so are rd_luma()'s */
     /* Both snapshots are written by the first candidate that is evaluated, and
      * at least one always is (a preset above 0 with no legal Intra_16x16 mode
      * returns above), but initialising them keeps the compiler from warning

@@ -603,6 +603,12 @@ int  aeg_me_block_t(const pixel *ref, int rstride, const pixel *cur,
                     const int (*extra)[2], int nextra, int lambda,
                     const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
                     int *hpt);
+int  aeg_me_block_fs(const pixel *ref, int rstride, const pixel *cur,
+                     int cstride, int bw, int bh, int range, int subme,
+                     int pred_x, int pred_y, const int seed[2],
+                     const int (*extra)[2], int nextra, int lambda,
+                     const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
+                     int *hpt, const int fseed[2]);
 int  aeg_me_lambda(int qp);
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
                     int mb_x, int mb_y, int top_row,
