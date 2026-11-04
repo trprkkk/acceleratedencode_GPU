@@ -158,9 +158,15 @@ typedef struct aeg_params {
      *   1 = as field pictures (PAFF): every frame is two pictures, one per
      *       field, each predicted from the fields before it -- the second
      *       from the first -- which follows motion between the fields
-     *       instead of coding the combing it leaves in a frame.
-     * Field pictures code with one frame thread, without weighted
-     * prediction, the B pyramid or temporal direct (all turned off). */
+     *       instead of coding the combing it leaves in a frame;
+     *   2 = frame or field pictures, chosen per frame (adaptive PAFF): an
+     *       I/P frame goes to fields when a quick estimate of its
+     *       prediction cost as two fields beats the cost as a frame by 12 %,
+     *       the B frames before it follow it.
+     * Field coding runs with one frame thread, without the B pyramid,
+     * temporal direct or the NAL HRD; field pictures also without weighted
+     * prediction and chroma ME (with 1 turned off; with 2 the frame
+     * pictures keep them). */
     int field_coding;
     /* Bits per coded sample: 8 (the default; 0 also means 8) or 10 (High 10
      * profile, as x264's 10-bit build: the library holds both, compiled

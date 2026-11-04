@@ -11,6 +11,7 @@
  * drift; tools/aegverify checks exactly that by comparing the encoder's
  * reconstruction with an independent decode of the bitstream.
  */
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +463,11 @@ struct aeg_encoder {
     int ref_par[AEG_MAX_REFS];  /* parity of the field refpl[k] views     */
     int fld_cofs[AEG_MAX_REFS]; /* its chroma vertical offset (8.4.1.4)   */
     int vpad;                   /* rows of padding above/below a picture  */
+    /* p.field_coding 2 (frame or fields per picture): how each buffer's
+     * borders and half-sample planes are laid out (0 a frame's, 1 two
+     * fields'), and how the last anchor was coded (its B pictures follow) */
+    uint8_t slot_fst[AEG_NPIC];
+    int anchor_fld;
     /* the coefficient scans (field scans in a field) and the matching CABAC
      * category offset / CAVLC flags */
     const uint8_t *scan4, *scan8;
@@ -10108,20 +10114,27 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
     /* A stream without B pictures keeps pic_order_cnt_type 2 and spends nothing
      * on the picture order count; with them the POC is what direct mode scales
      * its vectors by, so every header carries it (7.3.3). */
-    if (e->p.bframes > 0 || e->fld) {
+    if (e->p.bframes > 0 || e->p.field_coding) {
         int max_lsb = 1 << e->poc_lsb_bits;
         /* counted from the last IDR picture, whose count has to be 0 (8.2.1);
          * a field's is twice its frame's display index, plus one for the
-         * second field */
+         * second field.  A frame picture among field pictures counts in
+         * fields too: its first field 2n, the other 2n + 1 (the PPS sends
+         * delta_pic_order_cnt_bottom; the lsb is the top field's). */
+        const int fmix = e->p.field_coding == 2 && !e->fld;
+        const int bff = e->p.interlaced == 2;
         int rel = e->fld ? e->cur_poc - 2 * e->last_idr_poc
-                         : e->cur_poc - e->last_idr_poc;
+                : fmix ? 2 * (e->cur_poc - e->last_idr_poc) + bff
+                       : e->cur_poc - e->last_idr_poc;
         aeg_write_slice_header_poc(&bw,
                                    slice == AEG_SLICE_B ? 6 : (slice ? 5 : 7),
                                    e->frame_num & ((1 << e->frame_num_bits) - 1),
                                    e->frame_num_bits |
                                        (e->p.interlaced ? AEG_SH_FIELD : 0) |
                                        (e->fld ? AEG_SH_FPIC : 0) |
-                                       (e->fld && e->fld_par ? AEG_SH_BOTTOM : 0),
+                                       (e->fld && e->fld_par ? AEG_SH_BOTTOM : 0) |
+                                       (fmix ? AEG_SH_DPOCB : 0) |
+                                       (fmix && bff ? AEG_SH_BOTTOM : 0),
                                    is_idr, e->idr_pic_id,
                                    rel & (max_lsb - 1), e->poc_lsb_bits,
                                    e->cur_is_ref,
@@ -11442,7 +11455,12 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
     const int is_ref = e->cur_is_ref;
     const int fp = e->cur_is_p, fb = e->cur_is_b;
     size_t out_len = 0;
-    int f;
+    int f, mstride[AEG_MAX_REFS];
+
+    /* (the reference views below double the strides; a frame picture
+     * after this one expects the frame's) */
+    for (f = 0; f < AEG_MAX_REFS; f++)
+        mstride[f] = e->mcr[f].stride;
 
     if (ensure_buf(&e->out, &e->out_cap,
                    (size_t)e->mb_count * 400 * 3 + 65536) != AEG_OK)
@@ -11548,6 +11566,8 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         rc = code_slices(e, fslice, fidr, &out_len);
         if (rc != AEG_OK) {
             field_leave(e);
+            for (f = 0; f < AEG_MAX_REFS; f++)
+                e->mcr[f].stride = mstride[f];
             return rc;
         }
         e->top_row = 0;
@@ -11576,6 +11596,8 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             field_mark(e, fidr);
         field_leave(e);
     }
+    for (f = 0; f < AEG_MAX_REFS; f++)
+        e->mcr[f].stride = mstride[f];
 
     /* distortion statistics, of the frame */
     {
@@ -11619,6 +11641,10 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         memset(e->slot_ref_poc[e->role_cur], 0, sizeof(e->slot_ref_poc[0]));
         e->slot_col_ok[e->role_cur] = 1;
     }
+    if (is_ref && e->p.field_coding == 2 && e->slot_low[e->role_cur].mem)
+        /* (the frame pictures' lowres pre-search reads it) */
+        aeg_lowres_build_rows(&e->slot_low[e->role_cur], e->recp[0],
+                              e->stride[0], e->w, e->h, 0, 8 * e->mb_h - 1);
     /* the buffer becomes a reference frame (field_mark stored it), or is
      * reused by the next picture */
     e->role_last = e->role_cur;
@@ -12055,14 +12081,290 @@ recode:
     return AEG_OK;
 }
 
+/* p.field_coding 2: a reference frame coded one way is read the other way
+ * by the next picture.  The samples are the same; the borders (a frame's
+ * edge rows replicated, or each field's) and the half-sample planes (6-tap
+ * across the frame's rows or within each field) are not, so they are
+ * redone for the structure about to read them. */
+static void slot_restructure(struct aeg_encoder *e, int s, int fld)
+{
+    aeg_mc_ctx *mc = &e->slot_mc[s];
+    int i, par, k;
+
+    if (e->slot_fst[s] == fld)
+        return;
+    for (i = 0; i < 3; i++) {
+        int w = i ? e->cw : e->w, h = i ? e->ch : e->h, st = e->stride[i];
+        if (!fld)
+            pad_edges(e->pic_plane[s][i], st, w, h);
+        else
+            for (par = 0; par < 2; par++)
+                pad_edges(e->pic_plane[s][i] + par * st, 2 * st, w, h / 2);
+    }
+    if (mc->buf) {
+        const pixel *y = e->pic_plane[s][0];
+        int st = mc->stride, ys = e->stride[0];
+        for (k = 1; k < 4; k++) {
+            if (!fld)
+                aeg_hpel_plane_rows((pixel *)mc->base[k], st, y, ys, e->w,
+                                    e->h, k, -AEG_PAD, e->h + AEG_PAD - 1);
+            else
+                for (par = 0; par < 2; par++)
+                    aeg_hpel_plane_rows((pixel *)mc->base[k] + par * st,
+                                        2 * st, y + par * ys, 2 * ys, e->w,
+                                        e->h / 2, k, -AEG_PAD,
+                                        e->h / 2 + AEG_PAD - 1);
+        }
+    }
+    e->slot_fst[s] = (uint8_t)fld;
+}
+
+/* The estimate behind the frame / field choice (fld_decide): a 16x16 block
+ * of `cur` matched in `ref` by a small integer diamond search kept inside
+ * the picture (w x h, so the borders, which differ between the structures,
+ * are never read), started from the vector of the block to its left.  The
+ * cost is the SAD at the vector found less the block's mean difference --
+ * a brightness change `m` (the frame's weighted prediction's business; the
+ * field pictures do without it) is taken out first. */
+static int fld_block_cost(const pixel *cur, int cs, const pixel *ref, int rs,
+                          int x, int y, int w, int h, int mv[2],
+                          const int up[2], int wg, int wo)
+{
+    static const int dia[4][2] = { { 0, -1 }, { -1, 0 }, { 1, 0 }, { 0, 1 } };
+    int bx = 0, by = 0, best = INT_MAX, it, i, j, k, sad = 0, step;
+    const pixel *c = cur + y * cs + x;
+    const int cand[3][2] = { { 0, 0 }, { mv[0], mv[1] }, { up[0], up[1] } };
+
+#define FLD_IN(cx, cy) (x + (cx) >= 0 && x + (cx) <= w - 16 && \
+                        y + (cy) >= 0 && y + (cy) <= h - 16)
+    for (k = 0; k < 3; k++) {
+        int v;
+        if (!FLD_IN(cand[k][0], cand[k][1]))
+            continue;
+        v = aeg_sad(16, 16, c, cs, ref + (y + cand[k][1]) * rs + x + cand[k][0], rs);
+        if (v < best)
+            best = v, bx = cand[k][0], by = cand[k][1];
+    }
+    /* diamonds of steps 8, 4, 2, 1 (motion over several frames) */
+    for (step = 8; step >= 1; step >>= 1)
+        for (it = 0; it < 8; it++) {
+            int nx = bx, ny = by;
+            for (i = 0; i < 4; i++) {
+                int cx = bx + step * dia[i][0], cy = by + step * dia[i][1], v;
+                if (!FLD_IN(cx, cy))
+                    continue;
+                v = aeg_sad(16, 16, c, cs, ref + (y + cy) * rs + x + cx, rs);
+                if (v < best)
+                    best = v, nx = cx, ny = cy;
+            }
+            if (nx == bx && ny == by)
+                break;
+            bx = nx; by = ny;
+        }
+#undef FLD_IN
+    mv[0] = bx; mv[1] = by;
+    {
+        const pixel *r = ref + (y + by) * rs + x + bx;
+        /* SATD: what the transform makes of the residual (a field's rows
+         * are further apart, its residual less correlated); no more than
+         * the block costs against its own mean (intra, roughly) */
+        pixel t[256];
+        int sum = 0, intra;
+        for (j = 0; j < 16; j++)
+            for (i = 0; i < 16; i++) {
+                int v = (((int)r[j * rs + i] * wg + 32) >> 6) + wo;
+                t[16 * j + i] = (pixel)(v < 0 ? 0 : v > PIXEL_MAX ? PIXEL_MAX : v);
+                sum += c[j * cs + i];
+            }
+        sad = aeg_satd_16x16(c, cs, t, 16);
+        for (i = 0; i < 256; i++)
+            t[i] = (pixel)((sum + 128) >> 8);
+        intra = aeg_satd_16x16(c, cs, t, 16);
+        if (intra < sad)
+            sad = intra;
+    }
+    return sad;
+}
+
+/* The two structures' prediction cost from the newest anchor `ref` (the
+ * picture a P frame predicts from): the frame's blocks against the frame;
+ * each field's against both fields of the reference, the second field's
+ * also against the first (half a frame period away -- what field pictures
+ * gain on motion). */
+static void fld_costs(const struct aeg_encoder *e, const pixel *ref,
+                      int64_t *frame_cost, int64_t *field_cost)
+{
+    const pixel *src = e->srcp[0];
+    const int st = e->stride[0], w = e->w, h = e->h, hf = e->h / 2;
+    const int first = field_first_par(e);
+    int x, y, f, mv[2], wg = 64, wo = 0;
+    int64_t fc = 0, dc = 0;
+    /* the vectors of the row above, per reference: upv[k * nb + x / 16] */
+    const int nb = w / 16 + 1;
+    int (*upv)[2] = (int (*)[2])calloc((size_t)3 * nb, sizeof(*upv));
+
+    if (!upv) {
+        *frame_cost = *field_cost = 0;
+        return;
+    }
+
+    if (e->p.weightp) {
+        /* the frame picture's weighted prediction takes out a brightness
+         * change -- x264's estimate: the gain the ratio of the standard
+         * deviations, the offset what is left of the means; the fields
+         * keep it */
+        double sc = 0, sr = 0, qc = 0, qr = 0, n = (double)w * h, g;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                double a = src[y * st + x], b = ref[y * st + x];
+                sc += a; sr += b; qc += a * a; qr += b * b;
+            }
+        sc /= n; sr /= n;
+        qc = qc / n - sc * sc;
+        qr = qr / n - sr * sr;
+        g = qr > 1.0 ? sqrt(qc / qr) : 1.0;
+        if (g < 0.5) g = 0.5;
+        if (g > 2.0) g = 2.0;
+        wg = (int)(g * 64 + 0.5);
+        wo = (int)lrint(sc - sr * wg / 64.0);
+        if (wg == 64 && wo >= -1 && wo <= 1)
+            wo = 0;
+    }
+    for (y = 0; y + 16 <= h; y += 16) {
+        mv[0] = mv[1] = 0;
+        for (x = 0; x + 16 <= w; x += 16) {
+            int *u = upv[x / 16];
+            fc += fld_block_cost(src, st, ref, st, x, y, w, h, mv, u, wg, wo);
+            u[0] = mv[0]; u[1] = mv[1];
+        }
+    }
+    for (f = 0; f < 2; f++) {
+        const int par = f ^ first;
+        const pixel *cur = src + par * st;
+        int mvs[3][2], k;
+        memset(upv, 0, (size_t)3 * nb * sizeof(*upv));
+        for (y = 0; y + 16 <= hf; y += 16) {
+            memset(mvs, 0, sizeof(mvs));
+            for (x = 0; x + 16 <= w; x += 16) {
+                /* same parity, other parity, (second field) the first */
+                const pixel *rf[3] = { ref + par * st, ref + (par ^ 1) * st,
+                                       src + first * st };
+                int b = INT_MAX;
+                for (k = 0; k < 2 + f; k++) {
+                    int *u = upv[k * nb + x / 16];
+                    int o = fld_block_cost(cur, 2 * st, rf[k], 2 * st, x, y,
+                                           w, hf, mvs[k], u, 64, 0);
+                    u[0] = mvs[k][0]; u[1] = mvs[k][1];
+                    if (o < b)
+                        b = o;
+                }
+                dc += b;
+            }
+        }
+    }
+    free(upv);
+    *frame_cost = fc;
+    *field_cost = dc;
+}
+
+/* Frame or fields for an anchor (p.field_coding 2), from its source: the
+ * rows of a frame of moving interlaced material alternate between two
+ * instants, so a row resembles the rows two above and below (its field)
+ * more than its neighbours (the other field) -- the comb.  Per macroblock,
+ * the vertical differences between neighbouring rows against those between
+ * rows of the same field; the picture goes to fields when enough of its
+ * macroblocks comb. */
+static int fld_decide(const struct aeg_encoder *e)
+{
+    const pixel *p = e->srcp[0];
+    const int st = e->stride[0], w = e->vw, h = e->vh & ~3;
+    int mbx, mby, comb = 0, n = 0;
+    static int thr = -1, frac = -1, mabs = -1;
+
+    if (thr < 0) {
+        const char *ev = getenv("AEG_FLDTHR");
+        thr = ev ? atoi(ev) : 110;          /* % of the same-field difference */
+        ev = getenv("AEG_FLDFRAC");
+        frac = ev ? atoi(ev) : 5;           /* % of macroblocks */
+        ev = getenv("AEG_FLDABS");
+        mabs = ev ? atoi(ev) : 1;           /* and this much per sample */
+    }
+    if (getenv("AEG_FLDFORCE")) {
+        /* debug: a pattern of 0 / 1 per display index, repeated */
+        const char *f = getenv("AEG_FLDFORCE");
+        size_t L = strlen(f);
+        return L ? f[e->cur_poc % L] == '1' : 0;
+    }
+    if (!getenv("AEG_FLDCOMB")) {
+        /* a P frame: by the prediction cost estimates, the fields to win
+         * by `bias` percent (two pictures' headers, more vectors) */
+        static int bias = -1;
+        int i, a = -1;
+        if (bias < 0) {
+            const char *ev = getenv("AEG_FLDBIAS");
+            bias = ev ? atoi(ev) : 12;
+        }
+        for (i = 0; i < e->ndpb; i++)
+            if (e->dpb[i].anchor && e->dpb[i].fm == 3 &&
+                (a < 0 || e->dpb[i].poc > e->dpb[a].poc))
+                a = i;
+        if (a >= 0) {
+            int64_t fc, dc;
+            fld_costs(e, e->pic_plane[e->dpb[a].slot][0], &fc, &dc);
+            if (getenv("AEG_FLDDBG"))
+                fprintf(stderr, "FLD poc %d frame %lld field %lld (%.1f%%)\n",
+                        e->cur_poc, (long long)fc, (long long)dc,
+                        fc ? 100.0 * dc / fc : 0.0);
+            return 100 * dc < (int64_t)(100 - bias) * fc;
+        }
+    }
+    for (mby = 0; mby + 16 <= h; mby += 16)
+        for (mbx = 0; mbx + 16 <= w; mbx += 16) {
+            int64_t fr = 0, fi = 0;
+            int x, y, sm[2] = { 0, 0 }, dc;
+            /* (less the difference between the fields' means: a fade or a
+             * flash changes the brightness between the fields, which field
+             * pictures, without weighted prediction, code worse) */
+            for (y = mby; y < mby + 16; y++)
+                for (x = 0; x < 16; x++)
+                    sm[y & 1] += p[y * st + mbx + x];
+            dc = (sm[0] - sm[1]) / 128;          /* top minus bottom */
+            for (y = mby; y < mby + 16 && y + 2 < h; y++) {
+                const pixel *a = p + y * st + mbx;
+                const int o = (y & 1) ? -dc : dc;
+                for (x = 0; x < 16; x++) {
+                    fr += abs((int)a[x] - (int)a[x + st] - o);
+                    fi += abs((int)a[x] - (int)a[x + 2 * st]);
+                }
+            }
+            n++;
+            comb += 100 * fr > (int64_t)thr * fi + (int64_t)mabs * 16 * 16 * 100;
+        }
+    if (getenv("AEG_FLDDBG"))
+        fprintf(stderr, "FLD poc %d comb %d/%d\n", e->cur_poc, comb, n);
+    return 100 * comb > frac * n;
+}
+
 static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
                         int64_t pts, aeg_packet *pkt)
 {
     int64_t t_all = aeg_now_ns();
-    int rc = frame_prologue(e, &slice, &is_idr, poc);
+    int rc, fld = e->p.field_coding == 1;
+
+    if (e->p.field_coding == 2) {
+        int i;
+        e->cur_poc = poc;
+        fld = slice == AEG_SLICE_B ? e->anchor_fld : fld_decide(e);
+        for (i = 0; i < e->ndpb; i++)
+            slot_restructure(e, e->dpb[i].slot, fld);
+        e->slot_fst[e->role_cur] = (uint8_t)fld;
+    }
+    rc = frame_prologue(e, &slice, &is_idr, poc);
     if (rc != AEG_OK)
         return rc;
-    if (e->p.field_coding)
+    if (slice != AEG_SLICE_B)
+        e->anchor_fld = fld;
+    if (fld)
         return field_frame_body(e, slice, is_idr, poc, pts, pkt, t_all);
     return frame_body(e, slice, is_idr, poc, pts, pkt, t_all);
 }
@@ -12144,7 +12446,8 @@ static int write_param_sets(struct aeg_encoder *e)
     size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                              e->p.transform_8x8, e->p.cabac, 0);
+                              e->p.transform_8x8, e->p.cabac, 0,
+                              e->p.field_coding == 2);
     /* worst case of a NAL: start code, header, and an emulation prevention
      * byte every two payload bytes */
     if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
@@ -12160,7 +12463,8 @@ static int write_param_sets(struct aeg_encoder *e)
         /* PPS 1: the same with weighted_pred_flag, for the P pictures that
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                           e->p.transform_8x8, e->p.cabac, 1);
+                           e->p.transform_8x8, e->p.cabac, 1,
+                           e->p.field_coding == 2);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
     }
     e->hdr_len = n;
@@ -12797,7 +13101,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->chroma_qp_offset > 12) pp->chroma_qp_offset = 12;
     if (pp->level_idc < 0 || pp->level_idc > 62) pp->level_idc = 0;
     if (pp->interlaced < 0 || pp->interlaced > 2) pp->interlaced = 0;
-    if (pp->field_coding < 0 || pp->field_coding > 1) pp->field_coding = 0;
+    if (pp->field_coding < 0 || pp->field_coding > 2) pp->field_coding = 0;
     if (pp->field_coding && !pp->interlaced) pp->interlaced = 1;
     /* frame_mbs_only_flag 0 crops in units of 4 rows (as x264 refuses) */
     if (pp->interlaced && (pp->height & 3)) {
@@ -12930,10 +13234,13 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (pp->nal_hrd)
             aeg_log(AEG_LOG_WARNING, "aeg: no NAL HRD with field pictures (yet)");
         pp->nal_hrd = 0;
-        pp->weightp = 0;
         pp->b_pyramid = 0;
         pp->direct = 1;
-        pp->chroma_me = 0;
+        /* (field pictures do without; frame pictures among them keep them) */
+        if (pp->field_coding == 1) {
+            pp->weightp = 0;
+            pp->chroma_me = 0;
+        }
     }
     /* The macroblock tree needs the lookahead ring, which only exists with B
      * pictures (without them every picture is coded as it arrives). */

@@ -960,6 +960,15 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase fld_b    176 144 12 2 4 -q 26 -p 3 --field --bff --slices 2
     run_bcase fld_cavlc 176 144 12 1 1 -q 28 -p 4 --field --no-cabac --ref 3
     run_bcase fld_crf  176 144 12 3 4 -p 2 --field --crf 24
+    # frame and field pictures mixed (--paff): the references re-padded and
+    # their half-sample planes rebuilt for the other structure, frame
+    # pictures' bottom-field POC; a forced pattern (AEG_FLDFORCE, per display
+    # index) for every switch, then the encoder's own choice
+    export AEG_FLDFORCE=0110100
+    run_bcase paff_mix  176 144 14 2 4 -q 26 -p 3 --paff
+    run_bcase paff_mixp 176 144 14 0 1 -q 26 -p 4 --paff --bff --no-cabac
+    unset AEG_FLDFORCE
+    run_bcase paff_auto 176 144 12 3 4 -q 26 -p 2 --paff --slices 2
     for fo in tff:T bff:B tff_hrd:T fld_p:T fld_b:B; do
         nm=${fo%%:*}; want=${fo#*:}
         got=$("$FF" -i "$TMP/$nm.264" -vf showinfo -f null - 2>&1 |
@@ -1010,6 +1019,9 @@ else
     run_bcase h10_cavlc   176 144 12 0 4 -q 26 -p 2 --no-cabac --bit-depth 10
     run_bcase h10_slices  176 144 12 2 6 -q 26 -p 3 --slices 3 --tff --bit-depth 10
     run_bcase h10_field   176 144 12 2 4 -q 26 -p 3 --field --bit-depth 10
+    export AEG_FLDFORCE=011
+    run_bcase h10_paff    176 144 12 2 4 -q 26 -p 3 --paff --bit-depth 10
+    unset AEG_FLDFORCE
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
     run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10

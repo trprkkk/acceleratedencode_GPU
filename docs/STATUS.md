@@ -5563,13 +5563,76 @@ reports the field order on every frame.
 PSNR BD-rate of `--field` against frame coding (`--tff`), preset 3, QP
 22..37, 60 frames woven from progressive clips by ffmpeg's `interlace`
 filter: cockatoo (fast motion) **-47.0 %**, vtest (mostly static) +4.3 %.
-Which one wins depends on the motion, so the next step is the per-picture
-frame/field decision, then MBAFF.  CPU time per frame is lower (fewer
-intra macroblocks); wall time is higher for now because frame threads are
-off.
+Which one wins depends on the motion: hence the per-picture choice below.
+CPU time per frame is lower (fewer intra macroblocks); wall time is higher
+for now because frame threads are off.
 
 Fixed on the way: with B pictures the slice header's POC lsb was the
 absolute display index, so after a mid-stream IDR the IDR's POC was not 0
 (decoders rebase it; ffmpeg's output was identical) -- it is now counted
 from the last IDR.  Only multi-GOP streams with B pictures change.
+
+### Frame or field per picture (`--paff`, `params.field_coding` 2)
+
+Each I/P frame is coded as a frame or as two fields; the B frames before it
+follow it, so a B picture's co-located picture (direct mode) always has its
+structure (the mixed cases of Table 8-6 never arise).  What the switch
+needs:
+
+* Frame pictures count their POC in fields: the top field's lsb, and
+  `delta_pic_order_cnt_bottom` +1 (tff) / -1 (bff) with the PPS's
+  `bottom_field_pic_order_in_frame_present_flag` -- the frame's fields get
+  2n and 2n+1 as a field-coded frame's do.
+* A reference read in the other structure is re-padded (a frame's edge rows
+  replicated, or each field's) and its half-sample planes rebuilt (6-tap
+  across the frame's rows or within each field) before the picture
+  (`slot_restructure`); the samples themselves are the same.  The motion
+  compensation contexts get the frame's strides back after a field picture.
+* A field-coded reference frame gets its lowres plane built, for the frame
+  pictures' lowres pre-search.
+* Frame pictures keep weighted prediction and chroma ME (field pictures do
+  without); the B pyramid stays off for both.
+
+**The choice** (`fld_decide`): against the newest anchor's reconstruction,
+a 16x16 integer diamond search (steps 8, 4, 2, 1 from the left, above and
+zero vectors, inside the picture) for the frame's blocks and for each
+field's against both reference fields -- the second field also against the
+first, half a frame period away.  The cost is the SATD at the vector found,
+capped by the block's SATD against its own mean (intra, roughly); the
+frame's prediction first takes out the brightness change weighted
+prediction would (x264's estimate: gain = ratio of standard deviations,
+offset from the means), the fields' does not.  Fields when their total is
+below 88 % of the frame's (`AEG_FLDBIAS`, default 12).  Frames without a
+reference fall back to a comb count (rows resembling their field's
+neighbours more than their own).  On the way:
+
+* A comb count alone could not separate a fade (brightness changes between
+  the fields; fields without weighted prediction, +105 % when chosen) from
+  moderate motion (short, -47 % with fields): every threshold failed one.
+* SAD instead of SATD put every clip below 93 % -- a field's residual is
+  less correlated vertically, which only the transform sees.
+* A one-step diamond from zero underestimated the frame at an anchor
+  distance of 4 (B-adapt at preset 3): the fade's anchor went to fields at
+  +60 % bits for it.
+
+PSNR BD-rate against frame coding (`--tff`), 40 woven frames, QP 22..37:
+
+| clip | p2 `--field` | p2 `--paff` | p3 `--field` | p3 `--paff` |
+|---|---|---|---|---|
+| cockatoo | -68.4 % | -68.4 % | | |
+| short | -46.7 % | -46.7 % | -42.4 % | -41.2 % |
+| megamind | -1.7 % | -2.4 % | -2.7 % | -1.2 % |
+| fade | +105.5 % | +0.0 % | +43.8 % | -0.6 % |
+| vtest | +12.4 % | +0.6 % | +15.9 % | +2.9 % |
+| tree | +8.9 % | -0.4 % | +6.9 % | +3.1 % |
+
+At preset 3 what `--paff` loses on vtest and tree is the B pyramid: frame
+coding without it is +2.9 % / +3.7 % (and `--paff` forced to frames the
+same), so the choices themselves gain 0.0..0.7 %.  Field pictures as
+reference B pictures (marking by field picture numbers) would give it back.
+
+Every combination decodes bit-exactly in ffmpeg: forced switch patterns
+(`AEG_FLDFORCE`, a 0/1 string per display index) with and without B,
+CABAC / CAVLC, 1..8 refs, bff, weighted prediction on a fade, slices, CRF /
+VBV, presets 0..4, 10-bit (`tests/run_tests.sh` `paff_*`, `h10_paff`).
 

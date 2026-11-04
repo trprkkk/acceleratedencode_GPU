@@ -434,7 +434,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
 
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8, int cabac,
-                     int weighted_pred)
+                     int weighted_pred, int bottom_poc)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, rbsp, cap, 0);
@@ -443,7 +443,9 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
     aeg_bw_ue(&bw, weighted_pred ? 1u : 0u); /* pic_parameter_set_id      */
     aeg_bw_ue(&bw, 0);          /* seq_parameter_set_id                    */
     aeg_bw_put(&bw, 1, cabac ? 1u : 0u); /* entropy_coding_mode_flag        */
-    aeg_bw_put(&bw, 1, 0);      /* bottom_field_pic_order_in_frame_present */
+    /* (frame pictures among field pictures give their bottom field its own
+     * count: delta_pic_order_cnt_bottom) */
+    aeg_bw_put(&bw, 1, bottom_poc ? 1u : 0u); /* bottom_field_pic_order_in_frame_present */
     aeg_bw_ue(&bw, 0);          /* num_slice_groups_minus1                 */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l0_default_active_minus1    */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l1_default_active_minus1    */
@@ -568,8 +570,10 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
     if (idr)
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);
-    /* bottom_field_pic_order_in_frame_present_flag is 0 in the PPS, so there
-     * is no delta_pic_order_cnt_bottom. */
+    /* delta_pic_order_cnt_bottom: only a frame picture of a stream whose PPS
+     * says so (field_coding 2): +1 top field first, -1 bottom first */
+    if (frame_num_bits & AEG_SH_DPOCB)
+        aeg_bw_se(bw, frame_num_bits & AEG_SH_BOTTOM ? -1 : 1);
     /* Temporal direct scales the co-located picture's vectors by the picture
      * order counts (8.4.1.2.3, b_direct_mv in the encoder); spatial direct
      * predicts them from the neighbours (8.4.1.2.2, b_direct_spatial). */

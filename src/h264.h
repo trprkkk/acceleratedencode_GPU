@@ -339,7 +339,7 @@ typedef struct aeg_pwt {
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8,
-                     int cabac, int weighted_pred);
+                     int cabac, int weighted_pred, int bottom_poc);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header.
  * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an
  * interlaced stream coded as frames), so the header carries field_pic_flag. */
@@ -349,6 +349,7 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
  * active reference counts (for a field the PPS defaults count double). */
 #define AEG_SH_FPIC   0x200
 #define AEG_SH_BOTTOM 0x400
+#define AEG_SH_DPOCB  0x800   /* frame picture: delta_pic_order_cnt_bottom */
 void   aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
                               int frame_num_bits, int idr, int idr_pic_id,
                               int cabac_init_idc, int slice_qp_delta,
