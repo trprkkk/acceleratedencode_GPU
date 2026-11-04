@@ -473,7 +473,28 @@ struct aeg_encoder {
     struct {
         pixel *srcp[3], *recp[3];
         int stride[3];
+        /* a P picture's frame references, while a field macroblock has its
+         * field references in their place (refs: the swap is in) */
+        int refs, l0, has_ref2;
+        pixel *refpl[AEG_MAX_REFS][3];
+        aeg_mc_ctx mcr[AEG_MAX_REFS];
+        int ref_poc[AEG_MAX_REFS], cofs[AEG_MAX_REFS];
     } mbf_save;
+    /* MBAFF: per buffer, the reference as field macroblocks read it -- the
+     * same samples with each field's own borders, and half-sample planes
+     * filtered within each field (mbaff_field_shadow, once the reference
+     * picture is complete) */
+    pixel *slot_fmem[AEG_NPIC], *slot_fpl[AEG_NPIC][3];
+    aeg_mc_ctx slot_fmc[AEG_NPIC];
+    uint8_t slot_fok[AEG_NPIC];        /* ... holds the buffer's picture */
+    /* The current P picture's field references for a top (0) and a bottom
+     * (1) field macroblock: list0 field k is the field of frame k >> 1 with
+     * the macroblock's parity when k is even, the other one when odd
+     * (8.4.2.1); fref_n of them (no more than AEG_MAX_REFS), 0: none. */
+    int fref_n;
+    pixel *fref_pl[2][AEG_MAX_REFS][3];
+    aeg_mc_ctx fref_mc[2][AEG_MAX_REFS];
+    int fref_poc[2][AEG_MAX_REFS], fref_cofs[2][AEG_MAX_REFS];
     int ref_par[AEG_MAX_REFS];  /* parity of the field refpl[k] views     */
     int fld_cofs[AEG_MAX_REFS]; /* its chroma vertical offset (8.4.1.4)   */
     int vpad;                   /* rows of padding above/below a picture  */
@@ -1032,15 +1053,28 @@ static int p_should_use_2refs(const struct aeg_encoder *e)
 }
 /* ref_idx_l0 of a P macroblock as CAVLC writes it: te(v), which is one
  * inverted bit when list0 has two entries and ue(v) with more (7.4.2.10). */
+/* Entries of list0 as the ref_idx syntax of the current macroblock counts
+ * them: a field macroblock of an MBAFF frame has two fields per frame
+ * (7.4.5.1), even when the slice has one frame (the index is then sent
+ * anyway: num_ref_idx_active > 1 or mb_field_decoding_flag !=
+ * field_pic_flag, 7.3.5.1).  The decision pass works with the field list in
+ * place (mbf_enter), whose frames the swap remembers. */
+static int l0_syn(const struct aeg_encoder *e)
+{
+    if (!e->cfld || !e->mbaff)
+        return e->cur_l0_active;
+    return 2 * (e->mbf_save.refs ? e->mbf_save.l0 : e->cur_l0_active);
+}
+
 static int ref_te_bits(const struct aeg_encoder *e, int ref)
 {
-    return e->cur_l0_active <= 1 ? 0 : e->cur_l0_active == 2 ? 1
-                                     : aeg_ue_bits((uint32_t)ref);
+    int n = l0_syn(e);
+    return n <= 1 ? 0 : n == 2 ? 1 : aeg_ue_bits((uint32_t)ref);
 }
 
 static void put_ref_te(const struct aeg_encoder *e, aeg_bitwriter *bw, int ref)
 {
-    if (e->cur_l0_active == 2)
+    if (l0_syn(e) == 2)
         aeg_bw_put(bw, 1, ref ? 0u : 1u);
     else
         aeg_bw_ue(bw, (uint32_t)ref);
@@ -1374,6 +1408,28 @@ static inline const aeg_mb *nb_mbA(const struct aeg_encoder *e, int mbx,
     return nb_left(e, mbx, mby, 0, 16, &yM);
 }
 
+/* MBAFF: a neighbour's vertical vector difference as the context of the
+ * current macroblock's sees it (9.3.3.1.1.7): halved from a frame neighbour
+ * of a field macroblock, doubled from a field neighbour of a frame one. */
+static inline int mvd_kind(const struct aeg_encoder *e, const aeg_mb *n,
+                           int v)
+{
+    if (!e->mbaff || n->fld == e->cfld)
+        return v;
+    v = v < 0 ? -v : v;
+    return e->cfld ? v >> 1 : v << 1;
+}
+
+/* ... and its reference index, for the zero test of ref_idx's context (a
+ * field neighbour of a frame macroblock counts as reference 0 up to 1). */
+static inline int ref_kind(const struct aeg_encoder *e, const aeg_mb *n,
+                           int r)
+{
+    if (!e->mbaff || n->fld == e->cfld)
+        return r;
+    return e->cfld ? r * 2 : r >> 1;
+}
+
 /* A field macroblock of an MBAFF frame: the planes as seen through its field
  * (its sixteen lines, every other frame line, at the pair's position), so
  * that everything addressing the picture by (mbx, mby) -- base + 16 mby rows
@@ -1396,6 +1452,35 @@ static void mbf_enter(struct aeg_encoder *e, int mby)
         e->recp[i] -= back;
         e->stride[i] = 2 * s;
     }
+    /* a P picture: the field references in place of the frames */
+    e->mbf_save.refs = e->fref_n > 0;
+    if (e->mbf_save.refs) {
+        const int n = e->fref_n;
+        int k;
+        e->mbf_save.l0 = e->cur_l0_active;
+        e->mbf_save.has_ref2 = e->has_ref2;
+        for (k = 0; k < n; k++) {
+            memcpy(e->mbf_save.refpl[k], e->refpl[k], sizeof(e->refpl[k]));
+            e->mbf_save.mcr[k] = e->mcr[k];
+            e->mbf_save.ref_poc[k] = e->ref_poc[k];
+            e->mbf_save.cofs[k] = e->fld_cofs[k];
+            /* addressed like the planes above: base' + (16 mby + y) 2s is
+             * field row 16 py + y, frame line 32 py + 2y + parity */
+            for (i = 0; i < 3; i++)
+                e->refpl[k][i] = e->fref_pl[bot][k][i] -
+                                 (i ? (ptrdiff_t)(16 * py + 16 * bot) * e->mbf_save.stride[i]
+                                    : (ptrdiff_t)(32 * py + 32 * bot) * e->mbf_save.stride[i]);
+            e->mcr[k] = e->fref_mc[bot][k];
+            for (i = 0; i < 4; i++)
+                if (e->mcr[k].base[i])
+                    e->mcr[k].base[i] -= (ptrdiff_t)(32 * py + 32 * bot) *
+                                         e->mbf_save.stride[0];
+            e->ref_poc[k] = e->fref_poc[bot][k];
+            e->fld_cofs[k] = e->fref_cofs[bot][k];
+        }
+        e->cur_l0_active = n;
+        e->has_ref2 = n > 1;
+    }
     e->cfld = 1;
     e->scan4 = aeg_field_scan4x4;
     e->scan8 = aeg_field_scan8x8;
@@ -1412,6 +1497,19 @@ static void mbf_leave(struct aeg_encoder *e)
         e->srcp[i] = e->mbf_save.srcp[i];
         e->recp[i] = e->mbf_save.recp[i];
         e->stride[i] = e->mbf_save.stride[i];
+    }
+    if (e->mbf_save.refs) {
+        const int n = e->fref_n;
+        int k;
+        for (k = 0; k < n; k++) {
+            memcpy(e->refpl[k], e->mbf_save.refpl[k], sizeof(e->refpl[k]));
+            e->mcr[k] = e->mbf_save.mcr[k];
+            e->ref_poc[k] = e->mbf_save.ref_poc[k];
+            e->fld_cofs[k] = e->mbf_save.cofs[k];
+        }
+        e->cur_l0_active = e->mbf_save.l0;
+        e->has_ref2 = e->mbf_save.has_ref2;
+        e->mbf_save.refs = 0;
     }
     e->cfld = 0;
     e->scan4 = aeg_scan4x4;
@@ -2813,7 +2911,7 @@ static void mc_rect_chroma_to(struct aeg_encoder *e, int list, pixel *dc[2],
     int pl;
     /* a field predicting from the field of the other parity: the chroma
      * rows sit a quarter of a chroma line off (8.4.1.4, Table 8-9/8-10) */
-    if (e->fld)
+    if (e->fld || e->cfld)
         mvy += e->fld_cofs[list];
     for (pl = 0; pl < 2; pl++) {
         const pixel *rc = e->refpl[list][1 + pl] +
@@ -3096,6 +3194,74 @@ static void nb_from_mb(nb_mv *n, const aeg_mb *m, int blk, int list)
              (int)m->ref_idx[blk]);
 }
 
+/* The macroblock holding the sample above-left of macroblock (mbx, mby)
+ * (neighbour D, mbx > 0) and the 4x4 block of it, or NULL.  In an MBAFF
+ * frame (Table 6-4) a frame bottom macroblock finds it in the left pair: row
+ * 15 of its top macroblock, or with a field pair row 7 of the bottom one
+ * (frame line 15 of the pair is bottom field line 7); every other kind in
+ * the pair above-left, as it finds B in the pair above. */
+static const aeg_mb *nb_mbD(const struct aeg_encoder *e, int mbx, int mby,
+                            int *blk)
+{
+    *blk = 15;
+    if (e->mbaff && !e->cfld && (mby & 1)) {
+        const aeg_mb *l0 = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
+        if (l0->fld) {
+            *blk = 7;
+            return l0 + e->mb_w;
+        }
+        return l0;
+    }
+    if (!nb_top_ok(e, mby))
+        return NULL;
+    return nb_mbB(e, mbx - 1, mby);
+}
+
+/* The vector of the 4x4 block covering luma location (xN, yN) of macroblock
+ * (mbx, mby), outside the macroblock: left (xN < 0 <= yN), above (yN < 0 <=
+ * xN < 16), above-right (xN > 15) or above-left (both < 0), as 6.4.12
+ * locates it (Table 6-4 in an MBAFF frame).  A neighbour of the other kind
+ * has its vector and reference index brought to the current macroblock's
+ * (8.4.1.3.1): a frame one seen from a field macroblock halves the vertical
+ * component and doubles the index, a field one seen from a frame macroblock
+ * the other way round. */
+static void nb_mv_at(const struct aeg_encoder *e, int mbx, int mby, int xN,
+                     int yN, int list, nb_mv *n)
+{
+    const aeg_mb *m = NULL;
+    int blk = 0;
+
+    if (xN < 0 && yN >= 0) {                                    /* A */
+        if (mbx > 0) {
+            int yM;
+            m = nb_left(e, mbx, mby, yN, 16, &yM);
+            blk = (yM >> 2) * 4 + 3;
+        }
+    } else if (xN >= 0 && xN < 16) {                            /* B */
+        if (nb_top_ok(e, mby)) {
+            m = nb_mbB(e, mbx, mby);
+            blk = 12 + (xN >> 2);
+        }
+    } else if (xN >= 16) {                                      /* C */
+        if (nb_top_ok(e, mby) && c_right_ok(e, mbx, mby)) {
+            m = nb_mbB(e, mbx + 1, mby);
+            blk = 12;
+        }
+    } else if (mbx > 0) {                                       /* D */
+        m = nb_mbD(e, mbx, mby, &blk);
+    }
+    nb_from_mb(n, m, blk, list);
+    if (e->mbaff && m && n->ref == NB_OK && m->fld != e->cfld) {
+        if (e->cfld) {
+            n->ref_idx *= 2;
+            n->mvy /= 2;
+        } else {
+            n->ref_idx >>= 1;
+            n->mvy *= 2;
+        }
+    }
+}
+
 /* Median of three motion vector components (H.264 8.4.1.3.1). */
 static int mv_median3(int a, int b, int c)
 {
@@ -3162,22 +3328,16 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
         type = AEG_MB_P8x8;
 
     /* A: the block left of the partition (inside this macroblock when bx > 0). */
-    if (bx > 0) {
+    if (bx > 0)
         NB_CUR(A, bx - 1, by);
-    } else if (mbx > 0) {
-        nb_from_mb(&A, &e->mbs[mby * e->mb_w + mbx - 1], (by << 2) + 3, list);
-    } else {
-        nb_from_mb(&A, NULL, 0, list);
-    }
+    else
+        nb_mv_at(e, mbx, mby, -1, 4 * by, list, &A);
 
     /* B: the block above the partition (inside this macroblock when by > 0). */
-    if (by > 0) {
+    if (by > 0)
         NB_CUR(B, bx, by - 1);
-    } else if (nb_top_ok(e, mby)) {
-        nb_from_mb(&B, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx, list);
-    } else {
-        nb_from_mb(&B, NULL, 0, list);
-    }
+    else
+        nb_mv_at(e, mbx, mby, 4 * bx, -1, list, &B);
 
     /* C: the block above and to the right of the partition.  Which block that
      * is depends on the partition width: a full-width partition reaches into
@@ -3193,36 +3353,19 @@ static void predict_mv_at_ref(struct aeg_encoder *e, int mbx, int mby,
             NB_CUR(C, cx, cy);
         } else if (cy >= 0) {
             nb_set(&C, NB_UNAVAIL, 0, 0);
-        } else if (cx <= 3) {
-            if (nb_top_ok(e, mby))
-                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + cx, list);
-            else
-                nb_from_mb(&C, NULL, 0, list);
         } else {
-            if (nb_top_ok(e, mby) && c_right_ok(e, mbx, mby))
-                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx + 1], 12, list);
-            else
-                nb_from_mb(&C, NULL, 0, list);
+            /* above (cx <= 3) or above-right of the macroblock */
+            nb_mv_at(e, mbx, mby, 4 * cx, -1, list, &C);
         }
         if (C.ref == NB_UNAVAIL) {
             /* The decoder's fallback is the cache slot one before the block
              * directly above the partition, i.e. the block above-left of the
-             * partition's top-left corner. */
-            if (by > 0 && bx > 0) {
+             * partition's top-left corner (in an MBAFF frame located like
+             * any other neighbour sample: FFmpeg's fetch_diagonal_mv). */
+            if (by > 0 && bx > 0)
                 NB_CUR(C, bx - 1, by - 1);
-            } else if (by > 0) {
-                if (mbx > 0)
-                    nb_from_mb(&C, &e->mbs[mby * e->mb_w + mbx - 1],
-                               ((by - 1) << 2) + 3, list);
-                else
-                    nb_from_mb(&C, NULL, 0, list);
-            } else if (bx > 0 && nb_top_ok(e, mby)) {
-                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx], 12 + bx - 1, list);
-            } else if (nb_top_ok(e, mby) && mbx > 0) {
-                nb_from_mb(&C, &e->mbs[(mby - 1) * e->mb_w + mbx - 1], 15, list);
-            } else {
-                nb_from_mb(&C, NULL, 0, list);
-            }
+            else
+                nb_mv_at(e, mbx, mby, 4 * bx - 1, 4 * by - 1, list, &C);
         }
     }
 
@@ -3293,50 +3436,80 @@ static void pred16_ref(struct aeg_encoder *e, int mbx, int mby, int ref,
  * intra, or sits at a zero vector, the skipped block's vector is (0,0).
  * Decoders reconstruct skipped macroblocks with exactly this rule, so the
  * encoder has to apply it before it may code one as a skip. */
+/* A vector inside the bounds of the motion search (+-range samples), which
+ * the reference borders are sized for. */
+static int mv_me_ok(const struct aeg_encoder *e, int mvx, int mvy)
+{
+    int r = 4 * (e->p.search_range ? e->p.search_range : 16);
+    return mvx >= -r && mvx <= r && mvy >= -r && mvy <= r;
+}
+
 static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
                      int *mvx, int *mvy)
 {
-    const aeg_mb *m;
-    int ax = 0, ay = 0, bx = 0, by = 0, cx = 0, cy = 0;
-    int refa = -1, refb = -1, refc = -1, match;
+    nb_mv A, B, C;
+    int match;
 
     *mvx = *mvy = 0;
     if (mbx <= 0 || !nb_top_ok(e, mby))
         return;
-    m = &e->mbs[mby * e->mb_w + mbx - 1];          /* A: left */
-    if (is_inter_type(m->type)) {
-        ax = m->mv[3][0]; ay = m->mv[3][1]; refa = m->ref_idx[3];
-        /* only a neighbour on reference 0 with a zero vector forces (0,0):
-         * one that sits still on the older picture is an ordinary vector */
-        if (refa == 0 && ax == 0 && ay == 0)
-            return;
-    }
-    m = &e->mbs[(mby - 1) * e->mb_w + mbx];        /* B: above */
-    if (is_inter_type(m->type)) {
-        bx = m->mv[12][0]; by = m->mv[12][1]; refb = m->ref_idx[12];
-        if (refb == 0 && bx == 0 && by == 0)
-            return;
-    }
-    if (c_right_ok(e, mbx, mby)) {                       /* C: above-right */
-        m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
-        if (is_inter_type(m->type)) {
-            cx = m->mv[12][0]; cy = m->mv[12][1]; refc = m->ref_idx[12];
-        }
-    } else {                                       /* ... else above-left */
-        m = &e->mbs[(mby - 1) * e->mb_w + mbx - 1];
-        if (is_inter_type(m->type)) {
-            cx = m->mv[15][0]; cy = m->mv[15][1]; refc = m->ref_idx[15];
-        }
-    }
-    match = (refc == 0) + (refb == 0) + (refa == 0);
+    /* only a neighbour on reference 0 with a zero vector forces (0,0): one
+     * that sits still on the older picture is an ordinary vector (in an
+     * MBAFF frame, after the frame/field scaling) */
+    nb_mv_at(e, mbx, mby, -1, 0, 0, &A);                        /* left */
+    if (A.ref == NB_OK && A.ref_idx == 0 && !A.mvx && !A.mvy)
+        return;
+    nb_mv_at(e, mbx, mby, 0, -1, 0, &B);                        /* above */
+    if (B.ref == NB_OK && B.ref_idx == 0 && !B.mvx && !B.mvy)
+        return;
+    nb_mv_at(e, mbx, mby, 16, -1, 0, &C);                       /* above-right */
+    if (C.ref == NB_UNAVAIL)
+        nb_mv_at(e, mbx, mby, -1, -1, 0, &C);                   /* ... above-left */
+    match = (C.ref_idx == 0) + (B.ref_idx == 0) + (A.ref_idx == 0);
     if (match == 1) {
-        if (refa == 0)      { *mvx = ax; *mvy = ay; }
-        else if (refb == 0) { *mvx = bx; *mvy = by; }
-        else                { *mvx = cx; *mvy = cy; }
+        if (A.ref_idx == 0)      { *mvx = A.mvx; *mvy = A.mvy; }
+        else if (B.ref_idx == 0) { *mvx = B.mvx; *mvy = B.mvy; }
+        else                     { *mvx = C.mvx; *mvy = C.mvy; }
     } else {
-        *mvx = mv_median3(ax, bx, cx);
-        *mvy = mv_median3(ay, by, cy);
+        *mvx = mv_median3(A.mvx, B.mvx, C.mvx);
+        *mvy = mv_median3(A.mvy, B.mvy, C.mvy);
     }
+}
+
+/* MBAFF: the mb_field_decoding_flag a decoder infers for pair (mbx, mby >>
+ * 1) when it has not read one (7.4.4): the left pair's, else the above
+ * pair's (in the slice), else frame. */
+static int mbaff_infer(const struct aeg_encoder *e, int mbx, int mby)
+{
+    int top = mby & ~1;
+
+    if (mbx > 0)
+        return e->mbs[top * e->mb_w + mbx - 1].fld;
+    if (top - 2 >= e->top_row)
+        return e->mbs[(top - 2) * e->mb_w + mbx].fld;
+    return 0;
+}
+
+/* P slice: is decided macroblock `t` a P_Skip -- P_L0_16x16 on reference 0
+ * without residual, at the skip vector?  (e->cfld is the macroblock's.)  In
+ * an MBAFF frame a pair whose two macroblocks are skipped takes the inferred
+ * frame/field kind, so a bottom macroblock under a skipped top one only is
+ * one when its pair is of that kind; otherwise it is sent as P_L0_16x16 --
+ * same prediction, a few bits more.  `top_skip`: the top one was. */
+static int p_skippable(const struct aeg_encoder *e, int mbx, int mby,
+                       const mbenc *t, int top_skip)
+{
+    int pmvx, pmvy;
+
+    if (t->type != AEG_MB_P16x16 || t->cbp != 0 || t->ref[0] != 0)
+        return 0;
+    pskip_mv(e, mbx, mby, &pmvx, &pmvy);
+    if (t->mv[0][0] != pmvx || t->mv[0][1] != pmvy)
+        return 0;
+    if (e->mbaff && (mby & 1) && top_skip &&
+        e->mbs[mby * e->mb_w + mbx].fld != mbaff_infer(e, mbx, mby))
+        return 0;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -4450,10 +4623,12 @@ static int nb_maxref(const struct aeg_encoder *e, int mbx, int mby)
         if (!is_inter_type(n->type))
             continue;
         for (b = 0; b < 16; b++)
-            if (n->ref_idx[b] > m)
-                m = n->ref_idx[b];
+            if (ref_kind(e, n, n->ref_idx[b]) > m)
+                m = ref_kind(e, n, n->ref_idx[b]);
     }
-    return m;
+    /* (in an MBAFF frame a neighbour's index, even scaled, can be past the
+     * current macroblock's list) */
+    return m < e->cur_l0_active ? m : e->cur_l0_active - 1;
 }
 
 /* The partitions' own reference search with three or more references:
@@ -5565,7 +5740,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         /* The block to match is the *source* macroblock.  recp still holds the
          * previous picture at this position (nothing has been reconstructed
          * here yet), so searching against it would always favour mv = 0. */
-        if (e->par_valid && e->par_full) {
+        if (e->par_valid && e->par_full && !e->cfld) {
             /* the whole-frame rounds already produced this macroblock's
              * quarter-pel vector (and its SATD) */
             const int idx = mby * e->mb_w + mbx;
@@ -5623,7 +5798,7 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         {
             int sx, sy, b;
             pskip_mv(e, mbx, mby, &sx, &sy);
-            if ((sx != mvx || sy != mvy) &&
+            if ((sx != mvx || sy != mvy) && (!e->mbaff || mv_me_ok(e, sx, sy)) &&
                 e->mb_ncand < (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0]))) {
                 mbcand *sc = &e->mb_cand[e->mb_ncand];
                 memset(sc, 0, sizeof(*sc));
@@ -5831,7 +6006,7 @@ static int inter_hdr_bits(const struct aeg_encoder *e, const mbenc *c)
             bits += (st == 0) ? 1 : (st <= 2 ? 2 : (st >= 11 ? 4 : 3));
         }
     /* ref_idx_l0 for P when two or more references are active. */
-    if (e->cur_l0_active > 1 && is_inter_type(c->type) && !is_b_type(c->type)) {
+    if (l0_syn(e) > 1 && is_inter_type(c->type) && !is_b_type(c->type)) {
         if (c->type == AEG_MB_P8x8) {
             for (i = 0; i < 4; i++)  /* te(v): 1 bit with cMax = 1 */
                 bits += ref_te_bits(e, c->ref[(i & 1) * 2 + (i >> 1) * 8]);
@@ -7832,17 +8007,26 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         if (e->cur_is_p) {
             int sx, sy, b;
 
+            int px, py;
+
             reset_mb_enc(&s, c->qp);
             s.type = AEG_MB_P16x16;
             s.nparts = 1;
             pskip_mv(e, mbx, mby, &sx, &sy);
+            px = sx; py = sy;
+            /* MBAFF: it may have to be sent as P_L0_16x16 after all (a
+             * skipped pair of the wrong kind, p_skippable), with its real
+             * predictor; and a field neighbour's vector, doubled for a frame
+             * macroblock, may reach past the borders the search keeps to */
+            if (e->mbaff)
+                pred16_ref(e, mbx, mby, 0, &px, &py);
             for (b = 0; b < 16; b++) {
                 s.mv[b][0] = (int16_t)sx;
                 s.mv[b][1] = (int16_t)sy;
-                s.pmv[b][0] = (int16_t)sx;
-                s.pmv[b][1] = (int16_t)sy;
+                s.pmv[b][0] = (int16_t)px;
+                s.pmv[b][1] = (int16_t)py;
             }
-            ok = 1;
+            ok = !e->mbaff || mv_me_ok(e, sx, sy);
         } else {
             int k;
 
@@ -7956,7 +8140,7 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
          * bit (7.4.2.10 / 9.1: value = !read_bits(1)), not ue(v) -- the two
          * only agree for 0, which is why a stream that never picked the
          * second reference decoded fine. */
-        if (e->cur_l0_active > 1) {
+        if (l0_syn(e) > 1) {
             if (c->type == AEG_MB_P8x8) {
                 for (p = 0; p < 4; p++) {
                     int b0 = (p & 1) * 2 + (p >> 1) * 8;
@@ -8382,15 +8566,18 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
             lx = mvd[by * 4 + bx - 1][0];
             ly = mvd[by * 4 + bx - 1][1];
         } else if (mbx) {
-            lx = e->mbs[idx - 1].mvd[list][by * 4 + 3][0];
-            ly = e->mbs[idx - 1].mvd[list][by * 4 + 3][1];
+            int yM;
+            const aeg_mb *lm = nb_left(e, mbx, mby, 4 * by, 16, &yM);
+            lx = lm->mvd[list][(yM >> 2) * 4 + 3][0];
+            ly = mvd_kind(e, lm, lm->mvd[list][(yM >> 2) * 4 + 3][1]);
         }
         if (by) {
             tx = mvd[(by - 1) * 4 + bx][0];
             ty = mvd[(by - 1) * 4 + bx][1];
         } else if (nb_top_ok(e, mby)) {
-            tx = e->mbs[idx - e->mb_w].mvd[list][12 + bx][0];
-            ty = e->mbs[idx - e->mb_w].mvd[list][12 + bx][1];
+            const aeg_mb *tm = nb_mbB(e, mbx, mby);
+            tx = tm->mvd[list][12 + bx][0];
+            ty = mvd_kind(e, tm, tm->mvd[list][12 + bx][1]);
         }
         ax = (lx < 0 ? -lx : lx) + (tx < 0 ? -tx : tx);
         ay = (ly < 0 ? -ly : ly) + (ty < 0 ? -ty : ty);
@@ -8413,10 +8600,9 @@ static void cabac_mb_mvd(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
 static void cabac_mb_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                              int mby, const mbenc *c)
 {
-    if (e->cur_l0_active <= 1 || is_intra_type(c->type))
+    if (l0_syn(e) <= 1 || is_intra_type(c->type))
         return;
     /* P_8x8 has 4 sub-macroblocks (one ref each), otherwise partitions. */
-    int idx = mby * e->mb_w + mbx;
     int n = (c->type == AEG_MB_P8x8) ? 4 : mb_part_count(c);
     uint8_t cur_ref[16] = {0};
     /* Seed with already coded parts of this MB for intra-MB neighbour lookup. */
@@ -8438,17 +8624,18 @@ static void cabac_mb_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
         if (x0 > 0) {
             refa = cur_ref[y0 * 4 + x0 - 1];
         } else if (mbx > 0) {
-            const aeg_mb *lm = &e->mbs[idx - 1];
+            int yM;
+            const aeg_mb *lm = nb_left(e, mbx, mby, 4 * y0, 16, &yM);
             if (!is_intra_type(lm->type))
-                refa = lm->ref_idx[y0 * 4 + 3];
+                refa = ref_kind(e, lm, lm->ref_idx[(yM >> 2) * 4 + 3]);
         }
         /* top: inside MB or top MB */
         if (y0 > 0) {
             refb = cur_ref[(y0 - 1) * 4 + x0];
         } else if (nb_top_ok(e, mby)) {
-            const aeg_mb *tm = &e->mbs[idx - e->mb_w];
+            const aeg_mb *tm = nb_mbB(e, mbx, mby);
             if (!is_intra_type(tm->type))
-                refb = tm->ref_idx[12 + x0];
+                refb = ref_kind(e, tm, tm->ref_idx[12 + x0]);
         }
         if (refa > 0) ctx++;
         if (refb > 0) ctx += 2;
@@ -8810,20 +8997,22 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
          * which is why the ternaries default to 1.  A B slice has its own
          * thirteen-wide block of skip contexts. */
         int ls, ts, base = CAB_SKIP + (slice == AEG_SLICE_B ? 13 : 0);
+        int sf = e->cfld;
 
-        if (slice == AEG_SLICE_B) {
-            /* The same derivation as for P -- a neighbour that was skipped does
-             * not increment the context, and a neighbour outside the slice
-             * counts as skipped -- on top of the B slice's own block of
-             * contexts thirteen entries further along (Table 9-34). */
-            ls = mbx ? e->mbs[idx - 1].skip : 1;
-            ts = (nb_top_ok(e, mby)) ? e->mbs[idx - e->mb_w].skip : 1;
-            base += !ls + !ts;
-        } else {
-            ls = mbx ? e->mbs[idx - 1].skip : 1;
-            ts = (nb_top_ok(e, mby)) ? e->mbs[idx - e->mb_w].skip : 1;
-            base += !ls + !ts;
-        }
+        /* The same derivation for P and B -- a neighbour that was skipped
+         * does not increment the context, and a neighbour outside the slice
+         * counts as skipped -- a B slice on its own block of contexts
+         * thirteen entries further along (Table 9-34).  In an MBAFF frame
+         * the neighbours are located with the pair's kind as the decoder
+         * knows it when it reads the flag: inferred for a top macroblock,
+         * and for a bottom one whose top one was skipped (its flag, if any,
+         * follows) -- 7.3.4, 7.4.4. */
+        if (e->mbaff && (!(mby & 1) || e->mbs[idx - e->mb_w].skip))
+            e->cfld = mbaff_infer(e, mbx, mby);
+        ls = mbx ? nb_mbA(e, mbx, mby)->skip : 1;
+        ts = nb_top_ok(e, mby) ? nb_mbB(e, mbx, mby)->skip : 1;
+        e->cfld = sf;
+        base += !ls + !ts;
         aeg_cabac_decision(cb, base, skip);
         if (skip) {
             /* A skipped macroblock has no residual, and its neighbours' coded
@@ -8905,7 +9094,7 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
                     }
                 }
             }
-            if (e->cur_l0_active > 1)
+            if (l0_syn(e) > 1)
                 cabac_mb_ref_idx(e, cb, mbx, mby, c);
             cabac_mb_mvd(e, cb, mbx, mby, c, 0);
         }
@@ -9007,13 +9196,9 @@ static int rd_cabac_bits(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     memcpy(save_mvd, e->mbs[idx].mvd, sizeof(save_mvd));
     if (c->cbp == 0 && c->type != AEG_MB_I16x16)
         c->qp = e->rd_last_qp;
-    if (slice == AEG_SLICE_P && c->type == AEG_MB_P16x16 && c->cbp == 0 &&
-        c->ref[0] == 0) {
-        int pmvx, pmvy;
-        pskip_mv(e, mbx, mby, &pmvx, &pmvy);
-        if (c->mv[0][0] == pmvx && c->mv[0][1] == pmvy)
-            skipped = 1;
-    }
+    /* (an estimate: the top macroblock's skip is not final yet) */
+    if (slice == AEG_SLICE_P && p_skippable(e, mbx, mby, c, 0))
+        skipped = 1;
     /* In a B slice a direct macroblock without residual is a skipped one: the
      * decoder reconstructs it from the co-located picture's vectors either way,
      * so the skip flag is free bits to leave unspent. */
@@ -9856,13 +10041,10 @@ static void rowpost_finalize_mb(struct aeg_encoder *e, int mbx, int mby,
             int skipped = 0;
             if (t->cbp == 0 && t->type != AEG_MB_I16x16)
                 qp = e->rp_qp;
-            if (slice == AEG_SLICE_P && t->type == AEG_MB_P16x16 &&
-                t->cbp == 0 && t->ref[0] == 0) {
-                int pmvx, pmvy;
-                pskip_mv(e, mbx, mby, &pmvx, &pmvy);
-                if (t->mv[0][0] == pmvx && t->mv[0][1] == pmvy)
-                    skipped = 1;
-            }
+            if (slice == AEG_SLICE_P &&
+                p_skippable(e, mbx, mby, t,
+                            (mby & 1) && e->rp_mbs[idx - e->mb_w].skip))
+                skipped = 1;
             if (slice == AEG_SLICE_B && t->type == AEG_MB_B_DIRECT &&
                 t->cbp == 0)
                 skipped = 1;
@@ -10238,8 +10420,11 @@ static int ft_wp_check(struct aeg_encoder *e, int wait)
     return 0;
 }
 
+static void mbaff_field_shadow(struct aeg_encoder *e, int s);
+static void mbaff_field_refs(struct aeg_encoder *e);
+
 /* MBAFF: is the macroblock pair (mbx, py) coded as a field pair?  So far
- * only in I slices, and only as a forced test pattern (AEG_MBFORCE: "all",
+ * only in I and P slices, and only as a forced test pattern (AEG_MBFORCE: "all",
  * or a number seeding a pseudo-random pattern per pair and picture). */
 static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
                             int py)
@@ -10252,7 +10437,11 @@ static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
         force = getenv("AEG_MBFORCE");
         once = 1;
     }
-    if (!force || slice != AEG_SLICE_I)
+    /* (not in the B pictures, nor yet in the P pictures of a stream with
+     * B pictures: direct mode's co-located macroblock of a field pair, Table
+     * 8-6, is still to come) */
+    if (!force || slice == AEG_SLICE_B ||
+        (slice == AEG_SLICE_P && e->p.bframes > 0))
         return 0;
     if (!strcmp(force, "all"))
         return 1;
@@ -10407,12 +10596,15 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
         for (mby = first_row; mby <= last_row && used < l0_saved - 1; mby++)
             for (mbx = 0; mbx < e->mb_w && used < l0_saved - 1; mbx++) {
                 const mbenc *t = &e->mb_encs[mby * e->mb_w + mbx];
+                /* (an MBAFF field macroblock's index counts fields: frame
+                 * entry ref >> 1 of the list, 8.4.2.1) */
+                const int sh = e->mbaff && e->mbs[mby * e->mb_w + mbx].fld;
                 int b;
                 if (!is_inter_type(t->type))
                     continue;
                 for (b = 0; b < 16; b++)
-                    if (t->ref[b] > used)
-                        used = t->ref[b];
+                    if ((t->ref[b] >> sh) > used)
+                        used = t->ref[b] >> sh;
             }
         e->cur_l0_active = used + 1;
     }
@@ -10515,13 +10707,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     tmp->qp = e->last_qp;
                 m->qp = (int8_t)tmp->qp;
 
-                if (slice == AEG_SLICE_P && tmp->type == AEG_MB_P16x16 &&
-                    tmp->cbp == 0 && tmp->ref[0] == 0) {
-                    int pmvx, pmvy;
-                    pskip_mv(e, mbx, mby, &pmvx, &pmvy);
-                    if (tmp->mv[0][0] == pmvx && tmp->mv[0][1] == pmvy)
-                        skipped = 1;
-                }
+                if (e->mbaff)
+                    mbf_syntax(e, m->fld);
+                if (slice == AEG_SLICE_P &&
+                    p_skippable(e, mbx, mby, tmp,
+                                (mby & 1) && e->mbs[idx - e->mb_w].skip))
+                    skipped = 1;
                 /* A direct macroblock of a B slice with no residual is exactly
                  * what the skip flag means: same prediction, no residual. */
                 if (slice == AEG_SLICE_B && tmp->type == AEG_MB_B_DIRECT &&
@@ -10561,8 +10752,6 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     fprintf(stderr, "\n");
                 }
                 e->mbaff_ff = mbaff_flag_coded(e, mbx, mby, skipped);
-                if (e->mbaff)
-                    mbf_syntax(e, m->fld);
                 write_mb_cabac(e, &cab, mbx, mby, tmp, slice, skipped);
                 if (e->mbaff)
                     mbf_syntax(e, 0);
@@ -10631,13 +10820,12 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
              * coded as part of the skip run: same picture, fewer bits. */
             {
                 int skipped = 0;
-                if (slice == AEG_SLICE_P && tmp->type == AEG_MB_P16x16 &&
-                    tmp->cbp == 0 && tmp->ref[0] == 0) {
-                    int pmvx, pmvy;
-                    pskip_mv(e, mbx, mby, &pmvx, &pmvy);
-                    if (tmp->mv[0][0] == pmvx && tmp->mv[0][1] == pmvy)
-                        skipped = 1;
-                }
+                if (e->mbaff)
+                    mbf_syntax(e, e->mbs[idx].fld);
+                if (slice == AEG_SLICE_P &&
+                    p_skippable(e, mbx, mby, tmp,
+                                (mby & 1) && e->mbs[idx - e->mb_w].skip))
+                    skipped = 1;
                 e->stat_mbs++;
                 e->stat_skipped += skipped;
                 e->stat_type[skipped ? AEG_MB_SKIP : (int)tmp->type]++;
@@ -10651,12 +10839,10 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                         flush_skip_run(&bw, &skip_run);
                     if (ff >= 0)                /* mb_field_decoding_flag */
                         aeg_bw_put(&bw, 1, (uint32_t)ff);
-                    if (e->mbaff)
-                        mbf_syntax(e, e->mbs[idx].fld);
                     write_mb(e, &bw, mbx, mby, tmp, slice == AEG_SLICE_P);
-                    if (e->mbaff)
-                        mbf_syntax(e, 0);
                 }
+                if (e->mbaff)
+                    mbf_syntax(e, 0);
             }
             e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
         }
@@ -12145,6 +12331,7 @@ recode:
         stage_rec(e, AEG_STAGE_INTER_PRED, dev_ip, aeg_now_ns() - t0);
         e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
     }
+    mbaff_field_refs(e);
     me_seed_frame(e);
     lr_seed_frame(e);
     pz_setup(e);
@@ -12339,6 +12526,12 @@ recode:
     e->st.frames++;
     e->st.enc_ns += aeg_now_ns() - t_all;
     e->frame_count++;
+    /* MBAFF: the field macroblocks' copy of a reference */
+    if (e->mbaff) {
+        e->slot_fok[e->role_cur] = 0;
+        if (e->cur_is_ref)
+            mbaff_field_shadow(e, e->role_cur);
+    }
     /* frame_num counts reference pictures only: a non-reference picture carries
      * PrevRefFrameNum + 1 (7.4.3), so all the B pictures of a group repeat the
      * value the anchor after them already had. */
@@ -12421,6 +12614,83 @@ recode:
                                aeg_now_ns() - t_all, e->mb_count);
     aeg_dispatch_update(&e->d);
     return AEG_OK;
+}
+
+/* MBAFF: the field macroblocks' copy of reference buffer s (slot_fpl,
+ * slot_fmc), once the picture in it is complete -- its samples with every
+ * field's rows replicated above and below the field, and the half-sample
+ * planes filtered within each field (frame macroblocks read the buffer
+ * itself: frame borders, filtered across the frame's rows). */
+static void mbaff_field_shadow(struct aeg_encoder *e, int s)
+{
+    aeg_mc_ctx *mc = &e->slot_fmc[s];
+    int i, par, k;
+
+    if (!e->slot_fmem[s]) {
+        int st[3] = { e->stride[0], e->stride[1], e->stride[2] };
+        if (enc_alloc_picture(e, &e->slot_fmem[s], e->slot_fpl[s]) != AEG_OK)
+            return;
+        e->stride[0] = st[0]; e->stride[1] = st[1]; e->stride[2] = st[2];
+        aeg_mc_ctx_init_pad(mc, e->w, e->h, e->stride[0], e->vpad);
+    }
+    for (i = 0; i < 3; i++) {
+        int w = i ? e->cw : e->w, h = i ? e->ch : e->h, st = e->stride[i];
+        memcpy(e->slot_fpl[s][i] - AEG_PAD, e->pic_plane[s][i] - AEG_PAD,
+               ((size_t)(h - 1) * st + w + 2 * AEG_PAD) * sizeof(pixel));
+        for (par = 0; par < 2; par++)
+            pad_edges(e->slot_fpl[s][i] + par * st, 2 * st, w, h / 2);
+    }
+    if (mc->buf) {
+        const pixel *y = e->slot_fpl[s][0];
+        int st = mc->stride, ys = e->stride[0];
+        for (k = 1; k < 4; k++)
+            for (par = 0; par < 2; par++)
+                aeg_hpel_plane_rows((pixel *)mc->base[k] + par * st, 2 * st,
+                                    y + par * ys, 2 * ys, e->w, e->h / 2, k,
+                                    -AEG_PAD, e->h / 2 + AEG_PAD - 1);
+    }
+    e->slot_fok[s] = 1;
+}
+
+/* MBAFF: the field references of the current P picture (fref_*), from its
+ * list0 frames, for field macroblocks of both parities.  A frame without
+ * its field copy ends the list there. */
+static void mbaff_field_refs(struct aeg_encoder *e)
+{
+    int n = 2 * e->cur_l0_active, cp, k, i;
+
+    e->fref_n = 0;
+    if (!e->mbaff || !e->cur_is_p || !e->has_ref)
+        return;
+    if (n > AEG_MAX_REFS)
+        n = AEG_MAX_REFS;
+    for (k = 0; k < n; k++) {
+        int sl = e->ref_slot[k >> 1];
+        if (sl < 0 || !e->slot_fok[sl] || e->refpl[k >> 1][0] != e->pic_plane[sl][0])
+            break;
+    }
+    n = k & ~1;
+    for (cp = 0; cp < 2; cp++)
+        for (k = 0; k < n; k++) {
+            const int f = k >> 1, par = (k & 1) ? !cp : cp, sl = e->ref_slot[f];
+            const aeg_mc_ctx *fm = &e->slot_fmc[sl];
+            aeg_mc_ctx *c = &e->fref_mc[cp][k];
+
+            for (i = 0; i < 3; i++)
+                e->fref_pl[cp][k][i] = e->slot_fpl[sl][i] + par * e->stride[i];
+            *c = e->mcr[f];
+            c->base[0] = e->fref_pl[cp][k][0];
+            for (i = 1; i < 4; i++)
+                c->base[i] = fm->buf ? fm->base[i] + par * fm->stride : NULL;
+            c->stride = 2 * e->stride[0];
+            c->ready = e->mcr[f].ready && fm->buf != NULL;
+            c->chroma = 0;
+            c->cstride = 2 * e->stride[1];
+            e->fref_poc[cp][k] = e->ref_poc[f];
+            /* the other parity's chroma rows sit a quarter line off */
+            e->fref_cofs[cp][k] = 2 * (cp - par);
+        }
+    e->fref_n = n;
 }
 
 /* p.field_coding 2: a reference frame coded one way is read the other way
@@ -15556,6 +15826,8 @@ void aeg_encoder_close(aeg_encoder *enc)
         for (i = 0; i < AEG_NPIC; i++) {
             aeg_free(e->pic_mem[i]);
             aeg_mc_ctx_free(&e->slot_mc[i]);
+            aeg_free(e->slot_fmem[i]);
+            aeg_mc_ctx_free(&e->slot_fmc[i]);
             aeg_lowres_free(&e->slot_low[i]);
             aeg_free(e->slot_mbs[i]);
         }

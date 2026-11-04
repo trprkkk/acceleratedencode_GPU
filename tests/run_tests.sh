@@ -975,15 +975,24 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase mbaff_b   176 144 12 2 4 -q 26 -p 3 --mbaff --slices 2
     run_bcase mbaff_cavlc 176 144 12 0 1 -q 28 -p 4 --mbaff --no-cabac --ref 3
     run_bcase mbaff_crf 176 144 12 3 4 -p 2 --mbaff --crf 24 --bff
-    # field macroblock pairs (forced pseudo-random pattern in I slices,
-    # AEG_MBFORCE): the field views and scans, neighbour derivation between
-    # frame and field pairs (Table 6-4), and the mixed-edge deblocking
+    # field macroblock pairs (forced pseudo-random pattern in I slices, and
+    # in P slices without B pictures; AEG_MBFORCE): the field views and scans,
+    # neighbour derivation between frame and field pairs (Table 6-4), the
+    # mixed-edge deblocking, the field references and the scaled neighbour
+    # vectors / indices of the P pairs
     export AEG_MBFORCE=11
     run_bcase mbaff_fi  176 144 12 2 4 -q 30 -p 3 --mbaff -g 4 --slices 2
     run_bcase mbaff_fic 176 144 12 0 1 -q 36 -p 1 --mbaff -g 3 --no-cabac \
         --deblock 2:1
     export AEG_MBFORCE=all
     run_bcase mbaff_fa  176 144 8 2 4 -q 26 -p 4 --mbaff -g 4 --bff
+    export AEG_MBFORCE=3
+    run_bcase mbaff_fp  176 144 12 0 4 -q 28 -p 3 --mbaff -g 12 --ref 3 \
+        --slices 2
+    run_bcase mbaff_fpb 176 144 12 0 4 -q 33 -p 1 --mbaff -g 12 --bff \
+        --ref 2 --deblock -1:1
+    run_bcase mbaff_fpc 176 144 12 0 4 -p 4 --mbaff -g 12 --ref 4 --crf 25 \
+        --no-cabac
     unset AEG_MBFORCE
     for fo in tff:T bff:B tff_hrd:T fld_p:T fld_b:B; do
         nm=${fo%%:*}; want=${fo#*:}
@@ -1041,6 +1050,8 @@ else
     run_bcase h10_mbaff   176 144 12 2 4 -q 26 -p 3 --mbaff --bit-depth 10
     export AEG_MBFORCE=5
     run_bcase h10_mbaff_fi 176 144 8 2 4 -q 34 -p 3 --mbaff -g 3 --bit-depth 10
+    run_bcase h10_mbaff_fp 176 144 10 0 4 -q 30 -p 2 --mbaff -g 10 --ref 2 \
+        --bit-depth 10
     unset AEG_MBFORCE
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10

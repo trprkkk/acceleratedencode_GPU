@@ -5689,10 +5689,35 @@ one starts:
 
    Field pairs are only chosen when `AEG_MBFORCE` sets a test pattern:
    `all`, or a number that seeds a pseudo-random pattern per pair and
-   picture. This applies to I slices only.
-3. P slices (to do): field reference lists (refIdx >> 1 with parity),
-   scaled neighbour motion vectors, P_Skip and the mvd contexts across
-   frame/field pairs.
+   picture.
+3. **Field pairs in P slices (done).** A field macroblock predicts from
+   fields. Every reference picture gets a field copy when it is finished
+   (`mbaff_field_shadow`): each field's lines at the frame's stride, with
+   their own padding and half-sample planes. The field list
+   (`mbaff_field_refs`) has 2n entries. Index 2i is frame entry i's field of
+   the current macroblock's parity, and 2i + 1 is its other field (8.4.2.1).
+   `mbf_enter` swaps the reference views in.
+   * **Neighbour vectors and indices** are scaled to the current
+     macroblock's kind. For a field macroblock beside a frame one: ref × 2
+     and mv_y / 2. For the reverse: ref / 2 and mv_y × 2. This covers the
+     median predictor, the 16x8 / 8x16 directional ones, P_Skip (whose
+     zero test uses the scaled values), the CABAC mvd contexts (|mvd_y|
+     scaled the same way) and the ref_idx contexts (`ref_kind`,
+     `mvd_kind`).
+   * **The C/D fallback** of a bottom macroblock follows Table 6-4,
+     through `nb_mbD` and `nb_mv_at`.
+   * **A skipped pair** gets its inferred field flag (`mbaff_infer`), and
+     a skipped top macroblock's P_Skip vector is derived under it. The flag
+     is only written once the bottom macroblock is not skipped, so a skip
+     is allowed only if the two agree (`p_skippable`).
+   * **The search** stays inside the reach of the padding (`mv_me_ok`). A
+     frame macroblock's skip vector inherited from a field neighbour can
+     be twice the search range.
+   * **The slice's num_ref_idx_active** counts a field macroblock's index
+     as ref >> 1.
+
+   Forcing applies to I slices, and to P slices of streams without B
+   pictures. Explicit weighted prediction stays off in MBAFF.
 4. B slices (to do): spatial and temporal direct with the co-located pair
    mapping of Table 8-6.
 5. The frame/field decision per pair (to do).
@@ -5708,7 +5733,8 @@ combination tested (`tests/run_tests.sh` `mbaff_*`, `h10_mbaff*`):
 * deblocking: offsets, QP up to 45, and off;
 * 10-bit;
 * P/B pictures referencing I pictures with field pairs;
+* P pictures with field pairs (without B pictures), with 1-8 references;
 * real clips (short, vtest, megamind, cockatoo, fade).
 
 Progressive streams are unchanged, and MBAFF without forcing is
-byte-identical to stage 1.
+byte-identical to stages 1 and 2.
