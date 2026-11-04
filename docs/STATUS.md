@@ -5432,3 +5432,54 @@ medium's quality aegenc preset 1 takes 3.0 times x264's time on cockL and
 5.3 times on vtestL, where 86 % of the macroblocks are skipped: x264 is
 cheapest exactly where little changes, and that is where to look next.
 Trees (tree +5.2, tree2 +14.4 % at p1) stay behind on the references.
+
+## Static content at presets 1 and 2: where the time goes
+
+At x264 medium's quality p1 took 3.0x x264 medium's time on cockL and 5.3x
+on vtestL (static, camera-noisy, 84-86 % skip macroblocks).  The cycle
+counters (`AEG_CMTIME=1`, vtestL, p1, QP 28, Mcyc) put the B pictures at
+about 1.1 G of the 2.2 G: analysis 455, the inter candidates' RD 450, the
+re-encodes after the decision (T8RD + the trellis pass, the section labelled
+`refine_mv`) 190, chroma + skip check 85.  P pictures: analysis 210, inter RD
+155, re-encodes 148, Intra_16x16 RD 114.
+
+**Exact (byte-identical at every preset, 10-bit, slices, frame threads):**
+
+* The trellis pass re-encoded the winner's luma even when nothing in it
+  quantised to a level; level selection only shrinks or removes existing
+  levels, so that re-encode cannot change anything and is skipped (it must
+  still stamp the macroblock QP: a residual-free winner may carry another).
+* With the partition sub-pel search on (p1 since `dfff9e8`), the B 16x8 /
+  8x16 (and p4's B_8x8) search already returns the SATD of the vector it
+  picks; it was predicted and measured a second time.
+* The inter residual gather runs row-wise, so it vectorises.
+
+vtestL p1 1.02 -> 0.86 s (-16 %), p2 1.09 -> 1.00 (-8 %); cockL p1 1.61 ->
+1.45 (-10 %), p2 1.80 -> 1.75 (interleaved minimum, single thread).  Against
+x264 medium that is about 4.4x on vtestL and 2.7x on cockL.
+
+**x264's B shortcuts, measured:**
+
+* Skip by SSD (x264 with RD: the direct prediction's SSD below six bits'
+  cost means B_SKIP before any search) almost never fires on vtest: at QP 30
+  six bits are an SSD of about 330 over 384 samples, under one per sample,
+  and camera noise is far above that.  Not kept.
+* RD only for candidates within G/16 of the best search cost
+  (`mb_analyse_b_rd`, G = 17): noisy static content puts every candidate's
+  SATD close together (5.3 candidates per B macroblock, 0.3 dropped), so
+  p1 / p2 gain nothing.  At p3 / p4 it pays with G = 20 (-0.00 / -0.01 % BD
+  for -2.8 / -5.2 % time; G = 17 +0.08 / +0.08 %) and is on there
+  (`AEG_BRDG`).
+* Skipping the joint bi-prediction refinement when the plain average loses
+  to one list: the average nearly always wins on noisy content, so it never
+  triggers.
+
+**The B partitions are a third of a B macroblock** on vtestL p1: without
+them analysis drops 414 -> 170 Mcyc and the RD pass 436 -> 308 (two
+candidates fewer), but they win 1214 of the 2200 coded B macroblocks and
+removing them costs 3.5 % of the bits.  The gate on the best 16x16 cost
+(96 lambda) does not hold up when raised (main + validation, p1): 128
++0.09 % for -3 %, 160 +0.19 %, 200 +0.33 % (cock +1.10), 300 +0.61 %.  B
+partitions without their own sub-pel search (`AEG_PSUBB=0`) +1.8 % bits on
+vtestL.  What is left is per-operation cost (x264's RD and searches are
+hand-written assembly) and the number of candidates priced.
