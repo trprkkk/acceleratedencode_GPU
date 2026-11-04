@@ -3623,7 +3623,17 @@ static int ref1_cands_on(void)
 
 /* x264's 4-point sub-pel diamond (AEG_ME_DIA) per search class, a mask:
  * 1 = B 16x8 / 8x16 / 8x8, 2 = P partitions, 4 = B 16x16, 8 = P 16x16 (every
- * reference).  AEG_SPDIA overrides. */
+ * reference).  BD-rate against the 8-point square, main + validation:
+ *
+ *            1         3         15
+ *   p1     +0.04 %   +0.33 %   +0.58 %  (-7 % time)
+ *   p2     +0.04 %             +0.60 %
+ *   p3     +0.06 %             +0.27 %
+ *   p4     +0.04 %
+ *
+ * The B partitions' searches take it for about -2 % of the time at presets
+ * 1 and 2 (vtestL: B analysis 430 -> 389 Mcyc); the rest costs more than the
+ * 0.1 % a prune may.  AEG_SPDIA overrides. */
 static int spdia_mask(const struct aeg_encoder *e)
 {
     static _Atomic int v = -2;
@@ -3631,8 +3641,7 @@ static int spdia_mask(const struct aeg_encoder *e)
         const char *ev = getenv("AEG_SPDIA");
         v = ev ? atoi(ev) : -1;
     }
-    (void)e;
-    return v >= 0 ? v : 0;
+    return v >= 0 ? v : e->p.preset <= 2 ? 1 : 0;
 }
 #define SUBME_F(e, cls) ((e)->p.subme | (spdia_mask(e) & (cls) ? AEG_ME_DIA : 0))
 
