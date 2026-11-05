@@ -5716,10 +5716,32 @@ one starts:
    * **The slice's num_ref_idx_active** counts a field macroblock's index
      as ref >> 1.
 
-   Forcing applies to I slices, and to P slices of streams without B
-   pictures. Explicit weighted prediction stays off in MBAFF.
-4. B slices (to do): spatial and temporal direct with the co-located pair
-   mapping of Table 8-6.
+   Explicit weighted prediction stays off in MBAFF.
+4. **Field pairs in B slices (done).** A field macroblock of a B picture
+   predicts from list 0's and list 1's fields of its own parity
+   (`fref_b`), on index 0 of both lists. Every partition of a B picture is
+   on index 0, so every scaled neighbour index is 0 too, and spatial direct's
+   index is 0 or unused. The index is still sent for a field macroblock
+   (one bin 0 per list and partition, context 54: `cabac_b_ref_idx`),
+   because mb_field_decoding_flag differs from field_pic_flag.
+   * **The 16x16 predictors and spatial direct** take their neighbours
+     through Table 6-4 with the frame/field scaling (`pred16_list`,
+     `nb_mv_at`).
+   * **colZeroFlag** reads the co-located pair as Table 8-6 maps it
+     (`col_block`):
+     * a frame macroblock over a field pair reads the field nearer in POC.
+       The frame's two fields have the same count, and the tie goes to the
+       bottom field. It uses 4x4 rows 2·bottom + y8.
+     * a field macroblock over a frame pair reads the top macroblock for
+       group row 0 (4x4 row 0) and the bottom one for group row 1 (4x4 row
+       2).
+   * **The B mb_type context** finds its neighbours A and B the MBAFF way.
+   * **B_Skip** follows the same skipped-pair rule as P_Skip (`b_skippable`).
+   * **Direct vectors** that reach past the reference borders are not
+     offered (`b_direct_reach`).
+
+   Field pairs are not used yet with the opposite-parity field in a B
+   picture (index 1).
 5. The frame/field decision per pair (to do).
 
 Under the forced patterns, ffmpeg decodes bit-exactly in every
@@ -5733,8 +5755,10 @@ combination tested (`tests/run_tests.sh` `mbaff_*`, `h10_mbaff*`):
 * deblocking: offsets, QP up to 45, and off;
 * 10-bit;
 * P/B pictures referencing I pictures with field pairs;
-* P pictures with field pairs (without B pictures), with 1-8 references;
+* P pictures with field pairs, with 1-8 references;
+* B pictures with field pairs over co-located pairs of either kind (1-3 B
+  pictures, `--b-adapt` 0..2, ABR / VBV);
 * real clips (short, vtest, megamind, cockatoo, fade).
 
 Progressive streams are unchanged, and MBAFF without forcing is
-byte-identical to stages 1 and 2.
+byte-identical to stages 1 to 3.
