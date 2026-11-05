@@ -5742,7 +5742,55 @@ one starts:
 
    Field pairs are not used yet with the opposite-parity field in a B
    picture (index 1).
-5. The frame/field decision per pair (to do).
+5. **The frame/field decision per pair (done).** Two steps (`AEG_MBDEC`):
+   * **Vertical SADs** (x264's `x264_field_vsad`, `mbaff_vsad_field`). The
+     pair's source luma is compared two ways: vertical differences within
+     the frame (32 lines) against those within each field (16 + 16). Half a
+     thousand (per 8 bits) favours the kind of the left and above pairs, so
+     that the choice does not flicker between neighbours.
+   * **A coded trial where the SADs are unsure** (presets 2-4,
+     `mbaff_pair_trial`). The SADs are unsure when they are within 50 % of
+     each other (`AEG_MBTG`). The pair is then coded both ways from the same
+     state. The price of each is the reconstruction's squared error plus
+     the mode decision's lambda times each macroblock's bits, and the
+     cheaper is kept. `pair_state` holds what coding a pair changes:
+     * the two macroblocks' decisions and stored neighbour data;
+     * the reconstruction;
+     * the CABAC shadow coder;
+     * the QP history;
+     * the luma memo's slot;
+     * the analysis scratch (`mb_modes` .. `mb_maxref`, which later
+       macroblocks can read).
+
+     `AEG_MBDEC=3` runs the trial but keeps the SADs' choice, and its output
+     has to equal the SADs alone (`tests/run_tests.sh`, "mbaff trial
+     restore"). That is how the scratch was found.
+
+   BD-rate against `--tff` (frame pictures with interlaced signalling) on 80
+   woven fields of four clips, QP 22-37:
+
+   | clip | p2 PAFF | p2 VSAD | p2 VSAD + trial | p3 VSAD | p3 VSAD + trial |
+   |---|---|---|---|---|---|
+   | cockatoo 640x352 | -66.54 | -61.27 | -61.72 | -56.08 | -56.59 |
+   | vtest 384x288 | +0.66 | -5.86 | -6.51 | -3.91 | -4.22 |
+   | megamind 352x256 | -24.78 | -20.98 | -26.43 | -18.14 | -21.88 |
+   | tree 320x240 | -0.15 | -0.10 | -0.10 | +0.44 | +0.41 |
+   | mean | -22.70 | -22.05 | **-23.69** | -19.42 | **-20.57** |
+   | time against `--tff` | +41 % | +53 % | +61 % | +55 % | +72 % |
+
+   Wider trial gates at p2 (mean, time):
+   * 75 %: -23.98 %, but tree +0.15.
+   * Every pair: -23.52 %, +171 % time. The trial then loses to the SADs on
+     tree (+0.97) and vtest (-4.82).
+
+   With every pair a frame pair (`AEG_MBDEC=0`) the mean is +0.23 %.
+
+   The time against `--tff` is mostly the frame threads, which field
+   coding turns off.
+
+   PAFF stays ahead on cockatoo, where the whole picture moves. Its second
+   field predicts from the first one, which an MBAFF field macroblock
+   cannot.
 
 Under the forced patterns, ffmpeg decodes bit-exactly in every
 combination tested (`tests/run_tests.sh` `mbaff_*`, `h10_mbaff*`):
@@ -5760,5 +5808,20 @@ combination tested (`tests/run_tests.sh` `mbaff_*`, `h10_mbaff*`):
   pictures, `--b-adapt` 0..2, ABR / VBV);
 * real clips (short, vtest, megamind, cockatoo, fade).
 
-Progressive streams are unchanged, and MBAFF without forcing is
-byte-identical to stages 1 to 3.
+The unforced decision (stage 5) decodes bit-exactly in 72 of 72
+combinations tested:
+* six real clips;
+* presets 0..4, CAVLC;
+* 1-3 B pictures, 5 references;
+* slices and slice threads (byte-identical across `-t`);
+* bff;
+* CRF, ABR and VBV;
+* deblocking offsets;
+* 10-bit;
+* `--b-adapt 2`.
+
+The tests (`mbaff_d*`, `h10_mbaff_d`) use a woven interlaced clip: `genyuv`
+mode 7, whose left half moves and right half stands still.
+
+Progressive streams are unchanged. Under the forced patterns, and with
+`AEG_MBDEC=0`, MBAFF is byte-identical to stage 4.

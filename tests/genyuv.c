@@ -14,7 +14,10 @@
  * prediction is for; mode 6 holds each picture of mode 0 for five frames and
  * adds a fine texture -- a clip of repeated frames with detail, where a held
  * picture coded finer than its reference costs far more than its (zero)
- * difference from it suggests, which is what the VBV re-coding is for.
+ * difference from it suggests, which is what the VBV re-coding is for;
+ * mode 7 is an interlaced clip, two fields woven per frame (even lines at
+ * time 2t, odd lines at 2t + 1), its left half moving fast and its right
+ * half still, so that an MBAFF encoder finds both field and frame pairs.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +49,10 @@ int main(int argc, char **argv)
                     else           { cx = x - t * 3; cy = y - t * 2; }
                 } else if (mode == 3) {
                     cx = x; cy = y;
+                } else if (mode == 7) {
+                    int tt = 2 * t + (y & 1);
+                    cx = x < w / 2 ? x + tt * 5 : x;
+                    cy = x < w / 2 ? y + tt : y;
                 } else if (mode == 4) {
                     int sx = x < w / 2 ? 1 : -1, sy = y < h / 2 ? 1 : -1;
                     cx = x + sx * t * 3;

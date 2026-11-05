@@ -10552,11 +10552,76 @@ static int ft_wp_check(struct aeg_encoder *e, int wait)
 static void mbaff_field_shadow(struct aeg_encoder *e, int s);
 static void mbaff_field_refs(struct aeg_encoder *e);
 
-/* MBAFF: is the macroblock pair (mbx, py) coded as a field pair?  So far
- * only in I and P slices, and only as a forced test pattern (AEG_MBFORCE: "all",
- * or a number seeding a pseudo-random pattern per pair and picture). */
+/* MBAFF decision mode: AEG_MBDEC=0 every pair a frame pair (stage 1-4
+ * behaviour), 1 x264's vertical-SAD rule alone (mbaff_vsad_field), 2 (the
+ * default) the vertical-SAD rule and, where it is unsure (mbaff_trial_gate),
+ * both kinds coded and the cheaper kept (mbaff_pair_trial), 3 as 2 but the
+ * vertical-SAD choice kept (a check of the trial's state restore: the output
+ * has to be mode 1's). */
+static int mbdec_mode(void)
+{
+    static _Atomic int env = -2;
+    if (env == -2) {
+        const char *ev = getenv("AEG_MBDEC");
+        env = ev ? atoi(ev) : 2;
+    }
+    return env;
+}
+
+/* When the trial runs: on the pairs whose vertical SADs (with the neighbour
+ * bias) are within this many percent of the frame one, -1 never, >= 1000
+ * always.  On the 80-field clips (p2, BD-rate against --tff; VSAD alone
+ * -22.05 %): 25 -23.21 %, 50 -23.69 %, 75 -23.98 % (but tree +0.15, VSAD
+ * alone -0.10), every pair -23.52 % (tree and vtest lose to VSAD alone, and
+ * +171 % time against +53 %).  50 costs +61 % at p2 and +72 % at p3 (VSAD alone +53 /
+ * +55 %), where it takes p3 from -19.42 to -20.57 %.  Presets 0/1: the
+ * vertical SADs alone.  AEG_MBTG overrides. */
+static int mbaff_trial_gate(const struct aeg_encoder *e)
+{
+    const int g = ENV_INT("AEG_MBTG", -100);
+    return g != -100 ? g : e->p.preset >= 2 ? 50 : -1;
+}
+
+/* x264's x264_field_vsad: the pair's source luma, vertical differences
+ * summed within the frame (32 lines) against within each field (16 + 16),
+ * with half a thousand (per 8 bits) in favour of the left and above pairs'
+ * kind, so that the choice does not flicker between neighbours. */
+static int mbaff_vsad_field(const struct aeg_encoder *e, int mbx, int py,
+                            int *unsure)
+{
+    const int st = e->stride[0];
+    const pixel *s0 = e->srcp[0] + (ptrdiff_t)32 * py * st + 16 * mbx;
+    const int bias = 512 << (BIT_DEPTH - 8);
+    int64_t fr = 0, fl = 0;
+    int x, y;
+
+    for (y = 0; y < 31; y++) {
+        const pixel *a = s0 + (ptrdiff_t)y * st;
+        for (x = 0; x < 16; x++)
+            fr += abs((int)a[x + st] - (int)a[x]);
+    }
+    for (y = 0; y < 30; y++) {
+        const pixel *a = s0 + (ptrdiff_t)y * st;
+        for (x = 0; x < 16; x++)
+            fl += abs((int)a[x + 2 * st] - (int)a[x]);
+    }
+    if (mbx > 0)
+        fl += bias - 2 * bias * e->mbs[2 * py * e->mb_w + mbx - 1].fld;
+    if (2 * py - 1 >= e->top_row)
+        fl += bias - 2 * bias * e->mbs[(2 * py - 1) * e->mb_w + mbx].fld;
+    if (unsure) {
+        const int g = mbdec_mode() >= 2 ? mbaff_trial_gate(e) : -1;
+        *unsure = g >= 1000 ||
+                  (g >= 0 && (fl > fr ? fl - fr : fr - fl) * 100 <= (int64_t)g * fr);
+    }
+    return fl < fr;
+}
+
+/* MBAFF: is the macroblock pair (mbx, py) coded as a field pair?  A forced
+ * test pattern (AEG_MBFORCE: "all", or a number seeding a pseudo-random
+ * pattern per pair and picture), else the decision (mbdec_mode). */
 static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
-                            int py)
+                            int py, int *unsure)
 {
     static const char *force;
     static int once;
@@ -10567,8 +10632,9 @@ static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
         once = 1;
     }
     (void)slice;
+    *unsure = 0;
     if (!force)
-        return 0;
+        return mbdec_mode() >= 1 ? mbaff_vsad_field(e, mbx, py, unsure) : 0;
     if (!strcmp(force, "all"))
         return 1;
     h = (unsigned)atoi(force) * 2654435761u ^ (unsigned)mbx * 40503u ^
@@ -10577,6 +10643,197 @@ static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
     h *= 0x5bd1e995u;
     h ^= h >> 15;
     return (h >> 7) & 1;
+}
+
+/* The decision pass's work on one macroblock: the analysis, the mode
+ * decision and reconstruction, and the decisions stored for the neighbour
+ * queries of the following macroblocks (and for the deblocking filter). */
+static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
+{
+    const int idx = mby * e->mb_w + mbx;
+    mbenc *tmp = &e->mb_encs[idx];
+    aeg_mb *m = &e->mbs[idx];
+    int i;
+    int64_t t0 = aeg_now_ns();
+
+    reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
+    {
+        CM_T0();
+        analyse_mb(e, mbx, mby, tmp);
+        CM_LAP(e, 6);
+    }
+    e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
+
+    t0 = aeg_now_ns();
+    code_mb(e, mbx, mby, tmp);
+    e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+
+    /* store the decisions for the neighbour queries of the following
+     * macroblocks (and for the deblocking filter) */
+    memset(m, 0, sizeof(*m));
+    m->fld = (uint8_t)(e->fld | e->cfld);
+    m->type = (uint8_t)tmp->type;
+    m->i16_mode = (uint8_t)tmp->i16_mode;
+    m->t8 = (uint8_t)mb_t8_coded(e, tmp, 0);
+    m->chroma_mode = (uint8_t)tmp->chroma_mode;
+    m->cbp = (uint8_t)tmp->cbp;
+    m->qp = (int8_t)tmp->qp;
+    /* All four masks, not the two the partitioned shapes need: B_8x8
+     * carries one per 8x8 group, and the deblocking filter reads them
+     * per 4x4 block.  Publishing only the first two left the bottom
+     * half of every B_8x8 at "no list" (which the mask fallback then
+     * read as *both*), so the filter disagreed with the decoder about
+     * the two bottom 8x8 groups of every such macroblock. */
+    for (i = 0; i < 4; i++)
+        m->blist[i] = tmp->blist[i];
+    for (i = 0; i < 4; i++)
+        m->sub_type[i] = (int8_t)tmp->sub_type[i];
+    for (i = 0; i < 16; i++)
+        m->intra4[i] = tmp->intra4[i];
+    for (i = 0; i < 4; i++)
+        m->intra8[i] = tmp->intra8[i];
+    for (i = 0; i < AEG_BLK_COUNT; i++)
+        m->nz[i] = tmp->nz[i];
+    for (i = 0; i < 4; i++)
+        m->nz8[i] = (int8_t)(tmp->nz8[i] != 0);
+    for (i = 0; i < 16; i++) {
+        m->mv[i][0] = tmp->mv[i][0];
+        m->mv[i][1] = tmp->mv[i][1];
+        m->mv1[i][0] = tmp->mv1[i][0];
+        m->mv1[i][1] = tmp->mv1[i][1];
+        m->ref_idx[i] = tmp->ref[i];
+    }
+    m->cost = (int32_t)tmp->sse;
+}
+
+
+#define PAIR_SCR_BEG offsetof(struct aeg_encoder, mb_modes)
+#define PAIR_SCR_END (offsetof(struct aeg_encoder, mb_maxref) + sizeof(int))
+
+/* MBAFF trial (mbdec_mode 2, 3): what coding a pair changes -- its two
+ * macroblocks' decisions and stored neighbour data, its reconstruction, the
+ * shadow coder and its QP history -- so that the pair can be coded both ways
+ * from the same start and the cheaper result kept. */
+typedef struct {
+    aeg_mb mbs[2];
+    mbenc enc[2];
+    aeg_cabac cab;
+    int rlq, rld, lq, ld;
+    int lmn;    /* the luma memo's eviction slot (it outlives a macroblock) */
+    /* The analysis scratch, mb_modes .. mb_maxref: not every path rewrites
+     * all of it, so what a later macroblock may find there is the kept
+     * run's. */
+    unsigned char scr[PAIR_SCR_END - PAIR_SCR_BEG];
+    pixel y[32 * 16], c[2][16 * 8];
+} pair_state;
+
+static void pair_state_io(struct aeg_encoder *e, int mbx, int ry,
+                          pair_state *ps, int save)
+{
+    const int idx = ry * e->mb_w + mbx;
+    int b, i, y;
+
+    for (b = 0; b < 2; b++) {
+        if (save) {
+            ps->mbs[b] = e->mbs[idx + b * e->mb_w];
+            ps->enc[b] = e->mb_encs[idx + b * e->mb_w];
+        } else {
+            e->mbs[idx + b * e->mb_w] = ps->mbs[b];
+            e->mb_encs[idx + b * e->mb_w] = ps->enc[b];
+        }
+    }
+    if (save) {
+        ps->cab = e->cab_shadow;
+        ps->rlq = e->rd_last_qp; ps->rld = e->rd_last_dqp;
+        ps->lq = e->last_qp; ps->ld = e->last_dqp;
+        ps->lmn = e->lmemo_next;
+        memcpy(ps->scr, (unsigned char *)e + PAIR_SCR_BEG, sizeof(ps->scr));
+    } else {
+        e->cab_shadow = ps->cab;
+        e->rd_last_qp = ps->rlq; e->rd_last_dqp = ps->rld;
+        e->last_qp = ps->lq; e->last_dqp = ps->ld;
+        e->lmemo_next = ps->lmn;
+        memcpy((unsigned char *)e + PAIR_SCR_BEG, ps->scr, sizeof(ps->scr));
+    }
+    for (y = 0; y < 32; y++) {
+        pixel *r = e->recp[0] + (ptrdiff_t)(16 * ry + y) * e->stride[0] + 16 * mbx;
+        if (save)
+            memcpy(ps->y + 16 * y, r, 16 * sizeof(pixel));
+        else
+            memcpy(r, ps->y + 16 * y, 16 * sizeof(pixel));
+    }
+    for (i = 0; i < 2; i++)
+        for (y = 0; y < 16; y++) {
+            pixel *r = e->recp[1 + i] + (ptrdiff_t)(8 * ry + y) * e->stride[1] + 8 * mbx;
+            if (save)
+                memcpy(ps->c[i] + 8 * y, r, 8 * sizeof(pixel));
+            else
+                memcpy(r, ps->c[i] + 8 * y, 8 * sizeof(pixel));
+        }
+}
+
+/* Code pair (mbx, ry / 2) as a field (fld) or frame pair; its price: the
+ * sum of squared errors of the reconstruction (before the loop filter) plus
+ * each macroblock's bits at the mode decision's lambda. */
+static int64_t pair_run(struct aeg_encoder *e, int mbx, int ry, int fld)
+{
+    double bits = 0;
+    int64_t sse = 0;
+    int b, i, x, y;
+
+    e->pair_fld = fld;
+    for (b = 0; b < 2; b++) {
+        const int mby = ry + b;
+        const mbenc *t = &e->mb_encs[mby * e->mb_w + mbx];
+        double lambda;
+        if (fld)
+            mbf_enter(e, mby);
+        decide_mb(e, mbx, mby);
+        lambda = AEG_LAMBDA(t->qp - e->mode_lambda_off);
+        if (e->cur_is_p)
+            lambda *= P_MODE_LAMBDA;
+        bits += lambda * (e->p.cabac ? e->cab_shadow.cost256 / 256.0 : (double)t->bits);
+        if (e->cfld)
+            mbf_leave(e);
+    }
+    for (y = 0; y < 32; y++) {
+        const ptrdiff_t o = (ptrdiff_t)(16 * ry + y) * e->stride[0] + 16 * mbx;
+        for (x = 0; x < 16; x++) {
+            int d = (int)e->recp[0][o + x] - (int)e->srcp[0][o + x];
+            sse += d * d;
+        }
+    }
+    for (i = 1; i < 3; i++)
+        for (y = 0; y < 16; y++) {
+            const ptrdiff_t o = (ptrdiff_t)(8 * ry + y) * e->stride[1] + 8 * mbx;
+            for (x = 0; x < 8; x++) {
+                int d = (int)e->recp[i][o + x] - (int)e->srcp[i][o + x];
+                sse += d * d;
+            }
+        }
+    return sse + (int64_t)(bits + 0.5);
+}
+
+/* Both ways, the other kind than `pref` first, and keeps the cheaper (on a
+ * tie `pref`).  Mode 3 runs `pref` first and keeps it: the restore of the
+ * first result is what it checks. */
+static void mbaff_pair_trial(struct aeg_encoder *e, int mbx, int ry, int pref)
+{
+    pair_state s0, r1;
+    const int chk = mbdec_mode() == 3;
+    const int first = chk ? pref : !pref;
+    int64_t c1, c2;
+    int keep;
+
+    pair_state_io(e, mbx, ry, &s0, 1);
+    c1 = pair_run(e, mbx, ry, first);
+    pair_state_io(e, mbx, ry, &r1, 1);
+    pair_state_io(e, mbx, ry, &s0, 0);
+    c2 = pair_run(e, mbx, ry, !first);
+    keep = chk ? pref : c1 < c2 ? first : !first;
+    if (keep == first)
+        pair_state_io(e, mbx, ry, &r1, 0);
+    e->pair_fld = keep;
 }
 
 /* One slice of the current picture: macroblock rows `first_row` to `last_row`
@@ -10631,72 +10888,24 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 lr_seed_rows(e, rr + 1);
         }
         for (k = 0; k < nk; k++) {
-            int idx;
-            mbenc *tmp;
-            aeg_mb *m;
-            int i;
-            int64_t t0 = aeg_now_ns();
-
             mbx = k >> e->mbaff;
             mby = ry + (k & e->mbaff);
-            idx = mby * e->mb_w + mbx;
-            tmp = &e->mb_encs[idx];
-            m = &e->mbs[idx];
             if (e->mbaff) {
-                if (!(mby & 1))
-                    e->pair_fld = mbaff_pair_field(e, slice, mbx, mby >> 1);
+                if (!(mby & 1)) {
+                    int unsure;
+                    e->pair_fld = mbaff_pair_field(e, slice, mbx, mby >> 1, &unsure);
+                    /* both ways (the whole pair at once) */
+                    if (unsure) {
+                        mbaff_pair_trial(e, mbx, ry, e->pair_fld);
+                        k++;
+                        continue;
+                    }
+                }
                 if (e->pair_fld)
                     mbf_enter(e, mby);
             }
 
-            reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
-            {
-                CM_T0();
-                analyse_mb(e, mbx, mby, tmp);
-                CM_LAP(e, 6);
-            }
-            e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
-
-            t0 = aeg_now_ns();
-            code_mb(e, mbx, mby, tmp);
-            e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
-
-            /* store the decisions for the neighbour queries of the following
-             * macroblocks (and for the deblocking filter) */
-            memset(m, 0, sizeof(*m));
-            m->fld = (uint8_t)(e->fld | e->cfld);
-            m->type = (uint8_t)tmp->type;
-            m->i16_mode = (uint8_t)tmp->i16_mode;
-            m->t8 = (uint8_t)mb_t8_coded(e, tmp, 0);
-            m->chroma_mode = (uint8_t)tmp->chroma_mode;
-            m->cbp = (uint8_t)tmp->cbp;
-            m->qp = (int8_t)tmp->qp;
-            /* All four masks, not the two the partitioned shapes need: B_8x8
-             * carries one per 8x8 group, and the deblocking filter reads them
-             * per 4x4 block.  Publishing only the first two left the bottom
-             * half of every B_8x8 at "no list" (which the mask fallback then
-             * read as *both*), so the filter disagreed with the decoder about
-             * the two bottom 8x8 groups of every such macroblock. */
-            for (i = 0; i < 4; i++)
-                m->blist[i] = tmp->blist[i];
-            for (i = 0; i < 4; i++)
-                m->sub_type[i] = (int8_t)tmp->sub_type[i];
-            for (i = 0; i < 16; i++)
-                m->intra4[i] = tmp->intra4[i];
-            for (i = 0; i < 4; i++)
-                m->intra8[i] = tmp->intra8[i];
-            for (i = 0; i < AEG_BLK_COUNT; i++)
-                m->nz[i] = tmp->nz[i];
-            for (i = 0; i < 4; i++)
-                m->nz8[i] = (int8_t)(tmp->nz8[i] != 0);
-            for (i = 0; i < 16; i++) {
-                m->mv[i][0] = tmp->mv[i][0];
-                m->mv[i][1] = tmp->mv[i][1];
-                m->mv1[i][0] = tmp->mv1[i][0];
-                m->mv1[i][1] = tmp->mv1[i][1];
-                m->ref_idx[i] = tmp->ref[i];
-            }
-            m->cost = (int32_t)tmp->sse;
+            decide_mb(e, mbx, mby);
             if (e->cfld)
                 mbf_leave(e);
         }

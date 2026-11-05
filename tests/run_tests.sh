@@ -975,6 +975,28 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase mbaff_b   176 144 12 2 4 -q 26 -p 3 --mbaff --slices 2
     run_bcase mbaff_cavlc 176 144 12 0 1 -q 28 -p 4 --mbaff --no-cabac --ref 3
     run_bcase mbaff_crf 176 144 12 3 4 -p 2 --mbaff --crf 24 --bff
+    # the frame/field decision per pair, on a woven interlaced clip (mode 7):
+    # the vertical SADs alone (presets 0/1), and with the coded trial of
+    # both kinds where they are unsure (presets 2-4)
+    run_bcase mbaff_d1  176 144 12 0 7 -q 28 -p 1 --mbaff --no-cabac
+    run_bcase mbaff_d2  176 144 12 2 7 -q 26 -p 3 --mbaff --slices 2
+    run_bcase mbaff_d3  176 144 12 3 7 -p 4 --mbaff --crf 25 --ref 3 --bff
+    export AEG_MBTG=1000    # (every pair)
+    run_bcase mbaff_d4  176 144 10 3 7 -q 30 -p 2 --mbaff --deblock -1:0
+    unset AEG_MBTG
+    # the trial restores everything a pair's coding changed: run but its
+    # result discarded (AEG_MBDEC=3), the output is the vertical SADs' alone
+    "$BUILD/genyuv" 176 144 12 "$TMP/mbdec.yuv" 7 >/dev/null
+    for m in 1 3; do
+        AEG_MBDEC=$m AEG_MBTG=1000 $BUILD/aegenc -w 176 -h 144 -n 12 \
+            -i "$TMP/mbdec.yuv" -o "$TMP/mbdec$m.264" -p 2 --crf 24 \
+            --bframes 3 --mbaff >/dev/null 2>&1
+    done
+    if cmp -s "$TMP/mbdec1.264" "$TMP/mbdec3.264"; then
+        echo "   mbaff trial restore: discarded trial leaves the output unchanged"
+    else
+        echo "   mbaff trial restore: FAILED (AEG_MBDEC=3 differs from 1)"; FAIL=1
+    fi
     # field macroblock pairs (forced pseudo-random pattern, AEG_MBFORCE): the
     # field views and scans, neighbour derivation between frame and field
     # pairs (Table 6-4), the mixed-edge deblocking, the field references and
@@ -1058,6 +1080,7 @@ else
     run_bcase h10_mbaff_fp 176 144 10 0 4 -q 30 -p 2 --mbaff -g 10 --ref 2 \
         --bit-depth 10
     unset AEG_MBFORCE
+    run_bcase h10_mbaff_d 176 144 12 2 7 -q 28 -p 3 --mbaff --bit-depth 10
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
     run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10
