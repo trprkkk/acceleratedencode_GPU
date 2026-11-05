@@ -5826,7 +5826,7 @@ mode 7, whose left half moves and right half stands still.
 Progressive streams are unchanged. Under the forced patterns, and with
 `AEG_MBDEC=0`, MBAFF is byte-identical to stage 4.
 
-### Field pictures or an MBAFF frame per frame (`--paff --mbaff`, `params.field_coding` 4)
+### Field pictures or an MBAFF frame per frame (`--paff-mbaff`, `params.field_coding` 4)
 
 MBAFF trailed PAFF by about 5 points on cockatoo, where the whole picture
 moves. With every pair forced to fields (`AEG_MBFORCE=all`), an MBAFF stream
@@ -5841,7 +5841,10 @@ had half again as many intra macroblocks. The cause is structural:
 * The I frame's second field is a P field in PAFF.
 
 H.264 lets a stream with `mb_adaptive_frame_field_flag` code each picture
-either as a field pair or as an MBAFF frame, so mode 4 does both:
+either as a field pair or as an MBAFF frame, so mode 4 does both. It is an
+option of its own, `--paff-mbaff`. `--mbaff` keeps x264's meaning (every
+picture an MBAFF frame), and `--field` / `--paff` / `--mbaff` /
+`--paff-mbaff` exclude each other (the last one given counts).
 * **Choice.** Per anchor frame, PAFF's estimate (`fld_decide`) chooses
   between field pictures and an MBAFF frame. The fields have to win by 16 %
   rather than PAFF's 12 %, because an MBAFF frame codes its moving pairs as

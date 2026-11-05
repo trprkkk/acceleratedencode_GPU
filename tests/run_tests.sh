@@ -984,18 +984,18 @@ if command -v "$FF" >/dev/null 2>&1; then
     export AEG_MBTG=1000    # (every pair)
     run_bcase mbaff_d4  176 144 10 3 7 -q 30 -p 2 --mbaff --deblock -1:0
     unset AEG_MBTG
-    # field pictures or an MBAFF frame per anchor (--paff --mbaff): the
+    # field pictures or an MBAFF frame per anchor (--paff-mbaff): the
     # decision on the woven clip, then forced patterns of both (AEG_FLDFORCE
     # per display index, AEG_MBFORCE inside the MBAFF frames): field
     # pictures reading MBAFF frames and the other way round, and in the B
     # MBAFF frames the co-located field nearer in POC (tff: top, bff: bottom)
-    run_bcase pm_auto   176 144 12 2 7 -q 26 -p 3 --paff --mbaff
+    run_bcase pm_auto   176 144 12 2 7 -q 26 -p 3 --paff-mbaff
     export AEG_FLDFORCE=0110 AEG_MBFORCE=7
-    run_bcase pm_mix    176 144 16 3 4 -q 27 -p 2 --paff --mbaff -g 8
-    run_bcase pm_mixc   176 144 12 0 4 -q 30 -p 4 --paff --mbaff --ref 3 \
+    run_bcase pm_mix    176 144 16 3 4 -q 27 -p 2 --paff-mbaff -g 8
+    run_bcase pm_mixc   176 144 12 0 4 -q 30 -p 4 --paff-mbaff --ref 3 \
         --no-cabac --slices 2
     export AEG_FLDFORCE=1001
-    run_bcase pm_mixb   176 144 14 2 4 -p 1 --paff --mbaff --crf 25 --bff
+    run_bcase pm_mixb   176 144 14 2 4 -p 1 --paff-mbaff --crf 25 --bff
     unset AEG_FLDFORCE AEG_MBFORCE
     # the trial restores everything a pair's coding changed: run but its
     # result discarded (AEG_MBDEC=3), the output is the vertical SADs' alone
@@ -1095,7 +1095,7 @@ else
     unset AEG_MBFORCE
     run_bcase h10_mbaff_d 176 144 12 2 7 -q 28 -p 3 --mbaff --bit-depth 10
     AEG_FLDFORCE=01; export AEG_FLDFORCE
-    run_bcase h10_pm    176 144 12 3 4 -q 28 -p 3 --paff --mbaff --bit-depth 10
+    run_bcase h10_pm    176 144 12 3 4 -q 28 -p 3 --paff-mbaff --bit-depth 10
     unset AEG_FLDFORCE
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
