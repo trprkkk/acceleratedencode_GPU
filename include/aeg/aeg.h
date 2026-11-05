@@ -169,7 +169,11 @@ typedef struct aeg_params {
      *       the pair's vertical SADs within the frame and within the fields
      *       (x264's rule) and, at presets 2-4 where those are close, by
      *       coding the pair both ways and keeping the cheaper; without
-     *       weighted prediction; the NAL HRD stays.
+     *       weighted prediction; the NAL HRD stays;
+     *   4 = 2 and 3 together: per anchor frame, two field pictures or an
+     *       MBAFF frame (the B frames follow their anchor) -- field pictures
+     *       where the whole picture moves (the second field predicts from
+     *       the first, which no MBAFF frame can), MBAFF frames elsewhere.
      * Field coding runs with one frame thread, without the B pyramid,
      * temporal direct or the NAL HRD; field pictures also without weighted
      * prediction and chroma ME (with 1 turned off; with 2 the frame

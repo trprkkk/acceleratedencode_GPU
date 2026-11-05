@@ -3723,9 +3723,12 @@ static void b_direct_mv(const struct aeg_encoder *e, int mbx, int mby,
  * 4x4 block of it that colZeroFlag reads (8.4.1.2.1, direct_8x8_inference:
  * the group's corner).  In an MBAFF frame (Table 8-6) a macroblock whose
  * co-located pair is of the other kind reads:
- *   a frame macroblock, field pair: the field nearer in POC -- the frame's
- *     two fields have the same count here (no delta_pic_order_cnt_bottom),
- *     and the tie goes to the bottom one -- at 4x4 rows 2 bot + y8;
+ *   a frame macroblock, field pair: the field nearer in POC to the current
+ *     frame's (the smaller of its fields') -- with field_coding 3 the two
+ *     fields of a frame have the same count (no delta_pic_order_cnt_bottom)
+ *     and the tie goes to the bottom one; with 4 they are 2n and 2n + 1,
+ *     so of the later co-located frame the field coded first, the top one
+ *     (bff: the bottom one) -- at 4x4 rows 2 bot + y8;
  *   a field macroblock, frame pair: the top macroblock for group row 0
  *     (4x4 row 0), the bottom one for group row 1 (4x4 row 2).
  * (FFmpeg pred_spatial_direct_motion: col_parity, b8_stride / b4_stride.) */
@@ -3740,8 +3743,9 @@ static const aeg_mb *col_block(const struct aeg_encoder *e, int mbx, int mby,
         return &e->col_mbs[mby * e->mb_w + mbx];
     }
     if (!e->cfld) {
+        const int par = e->p.field_coding == 4 ? e->p.interlaced == 2 : 1;
         *blk = (2 * (mby & 1) + y8) * 4 + 3 * x8;
-        return &e->col_mbs[(top + 1) * e->mb_w + mbx];
+        return &e->col_mbs[(top + par) * e->mb_w + mbx];
     }
     *blk = 8 * y8 + 3 * x8;
     return &e->col_mbs[(top + y8) * e->mb_w + mbx];
@@ -10953,7 +10957,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
          * second field.  A frame picture among field pictures counts in
          * fields too: its first field 2n, the other 2n + 1 (the PPS sends
          * delta_pic_order_cnt_bottom; the lsb is the top field's). */
-        const int fmix = e->p.field_coding == 2 && !e->fld;
+        const int fmix = (e->p.field_coding == 2 || e->p.field_coding == 4) && !e->fld;
         const int bff = e->p.interlaced == 2;
         int rel = e->fld ? e->cur_poc - 2 * e->last_idr_poc
                 : fmix ? 2 * (e->cur_poc - e->last_idr_poc) + bff
@@ -12500,10 +12504,18 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         memset(e->slot_ref_poc[e->role_cur], 0, sizeof(e->slot_ref_poc[0]));
         e->slot_col_ok[e->role_cur] = 1;
     }
-    if (is_ref && e->p.field_coding == 2 && e->slot_low[e->role_cur].mem)
+    if (is_ref && (e->p.field_coding == 2 || e->p.field_coding == 4) &&
+        e->slot_low[e->role_cur].mem)
         /* (the frame pictures' lowres pre-search reads it) */
         aeg_lowres_build_rows(&e->slot_low[e->role_cur], e->recp[0],
                               e->stride[0], e->w, e->h, 0, 8 * e->mb_h - 1);
+    /* field_coding 4: the field macroblocks of a later MBAFF frame read it
+     * through its field copy */
+    if (e->p.field_coding == 4) {
+        e->slot_fok[e->role_cur] = 0;
+        if (is_ref)
+            mbaff_field_shadow(e, e->role_cur);
+    }
     /* the buffer becomes a reference frame (field_mark stored it), or is
      * reused by the next picture */
     e->role_last = e->role_cur;
@@ -13271,13 +13283,17 @@ static int fld_decide(const struct aeg_encoder *e)
     }
     if (!getenv("AEG_FLDCOMB")) {
         /* a P frame: by the prediction cost estimates, the fields to win
-         * by `bias` percent (two pictures' headers, more vectors) */
-        static int bias = -1;
+         * by `bias` percent (two pictures' headers, more vectors).  Against
+         * an MBAFF frame (field_coding 4), which codes its moving pairs as
+         * fields itself, by 16.  On the 80-field clips (BD-rate against
+         * --tff, means of four clips) 16 gives -25.05 % at p2 and -22.70 %
+         * at p3, 20 -25.23 / -22.27 %; at p2 12 gives -24.66 % and 30
+         * -25.17 %.  Only megamind moves (p2 at 12/16/20/30: -25.63, -27.07,
+         * -27.81, -27.55 %; p3 at 12/16/20: -24.31, -25.37, -23.63 %), a few
+         * anchors flipping either way. */
+        const int bias = ENV_INT("AEG_FLDBIAS", -1) >= 0 ? ENV_INT("AEG_FLDBIAS", -1)
+                       : e->p.field_coding == 4 ? 16 : 12;
         int i, a = -1;
-        if (bias < 0) {
-            const char *ev = getenv("AEG_FLDBIAS");
-            bias = ev ? atoi(ev) : 12;
-        }
         for (i = 0; i < e->ndpb; i++)
             if (e->dpb[i].anchor && e->dpb[i].fm == 3 &&
                 (a < 0 || e->dpb[i].poc > e->dpb[a].poc))
@@ -13325,13 +13341,16 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
     int64_t t_all = aeg_now_ns();
     int rc, fld = e->p.field_coding == 1;
 
-    if (e->p.field_coding == 2) {
+    if (e->p.field_coding == 2 || e->p.field_coding == 4) {
         int i;
         e->cur_poc = poc;
         fld = slice == AEG_SLICE_B ? e->anchor_fld : fld_decide(e);
         for (i = 0; i < e->ndpb; i++)
             slot_restructure(e, e->dpb[i].slot, fld);
         e->slot_fst[e->role_cur] = (uint8_t)fld;
+        /* 4: a frame picture is an MBAFF frame */
+        if (e->p.field_coding == 4)
+            e->pic.mbaff = e->mbaff = !fld;
     }
     rc = frame_prologue(e, &slice, &is_idr, poc);
     if (rc != AEG_OK)
@@ -13421,7 +13440,7 @@ static int write_param_sets(struct aeg_encoder *e)
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                               e->p.transform_8x8, e->p.cabac, 0,
-                              e->p.field_coding == 2);
+                              e->p.field_coding == 2 || e->p.field_coding == 4);
     /* worst case of a NAL: start code, header, and an emulation prevention
      * byte every two payload bytes */
     if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
@@ -13438,7 +13457,7 @@ static int write_param_sets(struct aeg_encoder *e)
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                            e->p.transform_8x8, e->p.cabac, 1,
-                           e->p.field_coding == 2);
+                           e->p.field_coding == 2 || e->p.field_coding == 4);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
     }
     e->hdr_len = n;
@@ -14075,7 +14094,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->chroma_qp_offset > 12) pp->chroma_qp_offset = 12;
     if (pp->level_idc < 0 || pp->level_idc > 62) pp->level_idc = 0;
     if (pp->interlaced < 0 || pp->interlaced > 2) pp->interlaced = 0;
-    if (pp->field_coding < 0 || pp->field_coding > 3) pp->field_coding = 0;
+    if (pp->field_coding < 0 || pp->field_coding > 4) pp->field_coding = 0;
     if (pp->field_coding && !pp->interlaced) pp->interlaced = 1;
     /* frame_mbs_only_flag 0 crops in units of 4 rows (as x264 refuses) */
     if (pp->interlaced && (pp->height & 3)) {
@@ -14212,7 +14231,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->b_pyramid = 0;
         pp->direct = 1;
         /* (field pictures do without; frame pictures among them keep them) */
-        if (pp->field_coding == 1 || pp->field_coding == 3) {
+        if (pp->field_coding != 2) {
             pp->weightp = 0;
             pp->chroma_me = 0;
         }
@@ -14356,7 +14375,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * read the same field. */
     e->poc_lsb_bits = 8;
     e->vpad = pp->field_coding ? 2 * AEG_PAD : AEG_PAD;
-    e->mbaff = pp->field_coding == 3;
+    e->mbaff = pp->field_coding >= 3;   /* (4: per picture, encode_frame) */
     e->mbaff_ff = -1;
     e->scan4 = aeg_scan4x4;
     e->scan8 = aeg_zigzag8x8;
@@ -14406,7 +14425,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (want > e->mb_h) want = e->mb_h;
         e->slice_rows = (e->mb_h + want - 1) / want;
         /* MBAFF: a slice holds whole macroblock pairs */
-        if (pp->field_coding == 3)
+        if (pp->field_coding >= 3)
             e->slice_rows += e->slice_rows & 1;
         e->n_slices = (e->mb_h + e->slice_rows - 1) / e->slice_rows;
 

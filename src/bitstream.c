@@ -100,7 +100,8 @@ int aeg_sps_max_refs(const aeg_params *p)
     return (p->refs >= 3 ? p->refs + (p->bframes > 0 && p->b_pyramid) :
             (p->bframes > 0 && p->b_pyramid) ? 3 :
             ((p->bframes > 0 || p->refs >= 2) ? 2 : 1)) +
-           (p->field_coding == 1 || p->field_coding == 2);
+           (p->field_coding == 1 || p->field_coding == 2 ||
+            p->field_coding == 4);
 }
 
 /* max_dec_frame_buffering (E.2.1): at least max_num_ref_frames and at least
@@ -416,7 +417,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     aeg_bw_ue(&bw, (uint32_t)(fmo ? mb_h - 1 : mb_h / 2 - 1));
     aeg_bw_put(&bw, 1, (uint32_t)fmo);   /* frame_mbs_only_flag             */
     if (!fmo)
-        aeg_bw_put(&bw, 1, p->field_coding == 3 ? 1u : 0u); /* mb_adaptive_frame_field_flag */
+        aeg_bw_put(&bw, 1, p->field_coding >= 3 ? 1u : 0u); /* mb_adaptive_frame_field_flag */
     aeg_bw_put(&bw, 1, 1);               /* direct_8x8_inference_flag       */
     if (crop_r || crop_b) {
         aeg_bw_put(&bw, 1, 1);           /* frame_cropping_flag             */
@@ -571,7 +572,7 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         aeg_bw_ue(bw, (uint32_t)idr_pic_id);
     aeg_bw_put(bw, poc_lsb_bits, (uint32_t)poc_lsb);
     /* delta_pic_order_cnt_bottom: only a frame picture of a stream whose PPS
-     * says so (field_coding 2): +1 top field first, -1 bottom first */
+     * says so (field_coding 2, 4): +1 top field first, -1 bottom first */
     if (frame_num_bits & AEG_SH_DPOCB)
         aeg_bw_se(bw, frame_num_bits & AEG_SH_BOTTOM ? -1 : 1);
     /* Temporal direct scales the co-located picture's vectors by the picture

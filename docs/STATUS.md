@@ -5825,3 +5825,63 @@ mode 7, whose left half moves and right half stands still.
 
 Progressive streams are unchanged. Under the forced patterns, and with
 `AEG_MBDEC=0`, MBAFF is byte-identical to stage 4.
+
+### Field pictures or an MBAFF frame per frame (`--paff --mbaff`, `params.field_coding` 4)
+
+MBAFF trailed PAFF by about 5 points on cockatoo, where the whole picture
+moves. With every pair forced to fields (`AEG_MBFORCE=all`), an MBAFF stream
+was still 15 % larger than field pictures at the same PSNR (p2, q28, 40
+frames: 193510 against 167819 bytes; 13.7 % without B pictures), and it
+had half again as many intra macroblocks. The cause is structural:
+* The second field of a field pair predicts from the first, one field
+  period away.
+* A bottom field macroblock of an MBAFF frame cannot do that, because its
+  top field is in the same picture. Its nearest reference is two field
+  periods back.
+* The I frame's second field is a P field in PAFF.
+
+H.264 lets a stream with `mb_adaptive_frame_field_flag` code each picture
+either as a field pair or as an MBAFF frame, so mode 4 does both:
+* **Choice.** Per anchor frame, PAFF's estimate (`fld_decide`) chooses
+  between field pictures and an MBAFF frame. The fields have to win by 16 %
+  rather than PAFF's 12 %, because an MBAFF frame codes its moving pairs as
+  fields itself. The B frames follow their anchor, so a B picture's
+  co-located picture always has its own structure.
+* **Headers.** The SPS sets `mb_adaptive_frame_field_flag`, and the DPB has
+  PAFF's extra frame. The PPS has `bottom_field_pic_order_in_frame_present`,
+  and the MBAFF frames count POC in fields like PAFF's frame pictures (top
+  2n, bottom 2n ± 1).
+* **References across the two structures.**
+  * A field-coded reference frame gets the field copy that MBAFF field
+    macroblocks read (`mbaff_field_shadow`).
+  * Each picture re-lays its references' borders and half-sample planes for
+    its own structure (`slot_restructure`).
+  * The deblocking filter's MBAFF flag follows the picture.
+* **Co-located field.** In a B MBAFF frame, a frame macroblock over a field
+  co-located pair reads the field nearer in POC. With distinct field counts
+  that is the field coded first (tff: top, bff: bottom), not the bottom one
+  of the equal-count tie in mode 3 (`col_block`). Reverting this breaks the
+  tff cases.
+
+BD-rate against `--tff` on the 80-field clips, QP 22-37:
+
+| clip | p2 PAFF | p2 MBAFF | **p2 PAFF+MBAFF** | p3 PAFF | p3 MBAFF | **p3 PAFF+MBAFF** |
+|---|---|---|---|---|---|---|
+| cockatoo | -66.54 | -61.72 | **-66.55** | -61.64 | -56.59 | **-61.65** |
+| vtest | +0.66 | -6.51 | -6.50 | +2.98 | -4.22 | -4.21 |
+| megamind | -24.78 | -26.43 | **-27.07** | -24.46 | -21.88 | **-25.37** |
+| tree | -0.15 | -0.10 | -0.08 | +0.25 | +0.41 | +0.42 |
+| mean | -22.70 | -23.69 | **-25.05** | -20.72 | -20.57 | **-22.70** |
+| time | +41 % | +61 % | +60 % | +63 % | +77 % | about +75 % |
+
+Each clip lands on the better of the two modes, or within 0.2 points of it.
+On megamind the mix (13 field / 27 MBAFF anchors in 40 frames) beats both.
+
+Tests:
+* ffmpeg decodes bit-exactly 60 of 60 combinations of the decision: five
+  clips; presets 0..4; CAVLC; 1-3 B pictures; slices and threads; bff;
+  CRF, ABR and VBV; 10-bit.
+* It also decodes 48 of 48 forced mixes: `AEG_FLDFORCE` patterns times
+  `AEG_MBFORCE`, tff and bff (`tests/run_tests.sh` `pm_*`, `h10_pm`).
+* Every other mode (`--mbaff`, `--paff`, `--field`, `--tff`, progressive)
+  is byte-identical to before.

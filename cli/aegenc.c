@@ -85,6 +85,7 @@ static void usage(void)
 "  --paff           frame or field pictures, chosen per frame from the source\n"
 "                   (B frames follow their anchor); --tff unless --bff\n"
 "  --mbaff          MBAFF frames: frame or field per macroblock pair\n"
+"  --paff --mbaff   per frame, field pictures or an MBAFF frame\n"
 "  --level <l>      force the level (4.1, 41; default: the smallest that\n"
 "                   fits)\n"
 "  --seek <n>       skip the first n input frames\n"
@@ -678,8 +679,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--tff")) interlaced = 1;
         else if (!strcmp(a, "--bff")) interlaced = 2;
         else if (!strcmp(a, "--field")) field_coding = 1;
-        else if (!strcmp(a, "--paff")) field_coding = 2;
-        else if (!strcmp(a, "--mbaff")) field_coding = 3;
+        else if (!strcmp(a, "--paff")) field_coding = field_coding >= 3 ? 4 : 2;
+        else if (!strcmp(a, "--mbaff")) field_coding = field_coding == 2 || field_coding == 4 ? 4 : 3;
         else if (!strcmp(a, "--qpmin")) p.qp_min = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--qpmax")) p.qp_max = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--chroma-qp-offset"))
