@@ -185,6 +185,11 @@ static int boundary_strength(const aeg_mb *p, int pa, const aeg_mb *q, int qa,
         if ((lp & 2) && (abs(p->mv1[pa][0] - q->mv1[qa][0]) >= 4 ||
                          abs(p->mv1[pa][1] - q->mv1[qa][1]) >= my))
             return 1;
+        /* (an MBAFF field macroblock's lists predict from the field of
+         * either parity: different fields are different pictures) */
+        if (((lp & 1) && p->ref_idx[pa] != q->ref_idx[qa]) ||
+            ((lp & 2) && p->ref_idx1[pa] != q->ref_idx1[qa]))
+            return 1;
         return 0;
     }
     /* P multi-reference: different reference indices also cause filtering,

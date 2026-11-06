@@ -159,6 +159,9 @@ typedef struct aeg_mb {
      * from (0 = newest, 1 = oldest).  One reference per list for B, so this
      * is 0 there. */
     uint8_t  ref_idx[16];
+    /* ... and list 1's: in an MBAFF B picture a field macroblock chooses the
+     * field of either parity of each list's frame (b_ref); 0 otherwise */
+    uint8_t  ref_idx1[16];
     int8_t   nz[AEG_BLK_COUNT];
     int8_t   nz8[4];          /* 8x8 groups with a non-zero coefficient   */
     uint8_t  skip;            /* P slice: coded as a skip run / flag      */
@@ -180,8 +183,9 @@ typedef struct aeg_mb {
  * reference-index test -- has to ask per block rather than per macroblock as
  * soon as a B macroblock may predict one partition from list 0 and the next
  * from list 1: the union of the two masks would tell every block that both
- * lists are in use.  Every reference index of a used list is 0 (the encoder
- * keeps one reference per list), so a mask is all a comparison needs. */
+ * lists are in use.  The reference indices (ref_idx / ref_idx1) are compared
+ * separately: 0 but in an MBAFF B field macroblock (field index 0 or 1 of
+ * each list's one frame). */
 static inline int aeg_mb_block_lists(const aeg_mb *m, int blk)
 {
     int p;

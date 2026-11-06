@@ -5741,8 +5741,9 @@ one starts:
    * **Direct vectors** that reach past the reference borders are not
      offered (`b_direct_reach`).
 
-   Field pairs are not used yet with the opposite-parity field in a B
-   picture (index 1).
+   Since then a field macroblock may also predict each list from the field
+   of the other parity (field index 1); see "MBAFF B field macroblocks on
+   the field of either parity" below.
 5. **The frame/field decision per pair (done).** Two steps (`AEG_MBDEC`):
    * **Vertical SADs** (x264's `x264_field_vsad`, `mbaff_vsad_field`). The
      pair's source luma is compared two ways: vertical differences within
@@ -6091,3 +6092,78 @@ Cockatoo never changes structure (all fields), so its loss against `--field`
 (1.20x / 1.46x) is the decision's wait: an anchor cannot overlap the
 previous anchor. Making the estimate row-wise would remove that, but its
 search follows the vectors of its neighbours and has no fixed reach.
+
+### MBAFF B field macroblocks on the field of either parity
+
+In an MBAFF frame a field macroblock of a B picture used to predict both lists
+from the field of its own parity (field index 0). Each list has one frame, but
+a field macroblock sees two fields of it (8.2.4.2.5: the same parity first,
+then the other). For one list the other parity is nearer in time: with top
+field first, list 0 for a top macroblock and list 1 for a bottom one. Now each
+list of a field macroblock uses index 0 or 1.
+
+* **The choice (`bfld_prep`)** is made once per field macroblock, before the
+  analysis. Per list, a 16x16 search runs on both fields. The winner has the
+  lowest distortion plus λ·(vector-difference bits + index bits). Every
+  partition of the macroblock then uses that field for the list
+  (`e->b_ref[list]`). The chosen field becomes reference entry `list` and the
+  other one moves to `list + 2` (`mbf_set_ref`), so the rest of the B analysis
+  runs as before. Field reference entries 2 and 3 hold the other parity
+  (`mbaff_field_refs`, `fref_n` 4).
+* **Storage:** `aeg_mb.ref_idx1` (new) and `mbenc.ref1` hold list 1's index
+  next to `ref_idx`/`ref`. `bfld_stamp` writes `b_ref` into every inter
+  candidate of the macroblock.
+* **Vector prediction** uses the macroblock's index for the current list
+  (`b_mv_predict`, `predict_mv_at`, `refresh_pmvs`). Neighbours count with
+  their own list's index, scaled to the current kind (`nb_from_mb`).
+* **Spatial direct** derives each list's index from the neighbours
+  (`b_direct_refs`, 8.4.1.2.2: the smallest of A, B, C/D after scaling). The
+  vector is the predictor for that index, and colZeroFlag zeroes only the
+  lists on index 0. Direct and skip are offered only when the derived indices
+  are the chosen ones (`bdr_no`, checked in `direct_group_ok`). A list-1-only
+  co-located block now needs its list 1 index to be 0.
+* **Syntax (CABAC; B pictures need CABAC):** `cabac_b_ref_idx` sends all list 0
+  indices, then all list 1 indices. ctxIdxInc = condTermA + 2·condTermB. A
+  neighbour counts when it predicts from the list, is not direct (B_Skip,
+  B_Direct_16x16 or a direct 8x8 group) and its scaled index is above 0 (above
+  1 for a field neighbour of a frame macroblock). Binarisation is unary, with
+  the second bin on ctxIdxInc 4.
+* **Deblocking** compares each list's index in B pictures too, because
+  different fields are different reference pictures.
+* **Pitfalls found on the way:**
+  * The RD deblocking estimate (`dbrdo_delta`) builds its `aeg_mb` on the stack
+    field by field, so it has to copy `ref_idx1`. Before this fix the
+    uninitialised field changed progressive `-p 3` output.
+  * `rd_luma` copies the candidate itself, so it needs `bfld_stamp` too. Its
+    memo restore keeps `ref1`.
+  * The search in `bfld_prep` has to set `me_lambda`. `analyse_mb` sets it
+    later, so the extra search ran with the previous macroblock's value, which
+    differs between serial and frame-threaded runs.
+* `AEG_BSAMEPAR=1` restores the old behaviour (own parity only) for
+  comparisons.
+
+**Unchanged output:** progressive, `--tff`, `--field` and `--paff` streams
+(presets 1–4) are byte-identical to before. MBAFF P-only streams are
+byte-identical too, and so are MBAFF B streams with `AEG_BSAMEPAR`.
+
+**Checks:**
+* ffmpeg decodes bit-exact: mega `--mbaff` p0–p4 (p4 with `--ref 3`, B_8x8),
+  cock p3, `--bff`, `--paff-mbaff`, vtest with CRF and `--slices 3`.
+* Forced choices (each list on index 1, alone and together) also decode
+  bit-exact.
+* Frame threads (2 and 3 workers), `AEG_MBSTALE` and `AEG_POISON` give the
+  serial stream. ftcmp matrix: 26/26 identical.
+* ThreadSanitizer and ASan/UBSan are clean; `make test` passes.
+
+BD-rate (PSNR, ffmpeg decode, QP 22/27/32/37) against the same-parity
+version:
+
+| clip | `--mbaff` p2 | `--mbaff` p3 | `--paff-mbaff` p2 | `--paff-mbaff` p3 |
+|---|---|---|---|---|
+| cockatoo 640x352, 30 frames | −1.57% | −4.46% | 0.00% | 0.00% |
+| megamind 352x256, 80 frames | −2.12% | −2.26% | −0.90% | −0.81% |
+| vtest 384x288, 60 frames | −1.74% | −2.14% | −1.74% | −2.13% |
+
+Cockatoo in mode 4 is coded as field pictures throughout, so it has no MBAFF
+B frames. Encode time is unchanged within noise (−3% to +4% at p2/p3).
+

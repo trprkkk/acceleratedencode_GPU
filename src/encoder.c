@@ -63,6 +63,7 @@ typedef struct mbenc {
     int      t8;
     int16_t  mv[16][2];             /* per 4x4 block, 1/4 pel, list 0        */
     uint8_t  ref[16];              /* P list0 reference index per 4x4      */
+    uint8_t  ref1[16];             /* list 1's (MBAFF B field macroblocks) */
     /* B pictures: the list 1 vector of each 4x4 block and, per partition, which
      * lists predict it (1 = list 0, 2 = list 1, 3 = both). */
     int16_t  mv1[16][2];
@@ -131,7 +132,8 @@ typedef struct {
     int     pmv[16][2];
     int     pmv1[16][2];
     uint8_t blist[4];
-    /* P list0 reference index per 4x4 block (0 or 1).  B pictures keep 0. */
+    /* P list0 reference index per 4x4 block (0 or 1).  B pictures keep 0
+     * (an MBAFF B field macroblock's are set from b_ref, bfld_stamp). */
     uint8_t ref[16];
     /* the motion search's cost (SATD + lambda * mvd bits) plus one;
      * 0 = not known (see b_rd_gate) */
@@ -512,9 +514,15 @@ struct aeg_encoder {
      * (8.4.2.1); fref_n of them (no more than AEG_MAX_REFS), 0: none. */
     int fref_n;
     /* a B picture's: entry 0 is list 0's field of the macroblock's parity,
-     * entry 1 list 1's (a field macroblock of a B picture stays on index 0
-     * of both lists, so the other parities are not needed) */
+     * entry 1 list 1's, entries 2 and 3 the other parity's (field reference
+     * index 1 of each list, 8.4.2.1) */
     int fref_b;
+    /* A field macroblock of an MBAFF B picture predicts each list from one
+     * field (b_ref[list]: 0 = its parity, 1 = the other), chosen up front
+     * (bfld_prep); entry `list` of refpl / mcr is that field, entry list + 2
+     * the other.  bfld_on: this macroblock does; bdr_no: direct mode may not
+     * be offered (its derived indices are not the chosen ones). */
+    int b_ref[2], bfld_on, bdr_no;
     pixel *fref_pl[2][AEG_MAX_REFS][3];
     aeg_mc_ctx fref_mc[2][AEG_MAX_REFS];
     int fref_poc[2][AEG_MAX_REFS], fref_cofs[2][AEG_MAX_REFS];
@@ -1478,6 +1486,27 @@ static inline int ref_kind(const struct aeg_encoder *e, const aeg_mb *n,
  * (its sixteen lines, every other frame line, at the pair's position), so
  * that everything addressing the picture by (mbx, mby) -- base + 16 mby rows
  * of `stride` -- lands on them; and the field scans and contexts. */
+/* Reference entry k of field macroblock row mby: field reference f of the
+ * macroblock's parity (fref_*), addressed like the planes mbf_enter sets
+ * up: base' + (16 mby + y) 2s is field row 16 py + y, frame line
+ * 32 py + 2y + parity.  (mbf_save.stride holds the frame's strides.) */
+static void mbf_set_ref(struct aeg_encoder *e, int mby, int k, int f)
+{
+    const int py = mby >> 1, bot = mby & 1;
+    int i;
+
+    for (i = 0; i < 3; i++)
+        e->refpl[k][i] = e->fref_pl[bot][f][i] -
+                         (i ? (ptrdiff_t)(16 * py + 16 * bot) * e->mbf_save.stride[i]
+                            : (ptrdiff_t)(32 * py + 32 * bot) * e->mbf_save.stride[i]);
+    e->mcr[k] = e->fref_mc[bot][f];
+    for (i = 0; i < 4; i++)
+        if (e->mcr[k].base[i])
+            e->mcr[k].base[i] -= (ptrdiff_t)(32 * py + 32 * bot) * e->mbf_save.stride[0];
+    e->ref_poc[k] = e->fref_poc[bot][f];
+    e->fld_cofs[k] = e->fref_cofs[bot][f];
+}
+
 static void mbf_enter(struct aeg_encoder *e, int mby)
 {
     const int py = mby >> 1, bot = mby & 1;
@@ -1508,19 +1537,7 @@ static void mbf_enter(struct aeg_encoder *e, int mby)
             e->mbf_save.mcr[k] = e->mcr[k];
             e->mbf_save.ref_poc[k] = e->ref_poc[k];
             e->mbf_save.cofs[k] = e->fld_cofs[k];
-            /* addressed like the planes above: base' + (16 mby + y) 2s is
-             * field row 16 py + y, frame line 32 py + 2y + parity */
-            for (i = 0; i < 3; i++)
-                e->refpl[k][i] = e->fref_pl[bot][k][i] -
-                                 (i ? (ptrdiff_t)(16 * py + 16 * bot) * e->mbf_save.stride[i]
-                                    : (ptrdiff_t)(32 * py + 32 * bot) * e->mbf_save.stride[i]);
-            e->mcr[k] = e->fref_mc[bot][k];
-            for (i = 0; i < 4; i++)
-                if (e->mcr[k].base[i])
-                    e->mcr[k].base[i] -= (ptrdiff_t)(32 * py + 32 * bot) *
-                                         e->mbf_save.stride[0];
-            e->ref_poc[k] = e->fref_poc[bot][k];
-            e->fld_cofs[k] = e->fref_cofs[bot][k];
+            mbf_set_ref(e, mby, k, k);
         }
         if (!e->fref_b) {
             e->cur_l0_active = n;
@@ -1557,6 +1574,7 @@ static void mbf_leave(struct aeg_encoder *e)
         e->has_ref2 = e->mbf_save.has_ref2;
         e->mbf_save.refs = 0;
     }
+    e->b_ref[0] = e->b_ref[1] = e->bfld_on = e->bdr_no = 0;
     e->cfld = 0;
     e->scan4 = aeg_scan4x4;
     e->scan8 = aeg_zigzag8x8;
@@ -3237,7 +3255,7 @@ static void nb_from_mb(nb_mv *n, const aeg_mb *m, int blk, int list)
     }
     nb_set_r(n, NB_OK, list ? m->mv1[blk][0] : m->mv[blk][0],
              list ? m->mv1[blk][1] : m->mv[blk][1],
-             (int)m->ref_idx[blk]);
+             (int)(list ? m->ref_idx1[blk] : m->ref_idx[blk]));
 }
 
 /* The macroblock holding the sample above-left of macroblock (mbx, mby)
@@ -3459,7 +3477,13 @@ static void predict_mv_at(struct aeg_encoder *e, int mbx, int mby,
                           int type, int p, int bx, int by, int pw, int list,
                           int *pmvx, int *pmvy)
 {
-    predict_mv_at_ref(e, mbx, mby, cur, NULL, avail, type, p, bx, by, pw, list, 0, pmvx, pmvy);
+    /* (a B field macroblock: every partition of a list on its b_ref) */
+    int8_t cr[16];
+    const int r = e->bfld_on ? e->b_ref[list] : 0;
+    if (r)
+        memset(cr, r, sizeof(cr));
+    predict_mv_at_ref(e, mbx, mby, cur, r ? cr : NULL, avail, type, p, bx, by,
+                      pw, list, r, pmvx, pmvy);
 }
 
 /* The 16x16 predictor for list-0 reference `ref` (no neighbour inside the
@@ -3598,10 +3622,10 @@ static void b_mv_predict(const struct aeg_encoder *e, int mbx, int mby, int list
     int a_av = 0, b_av = 0, c_av = 0, n;
 
     /* In an MBAFF frame the neighbours are located by Table 6-4 and brought
-     * to the macroblock's kind; every partition of a B picture is on index 0
-     * of its lists, which is what this rule amounts to. */
+     * to the macroblock's kind, and the index is the macroblock's (b_ref: 0
+     * but in a field macroblock that chose the other parity). */
     if (e->mbaff) {
-        pred16_list(e, mbx, mby, list, 0, mvx, mvy);
+        pred16_list(e, mbx, mby, list, e->b_ref[list], mvx, mvy);
         return;
     }
     if (mbx > 0) {
@@ -3665,8 +3689,11 @@ static int direct_group_ok(const struct aeg_encoder *e, int mbx, int mby, int g)
 {
     static const int grp4[4] = { 0, 3, 12, 15 };
     const aeg_mb *col;
-    /* spatial direct takes refIdx 0 of each list from the neighbours, never
-     * the co-located block's reference, so every group qualifies */
+    /* spatial direct takes each list's index from the neighbours, never the
+     * co-located block's reference, so every group qualifies -- unless an
+     * MBAFF B field macroblock chose other indices (bfld_prep) */
+    if (e->bdr_no)
+        return 0;
     if (e->p.direct == 1 || !e->col_ready)
         return 1;
     col = &e->col_mbs[mby * e->mb_w + mbx];
@@ -3756,7 +3783,8 @@ static void b_direct_mv(const struct aeg_encoder *e, int mbx, int mby,
  * Then, per 8x8 group, colZeroFlag: if the co-located anchor's block at the
  * group's corner (direct_8x8_inference) is inter, on its reference 0, and its
  * vector is within +-1 quarter sample in both components, the vectors of the
- * used lists (both on reference 0) are zero for that group.
+ * used lists on reference 0 are zero for that group.  (In an MBAFF field
+ * macroblock the derived index may be 1: b_direct_refs.)
  *
  * Returns the list mask, the same for all four groups. */
 /* The co-located macroblock of 8x8 group g of macroblock (mbx, mby) and the
@@ -3791,10 +3819,34 @@ static const aeg_mb *col_block(const struct aeg_encoder *e, int mbx, int mby,
     return &e->col_mbs[(top + y8) * e->mb_w + mbx];
 }
 
+/* MBAFF: the reference indices spatial direct derives for macroblock (mbx,
+ * mby) of the current kind (8.4.1.2.2): per list the smallest of the
+ * neighbours' A, B and C (else D), brought to the macroblock's kind; -1
+ * when none predicts from the list.  A frame macroblock's are 0 or -1 (a
+ * field neighbour's 1 halves to 0). */
+static void b_direct_refs(const struct aeg_encoder *e, int mbx, int mby,
+                          int ref[2])
+{
+    int list;
+    for (list = 0; list < 2; list++) {
+        nb_mv n[3];
+        int i;
+        nb_mv_at(e, mbx, mby, -1, 0, list, &n[0]);
+        nb_mv_at(e, mbx, mby, 0, -1, list, &n[1]);
+        nb_mv_at(e, mbx, mby, 16, -1, list, &n[2]);
+        if (n[2].ref == NB_UNAVAIL)
+            nb_mv_at(e, mbx, mby, -1, -1, list, &n[2]);
+        ref[list] = -1;
+        for (i = 0; i < 3; i++)
+            if (n[i].ref == NB_OK && (ref[list] < 0 || n[i].ref_idx < ref[list]))
+                ref[list] = n[i].ref_idx;
+    }
+}
+
 static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
                             int mv0[16][2], int mv1[16][2])
 {
-    int used[2], pmv[2][2], list, g, k, lists;
+    int used[2], pmv[2][2], list, g, k, lists, dref[2] = { 0, 0 };
 
     memset(mv0, 0, 32 * sizeof(mv0[0][0]));
     memset(mv1, 0, 32 * sizeof(mv1[0][0]));
@@ -3802,19 +3854,18 @@ static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
         const aeg_mb *m;
         int u = 0;
         if (e->mbaff) {
-            /* A, B and C (else D) located by Table 6-4; the index would be
-             * the smallest of theirs after the frame/field scaling, which in
-             * a B picture (every partition on index 0) is 0 */
-            nb_mv A, B, C;
-            nb_mv_at(e, mbx, mby, -1, 0, list, &A);
-            nb_mv_at(e, mbx, mby, 0, -1, list, &B);
-            nb_mv_at(e, mbx, mby, 16, -1, list, &C);
-            if (C.ref == NB_UNAVAIL)
-                nb_mv_at(e, mbx, mby, -1, -1, list, &C);
-            used[list] = A.ref == NB_OK || B.ref == NB_OK || C.ref == NB_OK;
+            /* A, B and C (else D) located by Table 6-4; the index is the
+             * smallest of theirs after the frame/field scaling (1 only for
+             * a field macroblock whose neighbours all are on the other
+             * parity, see bfld_prep) */
+            int r[2];
+            b_direct_refs(e, mbx, mby, r);
+            used[list] = r[list] >= 0;
+            dref[list] = used[list] ? r[list] : 0;
             pmv[list][0] = pmv[list][1] = 0;
             if (used[list])
-                pred16_list(e, mbx, mby, list, 0, &pmv[list][0], &pmv[list][1]);
+                pred16_list(e, mbx, mby, list, dref[list], &pmv[list][0],
+                            &pmv[list][1]);
             continue;
         }
         if (mbx > 0) {
@@ -3858,18 +3909,20 @@ static int b_direct_spatial(const struct aeg_encoder *e, int mbx, int mby,
                 if (col->ref_idx[cb] == 0)
                     v = col->mv[cb];
             } else if (lm & 2) {
-                v = col->mv1[cb];
+                if (col->ref_idx1[cb] == 0)
+                    v = col->mv1[cb];
             }
             if (v)
                 z = v[0] >= -1 && v[0] <= 1 && v[1] >= -1 && v[1] <= 1;
         }
         for (k = 0; k < 4; k++) {
             int b = ((y8 << 1) + (k >> 1)) * 4 + (x8 << 1) + (k & 1);
-            if (used[0] && !z) {
+            /* (colZeroFlag zeroes the lists on index 0 only) */
+            if (used[0] && !(z && !dref[0])) {
                 mv0[b][0] = pmv[0][0];
                 mv0[b][1] = pmv[0][1];
             }
-            if (used[1] && !z) {
+            if (used[1] && !(z && !dref[1])) {
                 mv1[b][0] = pmv[1][0];
                 mv1[b][1] = pmv[1][1];
             }
@@ -4087,7 +4140,8 @@ static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
     if (!on)
         return 0;
 #define NB_ADD(M, B) do {                                                   \
-        if (!is_intra_type((M)->type) && !(M)->ref_idx[B]) {               \
+        if (!is_intra_type((M)->type) &&                                   \
+            (list ? (M)->ref_idx1[B] : (M)->ref_idx[B]) == e->b_ref[list]) { \
             const int16_t *v_ = list ? (M)->mv1[B] : (M)->mv[B];            \
             nb[n][0] = v_[0]; nb[n][1] = v_[1]; n++;                        \
         }                                                                   \
@@ -4353,7 +4407,8 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                  * so its predictor is the same one the search stored and is
                  * left alone. */
                 int pmvx, pmvy;
-                int cur_r = (l == 0 && e->cur_l0_active > 1) ? (int)c->ref[b0] : 0;
+                int cur_r = l ? (int)c->ref1[b0]
+                              : (e->cur_l0_active > 1 || e->cur_is_b) ? (int)c->ref[b0] : 0;
                 predict_mv_at_ref(e, mbx, mby, (const int16_t (*)[2])cur[l], cur_ref[l],
                               avail[l], c->type, p, x0, y0, geo[2] / 4, l, cur_r,
                               &pmvx, &pmvy);
@@ -4376,7 +4431,7 @@ static void refresh_pmvs(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                         cur[l][b][0] = l ? c->mv1[b0][0] : c->mv[b0][0];
                         cur[l][b][1] = l ? c->mv1[b0][1] : c->mv[b0][1];
                         avail[l][b] = AEG_MVBLK_AVAIL;
-                        cur_ref[l][b] = (l == 0) ? (int8_t)c->ref[b0] : 0;
+                        cur_ref[l][b] = (int8_t)(l ? c->ref1[b0] : c->ref[b0]);
                     } else {
                         avail[l][b] = AEG_MVBLK_NOTUSED;
                         cur_ref[l][b] = -1;
@@ -4426,6 +4481,17 @@ static int part_subpel_b(const struct aeg_encoder *e)
 }
 
 static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t);
+
+/* A field macroblock of an MBAFF B picture: every block of an inter
+ * candidate on the indices bfld_prep chose (of both lists: the one a block
+ * does not predict from is never read). */
+static void bfld_stamp(const struct aeg_encoder *e, mbenc *t)
+{
+    if (e->bfld_on && is_inter_type(t->type)) {
+        memset(t->ref, e->b_ref[0], sizeof(t->ref));
+        memset(t->ref1, e->b_ref[1], sizeof(t->ref1));
+    }
+}
 
 static int bidir_part_on(const struct aeg_encoder *e)
 {
@@ -6961,6 +7027,7 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
             t->pmv1[b][1] = (int16_t)e->mb_cand[cand].pmv1[b][1];
             t->ref[b] = e->mb_cand[cand].ref[b];
         }
+        bfld_stamp(e, t);
         inter_predict_typed(e, mbx, mby, t);
         if (lmemo_on() && !e->coef_batch) {
             /* Candidates that predict the same pixels code the same luma: the
@@ -6996,6 +7063,7 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
                 memcpy(t->pmv, keep.pmv, sizeof(t->pmv));
                 memcpy(t->pmv1, keep.pmv1, sizeof(t->pmv1));
                 memcpy(t->ref, keep.ref, sizeof(t->ref));
+                memcpy(t->ref1, keep.ref1, sizeof(t->ref1));
                 for (y = 0; y < 16; y++)
                     memcpy(dst + y * s, m->rec + y * 16, 16 * sizeof(pixel));
             } else {
@@ -7055,6 +7123,7 @@ static void cand_enc(const struct aeg_encoder *e, int cand, int qp, mbenc *t)
         t->pmv1[b][1] = (int16_t)e->mb_cand[cand].pmv1[b][1];
         t->ref[b] = e->mb_cand[cand].ref[b];
     }
+    bfld_stamp(e, t);
 }
 
 /* The rate-distortion comparison of every inter candidate of one macroblock,
@@ -7432,6 +7501,7 @@ static int64_t dbrdo_delta(struct aeg_encoder *e, int mbx, int mby,
         memcpy(q.mv1, t->mv1, sizeof(q.mv1));
     memcpy(q.blist, t->blist, sizeof(q.blist));
     memcpy(q.ref_idx, t->ref, sizeof(q.ref_idx));
+    memcpy(q.ref_idx1, t->ref1, sizeof(q.ref_idx1));
     for (i = 0; i < AEG_BLK_COUNT; i++)
         q.nz[i] = (int8_t)(t->nz[i] != 0);
     for (i = 0; i < 4; i++)
@@ -9008,11 +9078,67 @@ static const uint8_t cab_i16_ctx_b[6] = { 32, 33, 34, 34, 35, 35 };
 /* MBAFF: ref_idx_l0 then ref_idx_l1 of a field macroblock of a B picture,
  * sent although each list has one frame (mb_field_decoding_flag !=
  * field_pic_flag, 7.3.5.1 / 7.3.5.2), per partition (or non-direct 8x8
- * group) predicting from the list.  Every partition of a B picture is on
- * index 0, so no neighbour's refIdxZeroFlag is clear (9.3.3.1.1.6: with a
- * field neighbour of a frame macroblock the test is > 1, which 0 passes as
- * well): ctxIdxInc 0 and the single bin 0 each time. */
-static void cabac_b_ref_idx(aeg_cabac *cb, const mbenc *c)
+ * group) predicting from the list: 0 (the macroblock's parity) or 1.
+ * ctxIdxInc = condTermA + 2 condTermB (9.3.3.1.1.6): a neighbouring
+ * partition counts when it predicts from the list, is not direct (B_Skip,
+ * B_Direct_16x16, a direct 8x8 group) and its index, brought to the current
+ * macroblock's kind (a field neighbour of a frame macroblock: > 1), is not
+ * 0.  Unary, the second bin on ctxIdxInc 4. */
+static int bref_cond(const struct aeg_encoder *e, const aeg_mb *m, int blk,
+                     int list)
+{
+    if (!m || is_intra_type(m->type) || m->type == AEG_MB_B_DIRECT)
+        return 0;
+    if (m->type == AEG_MB_B_8x8 &&
+        b_sub_direct[m->sub_type[(((blk >> 2) >= 2) << 1) + ((blk & 3) >= 2)]])
+        return 0;
+    if (!(aeg_mb_block_lists(m, blk) & (1 << list)))
+        return 0;
+    return ref_kind(e, m, list ? m->ref_idx1[blk] : m->ref_idx[blk]) > 0;
+}
+
+static int bref_cond_cur(const mbenc *c, int blk, int list)
+{
+    int g = (((blk >> 2) >= 2) << 1) + ((blk & 3) >= 2), lists;
+    if (c->type == AEG_MB_B_8x8) {
+        if (b_sub_direct[c->sub_type[g]])
+            return 0;
+        lists = c->blist[g] ? c->blist[g] : 3;
+    } else if (c->type == AEG_MB_B16x8) {
+        lists = mb_part_lists(c, (blk >> 2) >= 2);
+    } else if (c->type == AEG_MB_B8x16) {
+        lists = mb_part_lists(c, (blk & 3) >= 2);
+    } else {
+        lists = mb_part_lists(c, 0);
+    }
+    return (lists & (1 << list)) && (list ? c->ref1[blk] : c->ref[blk]) > 0;
+}
+
+static void cabac_b_ref_one(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                            int mby, const mbenc *c, int b0, int list)
+{
+    const int x0 = b0 & 3, y0 = b0 >> 2;
+    const int ref = list ? c->ref1[b0] : c->ref[b0];
+    int ctx = 0;
+
+    if (x0 > 0) {
+        ctx += bref_cond_cur(c, b0 - 1, list);
+    } else if (mbx > 0) {
+        int yM;
+        const aeg_mb *lm = nb_left(e, mbx, mby, 4 * y0, 16, &yM);
+        ctx += bref_cond(e, lm, (yM >> 2) * 4 + 3, list);
+    }
+    if (y0 > 0)
+        ctx += 2 * bref_cond_cur(c, b0 - 4, list);
+    else if (nb_top_ok(e, mby))
+        ctx += 2 * bref_cond(e, nb_mbB(e, mbx, mby), 12 + x0, list);
+    aeg_cabac_decision(cb, 54 + ctx, ref > 0);
+    if (ref)
+        aeg_cabac_decision(cb, 54 + 4, 0);
+}
+
+static void cabac_b_ref_idx(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
+                            int mby, const mbenc *c)
 {
     int list, p;
 
@@ -9021,11 +9147,15 @@ static void cabac_b_ref_idx(aeg_cabac *cb, const mbenc *c)
             for (p = 0; p < 4; p++)
                 if (!b_sub_direct[c->sub_type[p]] &&
                     ((c->blist[p] ? c->blist[p] : 3) & (1 << list)))
-                    aeg_cabac_decision(cb, 54, 0);
+                    cabac_b_ref_one(e, cb, mbx, mby, c, (p & 1) * 2 + (p >> 1) * 8,
+                                    list);
         } else {
             for (p = 0; p < part_count(c->type); p++)
-                if (mb_part_lists(c, p) & (1 << list))
-                    aeg_cabac_decision(cb, 54, 0);
+                if (mb_part_lists(c, p) & (1 << list)) {
+                    int geo[4], b0;
+                    mb_part_geom(c, p, geo, &b0);
+                    cabac_b_ref_one(e, cb, mbx, mby, c, b0, list);
+                }
         }
     }
 }
@@ -9237,7 +9367,7 @@ static void write_mb_cabac(struct aeg_encoder *e, aeg_cabac *cb, int mbx,
              * a pair per list it predicts from, list 0 first (Table 7-16). */
             if (c->type != AEG_MB_B_DIRECT) {
                 if (e->mbaff && e->cfld)
-                    cabac_b_ref_idx(cb, c);
+                    cabac_b_ref_idx(e, cb, mbx, mby, c);
                 if (lmask & 1)
                     cabac_mb_mvd(e, cb, mbx, mby, c, 0);
                 if (lmask & 2)
@@ -11027,6 +11157,61 @@ static int mbaff_pair_field(const struct aeg_encoder *e, int slice, int mbx,
 /* The decision pass's work on one macroblock: the analysis, the mode
  * decision and reconstruction, and the decisions stored for the neighbour
  * queries of the following macroblocks (and for the deblocking filter). */
+/* A field macroblock of an MBAFF B picture: per list, the field of its own
+ * parity (field reference index 0) or the other one (1) of the list's frame
+ * -- the other parity is the nearer field in time for one of the lists
+ * (top-field-first: list 0 for a top macroblock, list 1 for a bottom one).
+ * A 16x16 search on both, by distortion plus the vector difference's and
+ * the index's bits; every partition of the macroblock then predicts the
+ * list from that field (entry `list` of refpl / mcr, the other one moved to
+ * list + 2).  Direct mode derives its indices from the neighbours, so it is
+ * offered only when those are the chosen ones (bdr_no). */
+static void bfld_prep(struct aeg_encoder *e, int mbx, int mby, int qp)
+{
+    const int st = e->stride[0], idx = mby * e->mb_w + mbx;
+    const pixel *src = e->srcp[0] + mby * 16 * st + mbx * 16;
+    const int range = e->p.search_range ? e->p.search_range : 16;
+    int l, r, dref[2];
+
+    e->b_ref[0] = e->b_ref[1] = e->bfld_on = e->bdr_no = 0;
+    if (!e->cur_is_b || !e->mbaff || !e->cfld || !e->fref_b || e->fref_n < 4)
+        return;
+    e->bfld_on = 1;
+    /* (analyse_mb sets the same) */
+    e->me_lambda = me_lambda_on(e) ? aeg_me_lambda(qp) : 0;
+    for (l = 0; l < 2; l++) {
+        int best = INT_MAX, br = 0;
+        for (r = 0; r < 2; r++) {
+            int pmv[2], seed[2], mv[2], sad, cost;
+            mbf_set_ref(e, mby, l, l + 2 * r);
+            e->b_ref[l] = r;
+            pred16_list(e, mbx, mby, l, r, &pmv[0], &pmv[1]);
+            seed[0] = pmv[0] / 4;
+            seed[1] = pmv[1] / 4;
+            if (e->lr_valid) {
+                seed[0] = e->lr_mv[l][idx * 2];
+                seed[1] = e->lr_mv[l][idx * 2 + 1];
+            }
+            aeg_me_block_l(e->refpl[l][0] + mby * 16 * st + mbx * 16, st, src, st,
+                           16, 16, range, SUBME_F(e, 4), pmv[0], pmv[1], seed,
+                           NULL, 0, e->me_lambda, &e->mcr[l], &mv[0], &mv[1], &sad);
+            cost = sad + e->me_lambda * (aeg_mvd_bits(mv[0] - pmv[0], mv[1] - pmv[1]) +
+                                         1 + r);
+            if (cost < best)
+                best = cost, br = r;
+        }
+        e->b_ref[l] = br;
+        mbf_set_ref(e, mby, l, l + 2 * br);
+        mbf_set_ref(e, mby, l + 2, l + 2 * !br);
+    }
+    /* (no neighbour on either list: both on index 0, zero vectors) */
+    b_direct_refs(e, mbx, mby, dref);
+    if (dref[0] < 0 && dref[1] < 0)
+        dref[0] = dref[1] = 0;
+    e->bdr_no = (dref[0] >= 0 && dref[0] != e->b_ref[0]) ||
+                (dref[1] >= 0 && dref[1] != e->b_ref[1]);
+}
+
 static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
 {
     const int idx = mby * e->mb_w + mbx;
@@ -11036,6 +11221,7 @@ static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
     int64_t t0 = aeg_now_ns();
 
     reset_mb_enc(tmp, mb_qp_of(e, mbx, mby));
+    bfld_prep(e, mbx, mby, tmp->qp);
     {
         CM_T0();
         analyse_mb(e, mbx, mby, tmp);
@@ -11043,6 +11229,7 @@ static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
     }
     e->st.stage_ns[AEG_STAGE_MOTION_EST] += aeg_now_ns() - t0;
 
+    bfld_stamp(e, tmp);
     t0 = aeg_now_ns();
     code_mb(e, mbx, mby, tmp);
     e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
@@ -11081,6 +11268,7 @@ static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
         m->mv1[i][0] = tmp->mv1[i][0];
         m->mv1[i][1] = tmp->mv1[i][1];
         m->ref_idx[i] = tmp->ref[i];
+        m->ref_idx1[i] = tmp->ref1[i];
     }
     m->cost = (int32_t)tmp->sse;
 }
@@ -12830,7 +13018,7 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                     for (y = e->rp_dbk; y < e->mb_h; y++)
                         rowpost_deblock_row(e, e->rp_mbs, y);
             } else if (e->p.deblock) {
-                aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
+            aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
                                   e->p.deblock_beta, 1);
             }
             if (is_ref) {
@@ -13455,10 +13643,12 @@ static void mbaff_field_refs(struct aeg_encoder *e)
     if (e->cur_is_b) {
         if (!e->has_ref2 || !fref_frame_ok(e, 0) || !fref_frame_ok(e, 1))
             return;
+        /* (AEG_BSAMEPAR: the macroblock's parity only, as before) */
+        const int nk = getenv("AEG_BSAMEPAR") ? 2 : 4;
         for (cp = 0; cp < 2; cp++)
-            for (k = 0; k < 2; k++)
-                fref_fill(e, cp, k, k, cp);
-        e->fref_n = 2;
+            for (k = 0; k < nk; k++)
+                fref_fill(e, cp, k, k & 1, k >= 2 ? !cp : cp);
+        e->fref_n = nk;
         e->fref_b = 1;
         return;
     }
