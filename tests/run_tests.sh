@@ -1010,6 +1010,67 @@ if command -v "$FF" >/dev/null 2>&1; then
     else
         echo "   mbaff trial restore: FAILED (AEG_MBDEC=3 differs from 1)"; FAIL=1
     fi
+    # frame threads in MBAFF frames: a reference's field copy is built band
+    # by band behind the rows it publishes, and a pair waits for its field
+    # macroblocks' reach (twice as many frame rows).  Any worker count writes
+    # the serial stream, and so do AEG_POISON=1 (rows past that bound are
+    # garbage until it reaches them) and AEG_MBSTALE (the decisions array
+    # filled with garbage before every picture: a worker's holds whatever it
+    # coded last), with natural and forced (AEG_MBFORCE) field pairs
+    "$BUILD/genyuv" 176 160 16 "$TMP/mbft.yuv" 7 >/dev/null
+    bad=""
+    for mf in "" 3; do
+        if [ -n "$mf" ]; then export AEG_MBFORCE=$mf; fi
+        for o in "-p 3 -q 28 --ref 3" "-p 2 --crf 24 --bff" \
+                 "-p 4 -q 30 --ref 2 --b-pyramid 0"; do
+            for k in s ft2 ft3 ft4 pz st; do
+                ev="AEG_UNUSED=1"; t="--frame-threads 1"
+                case $k in
+                    ft2) t="--frame-threads 2" ;; ft3) t="--frame-threads 3" ;;
+                    ft4) t="--frame-threads 4" ;;
+                    pz) ev="AEG_POISON=1" ;; st) ev="AEG_MBSTALE=85" ;;
+                esac
+                env $ev $BUILD/aegenc -w 176 -h 160 -n 16 -i "$TMP/mbft.yuv" \
+                    -v 0 --mbaff $o $t -o "$TMP/mbft_$k.264" || bad="$bad rc:$k"
+                [ $k = s ] || cmp -s "$TMP/mbft_s.264" "$TMP/mbft_$k.264" ||
+                    bad="$bad $k[$mf $o]"
+            done
+        done
+        unset AEG_MBFORCE
+    done
+    if [ -z "$bad" ]; then
+        echo "   mbaff frame threads 2/3/4 = serial = AEG_POISON = AEG_MBSTALE"
+    else
+        echo "   mbaff frame threads: streams differ:$bad  FAIL"; FAIL=1
+    fi
+    # frame threads in field pictures (--field): a reference frame's rows
+    # are published once its second field reaches them (both fields final),
+    # its fields' half-resolution copies built behind them; a field reads
+    # frame rows 2 l + 1 for its field line l, and the second field its first
+    # without waiting.  Any worker count writes the serial stream, and so
+    # does AEG_POISON=1 (each reference frame read a copy garbage past that
+    # bound: planes, half-sample planes, the field's half-resolution copy,
+    # the co-located field's decisions)
+    bad=""
+    for o in "-p 3 -q 28 --ref 3" "-p 2 --crf 24 --bff" \
+             "-p 4 -q 30 --ref 2 --b-pyramid 0" "-p 1 -q 26 --bframes 0"; do
+        for k in s ft2 ft3 ft4 pz; do
+            ev="AEG_UNUSED=1"; t="--frame-threads 1"
+            case $k in
+                ft2) t="--frame-threads 2" ;; ft3) t="--frame-threads 3" ;;
+                ft4) t="--frame-threads 4" ;; pz) ev="AEG_POISON=1" ;;
+            esac
+            env $ev $BUILD/aegenc -w 176 -h 160 -n 16 -i "$TMP/mbft.yuv" \
+                -v 0 --field $o $t -o "$TMP/fdft_$k.264" || bad="$bad rc:$k"
+            [ $k = s ] || cmp -s "$TMP/fdft_s.264" "$TMP/fdft_$k.264" ||
+                bad="$bad $k[$o]"
+        done
+    done
+    if [ -z "$bad" ]; then
+        echo "   field-picture frame threads 2/3/4 = serial = AEG_POISON"
+    else
+        echo "   field-picture frame threads: streams differ:$bad  FAIL"; FAIL=1
+    fi
     # field macroblock pairs (forced pseudo-random pattern, AEG_MBFORCE): the
     # field views and scans, neighbour derivation between frame and field
     # pairs (Table 6-4), the mixed-edge deblocking, the field references and

@@ -247,7 +247,9 @@ typedef struct aeg_params {
     int slices;               /* slices per picture, 0/1 = one           */
     /* Frame threads: 2 = a non-reference B picture is coded next to the
      * picture after it (same bitstream as 1), 1 = off, 0 = auto (2 with more
-     * than one CPU unless threads == 1).  Constant QP only. */
+     * than one CPU unless threads == 1).  Constant QP only; with
+     * field_coding 0, 1 or 3 (2 and 4, which choose the structure per
+     * picture, code serially). */
     int frame_threads;
     int backend;              /* aeg_backend                            */
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */

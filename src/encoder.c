@@ -243,6 +243,20 @@ struct aeg_encoder {
     const pixel *pz_src[AEG_MAX_REFS][3], *pz_hsrc[AEG_MAX_REFS][4];
     const aeg_lowres *pz_lsrc[AEG_MAX_REFS];
     const aeg_mb *pz_msrc;
+    /* ... and of the MBAFF field copies the field macroblocks read
+     * (slot_fpl, slot_fmc) of buffer pzf_slot[l], list entry l's */
+    int pzf_slot[AEG_MAX_REFS];
+    pixel *pzf_mem[AEG_MAX_REFS], *pzf_plane[AEG_MAX_REFS][3];
+    aeg_mc_ctx pzf_mc[AEG_MAX_REFS];
+    /* ... and in a field picture (pzl_setup): copies of the reference
+     * frames (frame layout, frame rows) its field views read */
+    int pzl_on, pzl_slot[AEG_MAX_REFS], pzl_rows[AEG_MAX_REFS];
+    pixel *pzl_mem[AEG_MAX_REFS], *pzl_plane[AEG_MAX_REFS][3];
+    aeg_mc_ctx pzl_mc[AEG_MAX_REFS];
+    aeg_lowres pzl_low[AEG_MAX_REFS];
+    const aeg_lowres *pzl_lsrc[AEG_MAX_REFS];
+    aeg_mb *pzl_mbs;
+    const aeg_mb *pzl_msrc;
     int job_bref[AEG_MAX_BFRAMES + 4];
     int cur_bref;            /* the picture being coded is a reference B */
     pixel *recp[3];
@@ -483,8 +497,13 @@ struct aeg_encoder {
     /* MBAFF: per buffer, the reference as field macroblocks read it -- the
      * same samples with each field's own borders, and half-sample planes
      * filtered within each field (mbaff_field_shadow, once the reference
-     * picture is complete) */
+     * picture is complete, or band by band behind rowpost_pad when the
+     * picture is post-processed row by row: rowpost_fshadow) */
     pixel *slot_fmem[AEG_NPIC], *slot_fpl[AEG_NPIC][3];
+    int rp_fsh;                        /* frame bands copied into it       */
+    int rp_fhp;                        /* field bands with half-pel planes */
+    int rp_fon;                        /* this picture's built that way    */
+    int rp_lfon;                       /* a field's slot_lowf, row by row  */
     aeg_mc_ctx slot_fmc[AEG_NPIC];
     uint8_t slot_fok[AEG_NPIC];        /* ... holds the buffer's picture */
     /* The current P picture's field references for a top (0) and a bottom
@@ -507,6 +526,14 @@ struct aeg_encoder {
      * fields'), and how the last anchor was coded (its B pictures follow) */
     uint8_t slot_fst[AEG_NPIC];
     int anchor_fld;
+    /* field coding (1, 2, 4): per buffer, the half-resolution copy of each
+     * of its fields (the lowres pre-search of a field picture), built row by
+     * row as the field is post-processed (rowpost_bands); slot_lfok: they
+     * hold the buffer's picture.  Frame dimensions, as the copy a field
+     * picture would build of its reference itself (lr_seed_frame): its rows
+     * past the field's height repeat the field's last row. */
+    aeg_lowres slot_lowf[AEG_NPIC][2];
+    uint8_t slot_lfok[AEG_NPIC];
     /* the coefficient scans (field scans in a field) and the matching CABAC
      * category offset / CAVLC flags */
     const uint8_t *scan4, *scan8;
@@ -935,7 +962,7 @@ static size_t pic_bytes(const struct aeg_encoder *e)
 /* Picture buffer i with what a reference keeps next to its samples. */
 static int slot_alloc(struct aeg_encoder *e, int i)
 {
-    int st[3] = { e->stride[0], e->stride[1], e->stride[2] };
+    int st[3] = { e->stride[0], e->stride[1], e->stride[2] }, k;
     if (enc_alloc_picture(e, &e->pic_mem[i], e->pic_plane[i]) != AEG_OK)
         return AEG_ENOMEM;
     if (st[0])
@@ -946,7 +973,20 @@ static int slot_alloc(struct aeg_encoder *e, int i)
     if (aeg_lowres_alloc(&e->slot_low[i], e->mb_w, e->mb_h))
         e->slot_low[i].mem = NULL;
     e->slot_mbs[i] = (aeg_mb *)aeg_alloc((size_t)e->mb_count * sizeof(aeg_mb));
-    return e->slot_mbs[i] ? AEG_OK : AEG_ENOMEM;
+    if (!e->slot_mbs[i])
+        return AEG_ENOMEM;
+    if (e->p.field_coding && e->p.field_coding != 3 && !e->slot_lowf[i][0].mem)
+        for (k = 0; k < 2; k++)
+            if (aeg_lowres_alloc(&e->slot_lowf[i][k], e->mb_w, e->mb_h))
+                e->slot_lowf[i][k].mem = NULL;
+    if (e->p.field_coding >= 3 && !e->slot_fmem[i]) {
+        /* MBAFF: the field copy, here rather than on first use (a frame
+         * thread's worker builds it in its own copy of the encoder) */
+        if (enc_alloc_picture(e, &e->slot_fmem[i], e->slot_fpl[i]) != AEG_OK)
+            return AEG_ENOMEM;
+        aeg_mc_ctx_init_pad(&e->slot_fmc[i], e->w, e->h, e->stride[0], e->vpad);
+    }
+    return AEG_OK;
 }
 
 /* Point recp at the buffer being reconstructed.  The reference pointers
@@ -4060,7 +4100,11 @@ static int me_neighbour_cands(const struct aeg_encoder *e, int mbx, int mby,
         m = &e->mbs[(mby - 1) * e->mb_w + mbx];
         NB_ADD(m, 12);
         if (c_right_ok(e, mbx, mby)) {
-            m = &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
+            /* (an MBAFF bottom field macroblock's is the bottom macroblock
+             * of the pair above-right: the raster one is the next pair's
+             * top macroblock, not decided yet) */
+            m = e->mbaff && (mby & 1) ? nb_mbB(e, mbx + 1, mby)
+                                      : &e->mbs[(mby - 1) * e->mb_w + mbx + 1];
             NB_ADD(m, 12);
         }
     }
@@ -4723,6 +4767,10 @@ static int nb_maxref(const struct aeg_encoder *e, int mbx, int mby)
         const aeg_mb *n;
         if (x < 0 || x >= e->mb_w || (dy[d] && y < e->top_row))
             continue;
+        /* (in an MBAFF frame the bottom macroblock's top-right is the top
+         * macroblock of the next pair, not decided yet) */
+        if (e->mbaff && (mby & 1) && dx[d] > 0)
+            continue;
         n = &e->mbs[y * e->mb_w + x];
         if (!is_inter_type(n->type))
             continue;
@@ -5324,6 +5372,10 @@ static void lr_seed_frame(struct aeg_encoder *e)
         if (s >= 0 && ref == e->pic_plane[s][0] && e->slot_low[s].mem &&
             !e->fld) {
             e->lr_ref[l] = &e->slot_low[s];
+        } else if (s >= 0 && e->fld && e->slot_lfok[s] &&
+                   ref == e->pic_plane[s][0] + e->ref_par[l] * e->fsv.stride[0]) {
+            /* a reference field's own copy (the same rows as built here) */
+            e->lr_ref[l] = &e->slot_lowf[s][e->ref_par[l]];
         } else {
             aeg_lowres_build(&e->lr_pic[1 + l], ref, e->stride[0], e->w, e->h);
             e->lr_ref[l] = &e->lr_pic[1 + l];
@@ -10253,16 +10305,85 @@ static void rowpost_hpel(struct aeg_encoder *e, int m)
                             e->stride[0], e->w, e->h, k, ya, yb);
 }
 
+/* MBAFF: the field copy of the reference being post-processed (what
+ * mbaff_field_shadow makes of the complete picture), band by band behind
+ * rowpost_pad: frame band b once it is final and padded (its rows carry
+ * their left and right borders already), each field's top border with band
+ * 0 and its bottom border with the last band, and the half-sample planes of
+ * field band m (16 rows of each field, frame bands 2m and 2m + 1) once frame
+ * band 2m + 2 is there -- the 6-tap filter reads three field rows below the
+ * band, frame rows up to 32m + 37.  Every sample is computed from the same
+ * samples as in the whole-picture version. */
+static void rowpost_fshadow(struct aeg_encoder *e)
+{
+    const int s = e->role_cur, nf = e->mb_h / 2;
+    aeg_mc_ctx *mc = &e->slot_fmc[s];
+    int i, y, par, k;
+
+    while (e->rp_fsh < e->rp_band) {
+        const int b = e->rp_fsh;
+        for (i = 0; i < 3; i++) {
+            pixel *d = e->slot_fpl[s][i];
+            const pixel *src = e->recp[i];
+            int st = e->stride[i], w = i ? e->cw : e->w, h = i ? e->ch : e->h;
+            int bh = i ? 8 : 16, y0 = b * bh, y1 = y0 + bh;
+            size_t row = (size_t)(w + 2 * AEG_PAD) * sizeof(pixel);
+
+            if (y1 > h || b == e->mb_h - 1)
+                y1 = h;
+            memcpy(d + (ptrdiff_t)y0 * st - AEG_PAD, src + (ptrdiff_t)y0 * st - AEG_PAD,
+                   ((size_t)(y1 - y0 - 1) * st + w + 2 * AEG_PAD) * sizeof(pixel));
+            for (par = 0; par < 2; par++) {
+                pixel *f = d + par * st;
+                const int fst = 2 * st, fh = h / 2;
+                if (b == 0)
+                    for (y = 1; y <= AEG_PAD; y++)
+                        memcpy(f - (ptrdiff_t)y * fst - AEG_PAD, f - AEG_PAD, row);
+                if (b == e->mb_h - 1)
+                    for (y = 1; y <= AEG_PAD; y++)
+                        memcpy(f + (ptrdiff_t)(fh - 1 + y) * fst - AEG_PAD,
+                               f + (ptrdiff_t)(fh - 1) * fst - AEG_PAD, row);
+            }
+        }
+        e->rp_fsh++;
+    }
+    while (e->rp_fhp < nf &&
+           (e->rp_fsh == e->mb_h || e->rp_fsh >= 2 * e->rp_fhp + 3)) {
+        const int m = e->rp_fhp;
+        const int ya = m == 0 ? -AEG_PAD : 16 * m;
+        const int yb = m == nf - 1 ? e->h / 2 + AEG_PAD - 1 : 16 * m + 15;
+        if (mc->buf) {
+            const pixel *yp = e->slot_fpl[s][0];
+            int st = mc->stride, ys = e->stride[0];
+            for (k = 1; k < 4; k++)
+                for (par = 0; par < 2; par++)
+                    aeg_hpel_plane_rows((pixel *)mc->base[k] + par * st, 2 * st,
+                                        yp + par * ys, 2 * ys, e->w, e->h / 2,
+                                        k, ya, yb);
+        }
+        e->rp_fhp++;
+    }
+}
+
 /* Everything that rows < `final` being final allows. */
 static void rowpost_bands(struct aeg_encoder *e, int final)
 {
+    int pub;
     aeg_lowres *lo = &e->slot_low[e->role_cur];
 
     while (e->rp_band < final) {
-        rowpost_pad(e, e->rp_band);
-        if (lo->mem && !e->fld)       /* (a field's: lr_seed_frame builds it) */
+        const int b = e->rp_band;
+        rowpost_pad(e, b);
+        if (lo->mem && !e->fld)
             aeg_lowres_build_rows(lo, e->recp[0], e->stride[0], e->w, e->h,
-                                  8 * e->rp_band, 8 * e->rp_band + 7);
+                                  8 * b, 8 * b + 7);
+        else if (e->rp_lfon) {
+            /* a field's own copy (slot_lowf); with the last band the rows
+             * past the field's height too */
+            aeg_lowres *lf = &e->slot_lowf[e->role_cur][e->fld_par];
+            aeg_lowres_build_rows(lf, e->recp[0], e->stride[0], e->w, e->h,
+                                  8 * b, b == e->mb_h - 1 ? lf->h - 1 : 8 * b + 7);
+        }
         e->rp_band++;
     }
     while (e->rp_hpel + 1 < e->rp_band ||
@@ -10270,8 +10391,24 @@ static void rowpost_bands(struct aeg_encoder *e, int final)
         rowpost_hpel(e, e->rp_hpel);
         e->rp_hpel++;
     }
-    if (e->slot_rows[e->role_cur] != e->rp_hpel)
-        slot_publish(e, e->role_cur, e->rp_hpel);
+    pub = e->rp_hpel;
+    if (e->fld)
+        /* a field picture: published in frame rows, final once both fields
+         * are -- nothing during the first field, two frame rows per row of
+         * the second */
+        pub = e->fld_idx == 0 ? 0 : e->rp_hpel == e->mb_h ? e->fsv.mb_h
+                                                          : 2 * e->rp_hpel;
+    if (e->rp_fon) {
+        /* field macroblocks of the pictures predicting from it read the
+         * field copy: published as far as both are there */
+        int fr;
+        rowpost_fshadow(e);
+        fr = e->rp_fhp == e->mb_h / 2 ? e->mb_h : 2 * e->rp_fhp;
+        if (fr < pub)
+            pub = fr;
+    }
+    if (e->slot_rows[e->role_cur] != pub)
+        slot_publish(e, e->role_cur, pub);
 }
 
 static void rowpost_deblock_row(struct aeg_encoder *e, const aeg_mb *mbs, int y)
@@ -10293,10 +10430,33 @@ static int ref_rows_needed(const struct aeg_encoder *e, int r)
     int range = e->p.search_range ? e->p.search_range : 16;
     int line = 16 * r + 15 + range + 8, n;
 
+    if (e->mbaff) {
+        /* An MBAFF pair is decided at once (both rows).  Its field
+         * macroblocks search their field copies, 16 field rows per pair row
+         * and the range in field rows: frame row 2 * line + 1 of the copy.
+         * A frame macroblock may inherit a vector (skip, direct) from a field
+         * neighbour, twice as tall in frame rows. */
+        int fl = 16 * (r >> 1) + 15 + range + 8;
+        r |= 1;
+        line = 16 * r + 15 + 2 * range + 8;
+        if (2 * fl + 1 > line)
+            line = 2 * fl + 1;
+    }
+
     if (less < 0) {
         /* debug: AEG_RRLESS=n under AEG_POISON shows the margin is real */
         const char *ev = getenv("AEG_RRLESS");
         less = ev ? atoi(ev) : 0;
+    }
+    if (e->fld) {
+        /* A field picture: rows in field lines, the reference's published
+         * in frame rows (both its fields final there): field line fl is
+         * frame row 2 fl + 1 at most */
+        int fl = line;
+        if (e->lr_valid && 16 * r + 16 + 63 > fl)
+            fl = 16 * r + 16 + 63;
+        n = (2 * fl + 1 - less) / 16 + 1;
+        return n > e->fsv.mb_h ? e->fsv.mb_h : n;
     }
     if (e->lr_valid && 16 * r + 16 + 63 > line)
         line = 16 * r + 16 + 63;
@@ -10324,6 +10484,61 @@ static void pz_copy_rows_es(void *dst_, const void *src_, int stride,
 #define pz_copy_rows(d, s, st, pad, h, bh, b0, b1, nb) \
     pz_copy_rows_es(d, s, st, pad, h, bh, b0, b1, nb, sizeof(pixel))
 
+/* As pz_copy_rows, for a buffer with vpad rows above and below its planes
+ * (the MBAFF field copies) */
+static void pz_copy_vrows(pixel *dst, const pixel *src, int stride, int vpad,
+                          int h, int bh, int b0, int b1, int nb)
+{
+    int ya = b0 == 0 ? -vpad : b0 * bh;
+    int yb = b1 == nb ? h + vpad : b1 * bh;
+    if (yb > h + vpad)
+        yb = h + vpad;
+    if (yb > ya)
+        memcpy(dst + (ptrdiff_t)ya * stride - AEG_PAD,
+               src + (ptrdiff_t)ya * stride - AEG_PAD,
+               (size_t)(yb - ya) * stride * sizeof(pixel));
+}
+
+/* A field picture's poisoned reference copies (pzl_setup): the real rows
+ * up to frame row `need` of each, the frame's planes, half-sample planes,
+ * the field's half-resolution copy and, for direct mode, the co-located
+ * field's decisions as far as they go. */
+static void pzl_ensure(struct aeg_encoder *e, int need)
+{
+    const struct fld_save *v = &e->fsv;
+    int l, k;
+
+    for (l = 0; l < AEG_MAX_REFS; l++) {
+        const int s = e->pzl_slot[l], b0 = e->pzl_rows[l];
+        if (s < 0 || need <= b0)
+            continue;
+        for (k = 0; k < 3; k++)
+            pz_copy_vrows(e->pzl_plane[l][k], e->pic_plane[s][k], v->stride[k],
+                          e->vpad, k ? v->ch : v->h, k ? 8 : 16, b0, need, v->mb_h);
+        if (e->pzl_mc[l].buf && e->slot_mc[s].buf)
+            for (k = 1; k < 4; k++)
+                pz_copy_vrows((pixel *)e->pzl_mc[l].base[k], e->slot_mc[s].base[k],
+                              e->slot_mc[s].stride, e->vpad, v->h, 16, b0, need,
+                              v->mb_h);
+        if (e->pzl_lsrc[l]) {
+            /* frame rows < need: the field's rows < 8 need, its
+             * half-resolution rows < 4 need */
+            const aeg_lowres *src = e->pzl_lsrc[l];
+            int lp = (src->stride - src->w) / 2;
+            pz_copy_rows_es(e->pzl_low[l].plane, src->plane, src->stride, lp,
+                            src->h, 4, b0, need, v->mb_h, 1);
+        }
+        if (l == 1 && e->pzl_msrc) {
+            const int r0 = b0 / 2, r1 = need >= v->mb_h ? e->mb_h : need / 2;
+            const ptrdiff_t o = e->col_mbs - e->pzl_mbs;
+            if (r1 > r0)
+                memcpy(e->pzl_mbs + o + r0 * e->mb_w, e->pzl_msrc + r0 * e->mb_w,
+                       (size_t)(r1 - r0) * e->mb_w * sizeof(aeg_mb));
+        }
+        e->pzl_rows[l] = need;
+    }
+}
+
 /* Before the decision pass of row mby: make sure the references are there. */
 static int ref_rows_ensure(struct aeg_encoder *e, int mby)
 {
@@ -10335,8 +10550,14 @@ static int ref_rows_ensure(struct aeg_encoder *e, int mby)
             return 0;
         need = ref_rows_needed(e, mby);
         for (l = 0; l < nl; l++)
-            if (ref_wait(e, e->ref_slot[l], need))
+            /* (the second field's first: this worker coded it already) */
+            if (e->ref_slot[l] != e->role_cur &&
+                ref_wait(e, e->ref_slot[l], need))
                 return -1;
+        return 0;
+    }
+    if (e->pzl_on) {
+        pzl_ensure(e, ref_rows_needed(e, mby));
         return 0;
     }
     if (!e->pz_on)
@@ -10363,9 +10584,155 @@ static int ref_rows_ensure(struct aeg_encoder *e, int mby)
         if (l == 1 && e->pz_msrc)
             memcpy(e->pz_mbs + b0 * e->mb_w, e->pz_msrc + b0 * e->mb_w,
                    (size_t)(need - b0) * e->mb_w * sizeof(aeg_mb));
+        if (e->pzf_slot[l] >= 0) {
+            const int fs = e->pzf_slot[l];
+            for (k = 0; k < 3; k++)
+                pz_copy_vrows(e->pzf_plane[l][k], e->slot_fpl[fs][k],
+                              e->stride[k], e->vpad, k ? e->ch : e->h,
+                              k ? 8 : 16, b0, need, e->mb_h);
+            if (e->slot_fmc[fs].buf)
+                for (k = 1; k < 4; k++)
+                    pz_copy_vrows((pixel *)e->pzf_mc[l].base[k],
+                                  e->slot_fmc[fs].base[k], e->slot_fmc[fs].stride,
+                                  e->vpad, e->h, 16, b0, need, e->mb_h);
+        }
         e->pz_rows[l] = need;
     }
     return 0;
+}
+
+/* A field picture under AEG_POISON: every reference frame it reads (but its
+ * own, whose first field this worker coded) replaced by a copy that is
+ * garbage until pzl_ensure copies the rows the bound allows -- the frame's
+ * planes and half-sample planes (the field views keep their offsets), the
+ * reference field's half-resolution copy and the co-located field's
+ * decisions.  The copies have the frame's dimensions (the field's are in
+ * effect, fsv holds the frame's). */
+static void pzl_setup(struct aeg_encoder *e)
+{
+    static unsigned seed = 9876;
+    const struct fld_save *v = &e->fsv;
+    int l, k, i;
+
+    if (!getenv("AEG_POISON") || e->n_slices > 1 || !e->has_ref ||
+        !(e->cur_is_p || e->cur_is_b))
+        return;
+    e->pzl_on = 1;
+    e->pzl_msrc = NULL;
+    for (l = 0; l < AEG_MAX_REFS; l++) {
+        const int s = e->ref_slot[l];
+        aeg_mc_ctx *mc = &e->mcr[l];
+        ptrdiff_t off;
+        size_t n, nbytes;
+
+        e->pzl_slot[l] = -1;
+        e->pzl_lsrc[l] = NULL;
+        if (l >= nrefpl(e) || s < 0 || s == e->role_cur || !e->refpl[l][0])
+            continue;
+        off = e->refpl[l][0] - e->pic_plane[s][0];
+        if (off != 0 && off != v->stride[0])
+            continue;
+        if (!e->pzl_mem[l]) {
+            /* (enc_alloc_picture and friends size by the frame's height
+             * and set the frame's strides) */
+            int h = e->h, st[3] = { e->stride[0], e->stride[1], e->stride[2] };
+            e->h = v->h;
+            if (enc_alloc_picture(e, &e->pzl_mem[l], e->pzl_plane[l]) != AEG_OK) {
+                e->h = h;
+                memcpy(e->stride, st, sizeof(st));
+                continue;
+            }
+            aeg_mc_ctx_init_pad(&e->pzl_mc[l], e->w, v->h, v->stride[0], e->vpad);
+            e->h = h;
+            memcpy(e->stride, st, sizeof(st));
+            if (aeg_lowres_alloc(&e->pzl_low[l], e->mb_w, v->mb_h))
+                e->pzl_low[l].mem = NULL;
+            if (!e->pzl_mbs)
+                e->pzl_mbs = (aeg_mb *)aeg_alloc((size_t)v->mb_count * sizeof(aeg_mb));
+        }
+        {
+            int h = e->h;
+            e->h = v->h;
+            nbytes = pic_bytes(e) / sizeof(pixel);
+            e->h = h;
+        }
+        for (n = 0; n < nbytes; n++) {
+            seed = seed * 1103515245u + 12345u;
+            e->pzl_mem[l][n] = (pixel)(seed >> 16);
+        }
+        if (e->pzl_mc[l].buf)
+            memset(e->pzl_mc[l].buf, 0x6b,
+                   3 * (size_t)v->stride[0] * (v->h + 2 * e->vpad) * sizeof(pixel));
+        for (k = 0; k < 3; k++)
+            e->refpl[l][k] = e->pzl_plane[l][k] + (e->refpl[l][k] - e->pic_plane[s][k]);
+        mc->base[0] = e->refpl[l][0];
+        for (i = 1; i < 4; i++)
+            if (mc->base[i] && e->pzl_mc[l].buf && e->slot_mc[s].buf)
+                mc->base[i] = e->pzl_mc[l].base[i] + (mc->base[i] - e->slot_mc[s].base[i]);
+        if (e->lr_valid && l < e->lr_nl && e->pzl_low[l].mem &&
+            e->lr_ref[l] == &e->slot_lowf[s][e->ref_par[l]]) {
+            e->pzl_lsrc[l] = e->lr_ref[l];
+            memset(e->pzl_low[l].mem, 0x3c,
+                   (size_t)e->pzl_low[l].stride * (e->pzl_low[l].h + 2 * AEG_LA_PAD));
+            e->lr_ref[l] = &e->pzl_low[l];
+        }
+        if (l == 1 && e->cur_is_b && e->pzl_mbs &&
+            e->col_mbs == e->slot_mbs[s] + e->ref_par[1] * e->mb_count) {
+            e->pzl_msrc = e->col_mbs;
+            memset(e->pzl_mbs, 0x77, (size_t)v->mb_count * sizeof(aeg_mb));
+            e->col_mbs = e->pzl_mbs + e->ref_par[1] * e->mb_count;
+        }
+        e->pzl_slot[l] = s;
+        e->pzl_rows[l] = 0;
+    }
+}
+
+/* MBAFF: a poisoned copy of buffer s's field copy in place of the field
+ * references (fref_*) of list entry l that read it */
+static void pzf_setup(struct aeg_encoder *e, int l, int s)
+{
+    static unsigned seed = 54321;
+    int cp, k, i, hit = 0;
+    size_t n, nbytes;
+
+    if (!e->mbaff || !e->fref_n || !e->slot_fmem[s])
+        return;
+    for (cp = 0; cp < 2; cp++)
+        for (k = 0; k < e->fref_n; k++) {
+            ptrdiff_t off = e->fref_pl[cp][k][0] - e->slot_fpl[s][0];
+            hit |= off == 0 || off == e->stride[0];
+        }
+    if (!hit)
+        return;
+    if (!e->pzf_mem[l]) {
+        if (enc_alloc_picture(e, &e->pzf_mem[l], e->pzf_plane[l]) != AEG_OK)
+            return;
+        aeg_mc_ctx_init_pad(&e->pzf_mc[l], e->w, e->h, e->stride[0], e->vpad);
+    }
+    nbytes = pic_bytes(e) / sizeof(pixel);
+    for (n = 0; n < nbytes; n++) {
+        seed = seed * 1103515245u + 12345u;
+        e->pzf_mem[l][n] = (pixel)(seed >> 16);
+    }
+    if (e->pzf_mc[l].buf)
+        memset(e->pzf_mc[l].buf, 0x5a,
+               3 * (size_t)e->stride[0] * (e->h + 2 * e->vpad) * sizeof(pixel));
+    for (cp = 0; cp < 2; cp++)
+        for (k = 0; k < e->fref_n; k++) {
+            aeg_mc_ctx *c = &e->fref_mc[cp][k];
+            ptrdiff_t off = e->fref_pl[cp][k][0] - e->slot_fpl[s][0];
+            if (off != 0 && off != e->stride[0])
+                continue;
+            for (i = 0; i < 3; i++)
+                e->fref_pl[cp][k][i] = e->pzf_plane[l][i] +
+                                       (e->fref_pl[cp][k][i] - e->slot_fpl[s][i]);
+            c->base[0] = e->fref_pl[cp][k][0];
+            for (i = 1; i < 4; i++)
+                if (c->base[i] && e->pzf_mc[l].buf)
+                    c->base[i] = e->pzf_mc[l].base[i] +
+                                 (c->base[i] - e->slot_fmc[s].base[i]);
+        }
+    e->pzf_slot[l] = s;
 }
 
 /* Put the poisoned copies in place of this picture's references (the lists
@@ -10377,7 +10744,12 @@ static void pz_setup(struct aeg_encoder *e)
     static unsigned seed = 12345;
 
     e->pz_on = 0;
-    if (!getenv("AEG_POISON") || e->n_slices > 1 || !e->has_ref || e->fld ||
+    e->pzl_on = 0;
+    if (e->fld) {
+        pzl_setup(e);
+        return;
+    }
+    if (!getenv("AEG_POISON") || e->n_slices > 1 || !e->has_ref ||
         !(e->cur_is_p || e->cur_is_b))
         return;
     e->pz_on = 1;
@@ -10391,6 +10763,7 @@ static void pz_setup(struct aeg_encoder *e)
 
         e->pz_rows[l] = 0;
         e->pz_src[l][0] = NULL;
+        e->pzf_slot[l] = -1;
         if (s < 0 || rp[0] != e->pic_plane[s][0] ||
             (l == 0 && e->cur_is_p && e->p.weightp)) {
             e->pz_rows[l] = e->mb_h;
@@ -10432,6 +10805,7 @@ static void pz_setup(struct aeg_encoder *e)
             e->pz_lsrc[l] = e->lr_ref[l];
             e->lr_ref[l] = &e->pz_low[l];
         }
+        pzf_setup(e, l, s);
         if (l == 1 && e->cur_is_b && e->col_mbs == e->slot_mbs[s] && e->pz_mbs) {
             e->pz_msrc = e->col_mbs;
             memset(e->pz_mbs, 0x77, (size_t)e->mb_count * sizeof(aeg_mb));
@@ -10445,6 +10819,7 @@ static void pz_setup(struct aeg_encoder *e)
 static void pz_finish(struct aeg_encoder *e)
 {
     int l, k;
+    e->pzl_on = 0;      /* (a field's lists are set afresh for the next) */
     if (!e->pz_on)
         return;
     for (l = 0; l < e->pz_nl; l++) {
@@ -12330,6 +12705,11 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         return AEG_ENOMEM;
     e->ft_spec = 0;
     e->ft_abort = 0;
+    /* frame threads: field pictures never restart, and nothing they read
+     * does (no weighted prediction), so they register no generations */
+    for (f = 0; f < AEG_MAX_REFS; f++)
+        e->ft_gslot[f] = -1;
+    e->ft_reg = 0;
     memset(&e->wp, 0, sizeof(e->wp));
     if (is_idr)
         e->frame_num = 0;
@@ -12422,10 +12802,18 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 0, 6,
                                      sei, sn, 0);
         }
-        e->rp_on = 0;
+        /* a reference field coded as one slice is post-processed row by row
+         * behind its decision pass, as a frame is (rowpost_row) */
+        e->rp_on = is_ref && e->n_slices == 1 && e->slot_mbs[e->role_cur] &&
+                   slice_thread_count(e) == 1 && !getenv("AEG_NORP");
+        e->rp_fon = 0;
+        e->rp_lfon = is_ref && e->slot_lowf[e->role_cur][e->fld_par].mem != NULL;
         e->rp_dbk = e->rp_band = e->rp_hpel = 0;
         e->rp_qp = e->cur_qp;
-        e->rp_mbs = NULL;
+        e->rp_mbs = e->slot_mbs[e->role_cur] ?
+                    e->slot_mbs[e->role_cur] + e->fld_par * e->mb_count : NULL;
+        if (f == 0)
+            e->slot_rows[e->role_cur] = 0;
         rc = code_slices(e, fslice, fidr, &out_len);
         if (rc != AEG_OK) {
             field_leave(e);
@@ -12436,11 +12824,18 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         e->top_row = 0;
         {
             int64_t t0 = aeg_now_ns();
-            if (e->p.deblock)
+            if (e->rp_on) {
+                int y;
+                if (e->p.deblock)
+                    for (y = e->rp_dbk; y < e->mb_h; y++)
+                        rowpost_deblock_row(e, e->rp_mbs, y);
+            } else if (e->p.deblock) {
                 aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
                                   e->p.deblock_beta, 1);
+            }
             if (is_ref) {
-                e->rp_band = e->rp_hpel = 0;
+                if (!e->rp_on)
+                    e->rp_band = e->rp_hpel = 0;
                 rowpost_bands(e, e->mb_h);
             } else {
                 int i;
@@ -12450,10 +12845,13 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             }
             e->st.stage_ns[AEG_STAGE_DEBLOCK] += aeg_now_ns() - t0;
         }
-        if (is_ref && e->slot_mbs[e->role_cur])
-            /* (by parity: direct mode finds a co-located field by its) */
+        if (is_ref && e->slot_mbs[e->role_cur] && !e->rp_on)
+            /* (by parity: direct mode finds a co-located field by its;
+             * rowpost_finalize has stored them already when rp_on) */
             memcpy(e->slot_mbs[e->role_cur] + e->fld_par * e->mb_count, e->mbs,
                    (size_t)e->mb_count * sizeof(e->mbs[0]));
+        e->rp_on = 0;
+        e->rp_lfon = 0;
         pz_finish(e);
         if (is_ref)
             field_mark(e, fidr);
@@ -12504,6 +12902,7 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         memset(e->slot_ref_poc[e->role_cur], 0, sizeof(e->slot_ref_poc[0]));
         e->slot_col_ok[e->role_cur] = 1;
     }
+    e->slot_lfok[e->role_cur] = is_ref && e->slot_lowf[e->role_cur][0].mem;
     if (is_ref && (e->p.field_coding == 2 || e->p.field_coding == 4) &&
         e->slot_low[e->role_cur].mem)
         /* (the frame pictures' lowres pre-search reads it) */
@@ -12683,6 +13082,11 @@ recode:
     me_seed_frame(e);
     lr_seed_frame(e);
     pz_setup(e);
+    if (getenv("AEG_MBSTALE"))
+        /* debug: the decisions left by an earlier picture must not matter
+         * (frame threads hand each picture a worker's own array, holding
+         * whatever that worker coded last); the output has to stay the same */
+        memset(e->mbs, atoi(getenv("AEG_MBSTALE")), (size_t)e->mb_count * sizeof(aeg_mb));
 
     /* frame_num counts the pictures since the last IDR (H.264 8.2.1): an IDR
      * always carries 0, otherwise the decoder invents "non-existing" frames to
@@ -12754,6 +13158,8 @@ recode:
     e->rp_on = e->cur_is_ref && e->n_slices == 1 && e->slot_mbs[e->role_cur] &&
                slice_thread_count(e) == 1 && !getenv("AEG_NORP");
     e->rp_dbk = e->rp_band = e->rp_hpel = 0;
+    e->rp_fon = e->mbaff && e->cur_is_ref && e->slot_fmem[e->role_cur];
+    e->rp_fsh = e->rp_fhp = 0;
     e->rp_qp = e->cur_qp;
     e->rp_mbs = e->slot_mbs[e->role_cur];
     e->slot_rows[e->role_cur] = 0;
@@ -12818,7 +13224,7 @@ recode:
         }
         if (e->cur_is_ref) {
             if (!e->rp_on)
-                e->rp_band = e->rp_hpel = 0;
+                e->rp_band = e->rp_hpel = e->rp_fsh = e->rp_fhp = 0;
             rowpost_bands(e, e->mb_h);
         } else {
             int i;
@@ -12875,9 +13281,12 @@ recode:
     e->st.enc_ns += aeg_now_ns() - t_all;
     e->frame_count++;
     /* MBAFF: the field macroblocks' copy of a reference */
+    e->slot_lfok[e->role_cur] = 0;
     if (e->mbaff) {
         e->slot_fok[e->role_cur] = 0;
-        if (e->cur_is_ref)
+        if (e->rp_fon && e->rp_fhp == e->mb_h / 2)
+            e->slot_fok[e->role_cur] = 1;    /* (rowpost_fshadow built it) */
+        else if (e->cur_is_ref)
             mbaff_field_shadow(e, e->role_cur);
     }
     /* frame_num counts reference pictures only: a non-reference picture carries
@@ -14670,7 +15079,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (getenv("AEG_FTW"))
             ft = atoi(getenv("AEG_FTW"));
         if (ft >= 2 && e->p.bframes > 0 && !e->rc_active && !e->vbv_active &&
-            !pp->field_coding &&
+            pp->field_coding != 2 && pp->field_coding != 4 &&
             e->n_slices == 1 && !getenv("AEG_SEED") && !getenv("AEG_POISON") &&
             !(e->d.have_gpu &&
               (e->p.stage_backend[AEG_STAGE_MOTION_EST] == AEG_BACKEND_OPENCL ||
@@ -14844,7 +15253,8 @@ struct ft_worker {
     int dref;                   /* input picture of the list 0 reference
                                  * (wp_predict reads its source), or -1 */
     int rec_slot;               /* buffer reconstructed into, -1 = private */
-    int uses[AEG_MAX_REFS + 1], nuses; /* buffers counted in pic_busy */
+    int uses[AEG_NPIC + 1], nuses; /* buffers counted in pic_busy */
+    int fld;                    /* field pictures (field_frame_body) */
     int64_t pts, t_all, ns;
     aeg_packet pkt;
     struct ft_entry *ent;
@@ -15051,7 +15461,10 @@ static void *ft_thread(void *arg)
     struct ft_worker *w = (struct ft_worker *)arg;
     int64_t t0 = aeg_now_ns();
     for (;;) {
-        w->rc = frame_body(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt, w->t_all);
+        w->rc = w->fld ? field_frame_body(w->c, w->slice, w->idr, w->d, w->pts,
+                                          &w->pkt, w->t_all)
+                       : frame_body(w->c, w->slice, w->idr, w->d, w->pts, &w->pkt,
+                                    w->t_all);
         if (w->rc == AEG_OK) {
             /* the last check: every row it read was final */
             int stale;
@@ -15295,9 +15708,16 @@ static int ft_launch(struct aeg_encoder *e)
     for (k = 0; k < 3; k++)
         c->wp_plane[k] = w->wp_plane[k];
     w->nuses = 0;
-    for (k = 0; k < AEG_MAX_REFS; k++)
-        if (ref_valid(e, k) && e->ref_slot[k] >= 0)
-            w->uses[w->nuses++] = e->ref_slot[k];
+    /* field pictures (field_coding 1): each field has its own lists, from
+     * any frame in the DPB */
+    w->fld = e->p.field_coding == 1;
+    if (w->fld)
+        for (k = 0; k < e->ndpb; k++)
+            w->uses[w->nuses++] = e->dpb[k].slot;
+    else
+        for (k = 0; k < AEG_MAX_REFS; k++)
+            if (ref_valid(e, k) && e->ref_slot[k] >= 0)
+                w->uses[w->nuses++] = e->ref_slot[k];
     if (e->cur_is_ref) {
         /* a reference is reconstructed where the pictures predicting from
          * it read it, and published row by row (rowpost_*) */
@@ -15346,10 +15766,29 @@ static int ft_launch(struct aeg_encoder *e)
     e->frame_count++;
     e->enc_pos++;
     if (e->cur_is_ref) {
-        memcpy(e->slot_ref_poc[e->role_cur], e->ref_poc, sizeof(e->ref_poc));
+        if (w->fld)
+            memset(e->slot_ref_poc[e->role_cur], 0, sizeof(e->slot_ref_poc[0]));
+        else
+            memcpy(e->slot_ref_poc[e->role_cur], e->ref_poc, sizeof(e->ref_poc));
         e->slot_col_ok[e->role_cur] = 1;
     }
-    picture_rotate(e, e->cur_is_ref, idr);
+    /* its fields' half-resolution copies: built behind the rows it
+     * publishes, like the rest */
+    e->slot_lfok[e->role_cur] = w->fld && e->cur_is_ref &&
+                                e->slot_lowf[e->role_cur][0].mem;
+    if (e->mbaff)
+        /* its field copy: built behind the rows it publishes (rowpost_fshadow
+         * -- the pictures reading it wait for those rows) */
+        e->slot_fok[e->role_cur] = e->cur_is_ref && e->slot_fmem[e->role_cur];
+    {
+        /* (field pictures mark their reference frame as field_mark does,
+         * which is this without the frame's marking operations) */
+        int mmco = e->refctl.n_mmco;
+        if (w->fld)
+            e->refctl.n_mmco = 0;
+        picture_rotate(e, e->cur_is_ref, idr);
+        e->refctl.n_mmco = mmco;
+    }
     while (e->role_cur < 0) {
         /* every buffer is a reference or still read by a picture in flight */
         if ((rc = ft_join_oldest(e)) != AEG_OK)
@@ -15832,16 +16271,18 @@ int aeg_encoder_recon(aeg_encoder *enc, const uint8_t *plane[3], int stride[3],
     if (e->ft_on && e->ft_ret >= 0) {
         /* frame threads: the copy kept with the packet just handed out */
         const struct ft_entry *q = &e->ftq[e->ft_ret];
+        /* (laid out as enc_alloc_picture does: vpad rows above and below) */
+        const size_t vp = (size_t)e->vpad;
         size_t ls = (size_t)e->stride[0];
-        size_t lh = (size_t)(e->h + 2 * AEG_PAD);
+        size_t lh = (size_t)e->h + 2 * vp;
         size_t cs = (size_t)e->stride[1];
-        size_t ch = (size_t)((e->h + 1) / 2 + 2 * AEG_PAD);
+        size_t ch = (size_t)(e->h + 1) / 2 + 2 * vp;
         for (i = 0; i < 3; i++) {
             if (plane)
                 plane[i] = (const uint8_t *)(q->rec_mem +
                                              (i ? ls * lh + (size_t)(i - 1) * cs * ch +
-                                                  AEG_PAD * cs + AEG_PAD
-                                                : AEG_PAD * ls + AEG_PAD));
+                                                  vp * cs + AEG_PAD
+                                                : vp * ls + AEG_PAD));
             if (stride)
                 stride[i] = e->stride[i] * (int)sizeof(pixel);
         }
@@ -16144,8 +16585,10 @@ void aeg_encoder_close(aeg_encoder *enc)
         return;
     if (getenv("AEG_LATIME"))
         fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms, "
-                "restarts %lld\n", e->sched_ns / 1e6, e->ft_wait_ns / 1e6,
-                e->ft_worker_ns / 1e6, e->fsync ? (long long)e->fsync->restarts : 0LL);
+                "workers waited for rows %.0f ms, restarts %lld\n", e->sched_ns / 1e6,
+                e->ft_wait_ns / 1e6, e->ft_worker_ns / 1e6,
+                e->fsync ? e->fsync->wait_ns / 1e6 : 0.0,
+                e->fsync ? (long long)e->fsync->restarts : 0LL);
     ft_free(e);
     free(e->dts_q);
     aeg_input_cvt_free(&e->cvt);
@@ -16210,8 +16653,23 @@ void aeg_encoder_close(aeg_encoder *enc)
             aeg_free(e->slot_fmem[i]);
             aeg_mc_ctx_free(&e->slot_fmc[i]);
             aeg_lowres_free(&e->slot_low[i]);
+            aeg_lowres_free(&e->slot_lowf[i][0]);
+            aeg_lowres_free(&e->slot_lowf[i][1]);
             aeg_free(e->slot_mbs[i]);
         }
+        for (i = 0; i < AEG_MAX_REFS; i++) {
+            /* (the AEG_POISON debug copies) */
+            aeg_free(e->pz_mem[i]);
+            aeg_mc_ctx_free(&e->pz_mc[i]);
+            aeg_lowres_free(&e->pz_low[i]);
+            aeg_free(e->pzf_mem[i]);
+            aeg_mc_ctx_free(&e->pzf_mc[i]);
+            aeg_free(e->pzl_mem[i]);
+            aeg_mc_ctx_free(&e->pzl_mc[i]);
+            aeg_lowres_free(&e->pzl_low[i]);
+        }
+        aeg_free(e->pz_mbs);
+        aeg_free(e->pzl_mbs);
         aeg_free(e->wp_mem);
     }
     aeg_free(e->src_mem);

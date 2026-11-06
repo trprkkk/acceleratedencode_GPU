@@ -5552,8 +5552,9 @@ every frame as two field pictures, first field in display order first:
   parity (8.4.1.4), the deblocking filter's field rules (bS 3 on horizontal
   intra edges, vertical vector limit 2 quarter-rows), half-pel planes and
   padding built per field.
-* Turned off with field pictures: frame threads, weighted prediction, the B
-  pyramid, temporal direct, chroma ME, `--nal-hrd`.
+* Turned off with field pictures: weighted prediction, the B pyramid,
+  temporal direct, chroma ME, `--nal-hrd`. (Frame threads now run with
+  `--field`; see *Frame threads in field pictures*.)
 
 Every stream decodes bit-exactly in ffmpeg (tff and bff, I/P/B, CABAC and
 CAVLC, slices, 1..8 refs, CQP / CRF / ABR / VBV, mid-stream and scene-cut
@@ -5785,8 +5786,9 @@ one starts:
 
    With every pair a frame pair (`AEG_MBDEC=0`) the mean is +0.23 %.
 
-   The time against `--tff` is mostly the frame threads, which field
-   coding turns off.
+   The time against `--tff` was mostly the frame threads, which field
+   coding turned off. MBAFF frames now have frame threads, see *Frame threads
+   in MBAFF frames* below.
 
    PAFF stays ahead on cockatoo, where the whole picture moves. Its second
    field predicts from the first one, which an MBAFF field macroblock
@@ -5888,3 +5890,146 @@ Tests:
   `AEG_MBFORCE`, tff and bff (`tests/run_tests.sh` `pm_*`, `h10_pm`).
 * Every other mode (`--mbaff`, `--paff`, `--field`, `--tff`, progressive)
   is byte-identical to before.
+
+### Frame threads in MBAFF frames (`--mbaff`)
+
+Frame threads (see *Frame threads*) now run with `params.field_coding` 3.
+Field pictures (modes 1, 2 and 4) still code serially.
+
+The stream is byte-identical to the serial one for every worker count. Two
+pieces make that work:
+
+* **The field copy, band by band.** Field macroblocks read a reference
+  through its field copy (`slot_fpl`, `slot_fmc`). That copy used to be built
+  once the reference was complete (`mbaff_field_shadow`). On a worker it
+  would also have been built in the worker's own copy of the encoder. Now
+  `rowpost_fshadow` builds it behind `rowpost_pad`:
+  * frame band b once it is final and padded;
+  * each field's top border with band 0, its bottom border with the last
+    band;
+  * the half-sample planes of field band m (frame bands 2m and 2m+1) once
+    frame band 2m+2 is copied, because the 6-tap filter reads three field
+    rows below the band.
+
+  A reference publishes min(frame rows, 2 x field bands). The copies are
+  allocated with the picture buffers. The main thread marks the copy as
+  present at launch (`slot_fok`), as it does with the rest of what
+  `frame_body` changes. Serial output is unchanged: every sample comes from
+  the same samples as before.
+* **The wait bound** (`ref_rows_needed`). A pair is decided at once, so it
+  waits for the larger of:
+  * its field macroblocks' reach: range + 8 field rows below the pair's 16
+    field rows, which is frame row 2 x that + 1;
+  * its frame macroblocks' reach, with twice the range: a skip or direct
+    vector inherited from a field neighbour is twice as tall in frame rows.
+
+  `AEG_POISON=1` now also poisons the field copies (`pzf_setup`), and the
+  stream stays the same. Skipping the copy-in of the real field rows
+  changes it, so the poison is live.
+
+Two encoder-side reads of undecided macroblocks turned up on the way.
+Serially they read the previous picture's leftovers in `e->mbs`; a worker
+reads what it coded last, so the stream depended on the worker count:
+* `nb_maxref` (the reference-search limit from the neighbours) took the
+  raster top-right of a pair's bottom macroblock. That is the next pair's top
+  macroblock, so it now has none.
+* `me_neighbour_cands` (extra search starts) took the raster top-right of a
+  bottom *field* macroblock. It now takes the Table 6-4 one, the bottom
+  macroblock of the pair above-right.
+
+Both only steer the search, never the syntax, so every stream decoded
+correctly before too. MBAFF output changes; quality is unchanged
+(BD-rate new vs old, `--mbaff --ref 3`: megamind 80 frames p2 -0.09 %,
+vtest 60 frames p2 +0.03 %, 30-frame megamind/cockatoo p2/p3 between
+-0.07 and +0.19 %). Progressive, `--tff`, `--field`, `--paff` and (on these
+clips) `--paff-mbaff` are byte-identical to before.
+
+A debug switch, `AEG_MBSTALE=v`, fills the decisions array with byte v
+before every picture. The output must not change, and it now doesn't for
+progressive and for every field mode.
+
+The frame-thread recon accessor (`aeg_encoder_recon`, `--dump-recon`)
+located the planes with AEG_PAD rows of vertical padding. Field coding
+allocates `vpad` = 2 x AEG_PAD, so it now uses `vpad`. This only shows
+now, because field coding never ran with frame threads before.
+
+Tests: `tests/run_tests.sh` "mbaff frame threads" covers three option sets,
+natural and forced (`AEG_MBFORCE=3`) field pairs. The stream with 2, 3 or 4
+workers, with `AEG_POISON=1` and with `AEG_MBSTALE=85` must equal the
+serial one. Every `mbaff_*` / `h10_mbaff*` conformance case now runs with
+frame threads and decodes bit-exactly in ffmpeg. ThreadSanitizer and ASan
+are clean. `AEG_LATIME` now also reports how long workers waited for
+reference rows.
+
+Wall time, 2 cores, `-q 28`, min of 3 interleaved runs:
+
+| clip | preset | MBAFF serial | MBAFF frame threads | speedup | `--tff` frame threads |
+|---|---|---|---|---|---|
+| cockatoo 640x352, 30 frames | p2 | 1.50 s | 1.01 s | 1.49x | 0.96 s |
+| cockatoo | p3 | 3.53 s | 2.34 s | 1.51x | 2.11 s |
+| megamind 352x256, 80 frames | p2 | 1.38 s | 0.94 s | 1.47x | 0.66 s |
+| megamind | p3 | 3.27 s | 2.26 s | 1.45x | 1.61 s |
+
+That is below progressive's 1.73x. The pair bound reaches about 7 macroblock
+rows ahead against 4, and the field copy lags one more row, so on these
+small pictures (11 pair rows) workers wait about twice as long for rows.
+
+### Frame threads in field pictures (`--field`)
+
+Frame threads now also run with `params.field_coding` 1. A worker codes
+both fields of a frame (`field_frame_body`). Modes 2 and 4 still code
+serially: their per-picture decision reads the previous anchor's
+reconstruction, and `slot_restructure` rewrites shared buffers in place.
+
+* **Publishing.** A reference frame's rows count once both of its fields
+  are final there. During the first field it publishes nothing. During the
+  second it publishes 2 x the field rows whose half-sample planes are
+  built (all rows once complete). The row work behind the publishing is
+  the same as for frames: deblocking, padding, half-sample planes and the
+  decisions copy, per field (`rp_mbs` points into the parity's half).
+* **Half-resolution copies of a frame's fields.** `slot_lowf[s][parity]`
+  are now kept per buffer and built band by band (8 field rows per band;
+  the clamped rows past the field's height only at the last band). Before,
+  the field look-ahead built a field's copy from the reference planes each
+  time, so the output is unchanged.
+* **Wait bound.** A field macroblock row r reads field lines up to
+  l = 16 r + 15 + range + 8 (or 16 r + 16 + 63 with the look-ahead seeds),
+  which is frame row 2 l + 1 at most. The second field reads its own first
+  field without waiting: the same worker coded it.
+* **Marking at launch.** The main thread marks the frame as `field_mark`
+  does: `picture_rotate` with the marking operations of the frame-level
+  lists ignored. It also sets the buffer's co-located state as the field
+  path does.
+* **No restarts.** Field pictures use no weighted prediction, and neither
+  does anything they read in this mode, so no generations are registered.
+  A field worker never restarts or makes another restart.
+* **Poison.** `AEG_POISON` for field pictures (`pzl_setup`/`pzl_ensure`)
+  replaces every reference frame a field reads, except its own, with a
+  frame-sized copy that is garbage past the bound: planes, half-sample
+  planes, the field's half-resolution copy and the co-located field's
+  decisions. The field views keep their offsets into the copy. With
+  `AEG_RRLESS=48` (frame lines) the stream changes, so the copies are read.
+
+Serial output is byte-identical to before (progressive and every field
+mode; the field look-ahead now reads the stored copies). 2, 3 or 4 workers
+write the serial stream, including 10-bit, CRF, ABR and VBV.
+
+Tests: `tests/run_tests.sh` "field-picture frame threads" (four option sets:
+2/3/4 workers and `AEG_POISON` = serial). Every `fld_*` conformance case
+now runs with frame threads and decodes bit-exactly in ffmpeg.
+ThreadSanitizer and ASan/UBSan are clean.
+
+Wall time, 2 cores, `--field -q 28`, min of 3 interleaved runs:
+
+| clip | preset | serial | frame threads | speedup |
+|---|---|---|---|---|
+| cockatoo 640x352, 30 frames | p2 | 1.44 s | 1.20 s | 1.20x |
+| cockatoo | p3 | 3.53 s | 2.42 s | 1.46x |
+| megamind 352x256, 80 frames | p2 | 1.23 s | 0.96 s | 1.28x |
+| megamind | p3 | 2.87 s | 2.34 s | 1.23x |
+
+This is below MBAFF frames (about 1.5x). The next frame's first field reads
+both fields of its reference, so it cannot start until that reference's
+second field is under way. Workers spend about 40 % of their time waiting
+for rows (`AEG_LATIME`). B pictures, whose references are complete, are
+what overlap.
