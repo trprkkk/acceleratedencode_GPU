@@ -960,6 +960,11 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase fld_b    176 144 12 2 4 -q 26 -p 3 --field --bff --slices 2
     run_bcase fld_cavlc 176 144 12 1 1 -q 28 -p 4 --field --no-cabac --ref 3
     run_bcase fld_crf  176 144 12 3 4 -p 2 --field --crf 24
+    # the B pyramid in field pictures: the reference B's fields in both
+    # lists (list 1 nearest first), P fields' lists modified back to the
+    # newest anchor, a buffer of --ref + 2 frames (8 refs: 10)
+    run_bcase fld_pyr  176 144 13 3 4 -q 27 -p 4 --field
+    run_bcase fld_pyr2 176 144 13 3 4 -q 28 -p 1 --field --ref 2 --bff
     # frame and field pictures mixed (--paff): the references re-padded and
     # their half-sample planes rebuilt for the other structure, frame
     # pictures' bottom-field POC; a forced pattern (AEG_FLDFORCE, per display
@@ -996,6 +1001,11 @@ if command -v "$FF" >/dev/null 2>&1; then
         --no-cabac --slices 2
     export AEG_FLDFORCE=1001
     run_bcase pm_mixb   176 144 14 2 4 -p 1 --paff-mbaff --crf 25 --bff
+    # ... with the pyramid: reference B frames between field anchors and
+    # reference B fields between frame anchors (MMCO and sliding window)
+    export AEG_FLDFORCE=0000111100001111
+    run_bcase paff_pyr  176 144 17 3 4 -q 27 -p 3 --paff
+    run_bcase pm_pyr    176 144 17 3 4 -q 28 -p 2 --paff-mbaff --ref 2
     unset AEG_FLDFORCE AEG_MBFORCE
     # the trial restores everything a pair's coding changed: run but its
     # result discarded (AEG_MBDEC=3), the output is the vertical SADs' alone

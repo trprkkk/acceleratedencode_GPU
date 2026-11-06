@@ -112,6 +112,10 @@ typedef struct mbenc {
  * list.  The reference planes, their fractional planes and the per-reference
  * state are indexed 0..AEG_MAX_REFS-1. */
 #define AEG_MAX_REFS 8
+/* Entries of the reference buffer (max_num_ref_frames, aeg_sps_max_refs):
+ * --ref frames, the pyramid's reference B, and with field pictures the frame
+ * whose first field the second one still reads. */
+#define AEG_MAX_DPB (AEG_MAX_REFS + 2)
 /* Picture buffers: the two anchors around a group, its reference B picture
  * (B pyramid) and the picture being reconstructed. */
 #define AEG_NPIC 24           /* picture buffers at most (frame threads) */
@@ -192,7 +196,7 @@ struct aeg_encoder {
      * reference B picture of a pyramid is not). */
     /* fm: the fields of the entry that are reference fields (1 top,
      * 2 bottom; 3 for a frame) -- field pictures mark them one at a time */
-    struct { int slot, poc, fn, anchor, fm; } dpb[AEG_MAX_REFS + 1];
+    struct { int slot, poc, fn, anchor, fm; } dpb[AEG_MAX_DPB];
     int ndpb;
     int max_refs;            /* max_num_ref_frames of the SPS            */
     aeg_refctl refctl;       /* list modification / MMCO of this picture */
@@ -1184,8 +1188,8 @@ static int ref2_anchor_only(void)
  * first entries are not these. */
 static void set_refs_multi(struct aeg_encoder *e)
 {
-    int want[AEG_MAX_REFS], used[AEG_MAX_REFS + 1] = {0};
-    int dflt[AEG_MAX_REFS + 1], nd = 0, n = 0, i, j, k, ok = 1;
+    int want[AEG_MAX_REFS], used[AEG_MAX_DPB] = {0};
+    int dflt[AEG_MAX_DPB], nd = 0, n = 0, i, j, k, ok = 1;
 
     for (i = 0; i < e->ndpb; i++)
         if (e->dpb[i].anchor && (n == 0 || e->dpb[i].poc > e->dpb[want[0]].poc))
@@ -1289,7 +1293,7 @@ static void set_current_refs(struct aeg_encoder *e)
         if (l0 >= 0 && e->cur_is_p) {
             /* the default list 0 orders by decreasing frame_num; modify it
              * whenever its first entries are not the wanted ones */
-            int want[2], n = two ? 2 : 1, dflt[3], nd = 0, j, k, ok = 1;
+            int want[2], n = two ? 2 : 1, dflt[AEG_MAX_DPB], nd = 0, j, k, ok = 1;
             want[0] = l0;
             want[1] = l0b;
             for (i = 0; i < e->ndpb; i++) {
@@ -12775,11 +12779,27 @@ static void field_leave(struct aeg_encoder *e)
  * (list 1) -- then their fields taken alternately, starting with the
  * current field's parity.  Nothing is reordered or marked explicitly: the
  * sliding window does the marking (field_mark). */
-static int field_list(const struct aeg_encoder *e, int l, int out[][2])
+/* P field, `pw` 1: the order the encoder wants instead (with a B pyramid
+ * the default puts the reference B just coded first): the current frame (its
+ * first field), the newest anchor, then the rest by decreasing POC -- which
+ * without a reference B is the default order (anchors are coded in display
+ * order).  set_field_refs modifies the list to it. */
+static int pfield_rank(const struct aeg_encoder *e, int i, int newest)
 {
-    int ord[AEG_MAX_REFS + 1], n = 0, i, j, cnt = 0;
-    int ptr[2] = { 0, 0 }, want = e->fld_par;
+    return e->dpb[i].slot == e->role_cur ? 0 : i == newest ? 1 : 2;
+}
+
+static int field_list(const struct aeg_encoder *e, int l, int out[][2], int pw)
+{
+    int ord[AEG_MAX_DPB], n = 0, i, j, cnt = 0;
+    int ptr[2] = { 0, 0 }, want = e->fld_par, newest = -1;
     const int cur = e->cur_poc;
+
+    if (pw)
+        for (i = 0; i < e->ndpb; i++)
+            if (e->dpb[i].fm && e->dpb[i].anchor && e->dpb[i].slot != e->role_cur &&
+                (newest < 0 || e->dpb[i].poc > e->dpb[newest].poc))
+                newest = i;
 
     for (i = 0; i < e->ndpb; i++) {
         int ki, kj;
@@ -12798,7 +12818,13 @@ static int field_list(const struct aeg_encoder *e, int l, int out[][2])
                 if (ki != kj)
                     before = ki < kj;
                 else
-                    before = (pi > cur) ^ (l != 0) ? pi < pa : pi > pa;
+                    /* (both lists: the ones after the current field
+                     * nearest first ascending, the ones before
+                     * descending) */
+                    before = pi > cur ? pi < pa : pi > pa;
+            } else if (pw) {
+                int ri = pfield_rank(e, i, newest), ra = pfield_rank(e, a, newest);
+                before = ri != ra ? ri < ra : e->dpb[i].poc > e->dpb[a].poc;
             } else {
                 before = e->dpb[i].fn > e->dpb[a].fn;
             }
@@ -12849,7 +12875,7 @@ static void field_set_ref(struct aeg_encoder *e, int k, int di, int par)
 
 static void set_field_refs(struct aeg_encoder *e)
 {
-    int l0[2 * (AEG_MAX_REFS + 1)][2], l1[2 * (AEG_MAX_REFS + 1)][2];
+    int l0[2 * AEG_MAX_DPB][2], l1[2 * AEG_MAX_DPB][2];
     int n0, n1 = 0, k;
 
     memset(&e->refctl, 0, sizeof(e->refctl));
@@ -12866,9 +12892,9 @@ static void set_field_refs(struct aeg_encoder *e)
     e->bfp_on = 0;
     if (!e->cur_is_p && !e->cur_is_b)
         return;
-    n0 = field_list(e, 0, l0);
+    n0 = field_list(e, 0, l0, 0);
     if (e->cur_is_b) {
-        n1 = field_list(e, 1, l1);
+        n1 = field_list(e, 1, l1, 0);
         if (n1 > 1 && n1 == n0) {
             /* list 1 identical to list 0: its first two swap (8.2.4.2.4) */
             int same = 1;
@@ -12909,9 +12935,33 @@ static void set_field_refs(struct aeg_encoder *e)
     /* P: both fields of each of --ref frames (the second field of a frame
      * has its first field as the nearest picture of the other parity) */
     {
-        int na = 2 * e->p.refs;
+        int na = 2 * e->p.refs, lw[2 * AEG_MAX_DPB][2], ok = 1;
         if (na > n0) na = n0;
         if (na > AEG_MAX_REFS) na = AEG_MAX_REFS;
+        /* the wanted order (field_list pw), by ref_pic_list_modification
+         * when the default's first entries differ: field picture numbers,
+         * 2 FrameNumWrap + 1 for the current parity and 2 FrameNumWrap for
+         * the other, from CurrPicNum = 2 frame_num + 1 (8.2.4.1, 8.2.4.3.1) */
+        field_list(e, 0, lw, 1);
+        for (k = 0; k < na; k++)
+            ok &= lw[k][0] == l0[k][0] && lw[k][1] == l0[k][1];
+        if (!ok) {
+            int pred = 2 * e->frame_num + 1;
+            for (k = 0; k < na; k++) {
+                int pn = 2 * e->dpb[lw[k][0]].fn + (lw[k][1] == e->fld_par);
+                if (pn < pred) {
+                    e->refctl.mod_idc[k] = 0;
+                    e->refctl.mod_abs[k] = pred - pn - 1;
+                } else {
+                    e->refctl.mod_idc[k] = 1;
+                    e->refctl.mod_abs[k] = pn - pred - 1;
+                }
+                pred = pn;
+            }
+            e->refctl.n_mod = na;
+            e->refctl.n_mod_1ref = lw[0][0] != l0[0][0] || lw[0][1] != l0[0][1];
+            memcpy(l0, lw, sizeof(lw));
+        }
         for (k = 0; k < na; k++)
             field_set_ref(e, k, l0[k][0], l0[k][1]);
         e->has_ref = na > 0;
@@ -14908,7 +14958,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             aeg_log(AEG_LOG_WARNING, "aeg: no NAL HRD with field pictures (yet)");
         if (pp->field_coding != 3)
             pp->nal_hrd = 0;
-        if (pp->field_coding != 3 || getenv("AEG_NOMBPYR"))
+        /* (AEG_NOMBPYR / AEG_NOFPYR: none in MBAFF frames / field pictures) */
+        if (pp->field_coding == 3 ? getenv("AEG_NOMBPYR") != NULL
+                                  : getenv("AEG_NOFPYR") != NULL)
             pp->b_pyramid = 0;
         pp->direct = 1;
         /* (field pictures do without; frame pictures among them keep them) */

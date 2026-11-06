@@ -5552,8 +5552,9 @@ every frame as two field pictures, first field in display order first:
   parity (8.4.1.4), the deblocking filter's field rules (bS 3 on horizontal
   intra edges, vertical vector limit 2 quarter-rows), half-pel planes and
   padding built per field.
-* Turned off with field pictures: weighted prediction, the B pyramid,
-  temporal direct, chroma ME, `--nal-hrd`. (Frame threads now run with
+* Turned off with field pictures: weighted prediction, temporal direct,
+  chroma ME, `--nal-hrd`. (The B pyramid now runs in field pictures; see
+  *The B pyramid in field pictures*.) (Frame threads now run with
   `--field`; see *Frame threads in field pictures*.)
 
 Every stream decodes bit-exactly in ffmpeg (tff and bff, I/P/B, CABAC and
@@ -5592,7 +5593,8 @@ needs:
 * A field-coded reference frame gets its lowres plane built, for the frame
   pictures' lowres pre-search.
 * Frame pictures keep weighted prediction and chroma ME (field pictures do
-  without); the B pyramid stays off for both.
+  without); the B pyramid runs in both (see *The B pyramid in field
+  pictures*).
 
 **The choice** (`fld_decide`): against the newest anchor's reconstruction,
 a 16x16 integer diamond search (steps 8, 4, 2, 1 from the left, above and
@@ -5629,8 +5631,9 @@ PSNR BD-rate against frame coding (`--tff`), 40 woven frames, QP 22..37:
 
 At preset 3 what `--paff` loses on vtest and tree is the B pyramid: frame
 coding without it is +2.9 % / +3.7 % (and `--paff` forced to frames the
-same), so the choices themselves gain 0.0..0.7 %.  Field pictures as
-reference B pictures (marking by field picture numbers) would give it back.
+same), so the choices themselves gain 0.0..0.7 %.  (Since the pyramid runs
+in field pictures and in `--paff`'s frame pictures, vtest p3 `--paff` is
+-0.27 % against `--tff`: *The B pyramid in field pictures*.)
 
 Every combination decodes bit-exactly in ffmpeg: forced switch patterns
 (`AEG_FLDFORCE`, a 0/1 string per display index) with and without B,
@@ -6175,7 +6178,8 @@ following P picture's `ref_pic_list_modification`, the anchor's marking
 operations) exactly like a progressive one, and the field reference lists of
 its field macroblocks are derived from the final frame lists (8.2.4.2.5). So
 with `field_coding` 3 the pyramid now stays on (`AEG_NOMBPYR=1` turns it off
-for comparisons). Field pictures (1, 2, 4) still go without it.
+for comparisons). Field pictures (1, 2, 4) got it later: *The B pyramid in
+field pictures*.
 
 Bit-exact in ffmpeg: mega p2, cock p3 `--ref 3`, vtest p4 CRF `--bff`, mega p1
 `--slices 2`. Frame threads (2 and 3 workers), `AEG_MBSTALE` and
@@ -6232,3 +6236,67 @@ BD-rate (PSNR, ffmpeg decode) against one field per list:
 `--paff` and `--paff-mbaff` code vtest without field pictures, hence the
 zeros. Time: up to +7% at p2 (the extra searches), within noise at p3.
 
+### The B pyramid in field pictures (`--field`, `--paff`, `--paff-mbaff`)
+
+Field pictures (`field_coding` 1, 2, 4) now keep the B pyramid: the middle B
+frame of a group is a reference frame coded as two reference B fields (or,
+in modes 2/4, as a frame picture when its anchor is one). `AEG_NOFPYR=1`
+turns it off in modes 1/2/4 (`AEG_NOMBPYR=1` still does so for mode 3).
+
+* **Marking:** sliding window only, as before (`field_mark`, no MMCO in field
+  pictures). `max_num_ref_frames` is `--ref` + 1 (the reference B) + 1 (the
+  frame whose first field the second still reads). The window drops each
+  group's frames once nothing needs them. Frame pictures in modes 2/4 keep
+  their own marking (MMCO with refs < 3), and the two kinds mix in any order.
+* **B lists:** the defaults (8.2.4.2.4) already give list0 = the nearest
+  frame before, list1 = the nearest after, including the reference B.
+  In a reference B frame's second field both lists would hold its own first
+  field, so it stays on one field per list.
+* **P lists:** the default list (decreasing FrameNumWrap) would put the
+  reference B just coded first. `field_list(..., pw = 1)` gives the order
+  the encoder wants: the current frame's first field, then the newest anchor,
+  then the rest by decreasing POC. `set_field_refs` writes a
+  `ref_pic_list_modification` with field picture numbers (2·FrameNumWrap + 1
+  for the same parity, 2·FrameNumWrap for the other, from CurrPicNum
+  2·frame_num + 1) whenever the first active entries differ. Without a
+  reference B the two orders are the same.
+* **Fixed on the way:**
+  * The B field list sort inverted the order within the "before" and
+    "after" groups for list 1. Harmless while each group held one useful
+    frame, wrong with the reference B (list1[0] was the anchor).
+  * The reference buffer mirror (`dpb[]`) and the list scratch arrays held
+    `AEG_MAX_REFS` + 1 entries. With 8 refs, the pyramid and field pictures
+    that needs 10 (`AEG_MAX_DPB`). So did the two-reference P path's
+    default-list array (3 → `AEG_MAX_DPB`).
+
+**Unchanged output:** with `AEG_NOFPYR=1`, `--field`/`--paff`/`--paff-mbaff`
+are byte-identical to before (p1–p4, `--ref 2/3`, `--bff`, CRF). So are
+progressive, `--tff`, `--mbaff` and P-only field streams.
+
+**Checks:**
+* ffmpeg decodes bit-exact:
+  * `--field` p0–p4 (refs 1–8, `--bff`) and `--paff` p1–p4 (CRF,
+    `--slices 3`).
+  * `--paff-mbaff` p2–p4 (CRF, `--bff -t 2 --slices 2`) and 10-bit.
+  * Mixed frame/field groups: mega 80 and vtest in modes 2/4, plus forced
+    patterns both ways (`AEG_FLDFORCE`).
+* Frame threads (2 and 3 workers), `AEG_MBSTALE` and `AEG_POISON` give the
+  serial stream (three option sets, mega 80 and cock).
+* ASAN-clean in all three modes at p1/p2/p4.
+* New `make test` cases: `fld_pyr` (8 refs), `fld_pyr2`, `paff_pyr`,
+  `pm_pyr`.
+
+BD-rate (PSNR, ffmpeg decode) against `AEG_NOFPYR=1`:
+
+| clip | `--field` p2 | p3 | `--paff` p2 | p3 | `--paff-mbaff` p2 | p3 |
+|---|---|---|---|---|---|---|
+| cockatoo 30 | −0.36% | −5.39% | −0.36% | −5.39% | −0.36% | −5.39% |
+| megamind 80 | −1.18% | −4.36% | −1.27% | −3.10% | −1.42% | −3.15% |
+| vtest 60 | −2.53% | −4.29% | −0.64% | −3.85% | −1.45% | −4.28% |
+
+On vtest, modes 2/4 gain too: their frame pictures now have the pyramid.
+Against frame coding (`--tff`), vtest moves as follows:
+* `--paff`: from +0.66% / +2.98% to −0.01% / −0.27% (p2 / p3).
+* `--paff-mbaff`: from −6.50% / −4.21% to −8.37% / −8.34%.
+
+Time: within noise or lower (fewer bits to code).
