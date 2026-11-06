@@ -5552,9 +5552,9 @@ every frame as two field pictures, first field in display order first:
   parity (8.4.1.4), the deblocking filter's field rules (bS 3 on horizontal
   intra edges, vertical vector limit 2 quarter-rows), half-pel planes and
   padding built per field.
-* Turned off with field pictures: weighted prediction, temporal direct,
-  chroma ME. (`--nal-hrd` now runs with field pictures; see *The NAL HRD
-  in field pictures*.) (The B pyramid now runs in field pictures; see
+* Turned off with field pictures: temporal direct, chroma ME.
+  (`--nal-hrd` and weighted prediction now run with field pictures; see *The
+  NAL HRD in field pictures* and *Weighted prediction in field pictures*.) (The B pyramid now runs in field pictures; see
   *The B pyramid in field pictures*.) (Frame threads now run with
   `--field`; see *Frame threads in field pictures*.)
 
@@ -6348,3 +6348,88 @@ could occur. It now runs in every field mode.
   are also unchanged.
 * ASAN-clean on the field re-code path.
 * New `make test` cases: `fld_hrd` (forced re-codes), `paff_hrd`, `pm_hrd`.
+
+### Weighted prediction in field pictures (`--field`, `--paff`, `--paff-mbaff`)
+
+Explicit weighted prediction (`--weightp`, on from preset 1) used to be
+forced off in every field mode except the frame pictures of `--paff`. P field
+pictures now send a pred_weight_table as P frames do. MBAFF frames (`--mbaff`,
+and those of `--paff-mbaff`) still go without.
+
+* **Analysis:** `wp_analyse` runs on the field: the field's source against
+  list 0's first field, reconstructed (the same field of the previous frame,
+  or the first field of the same frame for a second field). It uses the same
+  half-resolution motion-compensated test and thresholds as a frame. One
+  addition applies to fields only: an eighth of the blocks must agree on the
+  sign of the level change. A cut between a frame's two fields left 7 of 176
+  blocks agreeing on megamind, which bought an offset of 29 that saved
+  nothing. Fade fields have 65–90%, and cockatoo's slow drift 18–39%.
+* **Weighted copy:** the motion search reads a weighted copy of the
+  reference field. It is built into the field's rows of the frame-sized
+  buffer, which is allocated before the field views because
+  `enc_alloc_picture` sets the frame strides. The search's half-pel planes
+  are filled from that copy into the field's rows of the list's own plane
+  buffer. The exact prediction still interpolates the real field and weights
+  afterwards (8.4.2.3).
+* **Frame threads:** a weighted field reads its whole reference field, so a
+  worker waits for it (`ref_wait` on all frame rows). The current frame's
+  first field is the worker's own and needs no wait. Field pictures still
+  never restart. The output is the same with 1, 2 or 3 workers, with
+  `AEG_POISON` and with `AEG_MBSTALE`.
+* **Structure decision (`fld_costs`):** with `--paff-mbaff`, the field cost
+  estimate now takes out the same global weight that the frame estimate of
+  `--paff` already did. An MBAFF frame has no weights, so during a fade the
+  fields should win, and do. With `--paff` the field estimate stays
+  unweighted. Weighting it there flipped anchors from weighted frames to
+  fields, which then coded worse:
+  * still fade: +0.0% → +1.0% / +8.1% (p2 / p3);
+  * moving fade: −17.75% → −16.78% against `--tff` (p2).
+  `AEG_FWPC=0/1` overrides the choice.
+* **Switches:** `AEG_NOFWP=1` turns field weights off. Those streams are
+  byte-identical to the previous commit in all three modes. PPS 1 is written
+  only when some picture can use it.
+* **Fixed on the way:** the `params.weightp` doc said "on from preset 2";
+  the code turns it on from preset 1.
+
+BD-rate (PSNR, ffmpeg decode) against `AEG_NOFWP=1`. The fades are woven
+clips with a per-field gain of 1.0 → 0.5 → 1.0 over 80 fields: "still"
+(`L_fade`, 384x288, 60 frames, near-static) and "moving" (megamind 80,
+352x256).
+
+| clip | `--field` p2 | p3 | `--paff` p2 | p3 | `--paff-mbaff` p2 | p3 |
+|---|---|---|---|---|---|---|
+| still fade | −41.50% | −31.84% | +0.00% | +0.00% | −28.54% | −16.16% |
+| moving fade | −10.34% | −7.64% | −8.56% | −6.24% | −9.52% | −7.64% |
+| cockatoo 30 | −0.20% | +0.02% | −0.22% | +0.00% | −0.20% | +0.02% |
+| megamind 80 | −0.01% | +0.02% | +0.03% | +0.00% | +0.11% | −0.21% |
+| vtest 60 | +0.05% | −0.42% | +0.00% | +0.00% | +0.01% | +0.01% |
+
+* **Still fade:** frame pictures win, since `--tff` ≈ `--paff` with weighted
+  frames. The decision of `--paff` keeps them, so 0.00% is the right answer.
+  `--paff-mbaff` against `--paff` went from +44.1% (unweighted MBAFF frames)
+  to +3.1%, by choosing weighted fields.
+* **Moving fade, against `--tff` at p2:** `--field` went from −7.0% to
+  −16.7%, `--paff` from −10.1% to −17.8%, and `--paff-mbaff` from −9.2% to
+  −18.4%.
+* **megamind `--paff-mbaff` p2 (+0.11%):** the remainder comes from the
+  decision estimate. Its global weight on non-fade content moves the
+  estimates by a few percent. With the decision unweighted it is +0.03%.
+
+**Time:** the analysis costs +5–6% serial on cockatoo (46 P fields
+analysed, 6 weighted). With 3 frame threads the wait adds up to about 6%
+more (cock `--field` +12%, `--paff` +5%). Megamind and the MBAFF mode stay
+within ±3%. `--weightp 0` removes the cost. A speculative start like the
+frame path's (`ft_spec` with restart) would remove the wait, but field
+pictures do not restart yet.
+
+**Checks:**
+* ffmpeg decodes bit-exact on both fades in all three modes: p0
+  (`--weightp 1`) to p4, 1–8 refs, `--bff`, `--slices 2/3`, CAVLC (P only),
+  P-only streams, 10-bit (`--field`, `--paff-mbaff`), and a VBV + NAL HRD
+  stream with re-coded fields (HRD check passes).
+* `AEG_NOFWP=1` streams match the previous commit. Progressive, `--tff` and
+  `--mbaff` are unchanged.
+* ASAN-clean in all three modes, with 1 and 3 frame threads, a VBV re-code
+  and 10-bit.
+* New `make test` cases: `fld_wp` (P, two slices), `fld_wp_b`, `paff_wp`,
+  `pm_wp` (each must send weights), `h10_fld_wp`.
