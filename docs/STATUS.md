@@ -5977,9 +5977,8 @@ small pictures (11 pair rows) workers wait about twice as long for rows.
 ### Frame threads in field pictures (`--field`)
 
 Frame threads now also run with `params.field_coding` 1. A worker codes
-both fields of a frame (`field_frame_body`). Modes 2 and 4 still code
-serially: their per-picture decision reads the previous anchor's
-reconstruction, and `slot_restructure` rewrites shared buffers in place.
+both fields of a frame (`field_frame_body`). Modes 2 and 4 followed; see
+*Frame threads with the structure chosen per anchor*.
 
 * **Publishing.** A reference frame's rows count once both of its fields
   are final there. During the first field it publishes nothing. During the
@@ -6012,7 +6011,8 @@ reconstruction, and `slot_restructure` rewrites shared buffers in place.
 
 Serial output is byte-identical to before (progressive and every field
 mode; the field look-ahead now reads the stored copies). 2, 3 or 4 workers
-write the serial stream, including 10-bit, CRF, ABR and VBV.
+write the serial stream, including 10-bit and CRF. ABR, VBV, slices and
+`AEG_POISON` turn frame threads off, as they do for frames.
 
 Tests: `tests/run_tests.sh` "field-picture frame threads" (four option sets:
 2/3/4 workers and `AEG_POISON` = serial). Every `fld_*` conformance case
@@ -6033,3 +6033,61 @@ both fields of its reference, so it cannot start until that reference's
 second field is under way. Workers spend about 40 % of their time waiting
 for rows (`AEG_LATIME`). B pictures, whose references are complete, are
 what overlap.
+
+### Frame threads with the structure chosen per anchor (`--paff`, `--paff-mbaff`)
+
+Frame threads now run with every `params.field_coding`. Modes 2 and 4 make
+`encode_frame`'s frame/field choice on the main thread, where the pictures
+are launched (`ft_fld_choose`). The serial code path is unchanged.
+
+* **Decision.** An anchor's estimate (`fld_decide` / `fld_costs`) reads the
+  newest anchor's reconstruction, so the main thread first joins that
+  anchor's worker. Anchors therefore no longer overlap each other; B
+  pictures take their anchor's structure and still overlap. The choice
+  itself is unchanged.
+* **Restructuring.** When the structure changes, the reference buffers'
+  borders and half-sample planes are rewritten in place
+  (`slot_restructure`), and the pictures in flight read them. Before that
+  the main thread joins every worker. Otherwise (same structure as the last
+  anchor) nothing is waited for beyond the usual rows.
+* **Mirroring.** The worker runs `field_frame_body` or `frame_body` by the
+  choice. The main thread marks `slot_fok` (the MBAFF field copy) for every
+  picture of mode 4, since its field pictures build that copy too. Field
+  pictures build their field copy and the frame's half-resolution copy at
+  the end; only pictures of the other structure read those, and those
+  pictures restructure, i.e. wait.
+* **No restarts.** A weighted P frame of mode 2 speculates only while its
+  reference is incomplete, and here its reference is always complete (the
+  decision waited for it). So nothing a field picture reads can restart.
+* **Fixed on the way.** The workers' private half-sample buffers (for the
+  weighted reference copy) had AEG_PAD rows of padding. Field coding pads
+  `vpad` = 2 x AEG_PAD, so a weighted P frame of `--paff` wrote past the
+  buffer (double free / heap overflow under frame threads). They now use
+  `vpad`. This only shows now, because weighted prediction exists only in
+  mode 2's frame pictures.
+
+Tests: `tests/run_tests.sh` "paff / paff-mbaff frame threads" covers four
+option sets, each with natural choices and with forced patterns
+(`AEG_FLDFORCE` 10 and 1100, which flip at nearly every anchor); 2, 3 or 4
+workers must give the serial stream. Also checked: the interlaced fade (weighted P
+frames), 80-frame megamind, 60-frame vtest, 10-bit; `AEG_POISON` (serial)
+with natural and forced patterns; ThreadSanitizer and ASan/UBSan with
+forced flips.
+
+Wall time, 2 cores, `-q 28`, min of 3 interleaved runs:
+
+| clip | mode | preset | serial | frame threads | speedup |
+|---|---|---|---|---|---|
+| cockatoo 640x352, 30 frames | `--paff` | p2 | 1.43 s | 1.31 s | 1.09x |
+| cockatoo | `--paff` | p3 | 3.45 s | 2.84 s | 1.21x |
+| megamind 352x256, 80 frames | `--paff` | p2 | 1.18 s | 0.93 s | 1.27x |
+| megamind | `--paff` | p3 | 2.94 s | 2.37 s | 1.24x |
+| cockatoo | `--paff-mbaff` | p2 | 1.48 s | 1.34 s | 1.10x |
+| cockatoo | `--paff-mbaff` | p3 | 3.49 s | 2.81 s | 1.24x |
+| megamind | `--paff-mbaff` | p2 | 1.28 s | 1.02 s | 1.25x |
+| megamind | `--paff-mbaff` | p3 | 3.15 s | 2.68 s | 1.18x |
+
+Cockatoo never changes structure (all fields), so its loss against `--field`
+(1.20x / 1.46x) is the decision's wait: an anchor cannot overlap the
+previous anchor. Making the estimate row-wise would remove that, but its
+search follows the vectors of its neighbours and has no fixed reach.

@@ -15079,7 +15079,6 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (getenv("AEG_FTW"))
             ft = atoi(getenv("AEG_FTW"));
         if (ft >= 2 && e->p.bframes > 0 && !e->rc_active && !e->vbv_active &&
-            pp->field_coding != 2 && pp->field_coding != 4 &&
             e->n_slices == 1 && !getenv("AEG_SEED") && !getenv("AEG_POISON") &&
             !(e->d.have_gpu &&
               (e->p.stage_backend[AEG_STAGE_MOTION_EST] == AEG_BACKEND_OPENCL ||
@@ -15348,8 +15347,9 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
     for (k = 0; k < 3; k++)
         if (aeg_lowres_alloc(&w->lr_pic[k], e->mb_w, e->mb_h))
             w->lr_pic[k].mem = NULL;
-    aeg_mc_ctx_init(&w->mcr[0], e->w, e->h, e->stride[0]);
-    aeg_mc_ctx_init(&w->mcr[1], e->w, e->h, e->stride[0]);
+    /* (field coding pads every plane vpad rows, twice AEG_PAD) */
+    aeg_mc_ctx_init_pad(&w->mcr[0], e->w, e->h, e->stride[0], e->vpad);
+    aeg_mc_ctx_init_pad(&w->mcr[1], e->w, e->h, e->stride[0], e->vpad);
     if (!w->c || !w->c0 || !w->mb_dqp0 ||
         !w->mbs || !w->mb_encs || !w->mb_dqp || !w->seed_mv ||
         !w->prev_seed || !w->seed_cand || !w->par_pos || !w->par_mv ||
@@ -15623,11 +15623,65 @@ static int ft_ring_guard(struct aeg_encoder *e)
  * and codes the picture (frame_body), while this thread does to the encoder
  * what coding the picture does to it (frame counters, reference marking,
  * the buffer rotation). */
+/* field_coding 2 / 4 under frame threads: encode_frame's frame / field
+ * choice, made where the pictures are launched.  An anchor's estimate reads
+ * the newest anchor's reconstruction (fld_decide), so that anchor's worker
+ * is waited for; and a change of structure rewrites the reference buffers'
+ * borders and half-sample planes in place (slot_restructure), which the
+ * pictures in flight read, so they all are.  B pictures take their anchor's
+ * structure and overlap as before. */
+static int ft_fld_choose(struct aeg_encoder *e, int slice, int poc, int *fldp)
+{
+    int fld, i, k, rc;
+
+    e->cur_poc = poc;
+    if (slice == AEG_SLICE_B) {
+        fld = e->anchor_fld;
+    } else {
+        int a = -1;
+        for (i = 0; i < e->ndpb; i++)
+            if (e->dpb[i].anchor && e->dpb[i].fm == 3 &&
+                (a < 0 || e->dpb[i].poc > e->dpb[a].poc))
+                a = i;
+        for (;;) {
+            int busy = 0;
+            for (k = 0; k < e->ft_nw; k++)
+                busy |= a >= 0 && e->ftw[k].busy &&
+                        e->ftw[k].rec_slot == e->dpb[a].slot;
+            if (!busy)
+                break;
+            if ((rc = ft_join_oldest(e)) != AEG_OK)
+                return rc;
+        }
+        fld = fld_decide(e);
+    }
+    for (i = 0; i < e->ndpb; i++)
+        if (e->slot_fst[e->dpb[i].slot] != fld)
+            break;
+    if (i < e->ndpb)
+        for (;;) {
+            int busy = 0;
+            for (k = 0; k < e->ft_nw; k++)
+                busy |= e->ftw[k].busy != 0;
+            if (!busy)
+                break;
+            if ((rc = ft_join_oldest(e)) != AEG_OK)
+                return rc;
+        }
+    for (i = 0; i < e->ndpb; i++)
+        slot_restructure(e, e->dpb[i].slot, fld);
+    e->slot_fst[e->role_cur] = (uint8_t)fld;
+    if (e->p.field_coding == 4)
+        e->pic.mbaff = e->mbaff = !fld;
+    *fldp = fld;
+    return AEG_OK;
+}
+
 static int ft_launch(struct aeg_encoder *e)
 {
     struct ft_worker *w = NULL;
     struct aeg_encoder *c;
-    int d, slice, idr, i, k, rc;
+    int d, slice, idr, i, k, rc, fld;
     int64_t t_all;
 
     /* A call pushes at most one packet and hands out the oldest one if it is
@@ -15659,8 +15713,14 @@ static int ft_launch(struct aeg_encoder *e)
     e->job_n--;
     bind_source(e, d);
     t_all = aeg_now_ns();
+    fld = e->p.field_coding == 1;
+    if ((e->p.field_coding == 2 || e->p.field_coding == 4) &&
+        (rc = ft_fld_choose(e, slice, d, &fld)) != AEG_OK)
+        return rc;
     if ((rc = frame_prologue(e, &slice, &idr, d)) != AEG_OK)
         return rc;
+    if ((e->p.field_coding == 2 || e->p.field_coding == 4) && slice != AEG_SLICE_B)
+        e->anchor_fld = fld;
     w->d = d;
     w->dref = e->p.weightp && e->cur_is_p && e->has_ref ? e->ref_poc[0] : -1;
     w->slice = slice;
@@ -15708,9 +15768,9 @@ static int ft_launch(struct aeg_encoder *e)
     for (k = 0; k < 3; k++)
         c->wp_plane[k] = w->wp_plane[k];
     w->nuses = 0;
-    /* field pictures (field_coding 1): each field has its own lists, from
-     * any frame in the DPB */
-    w->fld = e->p.field_coding == 1;
+    /* field pictures: each field has its own lists, from any frame in the
+     * DPB */
+    w->fld = fld;
     if (w->fld)
         for (k = 0; k < e->ndpb; k++)
             w->uses[w->nuses++] = e->dpb[k].slot;
@@ -15776,9 +15836,11 @@ static int ft_launch(struct aeg_encoder *e)
      * publishes, like the rest */
     e->slot_lfok[e->role_cur] = w->fld && e->cur_is_ref &&
                                 e->slot_lowf[e->role_cur][0].mem;
-    if (e->mbaff)
+    if (e->mbaff || e->p.field_coding == 4)
         /* its field copy: built behind the rows it publishes (rowpost_fshadow
-         * -- the pictures reading it wait for those rows) */
+         * -- the pictures reading it wait for those rows); field pictures of
+         * field_coding 4 build theirs at the end, and only pictures that
+         * restructure (wait for them) read it */
         e->slot_fok[e->role_cur] = e->cur_is_ref && e->slot_fmem[e->role_cur];
     {
         /* (field pictures mark their reference frame as field_mark does,

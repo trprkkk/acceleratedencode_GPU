@@ -1071,6 +1071,36 @@ if command -v "$FF" >/dev/null 2>&1; then
     else
         echo "   field-picture frame threads: streams differ:$bad  FAIL"; FAIL=1
     fi
+    # ... and with the structure chosen per anchor (--paff, --paff-mbaff):
+    # an anchor's choice waits for the newest anchor (its estimate reads that
+    # reconstruction), a change of structure for every picture in flight
+    # (the reference buffers are restructured in place).  Natural choices
+    # and forced patterns (AEG_FLDFORCE, per display index) that flip at
+    # nearly every anchor; the weighted P frames of --paff among them
+    bad=""
+    for ff in "" 10 1100; do
+        if [ -n "$ff" ]; then export AEG_FLDFORCE=$ff; fi
+        for o in "--paff -p 3 -q 28 --ref 3" "--paff -p 2 --crf 24 --bff" \
+                 "--paff-mbaff -p 3 -q 30 --ref 2" "--paff-mbaff -p 4 -q 26 --bff"; do
+            for k in s ft2 ft3 ft4; do
+                t="--frame-threads 1"
+                case $k in
+                    ft2) t="--frame-threads 2" ;; ft3) t="--frame-threads 3" ;;
+                    ft4) t="--frame-threads 4" ;;
+                esac
+                $BUILD/aegenc -w 176 -h 160 -n 16 -i "$TMP/mbft.yuv" -v 0 $o $t \
+                    -o "$TMP/pmft_$k.264" || bad="$bad rc:$k"
+                [ $k = s ] || cmp -s "$TMP/pmft_s.264" "$TMP/pmft_$k.264" ||
+                    bad="$bad $k[$ff $o]"
+            done
+        done
+        unset AEG_FLDFORCE
+    done
+    if [ -z "$bad" ]; then
+        echo "   paff / paff-mbaff frame threads 2/3/4 = serial"
+    else
+        echo "   paff / paff-mbaff frame threads: streams differ:$bad  FAIL"; FAIL=1
+    fi
     # field macroblock pairs (forced pseudo-random pattern, AEG_MBFORCE): the
     # field views and scans, neighbour derivation between frame and field
     # pairs (Table 6-4), the mixed-edge deblocking, the field references and
