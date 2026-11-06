@@ -5553,7 +5553,8 @@ every frame as two field pictures, first field in display order first:
   intra edges, vertical vector limit 2 quarter-rows), half-pel planes and
   padding built per field.
 * Turned off with field pictures: weighted prediction, temporal direct,
-  chroma ME, `--nal-hrd`. (The B pyramid now runs in field pictures; see
+  chroma ME. (`--nal-hrd` now runs with field pictures; see *The NAL HRD
+  in field pictures*.) (The B pyramid now runs in field pictures; see
   *The B pyramid in field pictures*.) (Frame threads now run with
   `--field`; see *Frame threads in field pictures*.)
 
@@ -6300,3 +6301,50 @@ Against frame coding (`--tff`), vtest moves as follows:
 * `--paff-mbaff`: from −6.50% / −4.21% to −8.37% / −8.34%.
 
 Time: within noise or lower (fewer bits to code).
+
+### The NAL HRD in field pictures (`--field`, `--paff`, `--paff-mbaff`)
+
+`--nal-hrd` used to be turned off (with a warning) whenever field pictures
+could occur. It now runs in every field mode.
+
+* **Timing:** each field picture is an access unit with its own picture
+  timing SEI (`pic_struct` 1/2). The first field of a frame keeps the frame's
+  removal time, `cpb_removal_delay` = 2·(frames since the buffering period).
+  The second field is removed one clock tick (half a frame period) later.
+  The DPB output delay is counted the same way. A buffering period goes on
+  the first field of an IDR only.
+* **Buffer model:** `vbv_update` takes the two fields out separately, with
+  R/2 delivered between them, and `vbv_available` counts the extra half
+  period (`vbv_gap`).
+* **Re-coding:** a field that the buffer cannot take is coded again, coarser
+  by the QP its overshoot asks for, up to three times. This is the frame
+  path's emergency re-code (`frame_body`). Field 0 must fit what is
+  available at the frame time. Field 1 must fit what field 0 left plus R/2.
+  Without this, a tiny buffer underflowed 2–3 times per 30 frames in every
+  field mode.
+* **Fixed on the way:** when the emergency re-code hit an IDR, the
+  buffering-period bookkeeping ran twice. The re-coded IDR then signalled
+  `cpb_removal_delay` 0, and the removal times stopped increasing (cock
+  `--tff`, 300/300 kb/s: "removal time of access unit 26 does not
+  increase"). The previous buffering period is now kept (`hrd_bp_prev`).
+  This is the only change to frame-coded streams: those with a re-coded IDR
+  under `--nal-hrd`.
+* **Checker:** `tools/hrd_check.py` now parses the stream itself (SPS/VUI,
+  access units, both SEIs) instead of relying on ffmpeg's demuxer, which
+  splits field streams unreliably. It simulates the Annex C.1 CPB (arrival,
+  removal, under- and overflow) and the output order. Negative tests (rate
+  ×0.7 → underflow, size ×0.5 → overflow) fail as they should.
+
+**Checks:**
+* ffmpeg decodes bit-exact and the checker passes, with 0 encoder
+  underflows. Cases:
+  * The three modes × three tight-buffer configurations (40/60/120 kbit
+    buffers, ABR and capped CRF) × cock and megamind 80 (18 streams with up
+    to 9 re-codes each).
+  * `--field --slices 3 --bff` and 10-bit `--paff`.
+  * Mixed frame/field structures (`AEG_FLDFORCE`).
+* Unchanged output for progressive, `--tff` and `--mbaff`, including VBV +
+  HRD streams, apart from the re-coded IDR fix above. Field modes without VBV
+  are also unchanged.
+* ASAN-clean on the field re-code path.
+* New `make test` cases: `fld_hrd` (forced re-codes), `paff_hrd`, `pm_hrd`.

@@ -683,11 +683,19 @@ struct aeg_encoder {
     double vbv_buf_bits;    /* B: the buffer size                           */
     double vbv_rate_bits;   /* R: bits delivered per picture period         */
     double vbv_full;        /* modelled fullness, bits                      */
+    /* Field pictures: the second field of a frame leaves the buffer a clock
+     * tick (half a picture period) after the first, so the model advances
+     * in ticks: `vbv_gap` ticks of delivery before the next access unit (2
+     * after a frame, 1 after a field pair), and `vbv_f1` the first field's
+     * bits of the frame being accounted (0: a frame picture). */
+    int    vbv_gap;
+    int    vbv_f1;
     /* the NAL HRD signalled from that model (nal_hrd): rate and CPB size as
      * the SPS states them, and the coded index of the last buffering period */
     int    hrd_on;
     double hrd_rate, hrd_cpb;
     int    hrd_bp_c;
+    int    hrd_bp_prev;     /* the buffering period before hrd_bp_c's */
     char   info[768];       /* the info SEI's text (info_sei)                */
     double vbv_min_full;    /* lowest level seen                            */
     int    vbv_underflows;
@@ -9765,7 +9773,7 @@ static int mb_qp_of(const struct aeg_encoder *e, int mbx, int mby)
  * that could never be sent at rate R). */
 static double vbv_available(const struct aeg_encoder *e)
 {
-    double level = e->vbv_full + e->vbv_rate_bits;
+    double level = e->vbv_full + e->vbv_rate_bits * 0.5 * e->vbv_gap;
 
     if (level > e->vbv_buf_bits)
         level = e->vbv_buf_bits;
@@ -9915,7 +9923,24 @@ static void vbv_update(struct aeg_encoder *e, int bits)
     }
     if (!e->vbv_active)
         return;
-    level = vbv_available(e) - (double)bits;
+    if (e->vbv_f1 > 0 && e->vbv_f1 < bits) {
+        /* a field pair: the first field leaves the buffer at the frame's
+         * time, the second a tick later */
+        level = vbv_available(e) - (double)e->vbv_f1;
+        if (level < 0.0) {
+            e->vbv_underflows++;
+            level = 0.0;
+        }
+        level += 0.5 * e->vbv_rate_bits;
+        if (level > e->vbv_buf_bits)
+            level = e->vbv_buf_bits;
+        level -= (double)(bits - e->vbv_f1);
+        e->vbv_gap = 1;
+    } else {
+        level = vbv_available(e) - (double)bits;
+        e->vbv_gap = 2;
+    }
+    e->vbv_f1 = 0;
     if (level < 0.0) {
         /* the picture needed more than the buffer held: the model cannot
          * deliver it, and a decoder would starve waiting for the rest */
@@ -13002,6 +13027,9 @@ static void field_mark(struct aeg_encoder *e, int fidr)
     }
 }
 
+static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
+                       int tick);
+
 static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                             int poc, int64_t pts, aeg_packet *pkt,
                             int64_t t_all)
@@ -13033,7 +13061,9 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         /* the second field of an intra frame predicts from the first */
         int fslice = f && slice == AEG_SLICE_I ? AEG_SLICE_P : slice;
         int fidr = is_idr && f == 0;
-        int rc;
+        int rc, fretry = 0, bfp_on0, srows0;
+        size_t fstart;
+        int64_t stat0[AEG_MB_TYPE_COUNT];
 
         field_enter(e, f);
         e->cur_is_p = fslice == AEG_SLICE_P;
@@ -13093,7 +13123,12 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         lr_seed_frame(e);
         pz_setup(e);
         bfp_keep(e, 1);
-
+        /* (what a VBV re-code of this field starts from again) */
+        fstart = out_len;
+        bfp_on0 = e->bfp_on;
+        srows0 = e->slot_rows[e->role_cur];
+        memcpy(stat0, e->stat_type, sizeof(stat0));
+frecode:
         if (e->p.aud) {
             uint8_t aud[2];
             aud[0] = (uint8_t)(((e->cur_is_b ? 2 : e->cur_is_p ? 1 : 0) << 5) | 0x10);
@@ -13111,6 +13146,8 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             size_t sn;
 
             memset(&s, 0, sizeof(s));
+            if (e->hrd_on)
+                hrd_timing(e, &s, fidr, poc, f);
             s.pt = 1;
             s.pt_struct = 1 + (e->fld_par ? 2 : 1);
             if (e->p.info_sei && e->frame_count == 0 && f == 0)
@@ -13139,6 +13176,36 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             for (f = 0; f < AEG_MAX_REFS; f++)
                 e->mcr[f].stride = mstride[f];
             return rc;
+        }
+        /* VBV emergency, as for a frame (frame_body): a field the buffer
+         * cannot take is coded again, coarser by the QP its overshoot asks
+         * for.  The first field leaves the buffer at the frame's time, the
+         * second a tick later with what the first left plus half a picture
+         * period's delivery (vbv_update).  Up to three attempts each. */
+        if (e->vbv_active && fretry < 3 && e->cur_qp < e->p.qp_max) {
+            double avail = vbv_available(e);
+            double bits = (double)(out_len - fstart) * 8.0;
+            if (f == 1) {
+                avail -= (double)e->vbv_f1;
+                if (avail < 0.0)
+                    avail = 0.0;
+                avail += 0.5 * e->vbv_rate_bits;
+                if (avail > e->vbv_buf_bits)
+                    avail = e->vbv_buf_bits;
+            }
+            if (bits > avail) {
+                int dq = (int)ceil(6.0 * log2(bits / (avail > 1.0 ? avail : 1.0))) + 1;
+                e->cur_qp += dq;
+                if (e->cur_qp > e->p.qp_max)
+                    e->cur_qp = e->p.qp_max;
+                fretry++;
+                e->vbv_recodes++;
+                out_len = fstart;
+                e->bfp_on = bfp_on0;
+                e->slot_rows[e->role_cur] = srows0;
+                memcpy(e->stat_type, stat0, sizeof(stat0));
+                goto frecode;
+            }
         }
         e->top_row = 0;
         {
@@ -13175,6 +13242,8 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         if (is_ref)
             field_mark(e, fidr);
         field_leave(e);
+        if (f == 0 && e->vbv_active)
+            e->vbv_f1 = (int)(out_len * 8);   /* (vbv_update) */
     }
     for (f = 0; f < AEG_MAX_REFS; f++)
         e->mcr[f].stride = mstride[f];
@@ -13254,6 +13323,44 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
     rc_update(e, (int)(out_len * 8));
     aeg_dispatch_update(&e->d);
     return AEG_OK;
+}
+
+/* The NAL HRD's timing SEI fields of the access unit about to be written
+ * (picture timing on every one, a buffering period on an IDR picture's
+ * first): a frame lasts two clock ticks (time_scale = 2 * fps_num), a field
+ * picture one -- `tick` is 1 for the second field of a frame, which leaves
+ * the CPB and is output a tick after the first.  The removal delays count
+ * from the last buffering period's picture, the output delay is the same
+ * for both fields of a frame. */
+static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
+                       int tick)
+{
+    const int c = e->frame_count;
+    const int reorder = e->p.bframes > 0 ? e->p.bframes : 0;
+    int dpb = 2 * (poc - c + reorder);
+
+    if (is_idr && !tick) {
+        /* the picture leaves the CPB when the model's level before it has
+         * arrived; delay + offset spans the whole buffer */
+        double whole = e->hrd_cpb / e->hrd_rate * 90000.0;
+        double d0 = vbv_available(e) / e->hrd_rate * 90000.0;
+        if (d0 > whole) d0 = whole;
+        if (d0 < 1.0) d0 = 1.0;
+        s->bp = 1;
+        s->bp_delay = (uint32_t)d0;
+        s->bp_offset = (uint32_t)(whole - (double)s->bp_delay);
+        /* (a picture coded again -- the VBV emergency -- comes here twice:
+         * its delay still counts from the buffering period before it) */
+        if (e->hrd_bp_c != c) {
+            e->hrd_bp_prev = e->hrd_bp_c;
+            e->hrd_bp_c = c;
+        }
+        s->cpb_delay = c ? (uint32_t)(2 * (c - e->hrd_bp_prev)) : 0;
+    } else {
+        s->cpb_delay = (uint32_t)(2 * (c - e->hrd_bp_c) + tick);
+    }
+    s->pt = s->pt_delays = 1;
+    s->dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
 }
 
 static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
@@ -13439,28 +13546,8 @@ recode:
         size_t sn;
 
         memset(&s, 0, sizeof(s));
-        if (e->hrd_on) {
-            const int c = e->frame_count;
-            const int reorder = e->p.bframes > 0 ? e->p.bframes : 0;
-            int dpb = 2 * (poc - c + reorder);
-            if (is_idr) {
-                /* the picture leaves the CPB when the model's level before
-                 * it has arrived; delay + offset spans the whole buffer */
-                double whole = e->hrd_cpb / e->hrd_rate * 90000.0;
-                double d0 = vbv_available(e) / e->hrd_rate * 90000.0;
-                if (d0 > whole) d0 = whole;
-                if (d0 < 1.0) d0 = 1.0;
-                s.bp = 1;
-                s.bp_delay = (uint32_t)d0;
-                s.bp_offset = (uint32_t)(whole - (double)s.bp_delay);
-                s.cpb_delay = c ? (uint32_t)(2 * (c - e->hrd_bp_c)) : 0;
-                e->hrd_bp_c = c;
-            } else {
-                s.cpb_delay = (uint32_t)(2 * (c - e->hrd_bp_c));
-            }
-            s.pt = s.pt_delays = 1;
-            s.dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
-        }
+        if (e->hrd_on)
+            hrd_timing(e, &s, is_idr, poc, 0);
         if (e->p.interlaced) {
             /* pic_struct 3 = top field, bottom field; 4 = the reverse */
             s.pt = 1;
@@ -14949,15 +15036,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->bframes < 2 || pp->direct != 1)
         pp->b_pyramid = 0;
     pp->b_pyramid = pp->b_pyramid ? 1 : 0;
-    /* Field pictures: not (yet) with weighted prediction, the pyramid (whose
-     * reference B frame would need its second field's lists and marking) or
-     * temporal direct (the co-located field's vectors), and chroma stays out
-     * of the motion search (its field offset is not in the cost). */
+    /* Field pictures: not (yet) with weighted prediction or temporal direct
+     * (the co-located field's vectors), and chroma stays out of the motion
+     * search (its field offset is not in the cost).  (The pyramid and the
+     * NAL HRD run in field pictures.) */
     if (pp->field_coding) {
-        if (pp->nal_hrd && pp->field_coding != 3)
-            aeg_log(AEG_LOG_WARNING, "aeg: no NAL HRD with field pictures (yet)");
-        if (pp->field_coding != 3)
-            pp->nal_hrd = 0;
         /* (AEG_NOMBPYR / AEG_NOFPYR: none in MBAFF frames / field pictures) */
         if (pp->field_coding == 3 ? getenv("AEG_NOMBPYR") != NULL
                                   : getenv("AEG_NOFPYR") != NULL)
@@ -15035,6 +15118,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         aeg_log(AEG_LOG_INFO, "aeg: ABR %d kb/s -> %.0f bits/frame at %g fps, start QP %d",
                 pp->bitrate_kbps, e->abr_bpf, fps, pp->qp);
     }
+    e->vbv_gap = 2;
     if (pp->vbv_maxrate_kbps > 0 && (e->rc_active || e->crf_on)) {
         double fps = (double)pp->fps_num / (double)pp->fps_den;
         {

@@ -1007,6 +1007,30 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase paff_pyr  176 144 17 3 4 -q 27 -p 3 --paff
     run_bcase pm_pyr    176 144 17 3 4 -q 28 -p 2 --paff-mbaff --ref 2
     unset AEG_FLDFORCE AEG_MBFORCE
+    # NAL HRD with field pictures: a field access unit is removed half a
+    # frame period after its first field, field 1's picture timing counts
+    # from field 0's, and both are held to the buffer on their own (a field
+    # that does not fit is coded again at a coarser QP).  The streams have to
+    # decode to the reconstruction and pass the Annex C check.
+    run_bcase fld_hrd  320 192 30 3 6 -p 2 --field --bitrate 300 --vbv-maxrate 300 --vbv-bufsize 60 --nal-hrd --bff
+    AEG_FLDFORCE=0110 \
+    run_bcase paff_hrd 320 192 30 3 6 -p 3 --paff --crf 16 --vbv-maxrate 400 --vbv-bufsize 80 --nal-hrd -g 10
+    AEG_FLDFORCE=0000111100001111 \
+    run_bcase pm_hrd   176 144 24 3 4 -p 1 --paff-mbaff --bitrate 200 --vbv-maxrate 250 --vbv-bufsize 120 --nal-hrd --slices 2
+    for c in fld_hrd paff_hrd pm_hrd; do
+        if command -v "$FF" >/dev/null 2>&1; then
+            python3 "$(dirname "$0")/../tools/hrd_check.py" "$FF" "$TMP/$c.264" \
+                "$TMP/$c.order" || FAIL=1
+        fi
+        if grep -q " 0 underflow(s)" "$TMP/$c.log"; then
+            echo "   $c: $(grep -o '[0-9]* coded again' "$TMP/$c.log"), no underflow"
+        else
+            echo "   $c: $(grep -o 'vbv:.*' "$TMP/$c.log")  FAIL"; FAIL=1
+        fi
+    done
+    if grep -q " 0 coded again" "$TMP/fld_hrd.log"; then
+        echo "   fld_hrd: no field coded again  FAIL"; FAIL=1
+    fi
     # the trial restores everything a pair's coding changed: run but its
     # result discarded (AEG_MBDEC=3), the output is the vertical SADs' alone
     "$BUILD/genyuv" 176 144 12 "$TMP/mbdec.yuv" 7 >/dev/null
