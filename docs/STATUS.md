@@ -6190,3 +6190,45 @@ BD-rate (PSNR, ffmpeg decode) against no pyramid:
 | megamind 352x256, 80 frames | −1.18% | −4.97% |
 | vtest 384x288, 60 frames | −1.45% | −4.22% |
 
+### B field pictures on two fields per list (`--field`, `--paff`, `--paff-mbaff`)
+
+A B field picture had one field per list, index 0: the field of its own
+parity of the nearest frame before it (list 0) and after it (list 1). Now each
+list holds two fields (`num_ref_idx_l0/l1_active` 2 in the slice header).
+Index 1 is the next field of the default list (8.2.4.2.4/8.2.4.2.5), as a rule
+the other parity of the same frame. Every macroblock picks one per list
+exactly as an MBAFF field macroblock does (previous sections): `bfld_prep`
+runs a 16x16 search on both fields of each list, `bfld_stamp` stores the
+indices, and the predictors, spatial direct (derived indices, `bdr_no`), the
+`ref_idx` syntax and the deblocking filter's per-list index test follow.
+
+* **Entries:** `set_field_refs` puts list0[1] and list1[1] in reference
+  entries 2 and 3 (`bfp_on`; `nrefpl` is 4), when both lists have two fields
+  and share none. `bfp_keep` saves the four entries after `pz_setup` (with
+  their reference views), so `bref_set` can pick from them per macroblock,
+  and restores them after the slices.
+* `AEG_BSAMEPAR=1` keeps one field per list.
+
+**Unchanged output:** progressive streams and field modes with
+`AEG_BSAMEPAR` are byte-identical to before; so are P-only field streams,
+and MBAFF frames (with `AEG_NOMBPYR`).
+
+**Checks:**
+* ffmpeg decodes bit-exact: `--field` p0–p4 (p4 `--ref 3 --bff`), `--paff` p1
+  CRF `--slices 3` and p3, `--paff-mbaff` p2 and p4 CRF `--bff -t 2 --slices
+  2`, and 10-bit `--field`.
+* Frame threads (2 and 3 workers), `AEG_MBSTALE` and `AEG_POISON` give the
+  serial stream (three option sets, mega and cock).
+* `make test` passes.
+
+BD-rate (PSNR, ffmpeg decode) against one field per list:
+
+| clip | `--field` p2 | p3 | `--paff` p2 | p3 | `--paff-mbaff` p2 | p3 |
+|---|---|---|---|---|---|---|
+| cockatoo | −1.35% | −4.16% | −1.35% | −4.16% | −1.35% | −4.16% |
+| megamind 80 | −0.78% | −0.96% | −0.75% | −1.25% | −0.80% | −1.18% |
+| vtest 60 | −1.73% | −2.34% | 0.00% | 0.00% | 0.00% | 0.00% |
+
+`--paff` and `--paff-mbaff` code vtest without field pictures, hence the
+zeros. Time: up to +7% at p2 (the extra searches), within noise at p3.
+

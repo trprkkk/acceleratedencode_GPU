@@ -584,9 +584,10 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         /* a field's default counts are 2 * default + 1 entries (7.4.3):
          * always say how many */
         aeg_bw_put(bw, 1, 1);         /* num_ref_idx_active_override_flag   */
-        aeg_bw_ue(bw, (uint32_t)(nos == 0 ? num_ref_idx_l0_active - 1 : 0));
-        if (nos == 1)
-            aeg_bw_ue(bw, 0);         /* num_ref_idx_l1_active_minus1       */
+        /* (a B field: both lists have num_ref_idx_l0_active entries) */
+        aeg_bw_ue(bw, (uint32_t)(num_ref_idx_l0_active - 1));
+        if (nos == 1)                 /* num_ref_idx_l1_active_minus1       */
+            aeg_bw_ue(bw, (uint32_t)(num_ref_idx_l0_active - 1));
     }
     if (nos == 0 || nos == 1) {
         if (frame_num_bits & AEG_SH_FPIC) {
