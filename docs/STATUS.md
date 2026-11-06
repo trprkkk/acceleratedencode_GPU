@@ -6167,3 +6167,26 @@ version:
 Cockatoo in mode 4 is coded as field pictures throughout, so it has no MBAFF
 B frames. Encode time is unchanged within noise (−3% to +4% at p2/p3).
 
+### The B pyramid in MBAFF frames (`--mbaff`)
+
+Every field mode used to turn the B pyramid off. An MBAFF frame is a frame
+picture, though: the reference B frame is marked, listed and modified (the
+following P picture's `ref_pic_list_modification`, the anchor's marking
+operations) exactly like a progressive one, and the field reference lists of
+its field macroblocks are derived from the final frame lists (8.2.4.2.5). So
+with `field_coding` 3 the pyramid now stays on (`AEG_NOMBPYR=1` turns it off
+for comparisons). Field pictures (1, 2, 4) still go without it.
+
+Bit-exact in ffmpeg: mega p2, cock p3 `--ref 3`, vtest p4 CRF `--bff`, mega p1
+`--slices 2`. Frame threads (2 and 3 workers), `AEG_MBSTALE` and
+`AEG_POISON` give the serial stream (mega and cock, three option sets);
+`make test` passes.
+
+BD-rate (PSNR, ffmpeg decode) against no pyramid:
+
+| clip | p2 | p3 |
+|---|---|---|
+| cockatoo 640x352, 30 frames | −0.02% | −2.36% |
+| megamind 352x256, 80 frames | −1.18% | −4.97% |
+| vtest 384x288, 60 frames | −1.45% | −4.22% |
+

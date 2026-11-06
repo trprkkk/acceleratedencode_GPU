@@ -174,10 +174,10 @@ typedef struct aeg_params {
      *       MBAFF frame (the B frames follow their anchor) -- field pictures
      *       where the whole picture moves (the second field predicts from
      *       the first, which no MBAFF frame can), MBAFF frames elsewhere.
-     * Field coding runs with one frame thread, without the B pyramid,
-     * temporal direct or the NAL HRD; field pictures also without weighted
-     * prediction and chroma ME (with 1 turned off; with 2 the frame
-     * pictures keep them). */
+     * Field coding runs without temporal direct; field pictures (1, 2, 4)
+     * also without the B pyramid, the NAL HRD, weighted prediction and
+     * chroma ME (with 1 turned off; with 2 the frame pictures keep the last
+     * two).  MBAFF frames (3) keep the B pyramid and the NAL HRD. */
     int field_coding;
     /* Bits per coded sample: 8 (the default; 0 also means 8) or 10 (High 10
      * profile, as x264's 10-bit build: the library holds both, compiled

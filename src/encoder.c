@@ -14827,7 +14827,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             aeg_log(AEG_LOG_WARNING, "aeg: no NAL HRD with field pictures (yet)");
         if (pp->field_coding != 3)
             pp->nal_hrd = 0;
-        pp->b_pyramid = 0;
+        if (pp->field_coding != 3 || getenv("AEG_NOMBPYR"))
+            pp->b_pyramid = 0;
         pp->direct = 1;
         /* (field pictures do without; frame pictures among them keep them) */
         if (pp->field_coding != 2) {
