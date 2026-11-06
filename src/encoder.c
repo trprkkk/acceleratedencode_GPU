@@ -456,6 +456,8 @@ struct aeg_encoder {
     aeg_pwt wp;
     pixel *wp_mem, *wp_plane[3];
     const pixel *wp_orig0;
+    int fwp;                /* field pictures send weights too (p.weightp
+                             * with field_coding 1, 2 or 4; AEG_NOFWP) */
     int cur_is_p;           /* the picture being coded is a P slice */
     int cur_is_b;           /* ... is a B slice                     */
     int cur_is_intra;       /* ... is an I slice (IDR or not)       */
@@ -12128,7 +12130,8 @@ static void wp_analyse(struct aeg_encoder *e)
     double sg;
 
     memset(&e->wp, 0, sizeof(e->wp));
-    if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8)
+    if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8 ||
+        e->mbaff || (e->fld && (!e->fwp || !e->wp_mem)))
         return;
 
     plane_stats(e->srcp[0], e->stride[0], e->w, e->h, &mc, &vc);
@@ -12190,6 +12193,13 @@ static void wp_analyse(struct aeg_encoder *e)
         if (getenv("AEG_WPDBG"))
             fprintf(stderr, "WPS mdiff %.2f pos %d neg %d of %d\n", mc - mr, npos, nneg, n);
         if ((npos > nneg ? npos : nneg) * 10 < (npos > nneg ? nneg : npos) * cons)
+            goto chroma_only;
+        /* A field, and an eighth of the blocks at least: a cut between a
+         * frame's two fields leaves a few well-predicted blocks of the second
+         * all one way (megamind: 7 of 176, an offset of 29 that saved
+         * nothing); the fields of a fade have 65-90 %, cockatoo's drift
+         * 18-39 % */
+        if (e->fld && (npos > nneg ? npos : nneg) * 8 < n)
             goto chroma_only;
     }
     {
@@ -12309,6 +12319,10 @@ done:
         const pixel *s;
         pixel *d;
         size_t k;
+        /* a field picture: the reference field's rows of the copy (every
+         * other row of the frame-sized buffer, allocated before the field
+         * views -- enc_alloc_picture sets the frame's strides) */
+        ptrdiff_t po = e->fld ? (ptrdiff_t)e->ref_par[0] * (ptrdiff_t)(ls0 / 2) : 0;
 
         if (!e->wp_mem && enc_alloc_picture(e, &e->wp_mem, e->wp_plane) != AEG_OK) {
             e->wp_mem = NULL;
@@ -12316,11 +12330,18 @@ done:
             return;
         }
         s = e->refpl[0][0] - AEG_PAD * ls0 - AEG_PAD;
-        d = e->wp_plane[0] - AEG_PAD * ls0 - AEG_PAD;
-        for (k = 0; k < ls0 * lh0; k++)
-            d[k] = wp_px(s[k], c);
+        d = e->wp_plane[0] + po - AEG_PAD * ls0 - AEG_PAD;
+        if (e->fld) {
+            size_t r, rl = ls0 / 2;
+            for (r = 0; r < lh0; r++)
+                for (k = 0; k < rl; k++)
+                    d[r * ls0 + k] = wp_px(s[r * ls0 + k], c);
+        } else {
+            for (k = 0; k < ls0 * lh0; k++)
+                d[k] = wp_px(s[k], c);
+        }
         e->wp_orig0 = e->refpl[0][0];
-        e->refpl[0][0] = e->wp_plane[0];
+        e->refpl[0][0] = e->wp_plane[0] + po;
     }
     if (getenv("AEG_WPDBG"))
         fprintf(stderr, "WP poc %d luma %d (%d,%d/%d) chroma %d (%d,%d %d,%d /%d)\n",
@@ -13050,11 +13071,15 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
     e->ft_spec = 0;
     e->ft_abort = 0;
     /* frame threads: field pictures never restart, and nothing they read
-     * does (no weighted prediction), so they register no generations */
+     * does (a weighted field waits for its whole reference field instead of
+     * speculating), so they register no generations */
     for (f = 0; f < AEG_MAX_REFS; f++)
         e->ft_gslot[f] = -1;
     e->ft_reg = 0;
     memset(&e->wp, 0, sizeof(e->wp));
+    if (e->fwp && !e->wp_mem &&
+        enc_alloc_picture(e, &e->wp_mem, e->wp_plane) != AEG_OK)
+        e->wp_mem = NULL;      /* (the fields go without weights) */
     if (is_idr)
         e->frame_num = 0;
     for (f = 0; f < 2; f++) {
@@ -13088,6 +13113,15 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         aq_compute(e);
         mbt_apply(e);
         crf_dither(e, e->cur_poc);
+        if (e->fwp && e->cur_is_p && e->has_ref) {
+            /* explicit weighted prediction of list 0's first field, from
+             * its reconstruction, as a frame's: the whole field is read
+             * (frame threads wait for it; the current frame's first field
+             * is this worker's own) */
+            if (e->ref_slot[0] != e->role_cur)
+                (void)ref_wait(e, e->ref_slot[0], e->fsv.mb_h);
+            wp_analyse(e);
+        }
         if ((e->cur_is_p || e->cur_is_b) && e->p.subme > 0) {
             /* the reference fields' planes: every other row of their
              * frames' (built as each field was coded, rowpost_hpel) */
@@ -13101,6 +13135,24 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                     continue;
                 sm = &e->slot_mc[s];
                 ctx->base[0] = e->refpl[l][0];
+                if (l == 0 && e->wp.lflag[0] && ctx->buf) {
+                    /* a weighted field: planes of the weighted copy, in
+                     * the field's rows of this list's own buffer */
+                    const int fs = e->fsv.stride[0];
+                    const int vp = ctx->vpad ? ctx->vpad : AEG_PAD;
+                    const size_t rows = (size_t)e->fsv.h + 2 * vp;
+                    for (i = 1; i < 4; i++) {
+                        ctx->base[i] = ctx->buf + (size_t)(i - 1) * fs * rows +
+                                       (size_t)vp * fs + AEG_PAD +
+                                       (size_t)e->ref_par[0] * fs;
+                        aeg_hpel_plane_fill((pixel *)ctx->base[i], 2 * fs,
+                                            e->refpl[0][0], 2 * fs, e->w,
+                                            e->h, i);
+                    }
+                    ctx->stride = 2 * fs;
+                    ctx->ready = 1;
+                    continue;
+                }
                 for (i = 1; i < 4; i++)
                     ctx->base[i] = sm->base[i] + e->ref_par[l] * sm->stride;
                 ctx->stride = 2 * sm->stride;
@@ -13172,6 +13224,7 @@ frecode:
         bfp_keep(e, 0);
         e->bfp_on = 0;
         if (rc != AEG_OK) {
+            wp_finish(e);
             field_leave(e);
             for (f = 0; f < AEG_MAX_REFS; f++)
                 e->mcr[f].stride = mstride[f];
@@ -13207,6 +13260,7 @@ frecode:
                 goto frecode;
             }
         }
+        wp_finish(e);
         e->top_row = 0;
         {
             int64_t t0 = aeg_now_ns();
@@ -13396,7 +13450,7 @@ recode:
         e->ft_reg = 1;
         pthread_mutex_unlock(&e->fsync->mu);
     }
-    if (e->p.weightp && e->cur_is_p && e->has_ref) {
+    if (e->p.weightp && e->cur_is_p && e->has_ref && !e->mbaff) {
         int pred = -1;
         if (e->fsync && !getenv("AEG_NOWPSPEC") &&
             __atomic_load_n(&e->fsync->rows[e->ref_slot[0]], __ATOMIC_ACQUIRE) <
@@ -14005,17 +14059,20 @@ static void fld_costs(const struct aeg_encoder *e, const pixel *ref,
     /* the vectors of the row above, per reference: upv[k * nb + x / 16] */
     const int nb = w / 16 + 1;
     int (*upv)[2] = (int (*)[2])calloc((size_t)3 * nb, sizeof(*upv));
+    const char *fwev = getenv("AEG_FWPC");
+    const int fwc = e->fwp && (fwev ? atoi(fwev) : e->p.field_coding == 4);
 
     if (!upv) {
         *frame_cost = *field_cost = 0;
         return;
     }
 
-    if (e->p.weightp) {
+    if ((e->p.weightp && e->p.field_coding == 2) || e->fwp) {
         /* the frame picture's weighted prediction takes out a brightness
          * change -- x264's estimate: the gain the ratio of the standard
-         * deviations, the offset what is left of the means; the fields
-         * keep it */
+         * deviations, the offset what is left of the means.  The field
+         * pictures' (fwp) take the same out of their prediction from the
+         * reference's fields; an MBAFF frame (field_coding 4) has none */
         double sc = 0, sr = 0, qc = 0, qr = 0, n = (double)w * h, g;
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
@@ -14037,7 +14094,9 @@ static void fld_costs(const struct aeg_encoder *e, const pixel *ref,
         mv[0] = mv[1] = 0;
         for (x = 0; x + 16 <= w; x += 16) {
             int *u = upv[x / 16];
-            fc += fld_block_cost(src, st, ref, st, x, y, w, h, mv, u, wg, wo);
+            const int fw = e->p.field_coding == 2;
+            fc += fld_block_cost(src, st, ref, st, x, y, w, h, mv, u,
+                                 fw ? wg : 64, fw ? wo : 0);
             u[0] = mv[0]; u[1] = mv[1];
         }
     }
@@ -14055,8 +14114,19 @@ static void fld_costs(const struct aeg_encoder *e, const pixel *ref,
                 int b = INT_MAX;
                 for (k = 0; k < 2 + f; k++) {
                     int *u = upv[k * nb + x / 16];
+                    /* Against an MBAFF frame (4), which has no weights,
+                     * the fields' estimate takes them out too: on two woven
+                     * fades (BD-rate against --tff, p2) -17.29 -> -18.36 %
+                     * moving, +44 -> +3 % still (where the frame pictures of
+                     * 2 are best).  Against a weighted frame picture (2) it
+                     * flips anchors the fields then code worse: -17.75 ->
+                     * -16.78 % moving, +0 -> +1 / +8 % (p2 / p3) still.
+                     * (Not the first field: the gain between the fields is
+                     * half the frames'.)  AEG_FWPC=0/1 overrides. */
+                    const int kw = fwc && k < 2;
                     int o = fld_block_cost(cur, 2 * st, rf[k], 2 * st, x, y,
-                                           w, hf, mvs[k], u, 64, 0);
+                                           w, hf, mvs[k], u, kw ? wg : 64,
+                                           kw ? wo : 0);
                     u[0] = mvs[k][0]; u[1] = mvs[k][1];
                     if (o < b)
                         b = o;
@@ -14269,7 +14339,8 @@ static int write_param_sets(struct aeg_encoder *e)
                 e->level_out % 10);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 7, sps, sl, 1);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
-    if (e->p.weightp) {
+    if (e->p.weightp && (e->p.field_coding == 0 || e->p.field_coding == 2 ||
+                         e->fwp)) {
         /* PPS 1: the same with weighted_pred_flag, for the P pictures that
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
@@ -15036,10 +15107,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->bframes < 2 || pp->direct != 1)
         pp->b_pyramid = 0;
     pp->b_pyramid = pp->b_pyramid ? 1 : 0;
-    /* Field pictures: not (yet) with weighted prediction or temporal direct
-     * (the co-located field's vectors), and chroma stays out of the motion
-     * search (its field offset is not in the cost).  (The pyramid and the
-     * NAL HRD run in field pictures.) */
+    /* Field pictures: not (yet) with temporal direct (the co-located
+     * field's vectors), and chroma stays out of the motion search (its field
+     * offset is not in the cost).  (The pyramid, the NAL HRD and weighted
+     * prediction run in field pictures; MBAFF frames go without weights.) */
     if (pp->field_coding) {
         /* (AEG_NOMBPYR / AEG_NOFPYR: none in MBAFF frames / field pictures) */
         if (pp->field_coding == 3 ? getenv("AEG_NOMBPYR") != NULL
@@ -15047,10 +15118,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             pp->b_pyramid = 0;
         pp->direct = 1;
         /* (field pictures do without; frame pictures among them keep them) */
-        if (pp->field_coding != 2) {
+        if (pp->field_coding == 3)
             pp->weightp = 0;
+        if (pp->field_coding != 2)
             pp->chroma_me = 0;
-        }
     }
     /* The macroblock tree needs the lookahead ring, which only exists with B
      * pictures (without them every picture is coded as it arrives). */
@@ -15193,6 +15264,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->poc_lsb_bits = 8;
     e->vpad = pp->field_coding ? 2 * AEG_PAD : AEG_PAD;
     e->mbaff = pp->field_coding >= 3;   /* (4: per picture, encode_frame) */
+    /* (AEG_NOFWP: the field pictures without weights, as before) */
+    e->fwp = pp->weightp && pp->field_coding && pp->field_coding != 3 &&
+             !getenv("AEG_NOFWP");
     e->mbaff_ff = -1;
     e->scan4 = aeg_scan4x4;
     e->scan8 = aeg_zigzag8x8;

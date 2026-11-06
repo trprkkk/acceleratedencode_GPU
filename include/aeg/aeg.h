@@ -176,8 +176,9 @@ typedef struct aeg_params {
      *       the first, which no MBAFF frame can), MBAFF frames elsewhere.
      * Field coding runs without temporal direct and keeps the B pyramid
      * (in field pictures too: a reference B frame's two fields); field
-     * pictures (1, 2, 4) also run without weighted prediction and chroma
-     * ME (with 1 turned off; with 2 the frame pictures keep both).  The NAL
+     * pictures (1, 2, 4) run without chroma ME (with 2 the frame pictures
+     * keep it).  Weighted prediction (weightp) runs in field pictures and
+     * frame pictures, not in MBAFF frames (3, and those of 4).  The NAL
      * HRD runs in every mode: a field picture is an access unit of its own,
      * removed half a frame period after the first field of its frame. */
     int field_coding;
@@ -294,8 +295,9 @@ typedef struct aeg_params {
     int refs;
     /* Explicit weighted prediction of P pictures (fades): 0 = off, 1 = a
      * weight and offset per picture for luma and chroma, chosen by a small
-     * motion-compensated test of the reference against the picture.  -1 = as
-     * the preset says (on from preset 2 up). */
+     * motion-compensated test of the reference against the picture (P field
+     * pictures too: each field against its list 0 field).  -1 = as the
+     * preset says (on from preset 1 up). */
     int weightp;
     /* B pyramid: the middle B picture of a group of two or more is a
      * reference picture for the others (x264's b-pyramid "normal").  -1 = on

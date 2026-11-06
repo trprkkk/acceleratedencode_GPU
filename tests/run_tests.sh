@@ -1031,6 +1031,26 @@ if command -v "$FF" >/dev/null 2>&1; then
     if grep -q " 0 coded again" "$TMP/fld_hrd.log"; then
         echo "   fld_hrd: no field coded again  FAIL"; FAIL=1
     fi
+    # Weighted prediction in field pictures (genyuv mode 5, a fade): list
+    # 0's first field weighted, the planes the search reads built from the
+    # weighted field, the field's slices on PPS 1 -- P only with two slices,
+    # with B pictures, and frame/field mixes with frame pictures (2) and
+    # MBAFF frames (4, which go without).  Each must send weights.
+    export AEG_WPDBG=1
+    run_case  fld_wp    320 192 10 5 -q 26 -p 3 --scenecut 0 --field --ref 2 --slices 2
+    run_bcase fld_wp_b  320 192 12 3 5 -q 26 -p 2 --scenecut 0 --field --bff
+    AEG_FLDFORCE=0110 \
+    run_bcase paff_wp   320 192 12 3 5 -q 27 -p 3 --scenecut 0 --paff
+    AEG_FLDFORCE=0110 \
+    run_bcase pm_wp     320 192 12 3 5 -q 27 -p 2 --scenecut 0 --paff-mbaff --ref 2
+    unset AEG_WPDBG
+    for c in fld_wp fld_wp_b paff_wp pm_wp; do
+        if grep -q "^WP poc .* luma 1" "$TMP/$c.log"; then
+            echo "   $c: $(grep -c '^WP poc .* luma 1' "$TMP/$c.log") weighted picture(s)"
+        else
+            echo "   $c: no weights sent  FAIL"; FAIL=1
+        fi
+    done
     # the trial restores everything a pair's coding changed: run but its
     # result discarded (AEG_MBDEC=3), the output is the vertical SADs' alone
     "$BUILD/genyuv" 176 144 12 "$TMP/mbdec.yuv" 7 >/dev/null
@@ -1225,6 +1245,7 @@ else
     run_bcase h10_vbv     176 144 20 3 6 -p 3 --bitrate 300 --vbv-maxrate 400 \
         --vbv-bufsize 200 --nal-hrd --bit-depth 10
     run_bcase h10_wp      176 144 12 0 6 -q 26 -p 3 --weightp 1 --bit-depth 10
+    run_bcase h10_fld_wp  176 144 12 3 5 -q 26 -p 2 --scenecut 0 --field --bit-depth 10
     run_bcase h10_qpmin   176 144 12 3 4 -p 2 --crf 2 --qpmin 6 --bit-depth 10
     # true 10-bit input: a 352x288 clip scaled down by ffmpeg into 10 bits
     "$BUILD/genyuv" 352 288 12 "$TMP/h10big.yuv" 4 >/dev/null
