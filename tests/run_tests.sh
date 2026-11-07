@@ -367,6 +367,13 @@ run_bcase bframes_fixidr 320 192 12 2 1 -q 26 --scenecut 0 -g 5 --b-adapt 0 --b-
 run_bcase bframes_t8    320 192 10 2 4 -q 22 --scenecut 0
 run_bcase bframes_nodeb 320 192 10 2 1 -q 24 --scenecut 0 --no-deblock
 run_bcase bframes_q8x8  320 192 10 1 1 -q 24 --scenecut 0 --no-8x8dct
+#   QP-RD moves single macroblocks off the picture QP (and back): the
+#   mb_qp_delta chain, the QP a macroblock without residual inherits and the
+#   deblocking QPs all have to follow it -- with the tree's weighting (CRF),
+#   P only, and two slices
+run_bcase qprd_crf      320 192 12 2 4 -p 3 --qp-rd 1 --crf 22 --scenecut 0
+run_bcase qprd_p        320 192 10 0 1 -p 4 -q 20 --scenecut 0
+run_bcase qprd_sl2      320 192 10 2 4 -p 3 --qp-rd 1 -q 30 --slices 2 --scenecut 0
 #   the rate controller gives a picture its QP from the running bit count, and a
 #   B picture is coded coarser than the anchors around it: the mb_qp_delta that
 #   follows has to survive both, which is what this case is for

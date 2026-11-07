@@ -100,6 +100,9 @@ static void usage(void)
 "  --refine-cand <n> refine every inter candidate's vectors, not only the\n"
 "                   winner's: 0 = off (default), 1 = on (costs about a third of\n"
 "                   the encode time at preset 4 for 0.3-0.6 points of BD-rate)\n"
+"  --qp-rd <n>      choose each macroblock's QP by rate-distortion (x264's\n"
+"                   subme 10): 0 = off, 1 = on (default at preset 4; needs\n"
+"                   CABAC; preset 3: -2.2 points of BD-rate for ~20%% time)\n"
 "  --b-pyramid <n>  1 = the middle B picture of a group is a reference for\n"
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
@@ -617,7 +620,7 @@ int main(int argc, char **argv)
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
-    int refine_mv = -1, refine_cand = -1, refs = -1, weightp = -1, bpyramid = -1;
+    int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
     int mbtree = -1, rclookahead = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
@@ -783,6 +786,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--subme")) subme = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--refine-mv")) refine_mv = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--refine-cand")) refine_cand = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--qp-rd")) qp_rd = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--ref")) refs = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--weightp")) weightp = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--b-pyramid")) bpyramid = int_arg(a, next_arg(argc, argv, &i));
@@ -877,6 +881,7 @@ int main(int argc, char **argv)
         if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
         if (refine_mv >= 0) bad |= range_bad("--refine-mv", refine_mv, 0, 3);
         if (refine_cand >= 0) bad |= range_bad("--refine-cand", refine_cand, 0, 1);
+        if (qp_rd >= 0) bad |= range_bad("--qp-rd", qp_rd, 0, 1);
         if (refs >= 0) bad |= range_bad("--ref", refs, 1, 8);
         if (weightp >= 0) bad |= range_bad("--weightp", weightp, 0, 1);
         if (bpyramid >= 0) bad |= range_bad("--b-pyramid", bpyramid, 0, 1);
@@ -1066,6 +1071,7 @@ int main(int argc, char **argv)
     if (subme >= 0) p.subme = subme;
     if (refine_mv >= 0) p.refine_mv = refine_mv;
     if (refine_cand >= 0) p.refine_cand = refine_cand;
+    if (qp_rd >= 0) p.qp_rd = qp_rd;
     if (refs >= 0) p.refs = refs;
     if (weightp >= 0) p.weightp = weightp;
     if (bpyramid >= 0) p.b_pyramid = bpyramid;

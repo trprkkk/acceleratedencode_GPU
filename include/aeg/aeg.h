@@ -284,6 +284,14 @@ typedef struct aeg_params {
      * Costs about a third of the encode time at preset 4 for 0.1-0.6 points of
      * BD-rate (see docs/STATUS.md, "Refining every candidate"). */
     int refine_cand;
+    /* QP-RD (x264's subme 10): the decided macroblock is coded again at the
+     * neighbouring QPs and the full rate-distortion price picks its QP (with
+     * the macroblock tree, distortion is weighted by how much later pictures
+     * inherit it).  0 = off, 1 = on; -1 = as the preset says (on at preset
+     * 4).  Needs CABAC.  About -2.2 points of BD-rate against x264 veryslow
+     * at CRF on the long clips, for 10 % of the encode time at preset 4 and
+     * 15-26 % at preset 3 (docs/STATUS.md, "QP-RD"). */
+    int qp_rd;
     /* P-picture reference pictures: 1..8.  -1 = as the preset says (8 at
      * preset 4, 4 at preset 3, 1 below).  The
      * second reference is the anchor before the previous one (with a B

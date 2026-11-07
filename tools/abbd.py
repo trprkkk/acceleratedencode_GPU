@@ -89,7 +89,7 @@ def encode(args, extra, clip, w, h, q, tag):
             env[k] = v
     t0 = time.time()
     subprocess.run([binary, '-w', str(w), '-h', str(h), '-i', clip, '-o', out,
-                    '-q', str(q), '-n', str(args.n), '-p', str(args.preset)] +
+                    '--crf' if args.crf else '-q', str(q), '-n', str(args.n), '-p', str(args.preset)] +
                    toks, check=True, capture_output=True, env=env)
     dt = time.time() - t0
     subprocess.run([args.ffmpeg, '-v', 'error', '-y', '-i', out, '-f', 'rawvideo',
@@ -131,6 +131,8 @@ def main():
                     metavar=('YUV', 'WxH'))
     ap.add_argument('-n', type=int, default=30)
     ap.add_argument('-q', default='22,25,28,31,34,37')
+    ap.add_argument('--crf', action='store_true',
+                    help='the -q values are CRF values')
     ap.add_argument('-p', '--preset', type=int, default=3)
     ap.add_argument('--a', default='')
     ap.add_argument('--b', default='')

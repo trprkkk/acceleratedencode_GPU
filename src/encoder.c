@@ -642,6 +642,8 @@ struct aeg_encoder {
     double  crf_rf;           /* rate factor                               */
     double  crf_qc;           /* 1 - effective qcomp (0 with the tree)     */
     double  crf_tree_off;     /* the QP shift: tree centring + calibration */
+    double  mbt_avg;          /* mean tree offset of the current picture */
+    int     mbt_on;           /* ... which has tree offsets               */
     double  crf_sum, crf_cnt; /* the short-term complexity blur            */
     double  crf_pqp, crf_pnorm; /* decaying average of the anchors' QP     */
     double  crf_anchor_q;     /* the last anchor's fractional QP            */
@@ -7747,6 +7749,148 @@ static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
            e->me_lambda * inter_hdr_bits(e, &t);
 }
 
+/* QP-RD (x264's mb_analyse_qp_rd, subme 10): the decided macroblock is
+ * coded again at neighbouring QPs and the full price (distortion plus the
+ * coder's bits, mb_qp_delta included) picks its QP (--qp-rd).  The QPs are compared with the decision's lambda (0.65x on P,
+ * the anchors' on B): with the plain lambda of the macroblock's QP it is
+ * -0.12% against -1.94% (cock, constant QP, p4). */
+static double mbt_strength(void);
+static int in_slots(const struct aeg_encoder *e);
+/* The macroblock tree's QP offset of this macroblock (0 without one). */
+static double mbt_off(const struct aeg_encoder *e, int mbx, int mby)
+{
+    const struct mbt_slot *m;
+    const int poc = e->fld ? e->fsv.cur_poc : e->cur_poc;
+
+    if (!e->mbt_on)
+        return 0.0;
+    m = &e->mbt[poc % in_slots(e)];
+    if (e->fld)
+        return 0.5 * (m->qp[2 * mby * e->mb_w + mbx] +
+                      m->qp[(2 * mby + 1) * e->mb_w + mbx]);
+    return m->qp[mby * e->mb_w + mbx];
+}
+
+static int qprd_on(const struct aeg_encoder *e)
+{
+    return e->p.cabac && e->p.qp_rd > 0;
+}
+
+/* The winner `b` coded once more at QP q, luma and chroma, into *t and the
+ * picture; its price. */
+static int64_t qprd_try(struct aeg_encoder *e, int mbx, int mby,
+                        const mbenc *b, int q, double lambda, mbenc *t)
+{
+    if (is_inter_type(b->type)) {
+        mbcand save = e->mb_cand[0];
+        int k;
+        e->mb_cand[0].type = b->type;
+        e->mb_cand[0].nparts = b->nparts;
+        memcpy(e->mb_cand[0].sub_type, b->sub_type, sizeof(b->sub_type));
+        memcpy(e->mb_cand[0].blist, b->blist, sizeof(b->blist));
+        for (k = 0; k < 16; k++) {
+            e->mb_cand[0].mv[k][0] = b->mv[k][0];
+            e->mb_cand[0].mv[k][1] = b->mv[k][1];
+            e->mb_cand[0].mv1[k][0] = b->mv1[k][0];
+            e->mb_cand[0].mv1[k][1] = b->mv1[k][1];
+            e->mb_cand[0].pmv[k][0] = b->pmv[k][0];
+            e->mb_cand[0].pmv[k][1] = b->pmv[k][1];
+            e->mb_cand[0].pmv1[k][0] = b->pmv1[k][0];
+            e->mb_cand[0].pmv1[k][1] = b->pmv1[k][1];
+            e->mb_cand[0].ref[k] = b->ref[k];
+        }
+        /* (the transform size stays the winner's) */
+        e->t8_force = b->t8 ? 2 : 1;
+        rd_luma(e, mbx, mby, t, q, b->type, 0, lambda, 0);
+        e->t8_force = 0;
+        e->mb_cand[0] = save;
+        inter_predict_typed(e, mbx, mby, t);
+        rd_chroma(e, mbx, mby, t, 1, b->chroma_mode, lambda);
+    } else {
+        if (b->type == AEG_MB_I16x16)
+            rd_luma(e, mbx, mby, t, q, AEG_MB_I16x16, b->i16_mode, lambda, -1);
+        /* (the modes are decided again: with the winner's modes kept,
+         * -20% time and +0.62% at p3 constant QP) */
+        else if (b->type == AEG_MB_I4x4)
+            rd_luma_i4x4(e, mbx, mby, t, q, lambda);
+        else
+            rd_luma_i8x8(e, mbx, mby, t, q, lambda);
+        rd_chroma(e, mbx, mby, t, 0, b->chroma_mode, lambda);
+    }
+    return rd_price(e, mbx, mby, t, 0, lambda);
+}
+
+static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
+                 double lambda)
+{
+    const int orig = best->qp, last = e->rd_last_qp;
+    pixel sl[16 * 16], sc[2 * 8 * 8];
+    mbenc t, bt;
+    int64_t bcost, ocost;
+    int dir, last_tried = 0;
+
+    /* What the macroblock tree wants: its offset o = -s*log2(w) for a
+     * macroblock whose error is inherited w times over lowers the QP and,
+     * with it, the lambda by w^(s/3) -- short of the w a distortion that
+     * counts w times should be priced with.  The rest, w^(1 - s/3) =
+     * 2^(o (3 - s) / 3s), goes on the lambda the QPs are compared with here
+     * (on the mode decision it is neutral: +0.01%).  Within the picture in
+     * full; of the picture's mean offset only 0.3, the rest of that is the
+     * rate controller's business.  CRF, long clips, p4 --aq 0, BD-rate
+     * against QP-RD off (vtestL/cockL/megaL): none of it +4.97/-2.04/~-0.6
+     * (the static background of vtestL is coarsened); all of it
+     * -6.84/+0.31/+4.96; relative only -1.14/-1.58/-0.16; 0.3 of the mean
+     * -4.43/-1.31/-0.53; 0.6 -7.01/-1.00/+0.93.  Not moving up where the
+     * tree lowered the QP instead: +0.79/-0.62/-0.53. */
+    if (e->mbt_on) {
+        const double s = mbt_strength();
+        const double o = mbt_off(e, mbx, mby) - 0.7 * e->mbt_avg;
+        lambda *= pow(2.0, o * (3.0 - s) / (3.0 * s));
+    }
+    snap_luma(e, mbx, mby, sl);
+    snap_chroma(e, mbx, mby, sc);
+    ocost = bcost = rd_price(e, mbx, mby, best, 0, lambda);
+    bt = *best;
+    for (dir = 1; dir >= -1; dir -= 2) {
+        /* monotone moving away from the previous macroblock's QP, one
+         * failure allowed moving towards it (x264 without psy-RD) */
+        const int thr = (last < orig && dir < 0) || (last > orig && dir > 0);
+        int64_t prev = ocost;
+        int q, fail = 0;
+        for (q = orig + dir; q >= e->p.qp_min && q <= e->p.qp_max; q += dir) {
+            int64_t cost;
+            if (q == last)
+                last_tried = 1;
+            cost = qprd_try(e, mbx, mby, best, q, lambda, &t);
+            if (cost < bcost) {
+                bcost = cost;
+                bt = t;
+                snap_luma(e, mbx, mby, sl);
+                snap_chroma(e, mbx, mby, sc);
+            }
+            fail = cost < prev ? 0 : fail + 1;
+            prev = cost;
+            if (fail > thr)
+                break;
+            /* (coarser and nothing left to code: coarser still is the same) */
+            if (dir > 0 && t.cbp == 0 && t.type != AEG_MB_I16x16)
+                break;
+        }
+    }
+    if (!last_tried && last != orig && last >= e->p.qp_min && last <= e->p.qp_max) {
+        int64_t cost = qprd_try(e, mbx, mby, best, last, lambda, &t);
+        if (cost < bcost) {
+            bcost = cost;
+            bt = t;
+            snap_luma(e, mbx, mby, sl);
+            snap_chroma(e, mbx, mby, sc);
+        }
+    }
+    *best = bt;
+    restore_luma(e, mbx, mby, sl);
+    restore_chroma(e, mbx, mby, sc);
+}
+
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     e->cmemo_gen++;             /* code_chroma()'s results are per macroblock */
@@ -8324,6 +8468,11 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 restore_chroma(e, mbx, mby, cbuf);
             }
         }
+    }
+    if (qprd_on(e) && (best.cbp != 0 || best.type == AEG_MB_I16x16) &&
+        e->mb_nmodes > 0) {
+        e->cmemo_gen++;     /* (a fresh chroma memo for the trials) */
+        qprd(e, mbx, mby, &best, lambda);
     }
     *c = best;
     /* Hand the macroblock to the shadow coder: its context states, its
@@ -9740,11 +9889,21 @@ static void mbt_apply(struct aeg_encoder *e)
     /* (a field: the frame's offsets, two macroblock rows to one) */
     const int poc = e->fld ? e->fsv.cur_poc : e->cur_poc;
 
+    e->mbt_avg = 0.0;
+    e->mbt_on = 0;
     if (!e->la_depth || !e->cur_is_ref)
         return;
     m = &e->mbt[poc % in_slots(e)];
     if (!m->qp || m->qd != poc)
         return;
+    {
+        const int fn = e->fld ? 2 * n : n;    /* (the frame's offsets) */
+        double sum = 0.0;
+        for (i = 0; i < fn; i++)
+            sum += m->qp[i];
+        e->mbt_avg = sum / fn;
+        e->mbt_on = 1;
+    }
     for (i = 0; i < n; i++) {
         float q = m->qp[i];
         int d;
@@ -15038,6 +15197,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * selection's, so it is off unless asked for. */
     if (pp->refine_cand < 0)
         pp->refine_cand = 0;
+    /* QP-RD: -2.2 points at CRF on the long clips at both slow presets, for
+     * +10 % time at preset 4 but +15-26 % at preset 3, which is the speed
+     * preset of the two -- there preset 4 with it is only a few percent
+     * slower and two points better. */
+    if (pp->qp_rd < 0)
+        pp->qp_rd = pp->preset >= 4;
     /* Level selection is a large amount of work (a price and an inverse
      * transform per candidate level), so presets 3 and 4 run it inside every
      * candidate (2: 0.15-2.4 points of BD-rate for 12-14 % of the encode time
@@ -15596,7 +15761,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  "keyint=%d scenecut=%d bframes=%d b-adapt=%d b-pyramid=%d "
                  "bqp=%d iqp=%d direct=%s ref=%d weightp=%d mbtree=%d "
                  "rc-lookahead=%d aq=%d:%d trellis=%d subme=%d range=%d "
-                 "refine-mv=%d refine-cand=%d partitions=%d cabac=%d "
+                 "refine-mv=%d refine-cand=%d qp-rd=%d partitions=%d cabac=%d "
                  "8x8dct=%d deblock=%d:%d:%d slices=%d%s",
                  AEG_VERSION_STRING, e->p.preset,
                  e->rc_active ? (e->vbv_active ? "abr+vbv" : "abr")
@@ -15608,7 +15773,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                  e->p.refs, e->p.weightp, e->p.mbtree,
                  e->p.mbtree ? e->p.rc_lookahead : 0, e->p.aq_mode,
                  e->p.aq_strength, e->p.trellis, e->p.subme,
-                 e->p.search_range, e->p.refine_mv, e->p.refine_cand,
+                 e->p.search_range, e->p.refine_mv, e->p.refine_cand, e->p.qp_rd,
                  e->p.partitions, e->p.cabac, e->p.transform_8x8,
                  e->p.deblock, e->p.deblock_alpha, e->p.deblock_beta,
                  e->n_slices, crf_txt);

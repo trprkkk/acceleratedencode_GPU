@@ -5135,7 +5135,8 @@ threads stay byte-identical and every conformance case holds.
 What remains of the CRF gap, largest first: the core coding of cockL (about 6
 points; the cock gap), references beyond two (about 3 on vtestL and megaL;
 next), strength beyond 1.6 on static content (about 1.3) and the lookahead
-length (0.8).
+length (0.8).  (Since then: refs up to 8, and QP-RD, which takes p4 from
++5.61 to +3.38% and p3 from +7.54 to +5.32%; see "QP-RD" at the end.)
 
 ## More than two P references
 
@@ -6433,3 +6434,104 @@ pictures do not restart yet.
   and 10-bit.
 * New `make test` cases: `fld_wp` (P, two slices), `fld_wp_b`, `paff_wp`,
   `pm_wp` (each must send weights), `h10_fld_wp`.
+
+## QP-RD (`--qp-rd`, `params.qp_rd`)
+
+The x264 ablation at CRF on the long clips (one tool of veryslow turned
+off; a positive number is what x264 loses without it):
+
+| x264 veryslow with | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| trellis=1 (not in decisions) | +4.31 | +0.97 | +3.31 | +2.86 |
+| subme=8 (no RD in all modes, no QP-RD) | +3.08 | +0.38 | +2.48 | +1.98 |
+| mixed-refs=0 | +0.59 | +3.49 | +1.79 | +1.96 |
+| bframes=3 | +0.03 | +0.86 | +1.19 | +0.69 |
+| me=hex | +0.52 | +0.93 | +0.58 | +0.68 |
+| no p4x4 | +0.05 | +0.82 | +1.00 | +0.62 |
+| subme=9 (no QP-RD) | +1.04 | −0.61 | +1.32 | +0.58 |
+| b-adapt=1 | +1.59 | +0.21 | −0.83 | +0.32 |
+| ref=8 | −0.13 | +0.44 | +0.40 | +0.24 |
+| weightb=0 | +0.08 | −0.04 | +0.38 | +0.14 |
+| merange=16 | +0.10 | +0.22 | +0.01 | +0.11 |
+| direct=spatial | −0.02 | +0.01 | +0.09 | +0.03 |
+
+We already have trellis in the decisions (`--trellis 2` at p3/p4), RD
+refinement of the winner, mixed references, p4x4 and an exhaustive-ish
+search. QP-RD was the missing x264 tool. Implicit weighted bipred
+(`weightb`) is worth 0.14% to x264 and less with our pyramid (most B
+reference pairs are equidistant), so it is not implemented. psy-rd does not
+apply: the comparison is PSNR with x264 at `--tune psnr`.
+
+**What it does (`qprd()` in `code_mb`).** After the decision is final
+(transform size, trellis, chroma, skip check), a macroblock with coded
+residual (or Intra_16x16) is coded again at QP+1, +2, ... and QP−1, −2, ...
+with the same mode, vectors and transform size. Intra NxN modes are decided
+again at each QP: keeping the winner's modes is 20% faster but loses 0.62%
+at p3 constant QP. Each trial is priced with the exact CABAC bits,
+`mb_qp_delta` included, against the previous macroblock's QP. As in x264
+without psy-RD, a direction stops at the first trial that is not cheaper
+than the one before, or the second when moving towards the previous QP.
+Going up also stops once nothing is left to code. The previous macroblock's
+QP is tried at the end if the walk did not reach it. The winner's recon
+is restored. A macroblock without residual codes the previous QP anyway, so
+it is not searched. The QPs are compared with the decision's lambda (0.65x
+on P, the anchors' on B). The plain lambda of the macroblock's QP gives
+−0.12% where the decision's gives −1.94% (cock, constant QP, p4).
+
+**The macroblock tree.** Plain QP-RD under CRF loses on vtestL: p4 BD-rate
+against QP-RD off, CRF, long clips, `--aq 0`, is +4.97 / −2.04 / ~−0.6
+(vtestL / cockL / megaL). vtestL's static background is coarsened. The
+tree lowers a macroblock's QP by `o = −s·log2(w)` when its error is
+inherited `w` times (s = `AEG_MBTS`/10 = 1.6). That lowers the lambda by
+`w^(s/3)`, short of the `w` that a distortion counted `w` times should be
+priced with. The remaining `w^(1−s/3) = 2^(o(3−s)/(3s))` goes on the QP-RD
+lambda. Weighting the mode decision the same way is neutral (+0.01%).
+
+How much of the picture's mean offset to include:
+
+| QP-RD lambda weight | vtestL | cockL | megaL | mean |
+|---|---|---|---|---|
+| none | +4.97 | −2.04 | ~−0.6 | |
+| full `o` | −6.84 | +0.31 | +4.96 | −0.52 |
+| 0.6 `o` | −4.73 | −1.36 | +0.72 | −1.79 |
+| `o − mean` (relative only) | −1.14 | −1.58 | −0.16 | −0.96 |
+| **`o − 0.7·mean`** (chosen) | **−4.43** | **−1.31** | **−0.53** | **−2.09** |
+| `o − 0.4·mean` | −7.01 | −1.00 | +0.93 | −2.36 |
+| none, no upward moves where `o < 0` | +0.79 | −0.62 | −0.53 | −0.12 |
+
+The frame-level part acts like a stronger tree. vtestL wants it and megaL
+does not (the same split as the tree strength itself; see "CRF on the long
+clips"), so only 0.3 of the mean is kept. Search width, constant QP: two
+failures allowed in both directions +0.13% (cock, p4); at most one step
++0.33% for −13% time (cock, vtest, short, p3).
+
+**Result** against x264 veryslow (CRF, long clips, PSNR BD-rate, aegenc
+`--aq 0`, x264 `--tune psnr`):
+
+| | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| p4 before | +9.75 | +3.41 | +3.66 | +5.61% |
+| **p4 `--qp-rd 1` (now the default)** | **+8.04** | **−1.18** | **+3.29** | **+3.38%** |
+| p3 | +10.58 | +6.94 | +5.11 | +7.54% |
+| p3 `--qp-rd 1` | +8.81 | +2.62 | +4.52 | +5.32% |
+
+At constant QP (no tree), 30-frame clips, against QP-RD off:
+
+| | cock | tree | vtest | mega | short | mean | time |
+|---|---|---|---|---|---|---|---|
+| p4 | −1.05 | −0.09 | −1.88 | −0.40 | −1.12 | −0.91% | +35% |
+| p3 | −1.74 | −0.04 | −2.28 | −1.24 | −1.12 | −1.28% | +42% |
+
+The constant-QP time includes QP 22, where most macroblocks have residual.
+**Time:** cockL, 120 frames, CRF 24, `-t 1`, min of 3 interleaved: p4
+7.34 → 8.08 s (+10%), p3 6.18 → 7.79 s (+26%). p3 is the speed preset of
+the two, and p4 with QP-RD is only 4% slower than p3 with it and two points
+better, so the default is on at preset 4 only. `--qp-rd 1` turns it on at
+p3 (or any preset with CABAC and the RD decision).
+
+**Checks:**
+* ffmpeg decodes bit-exact: p3/p4, CQP and CRF, `--bframes 0`,
+  `--slices 3`, `--mbaff`, `--paff`, `--field`, `--paff-mbaff`, 10-bit.
+* Frame threads (1, 2, 3 workers) are byte-identical, and slices are
+  identical across `-t`.
+* p3 and `--qp-rd 0` reconstructions match the previous commit.

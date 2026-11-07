@@ -171,6 +171,7 @@ void aeg_params_default(aeg_params *p)
     /* the rate-distortion refinement of the winning motion vector follows the
      * preset (see aeg_encoder_create) */
     p->refine_mv = -1;
+    p->qp_rd = -1;          /* (preset 4) */
     /* B pictures are on by default: three between two anchors, each quantised
      * twelve coarser than the anchors around it.  Both numbers come from the
      * measurement in docs/STATUS.md -- on five test clips at six QPs that pair
