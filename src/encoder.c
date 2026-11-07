@@ -10346,6 +10346,64 @@ static void rc_update(struct aeg_encoder *e, int bits)
  * the GOP, clamped to [8, 32]): a flash or a hard pan would otherwise turn
  * every picture into a keyframe. */
 static int in_slots(const struct aeg_encoder *e);
+static const int *la_intra(struct aeg_encoder *e, int d);
+static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
+                          int *intra);
+
+/* How badly picture d predicts from d - 1 on the lookahead's lowres
+ * estimates: the motion-searched cost (each block at the cheaper of inter
+ * and intra) over the all-intra cost, 0 (static) .. 1 (nothing to gain);
+ * -1 when the pair is not in the ring. */
+static double scene_ratio(struct aeg_encoder *e, int d)
+{
+    const int slots = in_slots(e), n = e->mb_count;
+    const int *ic;
+    int64_t icost = 0, pcost;
+    int i;
+
+    if (d < 1 || d - 1 < e->in_count - slots || d >= e->in_count ||
+        !e->in_low[d % slots].mem || !e->in_low[(d - 1) % slots].mem)
+        return -1.0;
+    ic = la_intra(e, d);
+    if (!ic)
+        return -1.0;
+    for (i = 0; i < n; i++)
+        icost += ic[i];
+    if (icost <= 0)
+        return 0.0;
+    pcost = la_cost_ci(e, d - 1, d, d, NULL);
+    return (double)pcost / (double)icost;
+}
+
+/* A cut is a spike: the picture predicts badly from the one before (ratio
+ * >= 0.5) and much worse (by 0.45) than both its neighbours do from theirs.
+ * Fast motion raises the ratio of a run of pictures (cockatoo: 0.4-0.77 for
+ * pictures with no cut, at most 0.32 above the picture before; x264's
+ * absolute test, ratio >= 1 - bias with the bias 0.1-0.4, cuts it there), a
+ * flash raises two in a row; a cut between two shots stands alone
+ * (Megamind: 0.82-0.86 against 0.09-0.24 around it; the synthetic cut of
+ * the conformance test, smooth patterns that are cheap to code intra: 0.60
+ * against 0.03).  The scenecut parameter scales both margins (120 = 1x;
+ * larger cuts less often, as with the zero-motion test).  -1: no estimate,
+ * use the zero-motion test. */
+static int scene_cut_lowres(struct aeg_encoder *e, int display)
+{
+    const double k = 120.0 / e->p.scenecut;      /* (default 120 -> 1) */
+    const double r = scene_ratio(e, display);
+    double rp, rn, nb;
+
+    if (r < 0.0)
+        return -1;
+    rp = scene_ratio(e, display - 1);
+    rn = scene_ratio(e, display + 1);
+    nb = rp > rn ? rp : rn;
+    if (nb < 0.0)
+        nb = 0.0;
+    if (getenv("AEG_SCDBG"))
+        fprintf(stderr, "SCDL display %d ratio %.3f prev %.3f next %.3f\n",
+                display, r, rp, rn);
+    return r >= 1.0 - 0.5 * k && r - nb >= 0.45 * k;
+}
 
 static int is_scene_cut(struct aeg_encoder *e, int is_idr, int display)
 {
@@ -10385,6 +10443,11 @@ static int is_scene_cut(struct aeg_encoder *e, int is_idr, int display)
          * differ, and the guard is about what the viewer sees */
         if (display - e->last_idr_poc < min_gop)
             return 0;
+        if (!ENV_INT("AEG_SCOLD", 0)) {
+            int r = scene_cut_lowres(e, display);
+            if (r >= 0)
+                return r;
+        }
     }
     /* every other sample in both directions: the ratio of two sums over a
      * quarter of the picture is within a percent or two of the whole one */
