@@ -282,6 +282,14 @@ FUZZ_TIME    ?= 60
 FUZZ_ENGINE  ?= driver
 FUZZ_SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined \
                 -fno-omit-frame-pointer
+# clang: no per-global COMDAT groups.  Their names hash the module's external
+# symbols, which are the same in the 8- and the 10-bit object of one source
+# (the _10 renaming comes after), so the linker would keep one group and leave
+# the other object's references pointing at discarded sections.
+FUZZ_CLANG   := -fno-sanitize-address-globals-dead-stripping
+ifeq ($(FUZZ_ENGINE),libfuzzer)
+FUZZ_SAN     += $(FUZZ_CLANG)
+endif
 ifeq ($(FUZZ_ENGINE),libfuzzer)
 FUZZ_LIBSAN  := $(FUZZ_SAN) -fsanitize=fuzzer-no-link
 FUZZ_LINK    := $(FUZZ_SAN) -fsanitize=fuzzer
