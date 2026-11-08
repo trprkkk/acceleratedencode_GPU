@@ -75,6 +75,25 @@ parameters: the encodes are byte-identical to the previous build.
    file's index sized an allocation straight from the file. The parser
    (`stats_parse`) now bounds it by the file's size.
 
+Getting the job running under clang found three more problems, none of
+them in the encoder's output:
+
+- **The tree did not build with clang 18.** `ENV_INT` (the
+  environment-tuning macro in `src/encoder.c`) ended its statement
+  expression with an `_Atomic int`, which clang ≤ 18 keeps atomic and then
+  refuses in arithmetic. It now yields a plain `int`.
+- **ASan's per-global COMDAT groups clash with the 10-bit build.** The
+  10-bit objects are compiled from the same sources and only renamed
+  (`_10`) afterwards. Clang names ASan's groups after a hash of the
+  module's external symbols, which is the same for both objects, so GNU ld
+  kept one and left the other's references in discarded sections. The
+  libFuzzer build therefore adds
+  `-fno-sanitize-address-globals-dead-stripping` (`FUZZ_CLANG` in the
+  Makefile). Any other clang + ASan build of this tree needs it too.
+- **libFuzzer's dictionary syntax is stricter than the driver's was:**
+  `\n` is refused and libFuzzer exits. The dictionary now uses `\x0A`,
+  and the driver refuses what libFuzzer refuses.
+
 The fuzzing also corrected the documentation: odd widths and heights are
 rounded down to even, and a caller's plane layout is checked against the
 rounded size (`include/aeg/aeg.h`).

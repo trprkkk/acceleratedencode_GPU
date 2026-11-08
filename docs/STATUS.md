@@ -6849,7 +6849,17 @@ machine has no clang). The driver has no coverage feedback; it mutates the
 corpus at random, using libFuzzer's options and artifact naming.
 
 **CI.** The new `fuzz` job runs 120 s per target with libFuzzer and 20 s
-per target with the gcc driver.
+per target with the gcc driver. It passes, as do the other four jobs. The
+job's first clang build found three problems, all fixed
+(`tests/fuzz/README.md`):
+- `ENV_INT` did not compile under clang 18;
+- ASan's COMDAT groups clashed with the `_10` renaming, so the libFuzzer
+  build adds `-fno-sanitize-address-globals-dead-stripping`;
+- libFuzzer refused the dictionary's `\n`.
+
+On failure the job puts the sanitizer report and the input (base64) in an
+annotation (`tools/ci/fuzz_report.sh`), because the raw logs and artifacts
+cannot be read from this sandbox.
 
 **Findings** (all fixed):
 
