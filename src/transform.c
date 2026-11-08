@@ -708,6 +708,33 @@ void aeg_trel_levels(const dctcoef *coef, int side, int qp, float *x, float *e,
     (void)c;
 }
 
+/* The same for a DC block: `had` is the Hadamard output aeg_quant_4x4_dc()
+ * (n = 16, luma) or aeg_quant_2x2_dc() (n = 4, chroma) quantises.  One unit
+ * of a luma DC level comes back as V * 2^(qp/6) / 4 in the DC of each of the
+ * sixteen blocks (aeg_dequant_4x4_dc_out()), one of a chroma DC level as
+ * V * 2^(qp/6) / 2 in each of four; with the 1/64 and the flat basis row of
+ * the block inverse both are worth (V * 2^(qp/6))^2 / 256 of pixel SSE, the
+ * value of position 0 of a 4x4 block. */
+void aeg_trel_dc_levels(const dctcoef *had, int n, int qp, float *x, float *e,
+                        int8_t *sgn)
+{
+    const int q = qp + QP_BD_OFFSET;
+    /* tl4_xs[q][0] is MF / 2^(15 + qp/6): two more bits for luma, one for
+     * chroma */
+    float xs, ue;
+    int i;
+
+    pthread_once(&tl_once, tl_init);
+    xs = tl4_xs[q][0] * (n == 16 ? 0.25f : 0.5f);
+    ue = tl4_e[q][0];
+    for (i = 0; i < n; i++) {
+        const int v = had[i];
+        x[i] = (float)(v < 0 ? -v : v) * xs;
+        e[i] = ue;
+        sgn[i] = v < 0 ? -1 : 1;
+    }
+}
+
 void aeg_quant_4x4_dc(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
     /* The 4x4 Hadamard multiplies the DC by another 16 on top of the 16 the

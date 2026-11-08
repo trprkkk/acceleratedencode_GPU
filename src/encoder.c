@@ -1703,6 +1703,10 @@ static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
 
 static void luma_inter_gather(const struct aeg_encoder *e, const pixel *src,
                               const pixel *pred, int16_t *res);
+static void trellis_luma_dc(struct aeg_encoder *e, int mbx, int mby,
+                            const mbenc *c, const pixel *src, int stride,
+                            const pixel *pred, int qp, const dctcoef *had,
+                            dctcoef *dcled);
 
 /* Intra_16x16 and chroma in the coefficient batch: the blocks' forward
  * halves in one tq_dc_batch() call, the DC Hadamard (sixteen or four values)
@@ -1775,6 +1779,8 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     }
     aeg_transform_dc4x4_fwd(dc, had);
     aeg_quant_4x4_dc(had, dcled, qp, 1);
+    if (e->p.trellis > 0 && e->p.cabac)
+        trellis_luma_dc(e, mbx, mby, c, src, e->stride[0], pred, qp, had, dcled);
     for (i = 0; i < 16; i++)
         nz_dc += dcled[i] != 0;
     memcpy(c->level[AEG_BLK_LUMA_DC], dcled, sizeof(dcled));
@@ -2098,7 +2104,6 @@ static int trel_viterbi(const aeg_cabac *sh, const struct trel *t,
     int8_t prevn[64][8];
     int16_t lvs[64][8];
     int i, start = -1, nd, best;
-
     for (i = n - 1; i >= 0; i--) {
         float xi = x[t->scan[i]];
         if (xi >= 0.5f) {
@@ -2495,7 +2500,9 @@ static int trellis_chroma_on(void)
  * become final in.  Off unless AEG_TI16=1: ours against ours it is worth
  * -0.04 / +0.07 % of BD-rate at preset 3 (5 clips / validation set) and
  * -0.04 / +0.05 % at preset 4, for 6-9 % of the encode time -- every
- * macroblock prices two Intra_16x16 candidates and few of them win. */
+ * macroblock prices two Intra_16x16 candidates and few of them win.  With
+ * the CABAC trellis (trel_viterbi) in front of the descent it is still
+ * +0.07 % for +9 % at preset 4. */
 static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
                            int blk, const pixel *src, int stride,
                            const pixel *pred, int qp, const int32_t *dcv)
@@ -2519,6 +2526,170 @@ static void trellis_i16_ac(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
     t.dc = dcv;
     trel_descent(&e->cab_shadow, &t, c->level[blk], src, stride, pred, 16, qp,
                  trellis_intra_lambda(AEG_LAMBDA(qp)), 2, 1);
+}
+
+static void cab_nz_mb(struct aeg_encoder *e, int mbx, int mby, int blk,
+                      int *a, int *b, int *va, int *vb);
+
+/* Which DC blocks get the trellis: bit 0 the Intra_16x16 luma DC, bit 1 the
+ * chroma DC (AEG_TDC, default both).  Ours against ours, PSNR BD-rate at
+ * constant QP on the five 30-frame clips: both -0.52 % at preset 4 (every
+ * clip -0.33 to -0.87 %), -0.24 % at preset 2, -0.42 % at preset 1, for no
+ * measurable time; the luma DC alone -0.12 %, the chroma DC alone -0.30 %
+ * (preset 4). */
+static int trellis_dc_mode(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_TDC");
+        v = ev ? atoi(ev) : 3;
+    }
+    return v;
+}
+
+/* A DC block through the trellis: `lev` holds the quantiser's levels and
+ * `x`/`ue`/`sg` the block's aeg_trel_dc_levels().  The trellis's levels and
+ * the quantiser's are priced exactly -- `sse_of` reconstructs the macroblock
+ * part the DC spreads over with the AC levels as they stand -- and the
+ * cheaper ones are left in lev[]. */
+typedef int64_t (*trel_dc_sse_fn)(const void *ctx, const dctcoef *dclev);
+
+static void trel_dc_block(const aeg_cabac *sh, const struct trel *t,
+                          const float *x, const float *ue, const int8_t *sg,
+                          double lambda, dctcoef *lev, trel_dc_sse_fn sse_of,
+                          const void *ctx)
+{
+    dctcoef vl[16], sc[16];
+    int64_t ob, vb;
+    int i;
+
+    memcpy(vl, lev, sizeof(dctcoef) * (size_t)t->n);
+    if (!trel_viterbi(sh, t, x, ue, sg, lambda, 1, vl) ||
+        !memcmp(vl, lev, sizeof(dctcoef) * (size_t)t->n))
+        return;
+    for (i = 0; i < t->n; i++)
+        sc[i] = lev[t->scan[i]];
+    ob = cabac_block_price(sh, sc, t->n, t->cat, t->cbf_ctx);
+    for (i = 0; i < t->n; i++)
+        sc[i] = vl[t->scan[i]];
+    vb = cabac_block_price(sh, sc, t->n, t->cat, t->cbf_ctx);
+    if (sse_of(ctx, vl) + trel_price(vb, lambda) <
+        sse_of(ctx, lev) + trel_price(ob, lambda))
+        memcpy(lev, vl, sizeof(dctcoef) * (size_t)t->n);
+}
+
+struct luma_dc_ctx {
+    const mbenc *c;
+    const pixel *src, *pred;
+    int stride, qp;
+};
+
+static int64_t luma_dc_sse(const void *vctx, const dctcoef *dclev)
+{
+    const struct luma_dc_ctx *k = vctx;
+    int32_t dcv[16];
+    int64_t sse = 0;
+    int blk;
+
+    aeg_dequant_4x4_dc_out(dclev, dcv, k->qp);
+    aeg_dc_block_unpermute(dcv);
+    for (blk = 0; blk < 16; blk++) {
+        const int bx = (blk & 3) * 4, by = (blk >> 2) * 4;
+        sse += aeg_idct_add_ssd4(k->c->level[blk], k->qp,
+                                 k->pred + by * 16 + bx, 16, &dcv[blk],
+                                 k->src + by * k->stride + bx, k->stride);
+    }
+    return sse;
+}
+
+/* The Intra_16x16 luma DC (cat 0), against the AC levels the quantiser has
+ * just produced. */
+static void trellis_luma_dc(struct aeg_encoder *e, int mbx, int mby,
+                            const mbenc *c, const pixel *src, int stride,
+                            const pixel *pred, int qp, const dctcoef *had,
+                            dctcoef *dcled)
+{
+    struct luma_dc_ctx k;
+    struct trel t;
+    float x[16], ue[16];
+    int8_t sg[16];
+    int a, b, va, vb;
+
+    if (!(trellis_dc_mode() & 1) || !trel_vit_on())
+        return;
+    cab_nz_mb(e, mbx, mby, AEG_BLK_LUMA_DC, &a, &b, &va, &vb);
+    t.side = 4;
+    t.n = 16;
+    t.scan = e->scan4;
+    t.cat = 0 + e->fcat;
+    t.cbf_ctx = cab_cbf_ctx(0, a, b, va, vb, 1);
+    t.dc = NULL;
+    aeg_trel_dc_levels(had, 16, qp, x, ue, sg);
+    k.c = c;
+    k.src = src;
+    k.pred = pred;
+    k.stride = stride;
+    k.qp = qp;
+    trel_dc_block(&e->cab_shadow, &t, x, ue, sg,
+                  trellis_intra_lambda(AEG_LAMBDA(qp)), dcled, luma_dc_sse, &k);
+}
+
+struct chroma_dc_ctx {
+    const dctcoef (*ac)[16];      /* the plane's four AC blocks */
+    const pixel *src, *pred;
+    int stride, qp;
+};
+
+static int64_t chroma_dc_sse(const void *vctx, const dctcoef *dclev)
+{
+    static const int bxy[4][2] = { {0, 0}, {4, 0}, {0, 4}, {4, 4} };
+    const struct chroma_dc_ctx *k = vctx;
+    int32_t dcv[4];
+    int64_t sse = 0;
+    int blk;
+
+    aeg_dequant_2x2_dc_out(dclev, dcv, k->qp);
+    for (blk = 0; blk < 4; blk++)
+        sse += aeg_idct_add_ssd4(k->ac[blk], k->qp,
+                                 k->pred + bxy[blk][1] * 8 + bxy[blk][0], 8,
+                                 &dcv[blk],
+                                 k->src + bxy[blk][1] * k->stride + bxy[blk][0],
+                                 k->stride);
+    return sse;
+}
+
+/* One plane's chroma DC (cat 3), against its AC levels as quantised. */
+static void trellis_chroma_dc(struct aeg_encoder *e, int mbx, int mby,
+                              const mbenc *c, int pl, int inter,
+                              const pixel *src, int stride, const pixel *pred,
+                              int qpc, const dctcoef *had, dctcoef *dclev)
+{
+    static const uint8_t ident[4] = { 0, 1, 2, 3 };
+    struct chroma_dc_ctx k;
+    struct trel t;
+    float x[4], ue[4];
+    int8_t sg[4];
+    int a, b, va, vb;
+    double lam = AEG_LAMBDA(c->qp);
+
+    if (!(trellis_dc_mode() & 2) || !trel_vit_on())
+        return;
+    cab_nz_mb(e, mbx, mby, AEG_BLK_CHROMA_DC + pl, &a, &b, &va, &vb);
+    t.side = 4;
+    t.n = 4;
+    t.scan = ident;
+    t.cat = 3 + e->fcat;
+    t.cbf_ctx = cab_cbf_ctx(3, a, b, va, vb, !inter);
+    t.dc = NULL;
+    aeg_trel_dc_levels(had, 4, qpc, x, ue, sg);
+    k.ac = (const dctcoef (*)[16])c->level[AEG_BLK_CHROMA_CB + pl * 4];
+    k.src = src;
+    k.pred = pred;
+    k.stride = stride;
+    k.qp = qpc;
+    trel_dc_block(&e->cab_shadow, &t, x, ue, sg,
+                  inter ? lam : trellis_intra_lambda(lam), dclev,
+                  chroma_dc_sse, &k);
 }
 
 /* One macroblock's luma 4x4 blocks of an inter macroblock, whose prediction is
@@ -3058,6 +3229,9 @@ static void code_chroma_run(struct aeg_encoder *e, int mbx, int mby, mbenc *c,
         }
         aeg_transform_dc2x2_fwd(dc, had);
         aeg_quant_2x2_dc(had, dclev, qpc, 1);
+        if (e->p.trellis > 0 && e->p.cabac && trellis_chroma_on())
+            trellis_chroma_dc(e, mbx, mby, c, pl, inter, src, e->stride[1], pred,
+                              qpc, had, dclev);
         for (i = 0; i < 4; i++)
             nz_dc += dclev[i] != 0;
         memcpy(c->level[AEG_BLK_CHROMA_DC + pl], dclev, sizeof(dclev));

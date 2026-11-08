@@ -5074,8 +5074,8 @@ core 164 every number here was measured with.)
 ## CRF on the long clips: where the gap to x264 veryslow is
 
 *Later:* QP-RD and then the CABAC trellis (both sections near the end) bring
-p4 to +0.57% against veryslow on these clips (cockL +3.37, vtestL −3.25,
-megaL +1.61) and p3 to +4.86%.
+p4 to +0.03% against veryslow on these clips (cockL +2.85, vtestL −4.19,
+megaL +1.43) and p3 to +4.31%.
 
 Before: at CRF on the long clips (cockL, vtestL, megaL; aegenc `--crf N --aq
 0`, x264 `-crf N --tune psnr`, CRF 18-33) p4 was +10.69 % against x264
@@ -6716,5 +6716,78 @@ single hotspot.
   now fixed.
 * CAVLC output is unchanged (the trellis is CABAC-only).
 
-**Next:** the same program for the I16x16 AC, the DC blocks and chroma.
-Those still use the descent alone.
+### The DC blocks, chroma and Intra_16x16 AC
+
+**Chroma AC** goes through the same level selection as luma
+(`code_chroma_run`), so the trellis has covered it from the start; the
+numbers above include it.
+
+**DC blocks** (`trellis_luma_dc`, `trellis_chroma_dc`). The Intra_16x16 luma
+DC (cat 0, 16 levels in `scan4` order) and each chroma DC (cat 3, 4 levels)
+used to be the plain deadzone quantiser's. They now go through
+`trel_viterbi` as well; `aeg_trel_dc_levels()` (transform.c) supplies the
+inputs:
+* **Unrounded level:** `|had|·MF₀ / 2^(17+qp/6)` for luma, `2^(16+qp/6)` for
+  chroma (the quantisers' shifts).
+* **Pixel SSE per unit of level:** one unit dequantises to `V·2^(qp/6)/4`
+  in the DC of each of the 16 luma blocks, or `/2` in each of the 4 chroma
+  blocks. With the flat basis row and the 1/64 of the block inverse, both
+  come to `(V·2^(qp/6))²/256`, the value of position 0 of a 4x4 block.
+* **Exact check:** the trellis's levels and the quantiser's are both priced
+  exactly. The bits are the CABAC price of the DC block; the SSE is the
+  reconstruction of the 16 (or 4) blocks with the AC levels as quantised.
+  The cheaper set is kept. The AC selection then runs against the decided
+  DC, as before.
+* **Lambdas:** luma DC uses the intra trellis lambda (0.5×); chroma DC uses
+  the chroma AC's (plain, 0.5× in intra macroblocks).
+
+`AEG_TDC` (bit 0 luma, bit 1 chroma; default 3) selects them. Ours against
+ours, constant QP, the five clips:
+
+| | cock | tree | vtest | mega | short | mean |
+|---|---|---|---|---|---|---|
+| p4, both | −0.44 | −0.33 | −0.48 | −0.87 | −0.48 | **−0.52** |
+| p4, luma DC only | −0.26 | −0.09 | −0.09 | −0.16 | −0.00 | −0.12 |
+| p4, chroma DC only | −0.36 | −0.29 | −0.40 | −0.20 | −0.23 | −0.30 |
+| p2, both | −0.21 | −0.38 | −0.43 | +0.17 | −0.36 | **−0.24** |
+| p1, both | −0.72 | −0.36 | −0.25 | −0.54 | −0.24 | **−0.42** |
+
+**Time:** about +1% on the short clips and +3–5% on cockL at p4 (wall-clock
+on the VM was noisy this session: min of 3 interleaved, 14.25–14.54 →
+14.93 s). Most chroma DC blocks leave the program at once (nothing rounds
+up), and the exact check runs only when the trellis changes something.
+Caching the "greater than 1" bin chains per block in `tv_level_bits` did
+not make `trel_viterbi` faster (gprof), so it was not kept.
+
+**Intra_16x16 AC** (`AEG_TI16=1`, still off): with the trellis in front of
+the descent it is +0.07% for +9% time at p4, the same verdict as before.
+Each macroblock prices two Intra_16x16 candidates and few of them win.
+
+**All-zero blocks are still not revived.** Intra blocks round at exactly 0.5,
+the same as the trellis's `round(x)`, so an all-zero intra block has no
+candidate. An inter block's only candidates are lone coefficients with x in
+[0.5, 0.75). Each would buy at most 0.5·e of distortion for a
+coded_block_flag, a significance flag, a last flag and a level, and for an
+8x8 block it would change the macroblock's coded block pattern. Several
+decision shortcuts rely on "the level selection never touches a zero".
+
+**Against x264 veryslow** (CRF, long clips, aegenc `--aq 0`):
+
+| | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| p4 with the 4x4/8x8 trellis | +3.37 | −3.25 | +1.61 | +0.57% |
+| **p4 with the DC trellis too** | **+2.85** | **−4.19** | **+1.43** | **+0.03%** |
+| p3 with the 4x4/8x8 trellis | +5.05 | +6.43 | +3.11 | +4.86% |
+| **p3 with the DC trellis too** | **+4.23** | **+5.65** | **+3.06** | **+4.31%** |
+
+CPU seconds for the run: p4 304, p3 212.
+
+**Checks:**
+* `make test` passes.
+* ffmpeg decodes bit-exact: p1, p2, p3, p4, `-g 1`, `--bframes 0`,
+  `--slices 3`, `--mbaff`, `--paff`, `--field`, `--paff-mbaff`, 10-bit.
+* `--frame-threads` 1, 2, 3 and 5 are byte-identical (p1, p3 MBAFF, p4,
+  p4 PAFF), and `--slices 4` is identical across `-t`. (`-t N` without
+  `--slices` codes N slices, so its stream differs by design.)
+* ASAN is clean, including QP 0 and 51, 10-bit and `-g 1`.
+* CAVLC output is unchanged.
