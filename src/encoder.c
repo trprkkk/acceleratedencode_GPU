@@ -10399,9 +10399,6 @@ static int scene_cut_lowres(struct aeg_encoder *e, int display)
     nb = rp > rn ? rp : rn;
     if (nb < 0.0)
         nb = 0.0;
-    if (getenv("AEG_SCDBG"))
-        fprintf(stderr, "SCDL display %d ratio %.3f prev %.3f next %.3f\n",
-                display, r, rp, rn);
     return r >= 1.0 - 0.5 * k && r - nb >= 0.45 * k;
 }
 

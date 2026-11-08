@@ -6535,3 +6535,44 @@ p3 (or any preset with CABAC and the RD decision).
 * Frame threads (1, 2, 3 workers) are byte-identical, and slices are
   identical across `-t`.
 * p3 and `--qp-rd 0` reconstructions match the previous commit.
+
+## Scene cuts from the lookahead's lowres costs
+
+Taking cockL apart: the zero-motion scene-cut test (`|cur − prev|` against
+the picture's AC energy) fired 7 times on cockL. cockL is one continuous
+handheld shot, and x264 codes a single I picture for it. Fast motion looks
+like a cut to a test that does not search motion, and each false cut costs
+an IDR plus the B group cut short before it.
+
+**The new test (`scene_cut_lowres`).** It runs where the lookahead's lowres
+estimates exist (the tree / b-adapt window, so p1 and up). The ratio is the
+motion-searched cost of a picture from the one before (each block at the
+cheaper of inter and intra) over its all-intra cost: 0 is static, 1 means
+nothing to gain from prediction. A cut is a *spike* of that ratio: at least
+0.5, and 0.45 above both neighbours' ratios.
+
+| clip | picture ratios |
+|---|---|
+| cockatoo, fast motion, no cut | 0.4–0.77, at most 0.32 above the picture before |
+| Megamind, real cuts | 0.82–0.86 against 0.09–0.24 around them |
+| synthetic cut of the conformance test (smooth, cheap intra) | 0.60 against 0.03 |
+
+x264's absolute test (ratio ≥ 1 − bias, bias 0.1–0.4) would also cut
+cockatoo. A flash raises two pictures in a row and is not a spike. The
+scenecut parameter scales both margins (120 = 1x; larger values cut less
+often, as with the old test). Without lowres estimates the zero-motion test
+still decides, and `AEG_SCOLD=1` restores it everywhere.
+
+**Result** (CRF, long clips, PSNR BD-rate against x264 veryslow; aegenc
+`--aq 0`):
+
+| | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| p4, old cut test | +8.04 | −1.18 | +3.29 | +3.38% |
+| **p4** | **+4.97** | −1.18 | +3.29 | **+2.36%** |
+| p3, old cut test | +10.58 | +6.94 | +5.11 | +7.54% |
+| **p3** | **+7.02** | +6.94 | +5.11 | **+6.35%** |
+
+cockL now has no cuts. megaL keeps its three real cuts, and its streams
+and vtestL's are byte-identical to the old test. The test runs in
+`schedule()` before anything is queued, so frame threads are unaffected.
