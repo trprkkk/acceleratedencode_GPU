@@ -276,14 +276,39 @@ jobs:
       # coverage-guided: the runner's clang with libFuzzer, every target from
       # the checked-in seeds (tests/fuzz/corpus); a crash, a leak or any UBSan
       # report fails the job and the reproducer is kept as an artifact
+      - name: clang and the libFuzzer runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang >/dev/null
+          clang --version | head -1
+          rt=$(clang -print-resource-dir)
+          if ! ls "$rt"/lib/*/libclang_rt.fuzzer*.a "$rt"/lib/linux/libclang_rt.fuzzer*.a 2>/dev/null; then
+            v=$(clang -dumpversion | cut -d. -f1)
+            sudo apt-get install -y -qq "libclang-rt-$v-dev" >/dev/null
+            ls "$rt"/lib/*/libclang_rt.fuzzer*.a "$rt"/lib/linux/libclang_rt.fuzzer*.a 2>/dev/null
+          fi
+      # the build and the runs go to a log; on failure its tail is also put in
+      # an annotation (readable through the checks API, unlike the raw log)
       - name: libFuzzer (clang), 120 s per target
-        run: make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120
+        run: |
+          set -o pipefail
+          if ! make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120 > fuzz-lf.log 2>&1; then
+            tail -n 80 fuzz-lf.log
+            echo "::error title=libFuzzer::$(grep -av '^warning' fuzz-lf.log | tail -n 40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          fi
+          grep -aE '^(==|Done|#[0-9]+ *DONE)' fuzz-lf.log || true
       # the same harnesses through the standalone driver (tests/fuzz/driver.c),
       # the way they run where there is no clang: keeps that path building
       - name: standalone driver (gcc), 20 s per target
         run: |
           rm -rf build-fuzz
-          make fuzz FUZZ_TIME=20
+          if ! make fuzz FUZZ_TIME=20 > fuzz-drv.log 2>&1; then
+            tail -n 80 fuzz-drv.log
+            echo "::error title=fuzz driver::$(grep -av '^warning' fuzz-drv.log | tail -n 40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          fi
+          grep -aE '^(==|driver:)' fuzz-drv.log
       - name: keep reproducers
         if: failure()
         uses: actions/upload-artifact@v4
@@ -291,4 +316,5 @@ jobs:
           name: fuzz-artifacts
           path: |
             build-fuzz/fuzz_*-*
+            fuzz-*.log
           if-no-files-found: ignore
