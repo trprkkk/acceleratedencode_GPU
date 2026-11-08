@@ -24,7 +24,10 @@
 #               fractional ones; the per-macroblock subpel walk is skipped)
 #   all         all of the above at once
 #
-# Set BE=opencl (or BE=cuda) to add one more run that *forces* the two
+# Without BE the device runs use -b auto, which opens only a GPU (a CUDA
+# device, else an OpenCL GPU).  Set BE=opencl (or BE=cuda) to run them all on
+# that backend -- the way to reach PoCL, an OpenCL runtime on the CPU -- and to
+# add one more run that *forces* the two
 # coefficient stages and the interpolation planes through that backend with
 # `-s tq=... -s iq=... -s inter=...`.  The
 # dispatcher is free not to pick those stages (it may measure the CPU as
@@ -101,8 +104,9 @@ run()
         return 1
     fi
     fps=$(sed -n 's/.*(\([0-9.]*\) fps).*/\1/p' "$TMP/$name.log" | tail -1)
-    gpu=$(sed -n 's/^ *stage \([a-z-]*\) *[0-9.]* ms *\([a-z]*\).*/\1(\2) /p' \
-          "$TMP/$name.log" | tr -d '\n' | tr -s ' ')
+    # "cpu", "gpu", or "cpu, N% of it on the device" -> stage(cpu,N%)
+    gpu=$(sed -n 's/^ *stage \([a-z-]*\) *[0-9.]* ms *\([a-z]*\)\(, \([0-9]*%\)\)\{0,1\}.*/\1(\2,\4) /p' \
+          "$TMP/$name.log" | sed 's/,)/)/' | tr -d '\n' | tr -s ' ')
     bytes=$(wc -c <"$TMP/$name.264" | tr -d ' ')
     psnr=$(sed -n 's/.*PSNR \([0-9.]*\) dB.*/\1/p' "$TMP/$name.log" | tail -1)
     printf '   %-10s %8s fps %7s B %6s dB  %s\n' \
@@ -110,18 +114,21 @@ run()
     return 0
 }
 
+# -b auto only opens a GPU; BE=opencl also reaches an OpenCL runtime on the
+# CPU (PoCL), so with BE set every device run names the backend
+DEV=${BE:+-b $BE}
 run cpu  -- -b cpu "$@" || fail=1
-run auto -- "$@" || fail=1
-run coefbatch AEG_COEF_BATCH=1 -- "$@" || fail=1
-run rdbatch AEG_RD_BATCH=1 -- "$@" || fail=1
-run search AEG_SEED=1 AEG_PARFULL=1 -- "$@" || fail=1
+run auto -- $DEV "$@" || fail=1
+run coefbatch AEG_COEF_BATCH=1 -- $DEV "$@" || fail=1
+run rdbatch AEG_RD_BATCH=1 -- $DEV "$@" || fail=1
+run search AEG_SEED=1 AEG_PARFULL=1 -- $DEV "$@" || fail=1
 # the same whole-frame search with the CPU implementations of its operations:
 # the device must reproduce it byte for byte
 run searchcpu AEG_SEED=1 AEG_PARFULL=1 -- -b cpu "$@" || fail=1
 if [ -n "${BE:-}" ]; then
-    run stageforce -- -s "tq=$BE" -s "iq=$BE" -s "inter=$BE" "$@" || fail=1
+    run stageforce -- $DEV -s "tq=$BE" -s "iq=$BE" -s "inter=$BE" "$@" || fail=1
 fi
-run all AEG_SEED=1 AEG_PARFULL=1 AEG_COEF_BATCH=1 AEG_RD_BATCH=1 -- "$@" \
+run all AEG_SEED=1 AEG_PARFULL=1 AEG_COEF_BATCH=1 AEG_RD_BATCH=1 -- $DEV "$@" \
     || fail=1
 
 echo "== bitstream: the coefficient stages may not change a single byte"

@@ -476,9 +476,10 @@ void aeg_mc_luma_p(pixel *dst, int dstride, const aeg_mc_ctx *mc,
                 x += 8;
             }
             if (w - x >= 4) {
-                _mm_storeu_si32(d + x,
+                /* (not _mm_storeu_si32: GCC < 9 lacks it) */
+                st32(d + x, _mm_cvtsi128_si32(
                                 _mm_avg_epu8(_mm_cvtsi32_si128(ld32(r1 + x)),
-                                             _mm_cvtsi32_si128(ld32(r2 + x))));
+                                             _mm_cvtsi32_si128(ld32(r2 + x)))));
                 x += 4;
             }
 #elif AEG_SIMD

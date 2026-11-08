@@ -256,7 +256,8 @@ typedef struct aeg_params {
     int backend;              /* aeg_backend                            */
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */
     int aq_mode;              /* 0 off, 1 variance AQ                   */
-    int aq_strength;          /* 0..3, default 1.0 (units of 0.1?)      */
+    int aq_strength;          /* tenths: 10 (default) = x264 aq-strength
+                                 1.0; 0 = adaptive quantisation off      */
     /* High-profile 8x8 luma transform.  One transform per 8x8 block instead of
      * four 4x4 ones, with the matching Intra_8x8 prediction modes; a stream that
      * uses it needs profile_idc 100 (High).  On by default: it is the larger of
@@ -270,7 +271,8 @@ typedef struct aeg_params {
     int deblock_alpha;        /* slice_alpha_c0_offset_div2, -6..6      */
     int deblock_beta;         /* slice_beta_offset_div2, -6..6          */
     int search_range;         /* integer pel search range, 0 = preset   */
-    int subme;                /* 0..9: subpel refinement quality        */
+    int subme;                /* 0 = whole-sample vectors, 1 = quarter-
+                                 sample refinement; 2..9 act as 1        */
     /* Rate-distortion refinement of the winning inter vector: 0 = off (the
      * vector is the one the SATD search returned), 1 = the four quarter-pel
      * neighbours, 2 = all eight.  Each step is one more full macroblock
@@ -384,8 +386,13 @@ typedef struct aeg_stats {
      * stage_ns, not a split of it) */
     int64_t stage_gpu_ns[AEG_STAGE_COUNT];
     int64_t stage_cpu_ns[AEG_STAGE_COUNT];
-    int     stage_use_gpu[AEG_STAGE_COUNT]; /* any of its work on a device */
-    double  psnr_y, psnr_u, psnr_v, psnr_avg; /* reconstructed vs source  */
+    int     stage_use_gpu[AEG_STAGE_COUNT]; /* any of its work on a device;
+                                               stage_gpu_ns / stage_ns says how much */
+    /* Reconstructed vs source over every picture coded so far, from the
+     * summed squared error (x264's "global" PSNR; psnr_avg weighs the planes
+     * by their sample counts).  ssim_y: the mean luma SSIM of the pictures,
+     * measured only with aeg_params.ssim (else 0). */
+    double  psnr_y, psnr_u, psnr_v, psnr_avg;
     double  ssim_y;
     /* VBV/HRD accounting (zero when the model is off): the lowest buffer level
      * the model reached, in bits, and how many pictures would have underflowed

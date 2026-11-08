@@ -96,7 +96,10 @@ static void usage(void)
 "  --seek <n>       skip the first n input frames\n"
 "  --range <int>    integer motion search range around the zero vector\n"
 "                   (default 48, at most 56)\n"
-"  --subme <int>    subpel refinement 0..2 (default 1)\n"
+"  --subme <int>    0 = whole-sample motion vectors only (default at -p 0),\n"
+"                   1 = half- then quarter-sample refinement (default);\n"
+"                   2..9 are accepted for x264 command lines and act as 1\n"
+"                   (x264's higher subme tools come with -p and --qp-rd)\n"
 "  --refine-mv <n>  0 = off, 1 = four quarter-pel neighbours of the winning\n"
 "                   vector (the cross), 2 = the four of all eight with the\n"
 "                   lowest SATD, 3 = all eight (rate-distortion refined,\n"
@@ -145,6 +148,7 @@ static void usage(void)
 "  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
 "  --nal-hrd        signal the VBV model as the NAL HRD: hrd_parameters in\n"
 "                   the SPS, buffering period and picture timing SEI\n"
+"  --ssim           also measure the luma SSIM (x264's --ssim)\n"
 "  --info-sei       write the encoder name and options into the stream (a\n"
 "                   user data SEI on the first picture, as x264 does)\n"
 "  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
@@ -728,6 +732,7 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(a, "--info-sei")) p.info_sei = 1;
+        else if (!strcmp(a, "--ssim")) p.ssim = 1;
         else if (!strcmp(a, "--colorprim") || !strcmp(a, "--transfer") ||
                  !strcmp(a, "--colormatrix")) {
             static const char *const pn[] = { "bt709", "bt470m", "bt470bg",
@@ -829,6 +834,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--calibrate")) {
             int r = aeg_calibrate(backend);
             printf("calibration: %s\n", r == 0 ? "ok" : "accelerator unavailable");
+            if (r == 0)
+                list_devices();
             return r == 0 ? 0 : 1;
         } else if (!strcmp(a, "--bench")) bench = 1;
         else if (!strcmp(a, "--dump-recon")) dumppath = next_arg(argc, argv, &i);
@@ -1325,11 +1332,16 @@ int main(int argc, char **argv)
                         printf(" %s %" PRId64, names[k], st.mb_types[k]);
                 printf("\n");
             }
-            printf("bitrate %.1f kb/s at %g fps, PSNR %.2f dB (Y+U+V average)\n",
+            /* over the whole encode, from the summed squared error */
+            printf("bitrate %.1f kb/s at %g fps, PSNR %.2f dB (Y %.2f U %.2f "
+                   "V %.2f)\n",
                    st.frames > 0
                        ? st.bytes * 8.0 * fps / (double)st.frames / 1000.0
                        : 0.0,
-                   fps, st.psnr_avg);
+                   fps, st.psnr_avg, st.psnr_y, st.psnr_u, st.psnr_v);
+            if (p.ssim)
+                printf("SSIM Y %.5f (%.3f dB)\n", st.ssim_y,
+                       st.ssim_y < 1.0 ? -10.0 * log10(1.0 - st.ssim_y) : 99.0);
             if (st.scene_cuts)
                 printf("scenecut: %" PRId64 " IDR picture(s) inserted\n",
                        st.scene_cuts);
@@ -1339,11 +1351,25 @@ int main(int argc, char **argv)
                        PRId64 " coded again\n",
                        st.vbv_min_fill_bits / 1000.0, st.vbv_underflows,
                        st.vbv_size_clamps, st.vbv_recodes);
-            for (i = 0; i < AEG_STAGE_COUNT; i++)
-                if (st.stage_ns[i] > 0)
-                    printf("  stage %-12s %8.1f ms  %s\n", aeg_stage_name(i),
-                           st.stage_ns[i] / 1e6,
-                           st.stage_use_gpu[i] ? "gpu" : "cpu");
+            for (i = 0; i < AEG_STAGE_COUNT; i++) {
+                /* the device's share of the time: motion estimation, say,
+                 * runs its seed rounds there but every macroblock's search
+                 * on the CPU */
+                double g;
+                if (st.stage_ns[i] <= 0)
+                    continue;
+                g = 100.0 * (double)st.stage_gpu_ns[i] / (double)st.stage_ns[i];
+                if (st.stage_gpu_ns[i] <= 0)
+                    printf("  stage %-12s %8.1f ms  cpu\n", aeg_stage_name(i),
+                           st.stage_ns[i] / 1e6);
+                else if (g >= 99.5)
+                    printf("  stage %-12s %8.1f ms  gpu\n", aeg_stage_name(i),
+                           st.stage_ns[i] / 1e6);
+                else
+                    printf("  stage %-12s %8.1f ms  cpu, %.0f%% of it on the "
+                           "device\n", aeg_stage_name(i), st.stage_ns[i] / 1e6,
+                           g < 1.0 ? 1.0 : g);
+            }
         }
     }
 

@@ -717,11 +717,6 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
     d->mu = malloc(sizeof(pthread_mutex_t));
     if (d->mu)
         pthread_mutex_init((pthread_mutex_t *)d->mu, NULL);
-    /* a guess until aeg_backend_calibrate() has measured this backend */
-    d->launch_ns = aeg_backend_launch_ns_for(d->ops.backend);
-    if (d->launch_ns <= 0)
-        d->launch_ns = 5 * 1000;
-    d->min_items_for_gpu = 256;
     aeg_log(AEG_LOG_INFO, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
             d->ops.desc);
 }
@@ -813,16 +808,14 @@ static void dispatch_update(aeg_dispatcher *d)
         /* the coefficient stages are placed by aeg_dispatch_coef_pick() */
         if (i == AEG_STAGE_TRANSFORM || i == AEG_STAGE_IQUANT_IDCT)
             continue;
-        /* Only switch to the GPU when the measurement is unambiguous
-         * (>= 10% faster) and the frame had enough work to amortise a
-         * launch; this includes the launch cost in the comparison. */
-        if (d->gpu_ns[i][1] > 0 && d->cpu_ns[i][1] > 0) {
-            int64_t gpu = d->gpu_ns[i][1] + d->launch_ns;
-            if (gpu * 100 < d->cpu_ns[i][1] * 90)
-                d->use_gpu[i] = 1;
-            else if (d->cpu_ns[i][1] * 100 < gpu * 90)
-                d->use_gpu[i] = 0;
-        }
+        /* Every other stage stays on the CPU unless -s puts it on a device.
+         * Of them only inter prediction has a device form, and that form
+         * rebuilds all the sub-sample planes of a reference on each call
+         * where the CPU path keeps them, so it cannot win the comparison; a
+         * timing vote here also never saw a device sample, since a stage is
+         * only timed on the side it ran on.  (Kept explicit rather than
+         * timed so the output never depends on the machine's speed.) */
+        d->use_gpu[i] = 0;
         d->cpu_ns[i][0] = 0;
         d->gpu_ns[i][0] = 0;
     }
@@ -974,27 +967,29 @@ int aeg_backend_query(aeg_backend b, aeg_device_info *out, int max)
         int first = n < max ? n : max, k;
         n += aeg_backend_query_opencl(out + n, max - n > 0 ? max - n : 0);
         n += aeg_backend_query_cuda(out + n, max - n > 0 ? max - n : 0);
-        for (k = first; k < n && k < max; k++) {
-            int be = out[k].backend;
-            if (be >= 0 && be < AEG_BACKEND_COUNT_) {
-                out[k].launch_overhead_ns = g_cal[be].launch_ns;
-                out[k].bytes_per_ns = g_cal[be].bytes_per_ns;
+        /* aeg_calibrate() measures the device a backend opens by default:
+         * its first GPU, else its first device */
+        int b;
+        for (b = AEG_BACKEND_OPENCL; b <= AEG_BACKEND_CUDA; b++) {
+            int pick = -1;
+            for (k = first; k < n && k < max; k++)
+                if (out[k].backend == b &&
+                    (pick < 0 || (out[k].is_gpu && !out[pick].is_gpu)))
+                    pick = k;
+            if (pick >= 0) {
+                out[pick].launch_overhead_ns = g_cal[b].launch_ns;
+                out[pick].bytes_per_ns = g_cal[b].bytes_per_ns;
             }
         }
     }
     return n;
 }
 
-/* What the last calibration of each backend measured: the fixed cost of a
- * batch call (launch plus the two transfers of a tiny batch) and the
- * throughput of a large one.  aeg_dispatch_init() takes the first as its
- * launch cost, aeg_backend_query() reports both. */
-
-int64_t aeg_backend_launch_ns_for(int backend)
-{
-    return backend >= 0 && backend < AEG_BACKEND_COUNT_ ?
-           __atomic_load_n(&g_cal[backend].launch_ns, __ATOMIC_RELAXED) : 0;
-}
+/* Calibration: the fixed cost of a batch call (launch plus the two
+ * transfers of a tiny batch) and the throughput of a large one, kept per
+ * backend for aeg_query_devices().  The dispatcher does not need them: the
+ * one placement it makes by itself (the coefficient stages) is decided by
+ * timing whole pictures both ways, which includes every launch and copy. */
 
 static int64_t cal_time(aeg_be_ops *ops, const int16_t *res, int nblk,
                         int16_t *level, int32_t *nz)

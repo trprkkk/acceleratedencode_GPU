@@ -11,6 +11,7 @@
  * arithmetic.  No vendor video extension, no fixed-function encoder block.
  */
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,7 +90,6 @@ OCL_SYMS(DECL)
 #define NBUF 12
 
 typedef struct ocl_ctx {
-    void *lib;
     cl_platform_id platform;
     cl_device_id device;
     cl_context ctx;
@@ -659,7 +659,6 @@ static void ocl_destroy(void *priv)
     if (o->prog) p_clReleaseProgram(o->prog);
     if (o->queue) p_clReleaseCommandQueue(o->queue);
     if (o->ctx) p_clReleaseContext(o->ctx);
-    if (o->lib) dlclose(o->lib);
     free(o);
 }
 
@@ -822,6 +821,27 @@ static int ocl_dev_is_gpu(cl_device_id d)
     return (t & CL_DEVICE_TYPE_GPU) != 0;
 }
 
+/* The loader is opened once per process and kept: the entry points are
+ * process-wide anyway, and an ICD loader sets up its platform list on first
+ * use and never frees it -- closing and reopening the library with every
+ * encoder would set it up (and lose it) again each time. */
+static pthread_once_t g_ocl_once = PTHREAD_ONCE_INIT;
+static int g_ocl_ok;
+
+static void ocl_load_once(void)
+{
+    void *lib = NULL;
+#define LOAD(ret, name, args) do { \
+        *(void **)(&p_##name) = dlsym(lib, #name); \
+        if (!p_##name) { ocl_load_error(#name); dlclose(lib); return; } \
+    } while (0);
+    if (ocl_load(&lib) != AEG_OK)
+        return;
+    OCL_SYMS(LOAD)
+#undef LOAD
+    g_ocl_ok = 1;
+}
+
 /* `want` >= 0: that entry of ocl_devices(); -1: the first GPU, else (unless
  * gpu_only) the first device of any kind.  backend.c asks for gpu_only when
  * the backend is chosen automatically: an OpenCL runtime on the host CPU
@@ -829,29 +849,19 @@ static int ocl_dev_is_gpu(cl_device_id d)
 int aeg_be_opencl_create(aeg_be_ops *ops, int want, int gpu_only)
 {
     ocl_ctx *o;
-    void *lib = NULL;
     cl_int st;
     size_t got;
     cl_platform_id plats[OCL_MAXDEV];
     cl_device_id devs[OCL_MAXDEV];
     int ndev, pick = -1, k;
 
-#define LOAD(ret, name, args) do { \
-        *(void **)(&p_##name) = dlsym(lib, #name); \
-        if (!p_##name) { ocl_load_error(#name); dlclose(lib); return AEG_EBACKEND; } \
-    } while (0);
-
-    if (ocl_load(&lib) != AEG_OK)
+    pthread_once(&g_ocl_once, ocl_load_once);
+    if (!g_ocl_ok)
         return AEG_EBACKEND;
-    OCL_SYMS(LOAD)
-#undef LOAD
 
     o = (ocl_ctx *)calloc(1, sizeof(*o));
-    if (!o) {
-        dlclose(lib);
+    if (!o)
         return AEG_ENOMEM;
-    }
-    o->lib = lib;
     ndev = ocl_devices(plats, devs);
     if (want >= 0) {
         pick = want < ndev ? want : -1;

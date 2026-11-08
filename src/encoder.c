@@ -733,6 +733,14 @@ struct aeg_encoder {
      * that codes non-reference B pictures next to the main thread, and the
      * queue that hands the packets out in coding order. */
     int    ft_on;
+    int    ft_worker_copy;  /* a frame-thread worker's copy of the encoder */
+    /* Distortion of the last coded picture (pic_quality) and its sums over
+     * the encode (qual_account, on the encoder itself only: a frame-thread
+     * worker's picture is counted when its packet is handed out). */
+    int64_t pic_sse[3];
+    double  pic_ssim;
+    int64_t qual_sse[3], qual_n;
+    double  qual_ssim;
     /* The device lane this copy's thread uses (aeg_be_lane): 0 for the
      * encoder itself, 1 + k * (slice threads) for frame-thread worker k, plus
      * the slice index for the copies of a picture's slice threads -- so that
@@ -761,6 +769,101 @@ static void stage_rec(struct aeg_encoder *e, int stage, int on_gpu, int64_t ns)
         e->st.stage_gpu_ns[stage] += ns;
     else
         e->st.stage_cpu_ns[stage] += ns;
+}
+
+/* x264's SSIM of one 8x8 window from its sums: s1, s2 of the two pictures,
+ * ss of both squares, s12 of the products (x264 ssim_end1, the constants
+ * scaled to the sample range). */
+static double ssim_window(double s1, double s2, double ss, double s12)
+{
+    const double c1 = .01 * .01 * PIXEL_MAX * PIXEL_MAX * 64;
+    const double c2 = .03 * .03 * PIXEL_MAX * PIXEL_MAX * 64 * 63;
+    double vars = ss * 64 - s1 * s1 - s2 * s2;
+    double covar = s12 * 64 - s1 * s2;
+    return (2 * s1 * s2 + c1) * (2 * covar + c2) /
+           ((s1 * s1 + s2 * s2 + c1) * (vars + c2));
+}
+
+/* The luma SSIM of the visible picture: 8x8 windows on a 4-sample grid, as
+ * x264 --ssim measures it. */
+static double pic_ssim_y(const struct aeg_encoder *e)
+{
+    const pixel *a = e->srcp[0], *b = e->recp[0];
+    int stride = e->stride[0], w4 = e->vw / 4, h4 = e->vh / 4;
+    double sum = 0;
+    int x, y, n = 0;
+    for (y = 0; y + 1 < h4; y++)
+        for (x = 0; x + 1 < w4; x++) {
+            int64_t s1 = 0, s2 = 0, ss = 0, s12 = 0;
+            int i, j;
+            for (j = 0; j < 8; j++)
+                for (i = 0; i < 8; i++) {
+                    int pa = a[(4 * y + j) * stride + 4 * x + i];
+                    int pb = b[(4 * y + j) * stride + 4 * x + i];
+                    s1 += pa;
+                    s2 += pb;
+                    ss += pa * pa + pb * pb;
+                    s12 += pa * pb;
+                }
+            sum += ssim_window((double)s1, (double)s2, (double)ss, (double)s12);
+            n++;
+        }
+    return n ? sum / n : 1.0;
+}
+
+/* Distortion of the picture just reconstructed, against its source, over
+ * the visible area (the cropped margin is not output): the squared error of
+ * each plane, and the luma SSIM when aeg_params.ssim asks for it.  Timed as
+ * the PSNR stage, always on the CPU. */
+static void pic_quality(struct aeg_encoder *e)
+{
+    int64_t t0 = aeg_now_ns(), dt;
+    int i;
+    for (i = 0; i < 3; i++) {
+        int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
+        int x, y;
+        int64_t acc = 0;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                int d = (int)e->recp[i][y * e->stride[i] + x] -
+                        (int)e->srcp[i][y * e->stride[i] + x];
+                acc += (int64_t)d * d;
+            }
+        e->pic_sse[i] = acc;
+    }
+    e->pic_ssim = e->p.ssim ? pic_ssim_y(e) : 0.0;
+    dt = aeg_now_ns() - t0;
+    e->st.stage_ns[AEG_STAGE_PSNR] += dt;
+    e->st.stage_cpu_ns[AEG_STAGE_PSNR] += dt;
+}
+
+static double psnr_of(int64_t sse, int64_t samples)
+{
+    if (sse <= 0)
+        return 99.0;
+    return 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX * (double)samples /
+                        (double)sse);
+}
+
+/* Counts one picture's distortion into the encode's aeg_stats: psnr_y/u/v
+ * and psnr_avg from the squared error summed over every picture so far
+ * (x264's "global" PSNR; psnr_avg weighs the planes by their samples), and
+ * ssim_y the mean of the pictures' SSIM. */
+static void qual_account(struct aeg_encoder *e, const int64_t sse[3],
+                         double ssim)
+{
+    int64_t ny = (int64_t)e->vw * e->vh, nc = (int64_t)e->vcw * e->vch;
+    int i;
+    for (i = 0; i < 3; i++)
+        e->qual_sse[i] += sse[i];
+    e->qual_ssim += ssim;
+    e->qual_n++;
+    e->st.psnr_y = psnr_of(e->qual_sse[0], e->qual_n * ny);
+    e->st.psnr_u = psnr_of(e->qual_sse[1], e->qual_n * nc);
+    e->st.psnr_v = psnr_of(e->qual_sse[2], e->qual_n * nc);
+    e->st.psnr_avg = psnr_of(e->qual_sse[0] + e->qual_sse[1] + e->qual_sse[2],
+                             e->qual_n * (ny + 2 * nc));
+    e->st.ssim_y = e->p.ssim ? e->qual_ssim / (double)e->qual_n : 0.0;
 }
 
 /* Which of the two batched coefficient code paths to use for this picture.
@@ -13913,23 +14016,9 @@ frecode:
         e->mcr[f].stride = mstride[f];
 
     /* distortion statistics, of the frame */
-    {
-        double sse = 0;
-        int i;
-        for (i = 0; i < 3; i++) {
-            int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
-            int x, y;
-            int64_t acc = 0;
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    int d = (int)e->recp[i][y * e->stride[i] + x] -
-                            (int)e->srcp[i][y * e->stride[i] + x];
-                    acc += (int64_t)d * d;
-                }
-            sse = sse + (double)acc / (double)(w * h);
-        }
-        e->st.psnr_avg = sse > 0 ? 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
-    }
+    pic_quality(e);
+    if (!e->ft_worker_copy)
+        qual_account(e, e->pic_sse, e->pic_ssim);
     if (pkt) {
         int64_t t = 0;
         int i;
@@ -14306,27 +14395,9 @@ recode:
     }
 
     /* distortion statistics */
-    {
-        int64_t t0 = aeg_now_ns();
-        double sse = 0;
-        int i;
-        for (i = 0; i < 3; i++) {
-            /* the visible picture only: the cropped margin is not output */
-            int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
-            int x, y;
-            int64_t acc = 0;
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    int d = (int)e->recp[i][y * e->stride[i] + x] -
-                            (int)e->srcp[i][y * e->stride[i] + x];
-                    acc += (int64_t)d * d;
-                }
-            sse = sse + (double)acc / (double)(w * h);
-            e->st.stage_ns[AEG_STAGE_PSNR] += 0;
-        }
-        e->st.psnr_avg = sse > 0 ? 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
-        (void)t0;
-    }
+    pic_quality(e);
+    if (!e->ft_worker_copy)
+        qual_account(e, e->pic_sse, e->pic_ssim);
 
     if (pkt) {
         pkt->data = e->out;
@@ -15972,8 +16043,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             if (aeg_lowres_alloc(&e->lr_pic[k], e->mb_w, e->mb_h))
                 e->lr_pic[k].mem = NULL;
     }
-    if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
-        !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost ||
+    if (!e->mb_encs || !e->seed_mv || !e->seed_cand || !e->seed_sad ||
+        !e->seed_cost || !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost ||
         !e->lr_scratch || !e->lr_mv[0] || !e->lr_mv[1] ||
         !e->lr_pic[0].mem || !e->lr_pic[1].mem || !e->lr_pic[2].mem) {
         aeg_set_last_error("out of memory");
@@ -16317,7 +16388,9 @@ struct ft_entry {
     size_t   cap, size;
     int64_t  pts;
     int      keyframe, qp, type;
-    double   psnr, qp_avg, qp_base;
+    double   qp_avg, qp_base;
+    int64_t  sse[3];            /* the picture's distortion (pic_quality) */
+    double   ssim;
     int      pending;           /* in a worker, not joined yet */
     pixel *rec_mem;
     int     *mbqp;
@@ -16597,7 +16670,7 @@ static struct ft_entry *ft_push(struct aeg_encoder *e)
 
 static int ft_fill(struct aeg_encoder *e, struct ft_entry *q,
                    const aeg_packet *pkt, const pixel *rec_mem,
-                   const aeg_mb *mbs, double psnr)
+                   const aeg_mb *mbs, const struct aeg_encoder *c)
 {
     int i;
 
@@ -16611,7 +16684,8 @@ static int ft_fill(struct aeg_encoder *e, struct ft_entry *q,
     q->type = pkt->type;
     q->qp_avg = pkt->qp_avg;
     q->qp_base = pkt->qp_base;
-    q->psnr = psnr;
+    memcpy(q->sse, c->pic_sse, sizeof(q->sse));
+    q->ssim = c->pic_ssim;
     memcpy(q->rec_mem, rec_mem, pic_bytes(e));
     for (i = 0; i < e->mb_count; i++)
         q->mbqp[i] = mbs[i].qp;
@@ -16659,7 +16733,7 @@ static int ft_join(struct aeg_encoder *e, struct ft_worker *w)
     if (rc == AEG_OK)
         rc = ft_fill(e, w->ent, &w->pkt,
                      w->rec_slot >= 0 ? e->pic_mem[w->rec_slot] : w->pic_mem,
-                     w->mbs, c->st.psnr_avg);
+                     w->mbs, c);
     for (k = 0; k < w->nuses; k++)
         e->pic_busy[w->uses[k]]--;
     w->nuses = 0;
@@ -16831,6 +16905,7 @@ static int ft_launch(struct aeg_encoder *e)
     *c = *e;
     aeg_dispatch_unlock(&e->d);
     c->ft_on = 0;
+    c->ft_worker_copy = 1;
     {
         int nt = slice_thread_count(e);
         c->lane = 1 + (int)(w - e->ftw) * (nt > 1 ? nt : 1);
@@ -17028,7 +17103,7 @@ static int ft_run(struct aeg_encoder *e, aeg_packet *pkt, int flushing)
         pkt->qp_avg = q->qp_avg;
         pkt->qp_base = q->qp_base;
     }
-    e->st.psnr_avg = q->psnr;
+    qual_account(e, q->sse, q->ssim);
     e->ft_ret = e->ftq_head;
     e->ftq_head = (e->ftq_head + 1) % FT_Q;
     e->ftq_n--;
@@ -17341,7 +17416,7 @@ int aeg_encoder_get_params(aeg_encoder *enc, aeg_params *out)
     *out = e->p;
     out->level_idc = e->level_out;
     out->slices = e->n_slices;
-    out->frame_threads = e->ft_on ? 2 : 1;
+    out->frame_threads = e->ft_on ? e->ft_nw : 1;   /* the workers in use */
     return AEG_OK;
 }
 

@@ -158,8 +158,6 @@ void aeg_be_cpu_ops(aeg_be_ops *ops);
  * fills ops with the CPU implementation. */
 int aeg_be_create(int which, aeg_be_ops *ops);
 int aeg_be_create_dev(int which, int dev, aeg_be_ops *ops);
-/* the last calibration of that backend (0 = never calibrated) */
-int64_t aeg_backend_launch_ns_for(int backend);
 
 /* Per-stage dispatch ------------------------------------------------- */
 typedef struct aeg_dispatcher {
@@ -170,8 +168,6 @@ typedef struct aeg_dispatcher {
     int64_t    cpu_ns[AEG_STAGE_COUNT][2]; /* [stage][last/ema]          */
     int64_t    gpu_ns[AEG_STAGE_COUNT][2];
     int64_t    bytes_moved[AEG_STAGE_COUNT];
-    int64_t    launch_ns;                  /* measured kernel launch cost */
-    int64_t    min_items_for_gpu;
     int        frames_measured;
     /* The coefficient stages (transform + inverse) are placed by trial, per
      * picture kind (aeg_dispatch_coef_pick / _done): [kind][0 cpu, 1 device]
