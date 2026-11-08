@@ -293,8 +293,7 @@ jobs:
         run: |
           set -o pipefail
           if ! make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120 > fuzz-lf.log 2>&1; then
-            tail -n 80 fuzz-lf.log
-            echo "::error title=libFuzzer::$(grep -av '^warning' fuzz-lf.log | tail -n 40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            sh tools/ci/fuzz_report.sh fuzz-lf.log libFuzzer
             exit 1
           fi
           grep -aE '^(==|Done|#[0-9]+ *DONE)' fuzz-lf.log || true
@@ -304,8 +303,7 @@ jobs:
         run: |
           rm -rf build-fuzz
           if ! make fuzz FUZZ_TIME=20 > fuzz-drv.log 2>&1; then
-            tail -n 80 fuzz-drv.log
-            echo "::error title=fuzz driver::$(grep -av '^warning' fuzz-drv.log | tail -n 40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            sh tools/ci/fuzz_report.sh fuzz-drv.log "fuzz driver"
             exit 1
           fi
           grep -aE '^(==|driver:)' fuzz-drv.log
