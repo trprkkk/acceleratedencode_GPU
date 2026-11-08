@@ -251,8 +251,8 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
 }
 
 /* Implemented in backend_opencl.c / backend_cuda.c */
-int aeg_be_opencl_create(aeg_be_ops *ops);
-int aeg_be_cuda_create(aeg_be_ops *ops);
+int aeg_be_opencl_create(aeg_be_ops *ops, int want, int gpu_only);
+int aeg_be_cuda_create(aeg_be_ops *ops, int want);
 
 /* ------------------------------------------------------------------ */
 /* Device guard                                                        */
@@ -622,11 +622,20 @@ static int be_guard_wrap(aeg_be_ops *ops)
     return AEG_OK;
 }
 
-static int be_create_raw(int which, aeg_be_ops *ops);
+static int be_create_raw(int which, int dev, aeg_be_ops *ops);
 
 int aeg_be_create(int which, aeg_be_ops *ops)
 {
-    int rc = be_create_raw(which, ops);
+    return aeg_be_create_dev(which, -1, ops);
+}
+
+/* `dev` >= 0: that device of the backend (aeg_device_info.device_index);
+ * -1: the backend's choice -- the first GPU.  With AEG_BACKEND_AUTO only a GPU
+ * is ever taken: an OpenCL runtime on the host CPU (PoCL) is for validation
+ * (-b opencl), and the native code is faster than it. */
+int aeg_be_create_dev(int which, int dev, aeg_be_ops *ops)
+{
+    int rc = be_create_raw(which, dev, ops);
     if (ops->backend != AEG_BACKEND_CPU && be_guard_wrap(ops) != AEG_OK) {
         if (ops->destroy)
             ops->destroy(ops->priv);
@@ -636,7 +645,7 @@ int aeg_be_create(int which, aeg_be_ops *ops)
     return rc;
 }
 
-static int be_create_raw(int which, aeg_be_ops *ops)
+static int be_create_raw(int which, int dev, aeg_be_ops *ops)
 {
     aeg_be_cpu_ops(ops);
 #if BIT_DEPTH != 8
@@ -654,23 +663,23 @@ static int be_create_raw(int which, aeg_be_ops *ops)
     case AEG_BACKEND_CPU:
         return AEG_OK;
     case AEG_BACKEND_OPENCL:
-        if (aeg_be_opencl_create(ops) == AEG_OK)
+        if (aeg_be_opencl_create(ops, dev, 0) == AEG_OK)
             return AEG_OK;
         aeg_be_cpu_ops(ops);
         aeg_set_last_error("OpenCL backend unavailable, using CPU");
         return AEG_EBACKEND;
     case AEG_BACKEND_CUDA:
-        if (aeg_be_cuda_create(ops) == AEG_OK)
+        if (aeg_be_cuda_create(ops, dev) == AEG_OK)
             return AEG_OK;
         aeg_be_cpu_ops(ops);
         aeg_set_last_error("CUDA backend unavailable, using CPU");
         return AEG_EBACKEND;
     case AEG_BACKEND_AUTO:
     default:
-        if (aeg_be_cuda_create(ops) == AEG_OK)
+        if (aeg_be_cuda_create(ops, dev) == AEG_OK)
             return AEG_OK;
         aeg_be_cpu_ops(ops);
-        if (aeg_be_opencl_create(ops) == AEG_OK)
+        if (aeg_be_opencl_create(ops, dev, 1) == AEG_OK)
             return AEG_OK;
         aeg_be_cpu_ops(ops);
         return AEG_OK;
@@ -684,7 +693,17 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
 {
     int i;
     memset(d, 0, sizeof(*d));
-    aeg_be_create(backend, &d->ops);
+    aeg_be_create_dev(backend, p ? p->device : -1, &d->ops);
+    if (d->ops.backend == AEG_BACKEND_CPU &&
+        (backend == AEG_BACKEND_OPENCL || backend == AEG_BACKEND_CUDA ||
+         (p && p->device >= 0))) {
+        if (p && p->device >= 0)
+            aeg_log(AEG_LOG_WARNING, "aeg: %s device %d is not available, "
+                    "using the CPU", aeg_backend_name(backend), p->device);
+        else
+            aeg_log(AEG_LOG_WARNING, "aeg: no %s device is available, using "
+                    "the CPU", aeg_backend_name(backend));
+    }
     d->have_gpu = d->ops.backend != AEG_BACKEND_CPU &&
                   d->ops.tq_batch != NULL;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
@@ -698,7 +717,10 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
     d->mu = malloc(sizeof(pthread_mutex_t));
     if (d->mu)
         pthread_mutex_init((pthread_mutex_t *)d->mu, NULL);
-    d->launch_ns = 5 * 1000;      /* refined by aeg_backend_calibrate() */
+    /* a guess until aeg_backend_calibrate() has measured this backend */
+    d->launch_ns = aeg_backend_launch_ns_for(d->ops.backend);
+    if (d->launch_ns <= 0)
+        d->launch_ns = 5 * 1000;
     d->min_items_for_gpu = 256;
     aeg_log(AEG_LOG_INFO, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
             d->ops.desc);
@@ -912,6 +934,12 @@ void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
 /* ------------------------------------------------------------------ */
 /* Device enumeration                                                  */
 /* ------------------------------------------------------------------ */
+/* What the last calibration of each backend measured (aeg_backend_calibrate) */
+#define AEG_BACKEND_COUNT_ 4     /* AUTO, CPU, OPENCL, CUDA */
+static struct {
+    int64_t launch_ns, bytes_per_ns;
+} g_cal[AEG_BACKEND_COUNT_];
+
 int aeg_query_devices(aeg_backend backend, aeg_device_info *out, int max);
 int aeg_calibrate(aeg_backend backend);
 
@@ -942,60 +970,99 @@ int aeg_backend_query(aeg_backend b, aeg_device_info *out, int max)
         if (b == AEG_BACKEND_CPU)
             return n;
     }
-    n += aeg_backend_query_opencl(out + n, max - n > 0 ? max - n : 0);
-    n += aeg_backend_query_cuda(out + n, max - n > 0 ? max - n : 0);
+    {
+        int first = n < max ? n : max, k;
+        n += aeg_backend_query_opencl(out + n, max - n > 0 ? max - n : 0);
+        n += aeg_backend_query_cuda(out + n, max - n > 0 ? max - n : 0);
+        for (k = first; k < n && k < max; k++) {
+            int be = out[k].backend;
+            if (be >= 0 && be < AEG_BACKEND_COUNT_) {
+                out[k].launch_overhead_ns = g_cal[be].launch_ns;
+                out[k].bytes_per_ns = g_cal[be].bytes_per_ns;
+            }
+        }
+    }
     return n;
 }
 
-/* Launch + transfer overhead measured by the last calibration, in ns. */
-static int64_t g_launch_ns;
+/* What the last calibration of each backend measured: the fixed cost of a
+ * batch call (launch plus the two transfers of a tiny batch) and the
+ * throughput of a large one.  aeg_dispatch_init() takes the first as its
+ * launch cost, aeg_backend_query() reports both. */
 
-int64_t aeg_backend_launch_ns(void)
+int64_t aeg_backend_launch_ns_for(int backend)
 {
-    return g_launch_ns;
+    return backend >= 0 && backend < AEG_BACKEND_COUNT_ ?
+           __atomic_load_n(&g_cal[backend].launch_ns, __ATOMIC_RELAXED) : 0;
+}
+
+static int64_t cal_time(aeg_be_ops *ops, const int16_t *res, int nblk,
+                        int16_t *level, int32_t *nz)
+{
+    int64_t best = 0;
+    int i;
+    /* the first call pays one-off costs (the kernel build, the buffers) */
+    for (i = 0; i < 8; i++) {
+        int64_t t0 = aeg_now_ns(), dt;
+        ops->tq_batch(ops->priv, res, nblk, 26, 1, level, nz);
+        if (ops->sync)
+            ops->sync(ops->priv);
+        dt = aeg_now_ns() - t0;
+        if (i && (!best || dt < best))
+            best = dt;
+    }
+    return best;
 }
 
 int aeg_backend_calibrate(aeg_backend b)
 {
+    enum { BIG = 8192 };            /* 512 KiB of residual up, as much down */
     aeg_be_ops ops;
-    int i;
-    int64_t best = 0;
-    int16_t res[64], level[64];
-    int32_t nz[4];
+    int64_t small, big;
+    int16_t *res, *level;
+    int32_t *nz;
+    int i, be;
 
     aeg_be_create(b, &ops);
     if (ops.backend == AEG_BACKEND_CPU)
         return AEG_EBACKEND;
-    for (i = 0; i < 64; i++)
-        res[i] = (int16_t)(i * 3 - 40);
-    /* A batch far smaller than the device's comfortable size measures the
-     * fixed cost of a call: kernel launch plus the two transfers. */
-    for (i = 0; i < 8; i++) {
-        int64_t t0 = aeg_now_ns();
-        ops.tq_batch(ops.priv, res, 4, 26, 1, level, nz);
-        if (ops.sync)
-            ops.sync(ops.priv);
-        else
-            (void)0;
-        {
-            int64_t dt = aeg_now_ns() - t0;
-            if (i && (!best || dt < best))
-                best = dt;
-        }
+    res = (int16_t *)malloc((size_t)BIG * 16 * sizeof(int16_t));
+    level = (int16_t *)malloc((size_t)BIG * 16 * sizeof(int16_t));
+    nz = (int32_t *)malloc((size_t)BIG * sizeof(int32_t));
+    if (!res || !level || !nz) {
+        free(res); free(level); free(nz);
+        if (ops.destroy)
+            ops.destroy(ops.priv);
+        return AEG_ENOMEM;
     }
+    for (i = 0; i < BIG * 16; i++)
+        res[i] = (int16_t)((i * 37) % 255 - 127);
+    /* a batch far below the device's comfortable size measures the fixed
+     * cost of a call; a large one, what each further byte costs */
+    small = cal_time(&ops, res, 4, level, nz);
+    big = cal_time(&ops, res, BIG, level, nz);
+    be = ops.backend;
     if (ops.destroy)
         ops.destroy(ops.priv);
-    g_launch_ns = best;
-    aeg_log(AEG_LOG_INFO, "aeg: %s launch+transfer overhead ~%lld us",
-            aeg_backend_name(ops.backend), (long long)(best / 1000));
+    free(res); free(level); free(nz);
+    if (be >= 0 && be < AEG_BACKEND_COUNT_) {
+        int64_t bytes = (int64_t)BIG * 16 * 2 * 2 + (int64_t)BIG * 4;
+        __atomic_store_n(&g_cal[be].launch_ns, small, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_cal[be].bytes_per_ns,
+                         big > small ? bytes / (big - small) : 0,
+                         __ATOMIC_RELAXED);
+    }
+    aeg_log(AEG_LOG_INFO, "aeg: %s launch+transfer overhead ~%lld us, "
+            "large batch %lld us", aeg_backend_name(be),
+            (long long)(small / 1000), (long long)(big / 1000));
     return AEG_OK;
 }
 
 /* Weak stubs so the library links without OpenCL/CUDA. */
 #if !defined(AEG_HAVE_OPENCL)
-int aeg_be_opencl_create(aeg_be_ops *ops)
+int aeg_be_opencl_create(aeg_be_ops *ops, int want, int gpu_only)
 {
-    (void)ops;
+    (void)ops; (void)want; (void)gpu_only;
     return AEG_EBACKEND;
 }
 int aeg_backend_query_opencl(aeg_device_info *out, int max)
@@ -1005,9 +1072,9 @@ int aeg_backend_query_opencl(aeg_device_info *out, int max)
 }
 #endif
 #if !defined(AEG_HAVE_CUDA)
-int aeg_be_cuda_create(aeg_be_ops *ops)
+int aeg_be_cuda_create(aeg_be_ops *ops, int want)
 {
-    (void)ops;
+    (void)ops; (void)want;
     return AEG_EBACKEND;
 }
 int aeg_backend_query_cuda(aeg_device_info *out, int max)

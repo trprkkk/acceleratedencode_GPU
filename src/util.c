@@ -157,6 +157,8 @@ void aeg_params_default(aeg_params *p)
     p->scenecut = 120;
     p->preset = AEG_PRESET_MEDIUM;
     p->backend = AEG_BACKEND_AUTO;
+    p->device = -1;
+    p->ssim = 0;
     for (i = 0; i < AEG_STAGE_COUNT; i++)
         p->stage_backend[i] = -1;
     /* Adaptive quantisation (variance AQ) is implemented but off by default:

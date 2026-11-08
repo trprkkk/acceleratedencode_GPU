@@ -39,6 +39,10 @@ typedef int nvrtcResult;
 /* The kernels are written in the common subset of OpenCL C and CUDA C; this
  * header turns the OpenCL spelling into the CUDA one.  The kernels are
  * declared `extern "C"` so that cuModuleGetFunction() finds them by name. */
+/* a transfer that fails sends the call back to the guard (backend.c),
+ * which runs the CPU reference instead -- never a silently wrong result */
+#define CU_CK(x) do { if ((x) != CUDA_SUCCESS) return AEG_EBACKEND; } while (0)
+
 static const char aeg_cuda_preamble[] =
     "typedef unsigned char uchar;\n"
     "typedef unsigned long long ulong;\n"
@@ -156,6 +160,9 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
                           const uint8_t *ref, int rstride, int bw, int bh,
                           const int16_t *mv, int count, int32_t *out)
 {
+    if (count <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dcur, dref, dmv, dout;
     int icur = cstride, iref = rstride, ibw = bw, ibh = bh, icount = count;
@@ -203,6 +210,9 @@ static int cuda_sad_batch(void *priv, const uint8_t *cur, int cstride,
 static int cuda_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
                          int intra, int16_t *level, int32_t *nz)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dres, dlev, dnz;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -220,22 +230,25 @@ static int cuda_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     dnz = cuda_buf(o, 2, (size_t)nblk * 4);
     if (!dres || !dlev || !dnz)
         return AEG_EBACKEND;
-    p_cuMemcpyHtoD_v2(dres, res, bytes);
+    CU_CK(p_cuMemcpyHtoD_v2(dres, res, bytes));
     args[0] = &dres; args[1] = &nblk; args[2] = &qbits; args[3] = &f;
     args[4] = &mf0;  args[5] = &mf1;  args[6] = &mf2;
     args[7] = &dlev; args[8] = &dnz;
     st = cuda_launch(o->k_tq, nblk, args);
     if (st != AEG_OK)
         return st;
-    p_cuMemcpyDtoH_v2(level, dlev, bytes);
+    CU_CK(p_cuMemcpyDtoH_v2(level, dlev, bytes));
     if (nz)
-        p_cuMemcpyDtoH_v2(nz, dnz, (size_t)nblk * 4);
+        CU_CK(p_cuMemcpyDtoH_v2(nz, dnz, (size_t)nblk * 4));
     return AEG_OK;
 }
 
 static int cuda_iq_idct_batch(void *priv, const int16_t *level, int nblk,
                               int qp, int16_t *res)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dlev, dres;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -251,13 +264,13 @@ static int cuda_iq_idct_batch(void *priv, const int16_t *level, int nblk,
     dres = cuda_buf(o, 1, bytes);
     if (!dlev || !dres)
         return AEG_EBACKEND;
-    p_cuMemcpyHtoD_v2(dlev, level, bytes);
+    CU_CK(p_cuMemcpyHtoD_v2(dlev, level, bytes));
     args[0] = &dlev; args[1] = &nblk; args[2] = &sh;
     args[3] = &ls0;  args[4] = &ls1;  args[5] = &ls2; args[6] = &dres;
     st = cuda_launch(o->k_iq, nblk, args);
     if (st != AEG_OK)
         return st;
-    p_cuMemcpyDtoH_v2(res, dres, bytes);
+    CU_CK(p_cuMemcpyDtoH_v2(res, dres, bytes));
     return AEG_OK;
 }
 
@@ -265,6 +278,9 @@ static int cuda_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
                             int intra, int16_t *level, int32_t *nz,
                             int16_t *rec)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dres, dlev, dnz, drec;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -308,6 +324,9 @@ static int cuda_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
                             int intra, int16_t *level, int32_t *nz,
                             int32_t *dc)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dres, dlev, dnz, ddc;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -346,6 +365,9 @@ static int cuda_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
 static int cuda_iq_dc_batch(void *priv, const int16_t *level,
                             const int32_t *dc, int nblk, int qp, int16_t *res)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dlev, ddc, dres;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -380,6 +402,11 @@ static int cuda_iq_dc_batch(void *priv, const int16_t *level,
 static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
                           int sb, int w, int h, uint64_t *out)
 {
+    if (w <= 0 || h <= 0) {
+        *out = 0;
+        return AEG_OK;
+    }
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr da, db, dout;
     size_t tw = (size_t)w / 8, th = (size_t)h / 8, count = tw * th;
@@ -401,8 +428,8 @@ static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b
     dout = cuda_buf(o, 2, count * 8);
     if (!da || !db || !dout)
         return AEG_EBACKEND;
-    p_cuMemcpyHtoD_v2(da, a, abytes);
-    p_cuMemcpyHtoD_v2(db, b, bbytes);
+    CU_CK(p_cuMemcpyHtoD_v2(da, a, abytes));
+    CU_CK(p_cuMemcpyHtoD_v2(db, b, bbytes));
     args[0] = &da; args[1] = &sa; args[2] = &db; args[3] = &sb;
     args[4] = &itw; args[5] = &ith; args[6] = &icount; args[7] = &dout;
     st = cuda_launch(o->k_sse, (int)count, args);
@@ -411,7 +438,10 @@ static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b
     tmp = (uint64_t *)malloc(count * 8);
     if (!tmp)
         return AEG_ENOMEM;
-    p_cuMemcpyDtoH_v2(tmp, dout, count * 8);
+    if (p_cuMemcpyDtoH_v2(tmp, dout, count * 8) != CUDA_SUCCESS) {
+        free(tmp);
+        return AEG_EBACKEND;
+    }
     for (i = 0; i < count; i++)
         acc += (size_t)tmp[i];
     free(tmp);
@@ -423,6 +453,9 @@ static int cuda_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b
 static int cuda_interp_plane(void *priv, const uint8_t *ref, int rstride,
                              int w, int h, int which, uint8_t *dst, int dstride)
 {
+    if (w <= 0 || h <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dref, ddst;
     size_t rows = (size_t)h + 2 * AEG_PAD;
@@ -468,8 +501,8 @@ static int cuda_ref_upload(void *priv, const uint8_t *const planes[4],
         CUdeviceptr d = cuda_buf(o, 4 + k, bytes);
         if (!d)
             return AEG_EBACKEND;
-        p_cuMemcpyHtoD_v2(d, planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
-                          bytes);
+        CU_CK(p_cuMemcpyHtoD_v2(d, planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
+                          bytes));
     }
     o->ref_stride = pstride;
     o->ref_w = w;
@@ -481,6 +514,9 @@ static int cuda_ref_upload(void *priv, const uint8_t *const planes[4],
 static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
                            int bh, const int16_t *pos, int count, int32_t *out)
 {
+    if (count <= 0)
+        return AEG_OK;
+
     cuda_ctx *o = (cuda_ctx *)priv;
     CUdeviceptr dcur, dpos, dout, dref[4];
     size_t rows = (size_t)(o->ref_valid ? o->ref_h : 0) + 2 * AEG_PAD;
@@ -499,8 +535,8 @@ static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
         return AEG_EBACKEND;
     for (k = 0; k < 4; k++)
         dref[k] = o->buf[4 + k];
-    p_cuMemcpyHtoD_v2(dcur, cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD, cbytes);
-    p_cuMemcpyHtoD_v2(dpos, pos, (size_t)count * 8);
+    CU_CK(p_cuMemcpyHtoD_v2(dcur, cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD, cbytes));
+    CU_CK(p_cuMemcpyHtoD_v2(dpos, pos, (size_t)count * 8));
     args[0] = &dcur;  args[1] = &cstride;
     for (k = 0; k < 4; k++)
         args[2 + k] = &dref[k];
@@ -510,7 +546,7 @@ static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     st = cuda_launch(o->k_satd, count, args);
     if (st != AEG_OK)
         return st;
-    p_cuMemcpyDtoH_v2(out, dout, (size_t)count * 4);
+    CU_CK(p_cuMemcpyDtoH_v2(out, dout, (size_t)count * 4));
     return AEG_OK;
 }
 
@@ -845,7 +881,9 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     return AEG_OK;
 }
 
-int aeg_be_cuda_create(aeg_be_ops *ops)
+/* `want` >= 0: that CUDA device (cuDeviceGet's ordinal, the --device
+ * number); -1: device 0. */
+int aeg_be_cuda_create(aeg_be_ops *ops, int want)
 {
     cuda_ctx *o;
     void *lib_cuda = NULL, *lib_nvrtc = NULL;
@@ -889,11 +927,11 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     o->lib_nvrtc = lib_nvrtc;
 
     if (p_cuInit(0) != CUDA_SUCCESS || p_cuDeviceGetCount(&count) != CUDA_SUCCESS
-        || count < 1) {
+        || count < 1 || want >= count) {
         cuda_destroy(o);
         return AEG_EBACKEND;
     }
-    if (p_cuDeviceGet(&o->device, 0) != CUDA_SUCCESS ||
+    if (p_cuDeviceGet(&o->device, want > 0 ? want : 0) != CUDA_SUCCESS ||
         p_cuCtxCreate_v2(&o->ctx, 0, o->device) != CUDA_SUCCESS) {
         o->ctx = NULL;
         cuda_destroy(o);
@@ -933,19 +971,22 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
 int aeg_backend_query_cuda(aeg_device_info *out, int max)
 {
     aeg_be_ops ops;
-    int n = 0;
-    if (max <= 0)
-        return 0;
-    if (aeg_be_cuda_create(&ops) == AEG_OK) {
-        cuda_ctx *o = (cuda_ctx *)ops.priv;
-        memset(&out[0], 0, sizeof(out[0]));
-        out[0].backend = AEG_BACKEND_CUDA;
-        snprintf(out[0].name, sizeof(out[0].name), "%s", o->name);
-        snprintf(out[0].vendor, sizeof(out[0].vendor), "NVIDIA");
-        out[0].is_gpu = 1;
-        out[0].global_mem = o->mem;
-        out[0].max_compute_units = o->cus;
-        n = 1;
+    int n = 0, k;
+    /* every device by ordinal (the list ends at the first that fails) */
+    for (k = 0; k < 16 && n < max; k++) {
+        cuda_ctx *o;
+        if (aeg_be_cuda_create(&ops, k) != AEG_OK)
+            break;
+        o = (cuda_ctx *)ops.priv;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].backend = AEG_BACKEND_CUDA;
+        snprintf(out[n].name, sizeof(out[n].name), "%s", o->name);
+        snprintf(out[n].vendor, sizeof(out[n].vendor), "NVIDIA");
+        out[n].is_gpu = 1;
+        out[n].global_mem = o->mem;
+        out[n].max_compute_units = o->cus;
+        out[n].device_index = k;
+        n++;
         if (ops.destroy)
             ops.destroy(ops.priv);
     }

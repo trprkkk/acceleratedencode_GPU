@@ -329,6 +329,16 @@ typedef struct aeg_params {
     int verbose;              /* unused; see aeg_set_log_level()        */
     int force_cpu_reference;  /* also compute CPU path for validation   */
     const char *dump_stats;   /* optional per-frame CSV path            */
+    /* Which device of `backend`: aeg_device_info.device_index (OpenCL:
+     * every device of every platform in order; CUDA: the device ordinal).
+     * -1 = the first GPU.  AEG_BACKEND_AUTO only ever takes a GPU; an
+     * OpenCL runtime on the CPU (PoCL) has to be asked for with
+     * AEG_BACKEND_OPENCL. */
+    int device;
+    /* Compute the luma SSIM of every picture into aeg_stats.ssim_y (x264's
+     * 8x8 windows on a 4-sample grid).  0 = off (the default; ssim_y stays
+     * 0). */
+    int ssim;
 } aeg_params;
 
 AEG_API void aeg_params_default(aeg_params *p);
@@ -546,8 +556,11 @@ typedef struct aeg_device_info {
     int         is_gpu;       /* heuristic: real GPU vs CPU emulation    */
     uint64_t    global_mem;
     int32_t     max_compute_units;
-    int64_t     launch_overhead_ns; /* measured, if calibrated          */
-    int64_t     bytes_per_ns;       /* measured upload bandwidth        */
+    /* filled from the backend's last aeg_calibrate(), 0 before one */
+    int64_t     launch_overhead_ns; /* fixed cost of one batch call         */
+    int64_t     bytes_per_ns;       /* transfer + kernel throughput of a
+                                       large batch, bytes/ns (= GB/s)      */
+    int32_t     device_index;       /* what aeg_params.device takes         */
 } aeg_device_info;
 
 AEG_API int aeg_query_devices(aeg_backend backend, aeg_device_info *out,

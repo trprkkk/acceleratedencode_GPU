@@ -31,7 +31,7 @@ typedef uint64_t cl_ulong;
 typedef intptr_t cl_context_properties;
 
 #define CL_SUCCESS 0
-#define CL_DEVICE_TYPE_ALL 0xFFFFFFFF
+#define CL_DEVICE_TYPE_ALL 0xFFFFFFFFull   /* cl_device_type is 64 bits */
 #define CL_MEM_READ_ONLY (1 << 2)
 #define CL_MEM_WRITE_ONLY (1 << 1)
 #define CL_MEM_READ_WRITE (1 << 0)
@@ -49,6 +49,10 @@ typedef intptr_t cl_context_properties;
 
 /* The OpenCL entry points are resolved at run time so that the encoder keeps
  * building (and running on the CPU) on machines without an OpenCL loader. */
+/* a transfer that fails sends the call back to the guard (backend.c),
+ * which runs the CPU reference instead -- never a silently wrong result */
+#define OCL_CK(x) do { if ((x) != CL_SUCCESS) return AEG_EBACKEND; } while (0)
+
 static void ocl_load_error(const char *name)
 {
     aeg_log(AEG_LOG_DEBUG, "aeg: OpenCL loader is missing %s", name);
@@ -56,7 +60,7 @@ static void ocl_load_error(const char *name)
 
 #define OCL_SYMS(X) \
     X(cl_int, clGetPlatformIDs, (cl_uint, cl_platform_id *, cl_uint *)) \
-    X(cl_int, clGetDeviceIDs, (cl_platform_id, cl_uint, cl_uint, cl_device_id *, cl_uint *)) \
+    X(cl_int, clGetDeviceIDs, (cl_platform_id, cl_ulong, cl_uint, cl_device_id *, cl_uint *)) \
     X(cl_int, clGetDeviceInfo, (cl_device_id, cl_uint, size_t, void *, size_t *)) \
     X(cl_context, clCreateContext, (cl_context_properties *, cl_uint, cl_device_id *, void *, void *, cl_int *)) \
     X(cl_command_queue, clCreateCommandQueue, (cl_context, cl_device_id, cl_ulong, cl_int *)) \
@@ -95,6 +99,7 @@ typedef struct ocl_ctx {
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
+    int index;                  /* in ocl_devices(), the --device number */
     /* the registered reference picture (see ref_upload) */
     int ref_stride, ref_w, ref_h, ref_valid;
     char name[96];
@@ -155,6 +160,9 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
                          const uint8_t *ref, int rstride, int bw, int bh,
                          const int16_t *mv, int count, int32_t *out)
 {
+    if (count <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mcur, mref, mmv, mout;
     size_t nthreads = (size_t)count;
@@ -211,6 +219,9 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
 static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
                         int intra, int16_t *level, int32_t *nz)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mres, mlev, mnz;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -226,7 +237,7 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     mnz = ocl_buf(o, 2, (size_t)nblk * 4, CL_MEM_WRITE_ONLY);
     if (!mres || !mlev || !mnz)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL);
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL));
     p_clSetKernelArg(o->k_tq, 0, sizeof(cl_mem), &mres);
     p_clSetKernelArg(o->k_tq, 1, sizeof(int), &nblk);
     p_clSetKernelArg(o->k_tq, 2, sizeof(int), &qbits);
@@ -240,16 +251,19 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
                                   0, NULL, NULL);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL);
+    OCL_CK(p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL));
     if (nz)
-        p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0, (size_t)nblk * 4, nz,
-                              0, NULL, NULL);
+        OCL_CK(p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0, (size_t)nblk * 4, nz,
+                              0, NULL, NULL));
     return AEG_OK;
 }
 
 static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
                              int16_t *res)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mlev, mres;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -263,7 +277,7 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
     mres = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
     if (!mlev || !mres)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL);
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL));
     p_clSetKernelArg(o->k_iq, 0, sizeof(cl_mem), &mlev);
     p_clSetKernelArg(o->k_iq, 1, sizeof(int), &nblk);
     p_clSetKernelArg(o->k_iq, 2, sizeof(int), &sh);
@@ -275,7 +289,7 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
                                   0, NULL, NULL);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL);
+    OCL_CK(p_clEnqueueReadBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL));
     return AEG_OK;
 }
 
@@ -283,6 +297,9 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
                            int intra, int16_t *level, int32_t *nz,
                            int16_t *rec)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mres, mlev, mnz, mrec;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -340,6 +357,9 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
 static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
                            int intra, int16_t *level, int32_t *nz, int32_t *dc)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mres, mlev, mnz, mdc;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -389,6 +409,9 @@ static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
 static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
                            int nblk, int qp, int16_t *res)
 {
+    if (nblk <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mlev, mdc, mres;
     size_t bytes = (size_t)nblk * 16 * 2;
@@ -431,6 +454,11 @@ static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
 static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
                          int sb, int w, int h, uint64_t *out)
 {
+    if (w <= 0 || h <= 0) {
+        *out = 0;
+        return AEG_OK;
+    }
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem ma, mb, mout;
     size_t tw = (size_t)w / 8, th = (size_t)h / 8, count = tw * th;
@@ -444,10 +472,12 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     mout = ocl_buf(o, 2, count * 8, CL_MEM_WRITE_ONLY);
     if (!ma || !mb || !mout)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, ma, CL_TRUE, 0, abytes, a, 0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mb, CL_TRUE, 0, (size_t)sb * h, b, 0, NULL, NULL);
-    if (!count)
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, ma, CL_TRUE, 0, abytes, a, 0, NULL, NULL));
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mb, CL_TRUE, 0, (size_t)sb * h, b, 0, NULL, NULL));
+    if (!count) {
+        *out = 0;              /* no whole 8x8 tile, as the CPU reference */
         return AEG_OK;
+    }
     p_clSetKernelArg(o->k_sse, 0, sizeof(cl_mem), &ma);
     p_clSetKernelArg(o->k_sse, 1, sizeof(int), &sa);
     p_clSetKernelArg(o->k_sse, 2, sizeof(cl_mem), &mb);
@@ -466,7 +496,11 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     tmp = (uint64_t *)malloc(count * 8);
     if (!tmp)
         return AEG_ENOMEM;
-    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, count * 8, tmp, 0, NULL, NULL);
+    if (p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, count * 8, tmp, 0,
+                              NULL, NULL) != CL_SUCCESS) {
+        free(tmp);
+        return AEG_EBACKEND;
+    }
     for (i = 0; i < count; i++)
         acc += tmp[i];
     free(tmp);
@@ -480,6 +514,9 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
 static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
                             int w, int h, int which, uint8_t *dst, int dstride)
 {
+    if (w <= 0 || h <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mref, mdst;
     size_t rows = (size_t)h + 2 * AEG_PAD;
@@ -533,9 +570,9 @@ static int ocl_ref_upload(void *priv, const uint8_t *const planes[4],
         cl_mem m = ocl_buf(o, 4 + k, bytes, CL_MEM_READ_ONLY);
         if (!m)
             return AEG_EBACKEND;
-        p_clEnqueueWriteBuffer(o->queue, m, CL_TRUE, 0, bytes,
+        OCL_CK(p_clEnqueueWriteBuffer(o->queue, m, CL_TRUE, 0, bytes,
                                planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
-                               0, NULL, NULL);
+                               0, NULL, NULL));
     }
     o->ref_stride = pstride;
     o->ref_w = w;
@@ -547,6 +584,9 @@ static int ocl_ref_upload(void *priv, const uint8_t *const planes[4],
 static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
                           int bh, const int16_t *pos, int count, int32_t *out)
 {
+    if (count <= 0)
+        return AEG_OK;
+
     ocl_ctx *o = (ocl_ctx *)priv;
     cl_mem mcur, mpos, mout, mref[4];
     size_t rows = (size_t)(o->ref_valid ? o->ref_h : 0) + 2 * AEG_PAD;
@@ -563,11 +603,11 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
         return AEG_EBACKEND;
     for (k = 0; k < 4; k++)
         mref[k] = o->buf[4 + k];
-    p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cbytes,
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cbytes,
                            cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD,
-                           0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mpos, CL_TRUE, 0, (size_t)count * 8, pos,
-                           0, NULL, NULL);
+                           0, NULL, NULL));
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mpos, CL_TRUE, 0, (size_t)count * 8, pos,
+                           0, NULL, NULL));
     p_clSetKernelArg(o->k_satd, 0, sizeof(cl_mem), &mcur);
     p_clSetKernelArg(o->k_satd, 1, sizeof(int), &cstride);
     for (k = 0; k < 4; k++)
@@ -586,8 +626,8 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     }
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4, out,
-                          0, NULL, NULL);
+    OCL_CK(p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4, out,
+                          0, NULL, NULL));
     return AEG_OK;
 }
 
@@ -716,6 +756,7 @@ static int ocl_clone(void *priv, aeg_be_ops *out)
     o->platform = src->platform;
     o->device = src->device;
     o->is_gpu = src->is_gpu;
+    o->index = src->index;
     o->mem = src->mem;
     o->cus = src->cus;
     memcpy(o->name, src->name, sizeof(o->name));
@@ -739,12 +780,61 @@ static int ocl_clone(void *priv, aeg_be_ops *out)
     return AEG_OK;
 }
 
-int aeg_be_opencl_create(aeg_be_ops *ops)
+/* Every device of every platform, in platform order: the list `--device`
+ * indexes.  (The first platform's first device used to be the only one
+ * looked at, so a CPU runtime listed before a GPU's took its place.) */
+#define OCL_MAXPLAT 16
+#define OCL_MAXDEV  32
+static int ocl_devices(cl_platform_id *plat, cl_device_id *dev)
+{
+    cl_platform_id pl[OCL_MAXPLAT];
+    cl_uint np = 0, i;
+    int n = 0;
+
+    if (p_clGetPlatformIDs(OCL_MAXPLAT, pl, &np) != CL_SUCCESS)
+        return 0;
+    if (np > OCL_MAXPLAT)
+        np = OCL_MAXPLAT;
+    for (i = 0; i < np && n < OCL_MAXDEV; i++) {
+        cl_device_id d[OCL_MAXDEV];
+        cl_uint nd = 0, j;
+        if (p_clGetDeviceIDs(pl[i], CL_DEVICE_TYPE_ALL, OCL_MAXDEV, d, &nd) !=
+            CL_SUCCESS)
+            continue;
+        if (nd > OCL_MAXDEV)
+            nd = OCL_MAXDEV;
+        for (j = 0; j < nd && n < OCL_MAXDEV; j++) {
+            plat[n] = pl[i];
+            dev[n] = d[j];
+            n++;
+        }
+    }
+    return n;
+}
+
+static int ocl_dev_is_gpu(cl_device_id d)
+{
+    /* cl_device_type is a 64-bit cl_bitfield: a smaller buffer makes the
+     * query fail (CL_INVALID_VALUE) and every device read as a non-GPU */
+    cl_ulong t = 0;
+    if (p_clGetDeviceInfo(d, CL_DEVICE_TYPE, sizeof(t), &t, NULL) != CL_SUCCESS)
+        return 0;
+    return (t & CL_DEVICE_TYPE_GPU) != 0;
+}
+
+/* `want` >= 0: that entry of ocl_devices(); -1: the first GPU, else (unless
+ * gpu_only) the first device of any kind.  backend.c asks for gpu_only when
+ * the backend is chosen automatically: an OpenCL runtime on the host CPU
+ * (PoCL) is a test vehicle, never faster than the native code. */
+int aeg_be_opencl_create(aeg_be_ops *ops, int want, int gpu_only)
 {
     ocl_ctx *o;
     void *lib = NULL;
     cl_int st;
     size_t got;
+    cl_platform_id plats[OCL_MAXDEV];
+    cl_device_id devs[OCL_MAXDEV];
+    int ndev, pick = -1, k;
 
 #define LOAD(ret, name, args) do { \
         *(void **)(&p_##name) = dlsym(lib, #name); \
@@ -762,21 +852,28 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         return AEG_ENOMEM;
     }
     o->lib = lib;
-    if (p_clGetPlatformIDs(1, &o->platform, NULL) != CL_SUCCESS ||
-        p_clGetDeviceIDs(o->platform, CL_DEVICE_TYPE_ALL, 1, &o->device,
-                         NULL) != CL_SUCCESS) {
+    ndev = ocl_devices(plats, devs);
+    if (want >= 0) {
+        pick = want < ndev ? want : -1;
+    } else {
+        for (k = 0; k < ndev && pick < 0; k++)
+            if (ocl_dev_is_gpu(devs[k]))
+                pick = k;
+        if (pick < 0 && !gpu_only && ndev > 0)
+            pick = 0;
+    }
+    if (pick < 0) {
         ocl_destroy(o);
         return AEG_EBACKEND;
     }
+    o->platform = plats[pick];
+    o->device = devs[pick];
+    o->index = pick;
     p_clGetDeviceInfo(o->device, CL_DEVICE_NAME, sizeof(o->name), o->name, &got);
     p_clGetDeviceInfo(o->device, CL_DEVICE_VENDOR, sizeof(o->vendor), o->vendor, &got);
     p_clGetDeviceInfo(o->device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(o->mem), &o->mem, NULL);
     p_clGetDeviceInfo(o->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(o->cus), &o->cus, NULL);
-    {
-        cl_uint t = 0;
-        p_clGetDeviceInfo(o->device, CL_DEVICE_TYPE, sizeof(t), &t, NULL);
-        o->is_gpu = (t & CL_DEVICE_TYPE_GPU) != 0;
-    }
+    o->is_gpu = ocl_dev_is_gpu(o->device);
     o->no_clone = ocl_pocl_unsafe_queues(o->device);
 
     o->ctx = p_clCreateContext(NULL, 1, &o->device, NULL, NULL, &st);
@@ -815,22 +912,26 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
     return AEG_OK;
 }
 
+/* The devices by --device index (the list ends at the first one the kernels
+ * do not build on). */
 int aeg_backend_query_opencl(aeg_device_info *out, int max)
 {
     aeg_be_ops ops;
-    int n = 0;
-    if (max <= 0)
-        return 0;
-    if (aeg_be_opencl_create(&ops) == AEG_OK) {
-        ocl_ctx *o = (ocl_ctx *)ops.priv;
-        memset(&out[0], 0, sizeof(out[0]));
-        out[0].backend = AEG_BACKEND_OPENCL;
-        snprintf(out[0].name, sizeof(out[0].name), "%s", o->name);
-        snprintf(out[0].vendor, sizeof(out[0].vendor), "%s", o->vendor);
-        out[0].is_gpu = o->is_gpu;
-        out[0].global_mem = o->mem;
-        out[0].max_compute_units = o->cus;
-        n = 1;
+    int n = 0, k;
+    for (k = 0; k < OCL_MAXDEV && n < max; k++) {
+        ocl_ctx *o;
+        if (aeg_be_opencl_create(&ops, k, 0) != AEG_OK)
+            break;
+        o = (ocl_ctx *)ops.priv;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].backend = AEG_BACKEND_OPENCL;
+        snprintf(out[n].name, sizeof(out[n].name), "%s", o->name);
+        snprintf(out[n].vendor, sizeof(out[n].vendor), "%s", o->vendor);
+        out[n].is_gpu = o->is_gpu;
+        out[n].global_mem = o->mem;
+        out[n].max_compute_units = o->cus;
+        out[n].device_index = k;
+        n++;
         if (ops.destroy)
             ops.destroy(ops.priv);
     }

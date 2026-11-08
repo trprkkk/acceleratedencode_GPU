@@ -66,7 +66,11 @@ static void usage(void)
 "  --qcomp <pct>    complexity-to-bits exponent of --crf and of pass 2, in\n"
 "                   percent (default 60: bits ~ complexity^0.6)\n"
 "  -n <int>         encode at most n frames\n"
-"  -b <backend>     auto | cpu | opencl | cuda (default auto)\n"
+"  -b <backend>     auto | cpu | opencl | cuda (default auto).  auto takes the\n"
+"                   first CUDA, else OpenCL GPU; an OpenCL runtime on the CPU\n"
+"                   (PoCL) only with -b opencl\n"
+"  --device <n>     device n of that backend (the #n of --list-devices;\n"
+"                   default: the first GPU)\n"
 "  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
 "  -p <preset>      0=ultrafast 1=fast 2=medium 3=slow 4=veryslow\n"
 "  --no-8x8dct      use only 4x4 luma transforms (drops High profile)\n"
@@ -518,11 +522,20 @@ static void list_devices(void)
     aeg_device_info info[16];
     int n = aeg_query_devices(AEG_BACKEND_AUTO, info, 16);
     int i;
-    printf("compute devices:\n");
-    for (i = 0; i < n; i++)
-        printf("  [%d] %-7s %-40s %s%s\n", i, aeg_backend_name(info[i].backend),
-               info[i].name, info[i].vendor,
-               info[i].is_gpu ? "" : " (no discrete GPU)");
+    printf("compute devices (select with -b <backend> --device <#>):\n");
+    for (i = 0; i < n; i++) {
+        if (info[i].backend == AEG_BACKEND_CPU)
+            printf("  %-7s    %-40s %s\n", aeg_backend_name(info[i].backend),
+                   info[i].name, info[i].vendor);
+        else
+            printf("  %-7s #%d %-40s %s%s\n", aeg_backend_name(info[i].backend),
+                   info[i].device_index, info[i].name, info[i].vendor,
+                   info[i].is_gpu ? "" : " (not a GPU: -b auto skips it)");
+        if (info[i].launch_overhead_ns)
+            printf("             calibrated: %lld us per call, %lld bytes/ns\n",
+                   (long long)(info[i].launch_overhead_ns / 1000),
+                   (long long)info[i].bytes_per_ns);
+    }
     if (n <= 1)
         printf("  (no CUDA/OpenCL device found; the CPU path is used)\n");
 }
@@ -753,6 +766,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-g")) gop = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-n")) max_frames = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-b")) backend = parse_backend(next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--device")) p.device = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-p")) p.preset = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--slices")) p.slices = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
@@ -855,6 +869,7 @@ int main(int argc, char **argv)
         bad |= range_bad("--slices", p.slices, 0, 1024);
         bad |= range_bad("-t", p.threads, 0, 256);
         bad |= range_bad("--frame-threads", p.frame_threads, 0, 8);
+        bad |= range_bad("--device", p.device, -1, 63);
         bad |= range_bad("--scenecut", p.scenecut, 0, 10000);
         bad |= range_bad("--pass", pass, 0, 2);
         bad |= range_bad("--qcomp", qcomp, 0, 100);
