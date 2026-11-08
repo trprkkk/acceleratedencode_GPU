@@ -19,6 +19,13 @@
 
 #if AEG_SIMD
 #include <emmintrin.h>
+#if defined(__SSE2__) && !defined(_mm_storeu_si32)
+static inline void _mm_storeu_si32(void *p, __m128i v)
+{
+    int32_t t = _mm_cvtsi128_si32(v);
+    memcpy(p, &t, 4);
+}
+#endif
 
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
  * undefined behaviour on an unaligned pixel address) */
