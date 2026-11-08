@@ -6576,3 +6576,46 @@ still decides, and `AEG_SCOLD=1` restores it everywhere.
 cockL now has no cuts. megaL keeps its three real cuts, and its streams
 and vtestL's are byte-identical to the old test. The test runs in
 `schedule()` before anything is queued, so frame threads are unaffected.
+
+## The cockL gap at constant QP: where it is
+
+After the scene-cut fix, cockL is the clip still behind x264 veryslow
+(+4.97% at CRF, p4). The measurements below are at constant QP with no tree
+on either side (aegenc `-p 4 --mbtree 0`, x264 veryslow `--tune psnr`), on
+30-frame pieces of cockL encoded separately (QP 22–37, PSNR BD-rate).
+
+**It is not one event.** Every piece trails:
+
+| frames | 0–29 | 30–59 | 60–89 | 90–119 | 120–149 | 150–179 | 180–209 | 210–239 | mean |
+|---|---|---|---|---|---|---|---|---|---|
+| vs veryslow | +3.74 | +1.79 | +0.43 | +3.87 | +4.29 | +2.25 | +3.67 | +5.03 | +3.14 |
+| vs veryslow `ref=2:bframes=3` | +4.70 | +2.16 | +1.40 | +4.21 | +5.74 | +2.54 | +4.07 | +4.96 | +3.72 |
+
+**By picture type and trellis** (the same x264 restriction on both sides;
+pieces 0, 3, 4, 7):
+
+| both encoders | 0 | 3 | 4 | 7 | mean |
+|---|---|---|---|---|---|
+| full | +3.74 | +3.87 | +4.29 | +5.03 | +4.23 |
+| I pictures only (`-g 1` / `keyint=1`) | +3.27 | +5.83 | +4.91 | +4.38 | +4.60 |
+| P only (`--bframes 0`) | +0.93 | +4.96 | +1.21 | +2.57 | +2.42 |
+| trellis off (`--trellis 0` / `trellis=0`) | +1.02 | +1.38 | +1.04 | +2.32 | +1.44 |
+| P only, trellis off | −2.33 | +1.46 | −1.26 | −0.20 | **−0.58** |
+
+So x264's trellis is worth about 2.8 points more than ours on this
+content, and intra coding is the weakest picture type. Without trellis on
+either side, the P coding is ahead.
+
+**Why the level selection falls short.** Ours is a coordinate descent from
+the quantiser's levels: ±1 moves on nonzero levels, two sweeps. It never
+revives a coefficient the deadzone removed. Intra rounds at 1/2 already, but
+inter at 1/4 (JM's 1/6, widened 1.5x). x264's trellis is a dynamic program
+over the CABAC level contexts from round-to-nearest (each coefficient at q,
+q−1 or 0). Moving our inter rounding point (full config):
+* 1/3: +3.38 (−0.85);
+* 1/2: +5.26 (+1.03).
+
+The descent cannot clean up after a round-to-nearest start the way x264's
+trellis does. The next step is a real CABAC trellis (x264's
+`quant_trellis_cabac`) in place of the descent, rather than tuning the
+deadzone.
