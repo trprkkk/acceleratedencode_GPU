@@ -6791,3 +6791,41 @@ CPU seconds for the run: p4 304, p3 212.
   `--slices` codes N slices, so its stream differs by design.)
 * ASAN is clean, including QP 0 and 51, 10-bit and `-g 1`.
 * CAVLC output is unchanged.
+
+## External audit: fixes and scope (`1e39497`, `043f23d`)
+
+An external review (written against `5929971`) was checked point by point.
+The full classification is in `docs/AUDIT_RESPONSE.md`. In summary:
+
+**Backends**
+- Every host-device copy is checked. Empty batches are guarded.
+- `CL_DEVICE_TYPE` was read into 4 of its 8 bytes. The query failed, so every
+  OpenCL device, including a real GPU, read as a non-GPU.
+- `-b auto` now opens only a GPU; PoCL needs `-b opencl`.
+- `--device N` selects a device. `libOpenCL` is loaded once per process.
+
+**Dispatcher**
+- The generic timed branch was dead code and double-counted the launch cost.
+  It is replaced by the explicit rule: under `auto`, only the coefficient
+  stages of P/B pictures are placed, by whole-picture timing.
+- Calibration is reported through `aeg_query_devices` / `--list-devices`.
+
+**Statistics**
+- `psnr_avg` was the last picture's PSNR. `aeg_stats.psnr_y/u/v/avg` are now
+  the encode's global PSNR (summed squared error), checked against an ffmpeg
+  decode.
+- `--ssim` adds x264's luma SSIM.
+- `get_params` reports the frame-thread workers in use.
+- The stage report shows the device's share of each stage.
+
+**Text and portability**
+- The `--subme`/`aq_strength` text is corrected.
+- GCC < 9 builds again (no `_mm_storeu_si32`).
+
+No stream changed: 15 configurations are byte-identical to `02a03e3`.
+`make test`, the OpenCL suite on PoCL, `gpu_validate.sh` (BE=opencl, now
+with `-b $BE` on every device run) and ASan+LSan pass.
+
+These remain open for the owner: HEVC scope, a GPU-resident data flow, the
+feature gaps, CMake/Windows/ARM, fuzzing, and a licence review of the
+x264-derived algorithms.

@@ -14,10 +14,15 @@
  * stream whose quality is defined by the same rate-distortion criteria x264
  * uses; the GPU only changes *how fast* those numbers are computed.
  *
- * Every stage can run on either the CPU or the GPU.  The dispatcher
- * (aeg_dispatch) measures both paths and routes each stage to whichever one
- * is actually faster for the current frame size, so small frames do not pay
- * GPU launch/transfer overhead while large frames get the full GPU speedup.
+ * H.264 only (there is no HEVC encoder; x265 is a comparison point), coded
+ * as 4:2:0 at 8 or 10 bits.  The data-parallel stages have device forms
+ * (OpenCL, CUDA) that must reproduce the CPU stream byte for byte.  With
+ * AEG_BACKEND_AUTO only a GPU is opened, and on it only the coefficient
+ * stages (transform + quantisation and their inverse) of P/B pictures are
+ * placed automatically, by timing whole pictures both ways; every other
+ * stage stays on the CPU unless aeg_params.stage_backend forces it.  The
+ * device paths have been run on PoCL (OpenCL on the CPU) and compiled for
+ * CUDA, not yet measured on a GPU -- see docs/AUDIT_RESPONSE.md.
  *
  * License: MIT (see LICENSE)
  */

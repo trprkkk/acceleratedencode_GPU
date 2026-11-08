@@ -7,6 +7,29 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
+**Scope and limits, plainly** (see [`docs/AUDIT_RESPONSE.md`](docs/AUDIT_RESPONSE.md)
+for the point-by-point answer to an external review):
+
+* **H.264 only.**  There is no HEVC/H.265 encoder here; "x265" below means
+  x265 is one of the encoders this one is *compared* against.  Coded as
+  4:2:0 only, 8- or 10-bit (4:2:2/4:4:4 input is converted to 4:2:0); no
+  lossless mode.
+* **Never run on a GPU.**  Every device path runs end to end on PoCL, an
+  OpenCL runtime on the *CPU*, and must write the CPU encoder's stream byte
+  for byte; the CUDA kernels are only compiled (NVRTC, every architecture).
+  Whether any device placement is faster than the CPU is unmeasured.
+* **What `-b auto` puts on a device:** a GPU only (a CUDA device, else an
+  OpenCL GPU; `-b opencl` is needed for PoCL), and on it only the two
+  coefficient stages of P/B pictures, by timing whole pictures both ways.
+  Everything else stays on the CPU unless `-s stage=backend` forces it.
+  The device paths are per-macroblock batches with blocking transfers -- a
+  correctness scaffold, not a GPU-resident design.
+* **Quality** is at x264 veryslow at constant QP (presets 3-4) and, with
+  CRF on long clips, preset 4 is now level with x264 veryslow (+0.03 %);
+  preset 3 is +4.3 %.  x264 is still 1.2-4x faster on the CPU.
+* Tested on Linux x86-64 (GCC 12, AVX2/SSE2/C paths); other OSes and
+  architectures are not built or tested here.
+
 > **Status: conformant High-profile encoder core (I, P and B pictures,
 > Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
 > 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, the same
@@ -63,9 +86,12 @@ speed single-threaded on 640x352 (median of 3, this 2-core sandbox):
 So at constant QP presets 3-4 match x264 veryslow and beat x265 medium (x265
 slow is still 4-5 % ahead), but on the CPU alone x264 reaches the same quality
 1.2x (p4) to 4x (p1) faster.  With rate control (CRF, both macroblock trees on)
-on 240-300-picture clips p4 is +1.2 % against x264 medium and +11.8 % against
-veryslow: the macroblock tree over long GOPs is the largest remaining quality
-gap.  High 10 keeps the same standing (p3 -4.9 % against x264 medium 10-bit).
+on the three 240-300-picture clips that comparison found p4 +11.8 % against
+x264 veryslow; since then QP-RD (`5929971`) and x264's CABAC trellis
+(`bb7d271`, `02a03e3`) brought it to **+0.03 %** (cockL +2.85, vtestL -4.19,
+megaL +1.43; `--aq 0` against x264 `--tune psnr`), and p3 to +4.31 % (see
+*CABAC trellis* in `docs/STATUS.md`).  High 10 keeps the same standing (p3
+-4.9 % against x264 medium 10-bit).
 
 Since the quoted status at the top was written the encoder gained B pyramid
 (`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock
@@ -108,6 +134,10 @@ Porting x264/x265 to the GPU is attractive because the expensive stages
 parallel, while the serial stages (entropy coding, bitstream assembly, rate
 control) are not.  This project therefore splits the encoder into two classes:
 
+The middle column says where a stage *can* run.  Under `-b auto` only the
+two coefficient rows are placed on a device (by measurement, below); the
+others run there only when `-s` forces them.
+
 | Stage | Where it runs | Why |
 |---|---|---|
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
@@ -135,8 +165,15 @@ launches and the batch's host work included); the faster side stays, with 10%
 hysteresis, and the slower one is re-tried every 64 pictures.  The motion
 search is never placed by timing, because its device form is a different
 search and the stream would then depend on the machine's speed; `-s est=`
-forces it.  `aeg_backend_calibrate()` measures a kernel launch + transfer
-round trip on its own.
+forces it.  No other stage is placed automatically: inter prediction is the
+only one with a device form, and that form rebuilds every sub-sample plane of
+a reference per call where the CPU keeps them, so it cannot win; `-s inter=`
+forces it.  `--calibrate` (`aeg_calibrate()`) measures the fixed cost of a
+batch call and the throughput of a large one and reports them in
+`--list-devices` / `aeg_query_devices()`; the coefficient placement does not
+need them, since its whole-picture timing already includes every launch and
+copy.  `--device N` picks a device of the chosen backend (the `#N` that
+`--list-devices` shows).
 
 Quality goal: the encoder must be *decision equivalent* to a CPU implementation
 of the same algorithm — same transforms, same quantiser, same integer
