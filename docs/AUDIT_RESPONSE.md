@@ -219,6 +219,26 @@ Tables come from ITU-T H.264. Whether any part is close enough to the GPL
 sources to be a derivative work needs a review by the owner (or counsel)
 before an MIT release. This document does not claim it is clean.
 
+**Since then: `docs/PROVENANCE.md`** lists, area by area, which file and
+function follows which x264 or FFmpeg algorithm, and which x264-specific
+constants it uses. It also runs a MOSS-style token scan
+(`tools/simscan.py`) against x264, both current and a 2016 version, and
+against FFmpeg n7.0.2. The findings:
+- **One function is x264 code re-typed:** `aeg_dither_plane` (the
+  high-bit-depth input dither, from x264's `filters/video/depth.c`). The
+  statement above that all code was "written for this project" is
+  therefore wrong for that function.
+- **Two smaller correspondences:**
+  - the ME lambda table equals `x264_lambda_tab`; it is computable from
+    its formula;
+  - the deblocking edge filters use the same idiom of the standard's
+    equations as x264 and FFmpeg.
+- **The algorithm cores** (trellis, mbtree, weightp, AQ, rate control,
+  B-adapt, ME) follow x264's methods and often its tuned constants, but
+  show no code correspondence.
+
+The memo is not a legal judgement; it is meant to make the review quick.
+
 **"Untested areas."** *Partly confirmed.*
 
 - Not covered:
@@ -246,4 +266,5 @@ before an MIT release. This document does not claim it is clean.
    which, if any?
 4. **CMake / Windows / ARM** support.
 5. ~~**Fuzzing**~~: done (`tests/fuzz/`; see above).
-6. **Licence review** of the x264-derived algorithms.
+6. **Licence review** of the x264-derived algorithms. The facts are in
+   `docs/PROVENANCE.md`; start with `aeg_dither_plane`.

@@ -6888,3 +6888,35 @@ byte-identical to `9554f89`, including:
 - two-pass, where the statistics files are equal too and a new pass 2
   reads the old file;
 - a Y4M input.
+
+## Provenance notes (`docs/PROVENANCE.md`, `tools/simscan.py`)
+
+For the owner's licence review, `docs/PROVENANCE.md` lists, by area, which
+file and function follows which x264 or FFmpeg algorithm or standard
+table, and which x264-specific constants it uses. It is not a legal
+judgement.
+
+**The scan.** `tools/simscan.py` cuts every C function into k-token runs,
+in two modes:
+- normalised identifiers/numbers, which compares the shape of the code;
+- raw, which finds code copied with its names.
+
+It looks the runs up in another code base. It was run against x264
+`c24e06c`, x264 `24f25b6` (2016, the last with the old b-adapt 1 rule this
+encoder uses) and FFmpeg n7.0.2.
+
+**Results:**
+- `aeg_dither_plane` is x264's `DITHER_PLANE` re-typed. Its names and its
+  statements agree; it scores 28 % normalised.
+- The ME lambda table equals `x264_lambda_tab`.
+- The deblocking edge filters share the x264/FFmpeg idiom of the
+  standard's equations (21–25 % raw).
+- `la_group_cost` follows `slicetype_path_cost`'s pyramid pricing (19 %).
+- The algorithm cores score 0.3–6 % against unrelated functions: they
+  follow x264's methods and constants in different code. These are the
+  trellis, mbtree, weightp, AQ (whose formula differs), ABR/VBV, B-adapt
+  and UMH.
+- FFmpeg: at most 18 % raw, all on the standard's kernels.
+
+**Corrected along the way:** the deblock-aware RD stage does follow x264
+(`b_deblock_rdo`, subme ≥ 9), as the source comment says.
