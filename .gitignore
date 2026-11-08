@@ -8,3 +8,7 @@ build/
 __pycache__/
 .ci/
 build-*/
+last-input
+crash-*
+leak-*
+timeout-*

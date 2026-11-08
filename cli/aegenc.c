@@ -223,7 +223,8 @@ static int parse_rate(const char *v, int *num, int *den)
     } else {
         *num = (int)floor(f * 1000.0 + 0.5), *den = 1000;
     }
-    return 0;
+    /* a rate that rounds to nothing (0.0001) is no rate at all */
+    return *num > 0 ? 0 : -1;
 }
 
 /* an H.273 code point by name or number, -1 = unknown */
@@ -578,6 +579,75 @@ static int pass1_put(aeg_pass1_frame **f, int *n, int *cap, int64_t d,
     if (d + 1 > *n)
         *n = (int)d + 1;
     return 0;
+}
+
+/* A --pass 2 statistics file: "aeg-stats 2 bframes=N", then "display type
+ * qp qp_base bits" per picture (type I, P, B or b for a reference B; qp the
+ * macroblocks' average, qp_base the picture's QP before their offsets); a
+ * file of bare numbers is the first format, one bit count per picture in
+ * display order without B pictures.  Returns 0, or -1 with the table freed
+ * and the reason printed. */
+static int stats_parse(FILE *sf, const char *name, int qp,
+                       aeg_pass1_frame **pass1, int *pass1_n, int *pass1_cap,
+                       int *pass1_bframes)
+{
+    char line[256];
+    int v2 = 0, k = 0;
+    long long lines = 0;
+
+    while (fgets(line, sizeof(line), sf)) {
+        long long d, b;
+        double q, qb;
+        int ty;
+        char t;
+
+        if (!strncmp(line, "aeg-stats 2", 11)) {
+            const char *kb = strstr(line, "bframes=");
+            v2 = 1;
+            if (kb) {
+                *pass1_bframes = atoi(kb + 8);
+                if (*pass1_bframes < 0 || *pass1_bframes > 16) {
+                    fprintf(stderr, "%s: bad header: %s", name, line);
+                    goto fail;
+                }
+            }
+            continue;
+        }
+        if (v2) {
+            /* The pictures are numbered from 0 in display order and written
+             * in coding order, one line each, so an index can run ahead of
+             * the lines read only by the B pictures held back: one far past
+             * them is damage -- and the table is allocated up to it, so the
+             * bound also keeps a damaged file from allocating gigabytes. */
+            if (sscanf(line, "%lld %c %lf %lf %lld", &d, &t, &q, &qb,
+                       &b) != 5 ||
+                !strchr("IPBb", t) || t == 0 || b < 0 || d < 0 ||
+                d > lines + 4096) {
+                fprintf(stderr, "%s: bad line: %s", name, line);
+                goto fail;
+            }
+            ty = t == 'I' ? 0 : t == 'B' ? 2 : t == 'b' ? 3 : 1;
+        } else {
+            if (sscanf(line, "%lld", &b) != 1)
+                break;
+            d = k++;
+            q = qb = qp;
+            ty = 1;
+        }
+        lines++;
+        if (pass1_put(pass1, pass1_n, pass1_cap, d, ty, q, qb, b) < 0) {
+            fprintf(stderr, "out of memory\n");
+            goto fail;
+        }
+    }
+    if (!v2)
+        *pass1_bframes = 0;   /* the first format is P-only */
+    return 0;
+fail:
+    free(*pass1);
+    *pass1 = NULL;
+    *pass1_n = *pass1_cap = 0;
+    return -1;
 }
 
 /* Write one packet to the stream and, if a reconstruction dump was asked for,
@@ -993,63 +1063,17 @@ int main(int argc, char **argv)
             return 1;
         }
         if (pass == 2) {
-            /* "aeg-stats 2" then "display type qp qp_base bits" per picture
-             * (type I, P, B or b for a reference B; qp the macroblocks'
-             * average, qp_base the picture's QP before their offsets);
-             * a file of bare numbers is the first format, one bit count per
-             * picture in display order without B pictures */
             FILE *sf = fopen(stats_path, "r");
-            char line[256];
-            int v2 = 0, k = 0;
-
             if (!sf) {
                 fprintf(stderr, "cannot read statistics file %s\n", stats_path);
                 return 1;
             }
-            while (fgets(line, sizeof(line), sf)) {
-                long long d, b;
-                double q, qb;
-                int ty;
-                char t;
-
-                if (!strncmp(line, "aeg-stats 2", 11)) {
-                    const char *kb = strstr(line, "bframes=");
-                    v2 = 1;
-                    if (kb)
-                        pass1_bframes = atoi(kb + 8);
-                    continue;
-                }
-                if (v2) {
-                    /* the pictures are numbered from 0 in display order: an
-                     * index far past the ones before it is damage, and the
-                     * table is allocated up to it */
-                    if (sscanf(line, "%lld %c %lf %lf %lld", &d, &t, &q, &qb,
-                               &b) != 5 ||
-                        !strchr("IPBb", t) || t == 0 || b < 0 || d < 0 ||
-                        d > (long long)pass1_n + 65536) {
-                        fprintf(stderr, "%s: bad line: %s", stats_path, line);
-                        fclose(sf);
-                        free(pass1);
-                        return 1;
-                    }
-                    ty = t == 'I' ? 0 : t == 'B' ? 2 : t == 'b' ? 3 : 1;
-                } else {
-                    if (sscanf(line, "%lld", &b) != 1)
-                        break;
-                    d = k++;
-                    q = qb = qp;
-                    ty = 1;
-                }
-                if (pass1_put(&pass1, &pass1_n, &pass1_cap, d, ty, q, qb, b) < 0) {
-                    fprintf(stderr, "out of memory\n");
-                    fclose(sf);
-                    free(pass1);
-                    return 1;
-                }
+            if (stats_parse(sf, stats_path, qp, &pass1, &pass1_n, &pass1_cap,
+                            &pass1_bframes) < 0) {
+                fclose(sf);
+                return 1;
             }
             fclose(sf);
-            if (!v2)
-                pass1_bframes = 0;   /* the first format is P-only */
             if (pass1_n <= 0) {
                 fprintf(stderr, "no statistics in %s\n", stats_path);
                 free(pass1);

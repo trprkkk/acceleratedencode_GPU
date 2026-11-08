@@ -272,7 +272,8 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
 {
     double rate = 0, cpb = 0;
     uint32_t units = (uint32_t)(p->fps_den > 0 ? p->fps_den : 1);
-    uint32_t scale = (uint32_t)(p->fps_num > 0 ? p->fps_num * 2 : 60);
+    /* time_scale is u(32): 2 * fps_num fits it unsigned, not as an int */
+    uint32_t scale = p->fps_num > 0 ? (uint32_t)p->fps_num * 2u : 60u;
 
     /* Table E-1: the sample aspect ratios that have an index of their own */
     static const unsigned char sar_tab[17][2] = {
@@ -286,8 +287,8 @@ static void write_vui(aeg_bitwriter *bw, const aeg_params *p, int max_refs)
         int sw = p->sar_w, sh = p->sar_h, a = sw, b = sh, idc = 255, i;
         while (b) { int t = a % b; a = b; b = t; }  /* reduce */
         sw /= a, sh /= a;
-        while (sw > 65535 || sh > 65535)
-            sw = (sw + 1) / 2, sh = (sh + 1) / 2;
+        while (sw > 65535 || sh > 65535)     /* (halved rounding up) */
+            sw = sw / 2 + (sw & 1), sh = sh / 2 + (sh & 1);
         for (i = 1; i < 17; i++)
             if (sar_tab[i][0] == sw && sar_tab[i][1] == sh)
                 idc = i;

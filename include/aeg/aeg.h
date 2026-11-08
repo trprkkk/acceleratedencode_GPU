@@ -116,7 +116,9 @@ typedef enum aeg_rcmode {
 } aeg_rcmode;
 
 typedef struct aeg_params {
-    int width, height;        /* luma dimensions, >= 16, any value      */
+    int width, height;        /* luma dimensions, >= 16; an odd one is
+                                 rounded down to even (4:2:0 crops in
+                                 pairs; aeg_encoder_get_params says)    */
     int fps_num, fps_den;     /* frame rate (e.g. 30/1, 30000/1001)     */
     /* The unit of the pts passed in and of the pts/dts handed back, in
      * seconds as a fraction (e.g. 1/90000 for MPEG-TS, 1/1000 for ms).  0/0

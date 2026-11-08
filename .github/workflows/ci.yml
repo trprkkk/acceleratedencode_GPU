@@ -267,3 +267,28 @@ jobs:
                 -i /tmp/ts.yuv $t -v 0 -o /tmp/ts.264
             done
           done
+
+  fuzz:
+    name: Fuzzing (libFuzzer + ASan/UBSan; the gcc driver as a smoke test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # coverage-guided: the runner's clang with libFuzzer, every target from
+      # the checked-in seeds (tests/fuzz/corpus); a crash, a leak or any UBSan
+      # report fails the job and the reproducer is kept as an artifact
+      - name: libFuzzer (clang), 120 s per target
+        run: make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120
+      # the same harnesses through the standalone driver (tests/fuzz/driver.c),
+      # the way they run where there is no clang: keeps that path building
+      - name: standalone driver (gcc), 20 s per target
+        run: |
+          rm -rf build-fuzz
+          make fuzz FUZZ_TIME=20
+      - name: keep reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            build-fuzz/fuzz_*-*
+          if-no-files-found: ignore

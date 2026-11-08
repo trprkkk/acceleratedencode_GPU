@@ -271,10 +271,52 @@ test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
 	./$(BUILD)/coef_check 200000
 	sh tests/run_tests.sh
 
+# Fuzzing (tests/fuzz/README.md).  `make fuzz` builds the library and the
+# targets with ASan + UBSan into build-fuzz/ and runs each target for
+# FUZZ_TIME seconds over its corpus with the standalone driver (any
+# compiler); `make fuzz FUZZ_ENGINE=libfuzzer CC=clang` links libFuzzer
+# instead, which adds coverage feedback.  A crash leaves its input in
+# build-fuzz/<target>-last-input (driver) or crash-* (libFuzzer).
+FUZZ_TARGETS := fuzz_api fuzz_image fuzz_cli
+FUZZ_TIME    ?= 60
+FUZZ_ENGINE  ?= driver
+FUZZ_SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+                -fno-omit-frame-pointer
+ifeq ($(FUZZ_ENGINE),libfuzzer)
+FUZZ_LIBSAN  := $(FUZZ_SAN) -fsanitize=fuzzer-no-link
+FUZZ_LINK    := $(FUZZ_SAN) -fsanitize=fuzzer
+FUZZ_MAIN    :=
+else
+FUZZ_LIBSAN  := $(FUZZ_SAN)
+FUZZ_LINK    := $(FUZZ_SAN)
+FUZZ_MAIN    := tests/fuzz/driver.c
+endif
+
+$(BUILD)/fuzz_%: tests/fuzz/fuzz_%.c tests/fuzz/fuzz.h $(FUZZ_MAIN) \
+                 cli/aegenc.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< $(FUZZ_MAIN) $(BUILD)/libaeg.a $(LDFLAGS) \
+	    $(FUZZ_LINK) $(LDLIBS)
+
+fuzz-build:
+	CFLAGS="-O1 -g $(FUZZ_LIBSAN)" LDFLAGS="$(FUZZ_LINK)" \
+	    $(MAKE) -s BUILD=build-fuzz FUZZ_ENGINE=$(FUZZ_ENGINE) \
+	    $(addprefix build-fuzz/,$(FUZZ_TARGETS))
+
+fuzz: fuzz-build
+	for t in $(FUZZ_TARGETS); do \
+	    d=tests/fuzz/$$t.dict; c=build-fuzz/corpus/$$t; \
+	    mkdir -p $$c && cp tests/fuzz/corpus/$${t#fuzz_}/* $$c/; \
+	    echo "== $$t ($(FUZZ_TIME) s)"; \
+	    ASAN_OPTIONS=detect_leaks=1 ./build-fuzz/$$t -max_total_time=$(FUZZ_TIME) \
+	        -max_len=4096 -artifact_prefix=build-fuzz/$$t- \
+	        $$( [ -f $$d ] && echo -dict=$$d ) $$c || exit 1; \
+	done
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean shared install uninstall examples install-check
+.PHONY: all test clean shared install uninstall examples install-check \
+        fuzz fuzz-build
 # every object's header dependencies (-MMD), the CLI's and the tests' too:
 # a changed struct in aeg.h has to rebuild everything that includes it
 -include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d) \

@@ -15836,6 +15836,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->la_depth = pp->mbtree ? pp->rc_lookahead : 0;
     if (pp->b_qp_offset < 0)
         pp->b_qp_offset = pp->mbtree ? 2 : 4;
+    /* (an offset past the QP scale only ever means "as coarse as it goes";
+     * clamped here, it cannot overflow the QP arithmetic) */
+    if (pp->b_qp_offset > 51)
+        pp->b_qp_offset = 51;
+    if (pp->i_qp_offset > 51)
+        pp->i_qp_offset = 51;
     /* A buffer model without a rate target makes no sense -- a constant-QP
      * stream cannot be squeezed into a channel -- so asking for a VBV turns
      * ABR on, with the maximum rate as the target when no bitrate was given.
