@@ -477,8 +477,16 @@ aeg_encoder_close(e);
   CPU suite and frame threads, the packaging checks and a real `make
   install`, the OpenCL backend on PoCL (`backend_check`, the conformance suite
   through the device, `gpu_validate.sh`), the CUDA kernels through NVRTC, an
-  ASan + UBSan build of the CPU and OpenCL host paths, and ThreadSanitizer on
-  the parallel-encoder and frame/slice-thread paths.
+  ASan + UBSan build of the CPU and OpenCL host paths, ThreadSanitizer on
+  the parallel-encoder and frame/slice-thread paths, and the fuzzers.
+* `tests/fuzz/` (`make fuzz`): fuzz targets for the library API with
+  arbitrary parameters, `aeg_encoder_encode_image` with arbitrary plane
+  layouts, and the CLI's Y4M, two-pass statistics and frame-rate parsers,
+  all under ASan + UBSan. They build with clang's libFuzzer
+  (`FUZZ_ENGINE=libfuzzer CC=clang`) or, with gcc, with a small standalone
+  driver. Five bugs found so far, all fixed (integer overflows in the VUI
+  and in QP offsets, an unbounded allocation in the statistics reader, a
+  frame rate of 0 accepted); see `tests/fuzz/README.md`.
 * `tests/run_tests.sh` encodes fifty-four synthetic cases (QP 12/23/26/40,
   presets 0–4, deblocking on/off, 64x64 … 320x208, forced CPU backend, 16x8,
   8x16 and P_8x8 partitioning with all four `sub_mb_type` shapes, P_Skip,
@@ -523,6 +531,7 @@ tests/kernel_check.c cross-checks every GPU kernel against the CPU reference
 tests/backend_check.c every device operation end to end on a real device
 tests/nvrtc_check.c the CUDA kernels through NVRTC (no GPU needed)
 tests/api_check.c   the public API alone (see above)
+tests/fuzz/         fuzz targets, standalone driver, seed corpora (README)
 tests/install_check.sh  make install, pkg-config, exports, header as C/C++
 tools/pocl_env.sh   a real OpenCL device without a GPU (PoCL), for the above
 tools/identity.sh   byte-compare two aegenc builds over fourteen configurations

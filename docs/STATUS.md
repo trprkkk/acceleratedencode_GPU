@@ -6827,5 +6827,64 @@ No stream changed: 15 configurations are byte-identical to `02a03e3`.
 with `-b $BE` on every device run) and ASan+LSan pass.
 
 These remain open for the owner: HEVC scope, a GPU-resident data flow, the
-feature gaps, CMake/Windows/ARM, fuzzing, and a licence review of the
-x264-derived algorithms.
+feature gaps, CMake/Windows/ARM, and a licence review of the x264-derived
+algorithms. (Fuzzing, also on this list then, is done: see the next
+section.)
+
+## Fuzzing (`tests/fuzz/`)
+
+**Targets.** Three, each with seed corpora in `tests/fuzz/corpus`:
+- `fuzz_api`: arbitrary `aeg_params`, then open, a few pictures, flush,
+  and the rest of the API.
+- `fuzz_image`: `aeg_encoder_encode_image` with every colour space, depth,
+  stride and alignment. Each plane is allocated exactly, so ASan catches
+  any overread.
+- `fuzz_cli`: the Y4M demuxer, the two-pass statistics parser and the
+  `--fps` syntax, with `cli/aegenc.c` included whole.
+
+**Build.** `make fuzz` builds them with ASan + UBSan
+(`-fno-sanitize-recover`) into `build-fuzz/`. The engine is libFuzzer
+under clang, or the standalone `tests/fuzz/driver.c` under gcc (this
+machine has no clang). The driver has no coverage feedback; it mutates the
+corpus at random, using libFuzzer's options and artifact naming.
+
+**CI.** The new `fuzz` job runs 120 s per target with libFuzzer and 20 s
+per target with the gcc driver.
+
+**Findings** (all fixed):
+
+| # | where | what |
+|---|---|---|
+| 1 | `bitstream.c` VUI | `time_scale = 2*fps_num` overflowed `int` |
+| 2 | `bitstream.c` VUI | SAR halving `(w+1)/2` overflowed at `INT_MAX` |
+| 3 | `aegenc.c` `parse_rate` | `0.000125` parsed as rate 0/1001 |
+| 4 | `encoder.c` `aeg_encoder_open` | `b_qp_offset`/`i_qp_offset` unbounded: `cur_qp += off` overflowed; now ≤ 51 |
+| 5 | `aegenc.c` `stats_parse` | a v2 index sized an allocation from the file (review); now bounded |
+
+Two harness mistakes were also fixed:
+- odd dimensions are rounded down to even, so layouts are now checked
+  against the rounded size (the header comment now says so);
+- a layout was called invalid without a misalignment.
+
+**Clean runs after the fixes** (the gcc driver, so mutation counts, not
+coverage):
+
+| target | runs | inputs, no finding |
+|---|---|---|
+| `fuzz_image` | 240 s | 156 366 |
+| `fuzz_cli` | 240 s | 357 924 |
+| `fuzz_api` | 420 s + 2 × 360 s, three seeds | 31 241 |
+
+The API target is slow (about 28 inputs/s) because every accepted
+parameter set opens an encoder and codes pictures.
+
+**Identity.** No in-range stream changed. 17 configurations are
+byte-identical to `9554f89`, including:
+- presets 0/2/4, CRF, ABR, VBV;
+- frame threads 3/5 and slices;
+- 10-bit and CAVLC;
+- PAFF, MBAFF and PAFF+MBAFF;
+- `--fps 30000/1001` / `29.97` with `--sar` and NAL HRD;
+- two-pass, where the statistics files are equal too and a new pass 2
+  reads the old file;
+- a Y4M input.

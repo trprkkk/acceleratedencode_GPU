@@ -222,11 +222,20 @@ before an MIT release. This document does not claim it is clean.
 **"Untested areas."** *Partly confirmed.*
 
 - Not covered:
-  - fuzzing of the library API and the raw input parsers;
   - any real GPU, including machines with several;
   - non-Linux builds.
 - Covered: CPU, frame and slice threads, PoCL, NVRTC, ASan/UBSan, TSan,
   install/pkg-config, and 76 conformance cases decoded by FFmpeg.
+- **Since then:** fuzzing of the library API, the image layouts and the
+  CLI's parsers (`tests/fuzz/`, `make fuzz`, and a CI job under libFuzzer).
+  It found five bugs, all fixed with no in-range stream change:
+  - the VUI `time_scale` overflowed;
+  - the SAR reduction overflowed;
+  - `--fps` accepted a rate of 0;
+  - the B/I QP offsets were unbounded and overflowed the QP arithmetic;
+  - the statistics reader made an unbounded allocation.
+
+  See `tests/fuzz/README.md`.
 
 ## Open items for the owner
 
@@ -236,6 +245,5 @@ before an MIT release. This document does not claim it is clean.
 3. **Feature gaps** (4:2:2/4:4:4, lossless, open GOP, field-picture direct):
    which, if any?
 4. **CMake / Windows / ARM** support.
-5. **Fuzzing** (libFuzzer/AFL harness for `aeg_encoder_encode` and the input
-   readers).
+5. ~~**Fuzzing**~~: done (`tests/fuzz/`; see above).
 6. **Licence review** of the x264-derived algorithms.
