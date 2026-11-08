@@ -44,10 +44,12 @@ static inline double aeg_lambda_of(int qp)
 }
 #define AEG_LAMBDA(qp) aeg_lambda_of(qp)
 
-/* An integer tuning switch from the environment, read once. */
+/* An integer tuning switch from the environment, read once.  The value is
+ * cast to plain int: a statement expression ending in an _Atomic object is
+ * itself _Atomic(int) to clang <= 18, which then refuses it in arithmetic. */
 #define ENV_INT(name, dflt) __extension__ ({ static _Atomic int v_ = -0x7fffffff; \
     if (v_ == -0x7fffffff) { const char *e_ = getenv(name);              \
-        v_ = e_ ? atoi(e_) : (dflt); } v_; })
+        v_ = e_ ? atoi(e_) : (dflt); } (int)v_; })
 
 typedef struct mbenc {
     dctcoef  level[AEG_BLK_COUNT][16];
