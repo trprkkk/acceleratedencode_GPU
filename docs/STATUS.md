@@ -5073,6 +5073,10 @@ core 164 every number here was measured with.)
 
 ## CRF on the long clips: where the gap to x264 veryslow is
 
+*Later:* QP-RD and then the CABAC trellis (both sections near the end) bring
+p4 to +0.57% against veryslow on these clips (cockL +3.37, vtestL −3.25,
+megaL +1.61) and p3 to +4.86%.
+
 Before: at CRF on the long clips (cockL, vtestL, megaL; aegenc `--crf N --aq
 0`, x264 `-crf N --tune psnr`, CRF 18-33) p4 was +10.69 % against x264
 veryslow and +0.22 against medium.  `tools/x264abl.py` now takes `--mode crf`
@@ -6519,10 +6523,19 @@ At constant QP (no tree), 30-frame clips, against QP-RD off:
 
 | | cock | tree | vtest | mega | short | mean | time |
 |---|---|---|---|---|---|---|---|
-| p4 | −1.05 | −0.09 | −1.88 | −0.40 | −1.12 | −0.91% | +35% |
-| p3 | −1.74 | −0.04 | −2.28 | −1.24 | −1.12 | −1.28% | +42% |
+| p4 | −1.05 | +2.28 | −1.88 | −0.40 | −0.67 | −0.34% | +35% |
+| p3 | −1.74 | +2.33 | −2.28 | −1.24 | −0.51 | −0.69% | +42% |
 
 The constant-QP time includes QP 22, where most macroblocks have residual.
+
+*Correction:* the tree and short entries first published here (−0.09 / −1.12
+at p4, −0.04 / −1.12 at p3) came from runs at the wrong frame size. Both
+clips are 320x240. The entries above are rerun at that size, with the trellis
+of the later section off as it was then. The time column is still from the
+first run. With that trellis on, p4 gives tree +1.96% and short −0.34%. At
+constant QP the lambda weighting is neutral (no tree offsets), so this is the
+plain search. On tree it takes lower QPs (+13% bits at QP 22) that the BD
+curve does not pay back. The CRF results above are not affected.
 **Time:** cockL, 120 frames, CRF 24, `-t 1`, min of 3 interleaved: p4
 7.34 → 8.08 s (+10%), p3 6.18 → 7.79 s (+26%). p3 is the speed preset of
 the two, and p4 with QP-RD is only 4% slower than p3 with it and two points
@@ -6619,3 +6632,89 @@ The descent cannot clean up after a round-to-nearest start the way x264's
 trellis does. The next step is a real CABAC trellis (x264's
 `quant_trellis_cabac`) in place of the descent, rather than tuning the
 deadzone.
+
+## A CABAC trellis in front of the level descent
+
+The cockL breakdown above put about 2.8 points on x264's trellis. Ours was
+a coordinate descent from the quantiser's levels that never revived a
+coefficient the deadzone had removed.
+
+**What runs now (`trel_viterbi`, encoder.c).** It is x264's
+`quant_trellis_cabac`: a dynamic program over the coefficients from the
+last possible one backwards, the order the coder sends levels in.
+
+* **States:** the eight nodes of the level state machine (how many levels
+  of 1 and above 1 are coded already, which picks the level contexts). Node
+  0 means nothing is coded yet, so the next non-zero level carries the
+  last-coefficient flag.
+* **Levels:** each coefficient may take round(x), round(x) − 1 or 0, x being
+  its unrounded level.
+* **Bits:** from the block's starting CABAC states, not advanced inside the
+  block, as in x264.
+* **Distortion:** the coefficient-domain model of `aeg_trel_levels()`
+  (transform.c). Level L at a position costs `e·(x − L)²`, where
+  `e = (V·2^(qp/6) [/4 for 8x8])² · |b_r|²·|b_c|² / 64²` is the pixel SSE of
+  one unit of level (V is the decoder's dequant scale, b the rows of its
+  inverse transform). Checked against the exact reconstruction SSE on
+  cockatoo, it agrees up to the integer rounding of the decoder.
+* **Inputs:** the unrounded levels come from one forward transform of
+  `src − pred` inside the level selection, so no caller changed.
+
+The trellis's levels and the quantiser's are both priced exactly (exact
+CABAC bits and reconstruction SSE). The cheaper pair is where the existing
+descent starts, so the result can only improve on the old one. All-zero
+blocks are still skipped (the shortcuts that rely on "the level selection
+never touches a zero" hold for whole blocks). `AEG_TVIT=0` turns the
+trellis off.
+
+**Ours against ours** (PSNR BD-rate against the descent alone, constant QP
+22–37, `--aq 0`, cock 640x352, tree 320x240, vtest 384x288, mega 352x256,
+short 320x240, 30 frames):
+
+| | cock | tree | vtest | mega | short | mean |
+|---|---|---|---|---|---|---|
+| p4 | −2.25 | −3.52 | −2.09 | −1.82 | −2.40 | **−2.42** |
+| p2 | | | | | | **−2.01** |
+| p1 | | | | | | **−2.07** |
+
+Variations, p4, same clips, against the trellis as adopted:
+
+| variation | mean |
+|---|---|
+| trellis only, no descent after it | +0.30 (−9% time) |
+| inter trellis lambda 0.60x / 0.95x (adopted 0.75x) | +0.05 / +0.31 |
+| intra trellis lambda 0.35x / 0.7x / 1.0x (adopted 0.5x) | +0.31 / −0.08 / +0.09 |
+| inter quantiser rounding 1/3 / 1/2 (adopted 1/4) | +0.13 / +1.10 |
+
+**Against x264 veryslow** (CRF, long clips, PSNR BD-rate, aegenc `--aq 0`):
+
+| | cockL | vtestL | megaL | mean |
+|---|---|---|---|---|
+| p4 before | +4.97 | −1.18 | +3.29 | +2.36% |
+| **p4** | **+3.37** | **−3.25** | **+1.61** | **+0.57%** |
+| p3 before | +7.02 | +6.94 | +5.11 | +6.35% |
+| **p3** | **+5.05** | **+6.43** | **+3.11** | **+4.86%** |
+
+**Time:** cockL, 120 frames, CRF 24, `-t 1`, min of 3 interleaved:
+* p3: 8.58 → 9.38 s (+9%);
+* p4: 11.90 → 13.63 s (+15%, its QP-RD trials run the trellis too);
+* p1/p2 on the short clips: about +10%.
+
+With per-QP tables in place of the float scales, p4 went from +20% to +15%,
+with identical output. The remaining cost is spread over the forward
+transform, the program itself and the second exact price; gprof shows no
+single hotspot.
+
+**Checks:**
+* `make test` passes.
+* ffmpeg decodes bit-exact: p1, p2, p4, CQP and CRF, `--bframes 0`,
+  `--slices 3`, `--mbaff`, `--paff`, `--field`, `--paff-mbaff`, 10-bit.
+* Frame threads are byte-identical to serial and to `-t 1`; slices are
+  identical across `-t`.
+* ASAN is clean: 8- and 10-bit, QP 0 and 51, interlaced. It found a
+  never-used out-of-range context-map read at the block's last position,
+  now fixed.
+* CAVLC output is unchanged (the trellis is CABAC-only).
+
+**Next:** the same program for the I16x16 AC, the DC blocks and chroma.
+Those still use the descent alone.

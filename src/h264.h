@@ -406,6 +406,8 @@ void aeg_idct_residual_c(const dctcoef *level, int qp, const int32_t *dc_in,
  * order the reference decoder's inverse transform reads. */
 void aeg_transform_8x8(const int16_t *res, int stride, dctcoef *coef);
 void aeg_quant_8x8(const dctcoef *coef, dctcoef *level, int qp, int intra);
+void aeg_trel_levels(const dctcoef *coef, int side, int qp, float *x, float *e,
+                     int8_t *sgn);
 void aeg_quant_8x8_c(const dctcoef *coef, dctcoef *level, int qp, int intra);
 /* Incremental 8x8 reconstruction for the trellis (see transform.c). */
 int64_t aeg_idct_add_ssd4(const dctcoef *level, int qp, const pixel *pred,

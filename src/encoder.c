@@ -2035,6 +2035,170 @@ static int64_t trel_price(int64_t bits256, double lambda)
     return (int64_t)(lambda * (double)bits256 / 256.0 + 0.5);
 }
 
+/* x264's CABAC trellis (quant_trellis_cabac): a dynamic program over the
+ * coefficients from the last possible one backwards, the order the coder sends
+ * the levels in, whose states are the nodes of the level state machine
+ * (9.3.2.2: how many levels of 1 and above 1 are coded already, which is what
+ * picks the level contexts).  Node 0 is "nothing coded yet": the next
+ * non-zero level is the last one and says so.  Each coefficient may take
+ * round(x), round(x) - 1 or 0, x being its unrounded level, so a coefficient
+ * the deadzone would remove can survive and one the rounding keeps can go.
+ * The bits come from the block's starting context states (the contexts are
+ * not advanced inside the block, as in x264), the distortion from the
+ * coefficient-domain model of aeg_trel_levels().  The result is a starting
+ * point: trel_descent_kn() prices it exactly against the quantiser's levels
+ * and polishes the better one. */
+static const uint8_t tv_lvl1[8] = { 1, 2, 3, 4, 0, 0, 0, 0 };
+static const uint8_t tv_gt1[8]  = { 5, 5, 5, 5, 6, 7, 8, 9 };
+static const uint8_t tv_next[2][8] = {
+    { 1, 2, 3, 3, 4, 5, 6, 7 },
+    { 4, 4, 4, 4, 5, 6, 7, 7 }
+};
+
+/* Bits (1/256) of a level of `abs` >= 1 coded from node `node`, sign included. */
+static inline uint32_t tv_level_bits(const uint8_t *state, int lvl_ctx, int cat,
+                                     int node, int abs)
+{
+    uint32_t c = aeg_cabac_bin_cost[state[lvl_ctx + tv_lvl1[node]]][abs > 1] + 256;
+    if (abs > 1) {
+        int g = tv_gt1[node], s, cnt;
+        if ((cat % 6) == 3 && g > 8)
+            g = 8;
+        s = state[lvl_ctx + g];
+        for (cnt = 2; cnt < 15 && cnt < abs; cnt++) {
+            c += aeg_cabac_bin_cost[s][1];
+            s = aeg_cabac_trans[s][1];
+        }
+        if (cnt < 15) {
+            c += aeg_cabac_bin_cost[s][0];
+        } else {
+            int rest = abs - 14, j = 0;
+            while (rest >= (1 << (j + 1)))
+                j++;
+            c += (uint32_t)(2 * j + 1) * 256;
+        }
+    }
+    return c;
+}
+
+/* Fills lev[] (natural order, positions of the block's scan only) with the
+ * trellis's levels for the unrounded levels x[] / unit errors e[] / signs
+ * sgn[] (natural order).  Returns 0 when there is nothing to choose (every
+ * coefficient rounds to 0 or a level is out of the search's range), 1 when
+ * lev[] was written. */
+static int trel_viterbi(const aeg_cabac *sh, const struct trel *t,
+                        const float *x, const float *e, const int8_t *sgn,
+                        double lambda, int allow_empty, dctcoef *lev)
+{
+    const struct aeg_cab_cat_ctx *k = &aeg_cab_cat[t->cat];
+    const uint8_t *state = sh->state;
+    const int n = t->n, big = n == 64;
+    const double lb = lambda / 256.0;
+    double score[8], nscore[8];
+    int8_t prevn[64][8];
+    int16_t lvs[64][8];
+    int i, start = -1, nd, best;
+
+    for (i = n - 1; i >= 0; i--) {
+        float xi = x[t->scan[i]];
+        if (xi >= 0.5f) {
+            if (start < 0)
+                start = i;
+            if (xi > 2000.0f)
+                return 0;
+        }
+    }
+    if (start < 0)
+        return 0;
+    for (nd = 0; nd < 8; nd++)
+        score[nd] = 1e300;
+    score[0] = 0.0;
+    for (i = start; i >= 0; i--) {
+        const int pos = t->scan[i];
+        const double xi = x[pos], ei = e[pos];
+        const int q = (int)(xi + 0.5);
+        const int flags = i < n - 1;
+        /* the last position of the block has no significance/last flags
+         * (and no entry in the 8x8 context maps) */
+        const int ci = flags ? i : 0;
+        const uint8_t *sig = &state[k->sig + (big ? k->sig8[ci] : ci)];
+        const uint8_t *lst = &state[k->last + (big ? aeg_cabac_last8[ci] : ci)];
+        const double d0 = ei * xi * xi;
+        int L;
+
+        for (nd = 0; nd < 8; nd++)
+            nscore[nd] = 1e300;
+        for (nd = 0; nd < 8; nd++) {
+            double sc = score[nd];
+            if (sc >= 1e299)
+                continue;
+            /* level 0: before the last coefficient nothing is sent */
+            {
+                double c = sc + d0;
+                if (nd && flags)
+                    c += lb * aeg_cabac_bin_cost[*sig][0];
+                if (c < nscore[nd]) {
+                    nscore[nd] = c;
+                    prevn[i][nd] = (int8_t)nd;
+                    lvs[i][nd] = 0;
+                }
+            }
+            for (L = q; L >= 1 && L >= q - 1; L--) {
+                uint32_t bits = tv_level_bits(state, k->level, t->cat, nd, L);
+                const int nn = tv_next[L > 1][nd];
+                double c;
+                if (flags)
+                    bits += aeg_cabac_bin_cost[*sig][1] +
+                            aeg_cabac_bin_cost[*lst][nd == 0];
+                c = sc + ei * (xi - L) * (xi - L) + lb * bits;
+                if (c < nscore[nn]) {
+                    nscore[nn] = c;
+                    prevn[i][nn] = (int8_t)nd;
+                    lvs[i][nn] = (int16_t)L;
+                }
+            }
+        }
+        memcpy(score, nscore, sizeof(score));
+    }
+    if (t->cbf_ctx >= 0) {
+        score[0] += lb * aeg_cabac_bin_cost[state[t->cbf_ctx]][0];
+        for (nd = 1; nd < 8; nd++)
+            score[nd] += lb * aeg_cabac_bin_cost[state[t->cbf_ctx]][1];
+    }
+    if (!allow_empty)
+        score[0] = 1e300;
+    best = 0;
+    for (nd = 1; nd < 8; nd++)
+        if (score[nd] < score[best])
+            best = nd;
+    if (score[best] >= 1e299)
+        return 0;
+    for (i = 0; i < n; i++)
+        lev[t->scan[i]] = 0;
+    for (i = 0, nd = best; i <= start; i++) {
+        const int pos = t->scan[i], L = lvs[i][nd];
+        lev[pos] = (dctcoef)(sgn[pos] < 0 ? -L : L);
+        nd = prevn[i][nd];
+    }
+    return 1;
+}
+
+/* Whether the level selection starts from the trellis (AEG_TVIT=0 turns it
+ * off, for measurements).  PSNR BD-rate against the descent alone, constant
+ * QP, five 30-frame clips: p1 -2.07 %, p2 -2.01 %, p4 -2.42 % (p4: -1.8
+ * to -3.5 % per clip); time +10 % (p1, p2), +9 % (p3) and +15 % (p4, whose QP-RD
+ * trials run it too) on cockL at CRF 24.  The trellis alone, without the
+ * descent after it: +0.30 % for -9 % time. */
+static int trel_vit_on(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_TVIT");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 /* The sweep itself: returns the cost of the levels it settles on, which are
  * written back through `lev`.  The moving cost is kept locally -- one inverse
  * transform and one local price per candidate -- and the block that wins is
@@ -2086,6 +2250,59 @@ static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
         int dummy;
         if (!aeg_nz_last(lev, nat, &dummy))
             return 0;
+    }
+    if (trel_vit_on()) {
+        /* the trellis's levels against the quantiser's, priced exactly; the
+         * cheaper pair is where the descent starts */
+        const int sd = t->side;
+        int16_t res[64];
+        dctcoef co[64], vl[64], sc2[64];
+        float xx[64], ee[64];
+        int8_t sg[64];
+        int y, x, dummy;
+
+        for (y = 0; y < sd; y++)
+            for (x = 0; x < sd; x++)
+                res[y * sd + x] = (int16_t)((int)src[y * stride + x] -
+                                            (int)pred[y * pred_stride + x]);
+        if (sd == 4)
+            aeg_transform_4x4(res, 4, co);
+        else
+            aeg_transform_8x8(res, 8, co);
+        aeg_trel_levels(co, sd, qp, xx, ee, sg);
+        memcpy(vl, lev, natsz);
+        if (trel_viterbi(sh, t, xx, ee, sg, lambda, allow_empty, vl) &&
+            memcmp(vl, lev, natsz)) {
+            int64_t ob, os, vb, vs;
+            if (known_sse >= 0) {
+                os = known_sse;
+                ob = known_bits;
+            } else {
+                for (i = 0; i < t->n; i++)
+                    sc2[i] = lev[t->scan[i]];
+                ob = cabac_block_price(sh, sc2, t->n, t->cat, t->cbf_ctx);
+                os = trel_sse(t, src, stride, pred, pred_stride, lev, qp);
+            }
+            for (i = 0; i < t->n; i++)
+                sc2[i] = vl[t->scan[i]];
+            vb = cabac_block_price(sh, sc2, t->n, t->cat, t->cbf_ctx);
+            vs = trel_sse(t, src, stride, pred, pred_stride, vl, qp);
+            if (vs + trel_price(vb, lambda) < os + trel_price(ob, lambda)) {
+                memcpy(lev, vl, natsz);
+                known_sse = vs;
+                known_bits = vb;
+                if (!aeg_nz_last(lev, nat, &dummy)) {
+                    if (out_sse) {
+                        *out_sse = vs;
+                        *out_bits = vb;
+                    }
+                    return vs + trel_price(vb, lambda);
+                }
+            } else {
+                known_sse = os;
+                known_bits = ob;
+            }
+        }
     }
     memcpy(cur, lev, natsz);
     for (i = 0; i < t->n; i++)

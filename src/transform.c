@@ -642,6 +642,72 @@ void aeg_quant_4x4_c(const dctcoef *coef, dctcoef *level, int qp, int intra)
         }
 }
 
+/* The trellis's view of a block (see trel_viterbi() in encoder.c): for every
+ * level position (the levels' layout: transposed for 4x4, raster for 8x8),
+ * the unrounded level |coef| * MF / 2^qbits, the sign of the coefficient, and
+ * the SSE in pixels that one unit of level reconstructs to,
+ *   (V * 2^(qp/6) [/ 4 for 8x8])^2 * |b_r|^2 * |b_c|^2 / 64^2,
+ * b being the rows of the decoder's inverse transform (8.5.12, 8.5.13).
+ * Choosing level L then costs about e * (x - L)^2: the basis is orthogonal,
+ * so the positions add up (up to the rounding and clipping of the decoder;
+ * on cockatoo the model is within a few percent of the exact SSE). */
+/* (per QP' and position, built once: the scale from |coef| to x, and e) */
+#define TL_QPS (52 + QP_BD_OFFSET)
+static float tl4_xs[TL_QPS][16], tl4_e[TL_QPS][16];
+static float tl8_xs[TL_QPS][64], tl8_e[TL_QPS][64];
+static pthread_once_t tl_once = PTHREAD_ONCE_INIT;
+static void tl_init(void)
+{
+    static const float n4[4] = { 4.0f, 2.5f, 4.0f, 2.5f };
+    static const float n8[8] = { 8.0f, 9.03125f, 5.0f, 9.03125f,
+                                 8.0f, 9.03125f, 5.0f, 9.03125f };
+    int q, r, c;
+    for (q = 0; q < TL_QPS; q++) {
+        const int m = q % 6, sh = q / 6;
+        const float inv4 = 1.0f / (float)(1 << (15 + sh));
+        const float inv8 = 1.0f / (float)(1 << (16 + sh)); /* DCT8_QUANT_SHIFT */
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 4; c++) {
+                const int cls = (c & 1) + (r & 1);
+                const float d = (float)(aeg_dequant_ls[m][cls] << sh);
+                tl4_xs[q][r * 4 + c] = aeg_quant_mf[m][cls] * inv4;
+                tl4_e[q][r * 4 + c] = d * d * n4[r] * n4[c] * (1.0f / 4096.0f);
+            }
+        for (r = 0; r < 8; r++)
+            for (c = 0; c < 8; c++) {
+                const float d = (float)(aeg_dequant8_ls[m][aeg_cls8[r][c]] << sh) * 0.25f;
+                tl8_xs[q][r * 8 + c] = aeg_quant8_mf[m][r * 8 + c] * inv8;
+                tl8_e[q][r * 8 + c] = d * d * n8[r] * n8[c] * (1.0f / 4096.0f);
+            }
+    }
+}
+
+void aeg_trel_levels(const dctcoef *coef, int side, int qp, float *x, float *e,
+                     int8_t *sgn)
+{
+    const int q = qp + QP_BD_OFFSET;
+    int r, c;
+
+    pthread_once(&tl_once, tl_init);
+    if (side == 4) {
+        memcpy(e, tl4_e[q], sizeof(tl4_e[q]));
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 4; c++) {
+                const int v = coef[c * 4 + r];
+                x[r * 4 + c] = (float)(v < 0 ? -v : v) * tl4_xs[q][r * 4 + c];
+                sgn[r * 4 + c] = v < 0 ? -1 : 1;
+            }
+    } else {
+        memcpy(e, tl8_e[q], sizeof(tl8_e[q]));
+        for (r = 0; r < 64; r++) {
+            const int v = coef[r];
+            x[r] = (float)(v < 0 ? -v : v) * tl8_xs[q][r];
+            sgn[r] = v < 0 ? -1 : 1;
+        }
+    }
+    (void)c;
+}
+
 void aeg_quant_4x4_dc(const dctcoef *coef, dctcoef *level, int qp, int intra)
 {
     /* The 4x4 Hadamard multiplies the DC by another 16 on top of the 16 the
