@@ -1,6 +1,6 @@
 # aegenc file syntax (libFuzzer dictionary format)
 "YUV4MPEG2 "
-"FRAME\n"
+"FRAME\x0A"
 "FRAME"
 " W"
 " H"
@@ -30,7 +30,7 @@
 " P "
 " B "
 " b "
-"\n"
+"\x0A"
 "/"
 ":"
 "1001"

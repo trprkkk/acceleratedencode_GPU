@@ -11,12 +11,14 @@
  *   -max_total_time=S  stop mutating after S seconds
  *   -max_len=N         longest input generated (default 4096)
  *   -seed=N            random seed (default 1)
- *   -dict=FILE         libFuzzer dictionary: "token" per line (\n \" \\ \xNN)
+ *   -dict=FILE         libFuzzer dictionary: "token" per line (\" \\ \xNN;
+ *                      libFuzzer itself refuses \n)
  *   -artifact_prefix=P the input being run is kept at P + "last-input", so a
  *                      sanitizer abort leaves the input that caused it
  */
 #include <dirent.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,15 +113,21 @@ static void load_dict(const char *path)
         }
         for (i++; i < n && p[i] != '"' && t < sizeof(tok); i++) {
             if (p[i] == '\\' && i + 1 < n) {
+                /* libFuzzer's escapes only (\\ \" \xNN): what it would
+                 * refuse is refused here too, so the gcc run catches it */
                 i++;
-                if (p[i] == 'n')
-                    tok[t++] = '\n';
-                else if (p[i] == 'x' && i + 2 < n) {
+                if (p[i] == 'x' && i + 2 < n && isxdigit(p[i + 1]) &&
+                    isxdigit(p[i + 2])) {
                     char hex[3] = {(char)p[i + 1], (char)p[i + 2], 0};
                     tok[t++] = (uint8_t)strtol(hex, NULL, 16);
                     i += 2;
-                } else
+                } else if (p[i] == '\\' || p[i] == '"')
                     tok[t++] = p[i];
+                else {
+                    fprintf(stderr, "driver: %s: escape '\\%c' that "
+                            "libFuzzer refuses\n", path, p[i]);
+                    exit(1);
+                }
             } else
                 tok[t++] = p[i];
         }

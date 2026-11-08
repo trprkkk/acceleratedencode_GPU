@@ -8,7 +8,7 @@ log=$1 title=$2
 [ -f "$log" ] || exit 0
 awk '
   /^== fuzz_/                     { tgt = $0 }
-  /ERROR: |runtime error:|deadly signal|out-of-memory|timeout after/ {
+  /ERROR: |runtime error:|deadly signal|out-of-memory|timeout after|ParseDictionaryFile|^ERROR|error:/ {
                                     on = 1; frames = 0 }
   on && /^ +#[0-9]+ /             { if (++frames > 14) next }
   on                              { print; if (/^SUMMARY/) on = 0 }
