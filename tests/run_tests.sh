@@ -374,6 +374,10 @@ run_bcase bframes_q8x8  320 192 10 1 1 -q 24 --scenecut 0 --no-8x8dct
 run_bcase qprd_crf      320 192 12 2 4 -p 3 --qp-rd 1 --crf 22 --scenecut 0
 run_bcase qprd_p        320 192 10 0 1 -p 4 -q 20 --scenecut 0
 run_bcase qprd_sl2      320 192 10 2 4 -p 3 --qp-rd 1 -q 30 --slices 2 --scenecut 0
+#   the fast walk (--qp-rd 2) jumps straight to the QP the tree points at,
+#   possibly several steps away
+run_bcase qprd2_crf     320 192 12 2 4 -p 3 --qp-rd 2 --crf 22 --scenecut 0
+run_bcase qprd2_sl2     320 192 10 2 4 -p 3 --qp-rd 2 --crf 26 --slices 2 --scenecut 0
 #   the rate controller gives a picture its QP from the running bit count, and a
 #   B picture is coded coarser than the anchors around it: the mb_qp_delta that
 #   follows has to survive both, which is what this case is for

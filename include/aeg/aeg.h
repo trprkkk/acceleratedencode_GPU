@@ -296,10 +296,12 @@ typedef struct aeg_params {
     /* QP-RD (x264's subme 10): the decided macroblock is coded again at the
      * neighbouring QPs and the full rate-distortion price picks its QP (with
      * the macroblock tree, distortion is weighted by how much later pictures
-     * inherit it).  0 = off, 1 = on; -1 = as the preset says (on at preset
-     * 4).  Needs CABAC.  About -2.2 points of BD-rate against x264 veryslow
-     * at CRF on the long clips, for 10 % of the encode time at preset 4 and
-     * 15-26 % at preset 3 (docs/STATUS.md, "QP-RD"). */
+     * inherit it).  0 = off, 1 = on (the full walk), 2 = fast (the QP the
+     * macroblock tree's weighting points at, then one step either way); -1 =
+     * as the preset says (1 at preset 4, else 0).  Needs CABAC.  At preset 3,
+     * CRF on the long clips: 1 is -2.36 points of BD-rate for about 15 % of
+     * the encode time, 2 is -2.25 for about 9 % (docs/STATUS.md, "QP-RD"
+     * and "A cheaper QP-RD walk"). */
     int qp_rd;
     /* P-picture reference pictures: 1..8.  -1 = as the preset says (8 at
      * preset 4, 4 at preset 3, 1 below).  The

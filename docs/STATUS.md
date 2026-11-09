@@ -7032,7 +7032,7 @@ preset-4 settings (+23 % for -0.38) are poor value at preset 3.
 the same result.  Whole-clip int64 copies took 2.5 GB per run, and two runs
 side by side were killed for lack of memory.
 
-## A cheaper QP-RD walk (experimental, `AEG_QPRD*`, default off)
+## A cheaper QP-RD walk (`--qp-rd 2`)
 
 QP-RD costs preset 3 about 15 % of its time (cockL / vtestL CRF 24, serial).
 gprof (cockL, 120 pictures, p3 `--qp-rd 1`) puts about 10 % of the encode in
@@ -7042,7 +7042,7 @@ the trials:
 - 21 % codes chroma again;
 - about 19 % is inter luma.
 
-Four switches (output unchanged without them):
+Four variants were tried with temporary environment switches:
 - **`AEG_QPRDKM=1`:** Intra NxN trials keep the winner's modes, which are
   decided again once at the QP the walk picks.
 - **`AEG_QPRDNT=1`:** the walk runs without the trellis, and only the chosen
@@ -7106,4 +7106,15 @@ Serial, the minimum of three wall-clock runs (cockL / vtestL):
   and +0.19 (long2) for -4.4 / -4.8 % CPU, which fails the 0.1 % gate.
   Preset 4 keeps the full walk.
 
-Nothing is switched on by default yet.
+**Adopted as an option:** PS + MAX 1 is now `--qp-rd 2`
+(`params.qp_rd = 2`).  `--qp-rd 1` keeps its meaning (the full walk, still
+the preset-4 default), and no preset turns 2 on.  The KM and NT switches
+were removed.  Checks:
+- `--qp-rd 1`, preset 4 (CRF, constant QP, 3 frame threads, 10-bit) and the
+  preset-3 default are byte-identical to the previous build.
+- `--qp-rd 2` is byte-identical to the measured PS + MAX 1 runs (four
+  encodes, presets 2-3, CRF and constant QP).
+- `--qp-rd 2` decodes in FFmpeg with B pictures off, 3 slices, MBAFF, PAFF,
+  `--paff-mbaff` and 10-bit.  Frame threads 1/2/3 are identical.
+- `make test` gains `qprd2_crf` and `qprd2_sl2` (decoder output equal to
+  the reconstruction).

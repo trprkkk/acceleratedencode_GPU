@@ -158,7 +158,6 @@ struct aeg_encoder {
     /* use_t8()'s answer while code_mb() tries the other transform size of
      * the winner: 0 = decide, 1 = 4x4, 2 = 8x8 (see t8_rd_on()) */
     int t8_force;
-    const uint8_t *qprd_modes;  /* QP-RD trials: Intra NxN modes to keep */
     /* The SATD me_partition_ref() measured for the vector it returned, when it
      * measured one (the fractional-offset test), else -1. */
     int me_last_satd;
@@ -7241,10 +7240,6 @@ static void code_luma_i4x4(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
         aeg_intra4x4_edge(&ied, top, left, tl, top_avail, left_avail);
         pmode = intra4_pred_mode(e, mbx, mby, t->intra4, rx, ry);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
-        if (e->qprd_modes) {
-            modes[0] = e->qprd_modes[blk];
-            nmodes = 1;
-        }
         if (intra_rd_on(e)) {
             best = intra_rd_modes(e, mbx, mby, t, 4, rb, sb, s, top, left, tl,
                                   top_avail, left_avail, modes, nmodes, pmode,
@@ -7482,10 +7477,6 @@ static void code_luma_i8x8(struct aeg_encoder *e, int mbx, int mby, mbenc *t,
                           top_avail && left_avail);
         pmode = intra8_pred_mode(e, mbx, mby, t->intra8, gx, gy);
         nmodes = intra4_mode_list(top_avail, left_avail, modes);
-        if (e->qprd_modes) {
-            modes[0] = e->qprd_modes[g];
-            nmodes = 1;
-        }
         if (intra_rd_on(e)) {
             best = intra_rd_modes(e, mbx, mby, t, 8, 0, src + by * s + bx, s,
                                   top, left, tl, top_avail, left_avail, modes,
@@ -8329,16 +8320,19 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
                  double lambda)
 {
     const int orig = best->qp, last = e->rd_last_qp;
+    /* --qp-rd 2: try the QP the weighted lambda points at (below) and walk at
+     * most one step either way from the better of the two.  On the long
+     * clips at preset 3 (CRF, against x264 veryslow) that keeps -2.25 of the
+     * full walk's -2.36 points for 60 % of its time (+9 % of the encode
+     * against +15 %); a one-step walk from the decided QP alone gives -1.62
+     * (vtestL wants the long moves the weighting asks for, see
+     * docs/STATUS.md). */
+    const int fast = e->p.qp_rd >= 2;
     pixel sl[16 * 16], sc[2 * 8 * 8];
     mbenc t, bt;
-    int64_t bcost, ocost, oexact, ocost0;
-    int dir, last_tried = 0;
-    /* AEG_QPRDNT: the walk prices the QPs without the trellis, and only the
-     * QP it settles on is coded again with it against the decided one */
-    const int nt = ENV_INT("AEG_QPRDNT", 0) && e->p.trellis > 0 && e->p.cabac;
-    const int trel = e->p.trellis;
-    int ctr = orig;             /* where the walk starts */
-    double pshift = 0.0;        /* the QP the weighted lambda points at */
+    int64_t bcost, ocost, cctr, cost;   /* best, decided QP, walk start */
+    int dir, last_tried = 0, ctr = orig;
+    double pshift = 0.0;
 
     /* What the macroblock tree wants: its offset o = -s*log2(w) for a
      * macroblock whose error is inherited w times over lowers the QP and,
@@ -8356,45 +8350,29 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
     if (e->mbt_on) {
         const double s = mbt_strength();
         const double o = mbt_off(e, mbx, mby) - 0.7 * e->mbt_avg;
-        lambda *= pow(2.0, o * (3.0 - s) / (3.0 * s));
-        /* (the QP that lambda * 2^(x/3) is the decision lambda of is x
-         * away: x = o (3 - s) / s) */
+        /* lambda * 2^(x/3) is the decision lambda of the QP x away, so this
+         * weighting points the walk at orig + o (3 - s) / s */
         pshift = o * (3.0 - s) / s;
+        lambda *= pow(2.0, o * (3.0 - s) / (3.0 * s));
     }
     snap_luma(e, mbx, mby, sl);
     snap_chroma(e, mbx, mby, sc);
-    oexact = ocost = bcost = rd_price(e, mbx, mby, best, 0, lambda);
+    cctr = ocost = bcost = rd_price(e, mbx, mby, best, 0, lambda);
     bt = *best;
-    if (ENV_INT("AEG_QPRDKM", 0) && (best->type == AEG_MB_I4x4 || best->type == AEG_MB_I8x8))
-        e->qprd_modes = best->type == AEG_MB_I4x4 ? best->intra4 : best->intra8;
-    if (nt) {
-        e->p.trellis = 0;
-        e->cmemo_gen++;
-        ocost = bcost = qprd_try(e, mbx, mby, best, orig, lambda, &t);
-        bt = t;
-    }
-    ocost0 = ocost;
-    /* AEG_QPRDPS: try the QP the weighted lambda points at first and walk
-     * from the better of the two */
-    if (ENV_INT("AEG_QPRDPS", 0)) {
+    if (fast) {
         int c = orig + (int)lrint(pshift);
-        if (c < e->p.qp_min)
-            c = e->p.qp_min;
-        if (c > e->p.qp_max)
-            c = e->p.qp_max;
+        c = c < e->p.qp_min ? e->p.qp_min : c > e->p.qp_max ? e->p.qp_max : c;
         if (c != orig) {
-            int64_t cost = qprd_try(e, mbx, mby, best, c, lambda, &t);
             if (c == last)
                 last_tried = 1;
+            cost = qprd_try(e, mbx, mby, best, c, lambda, &t);
             if (cost < bcost) {
                 bcost = cost;
                 bt = t;
                 ctr = c;
-                ocost = cost;
-                if (!nt) {
-                    snap_luma(e, mbx, mby, sl);
-                    snap_chroma(e, mbx, mby, sc);
-                }
+                cctr = cost;
+                snap_luma(e, mbx, mby, sl);
+                snap_chroma(e, mbx, mby, sc);
             }
         }
     }
@@ -8402,18 +8380,16 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
         /* monotone moving away from the previous macroblock's QP, one
          * failure allowed moving towards it (x264 without psy-RD) */
         const int thr = (last < ctr && dir < 0) || (last > ctr && dir > 0);
-        int64_t prev = ocost;
+        int64_t prev = cctr;
         int q, fail = 0;
         for (q = ctr + dir; q >= e->p.qp_min && q <= e->p.qp_max; q += dir) {
-            int64_t cost;
             if (q == last)
                 last_tried = 1;
             if (q == orig) {
-                /* (walking back over the decided QP from a predicted start:
-                 * its price is known, and it is not the best) */
-                cost = ocost0;
-                fail = cost < prev ? 0 : fail + 1;
-                prev = cost;
+                /* (back over the decided QP from a predicted start: its
+                 * price is known, it lost, and it is not a step) */
+                fail = ocost < prev ? 0 : fail + 1;
+                prev = ocost;
                 if (fail > thr)
                     break;
                 continue;
@@ -8422,62 +8398,26 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
             if (cost < bcost) {
                 bcost = cost;
                 bt = t;
-                if (!nt) {
-                    snap_luma(e, mbx, mby, sl);
-                    snap_chroma(e, mbx, mby, sc);
-                }
+                snap_luma(e, mbx, mby, sl);
+                snap_chroma(e, mbx, mby, sc);
             }
             fail = cost < prev ? 0 : fail + 1;
             prev = cost;
-            if (fail > thr)
-                break;
-            /* AEG_QPRDMAX: at most that many steps each way */
-            if (ENV_INT("AEG_QPRDMAX", 0) > 0 && (q - ctr) * dir >= ENV_INT("AEG_QPRDMAX", 0))
+            if (fail > thr || fast)
                 break;
             /* (coarser and nothing left to code: coarser still is the same) */
             if (dir > 0 && t.cbp == 0 && t.type != AEG_MB_I16x16)
                 break;
         }
     }
-    if (!last_tried && last != orig && last != ctr && last >= e->p.qp_min && last <= e->p.qp_max) {
-        int64_t cost = qprd_try(e, mbx, mby, best, last, lambda, &t);
+    if (!last_tried && last != orig && last != ctr && last >= e->p.qp_min &&
+        last <= e->p.qp_max) {
+        cost = qprd_try(e, mbx, mby, best, last, lambda, &t);
         if (cost < bcost) {
             bcost = cost;
             bt = t;
-            if (!nt) {
-                snap_luma(e, mbx, mby, sl);
-                snap_chroma(e, mbx, mby, sc);
-            }
-        }
-    }
-    if (nt) {
-        const int bq = bt.qp;
-        e->qprd_modes = NULL;
-        e->p.trellis = trel;
-        e->cmemo_gen++;
-        bt = *best;
-        bcost = oexact;
-        if (bq != orig) {
-            int64_t cost = qprd_try(e, mbx, mby, best, bq, lambda, &t);
-            if (cost < bcost) {
-                bcost = cost;
-                bt = t;
-                snap_luma(e, mbx, mby, sl);
-                snap_chroma(e, mbx, mby, sc);
-            }
-        }
-    } else if (e->qprd_modes) {
-        /* the walk kept the winner's modes; decide them again at the QP it
-         * chose */
-        e->qprd_modes = NULL;
-        if (bt.qp != orig) {
-            int64_t cost = qprd_try(e, mbx, mby, best, bt.qp, lambda, &t);
-            if (cost < bcost) {
-                bcost = cost;
-                bt = t;
-                snap_luma(e, mbx, mby, sl);
-                snap_chroma(e, mbx, mby, sc);
-            }
+            snap_luma(e, mbx, mby, sl);
+            snap_chroma(e, mbx, mby, sc);
         }
     }
     *best = bt;

@@ -108,8 +108,11 @@ static void usage(void)
 "                   winner's: 0 = off (default), 1 = on (costs about a third of\n"
 "                   the encode time at preset 4 for 0.3-0.6 points of BD-rate)\n"
 "  --qp-rd <n>      choose each macroblock's QP by rate-distortion (x264's\n"
-"                   subme 10): 0 = off, 1 = on (default at preset 4; needs\n"
-"                   CABAC; preset 3: -2.2 points of BD-rate for ~20%% time)\n"
+"                   subme 10; needs CABAC): 0 = off, 1 = the full walk over\n"
+"                   neighbouring QPs (default at preset 4), 2 = fast: the QP\n"
+"                   the macroblock tree points at and one step either way\n"
+"                   (preset 3: about +9%% time against +15%% for 1, keeping\n"
+"                   most of its gain)\n"
 "  --b-pyramid <n>  1 = the middle B picture of a group is a reference for\n"
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
@@ -973,7 +976,7 @@ int main(int argc, char **argv)
         if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
         if (refine_mv >= 0) bad |= range_bad("--refine-mv", refine_mv, 0, 3);
         if (refine_cand >= 0) bad |= range_bad("--refine-cand", refine_cand, 0, 1);
-        if (qp_rd >= 0) bad |= range_bad("--qp-rd", qp_rd, 0, 1);
+        if (qp_rd >= 0) bad |= range_bad("--qp-rd", qp_rd, 0, 2);
         if (refs >= 0) bad |= range_bad("--ref", refs, 1, 8);
         if (weightp >= 0) bad |= range_bad("--weightp", weightp, 0, 1);
         if (bpyramid >= 0) bad |= range_bad("--b-pyramid", bpyramid, 0, 1);

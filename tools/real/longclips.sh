@@ -23,3 +23,6 @@ cv vtest.avi    vtestL2 "select=gte(n\\,400),setpts=N/TB,crop=384:288:300:200" 3
 cv Megamind.avi megaL2  "crop=352:256:200:150" 240
 cv tree.avi     treeL   "format=yuv420p" 240
 ls -l "$REAL"/*L.yuv
+# a fixed mtime (part of the tools/x264cmp.py cache key): the clips are
+# deterministic, so a cache survives their re-creation
+touch -d @1700000000 "$REAL"/*.yuv ${REAL2:-/tmp/real2}/*.yuv 2>/dev/null || true
