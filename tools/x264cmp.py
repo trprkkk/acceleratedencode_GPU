@@ -84,7 +84,20 @@ def configs():
     # (medium, psy=0) is this same encoder there -- measured identical
     for p in X265_PRESETS:
         c['x265-' + p] = ('x265', p, ['-tune', 'psnr'])
+    # extra aegenc configurations: X264CMP_CFGS="name:preset:args;..." where
+    # args are aegenc options, and NAME=VALUE tokens go into the environment
+    # (AEG_* tuning switches), e.g. "p3qprd:3:--qp-rd 1;p3et:3:AEG_UMHET=500"
+    for spec in filter(None, os.environ.get('X264CMP_CFGS', '').split(';')):
+        name, preset, args = spec.split(':', 2)
+        c['aeg-' + name] = ('aeg', int(preset), args.split())
     return c
+
+
+def split_env(extra):
+    """aegenc options and NAME=VALUE environment tokens, apart."""
+    env = {t.split('=', 1)[0]: t.split('=', 1)[1] for t in extra
+           if '=' in t and not t.startswith('-')}
+    return [t for t in extra if not ('=' in t and not t.startswith('-'))], env
 
 
 def sha(path):
@@ -120,10 +133,11 @@ def src10(path, w, h):
     return out
 
 
-def timed(cmd):
+def timed(cmd, env=None):
     r0 = os.times()
     t0 = time.perf_counter()
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                   env=dict(os.environ, **env) if env else None)
     t1 = time.perf_counter()
     r1 = os.times()
     return (r1.children_user - r0.children_user) + (r1.children_system - r0.children_system), t1 - t0
@@ -141,7 +155,7 @@ def encode_cmd(cfg, clip, w, h, n, mode, v, dst, threads=1):
             cmd += ['--crf', str(v), '--aq', '0']
         else:
             cmd += ['-q', str(v)]
-        return cmd + extra
+        return cmd + split_env(extra)[0]
     lib = 'libx264' if enc == 'x264' else 'libx265'
     pf = 'yuv420p10le' if ten else 'yuv420p'
     cmd = [FF, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', pf,
@@ -170,24 +184,32 @@ def measure(cfg, clip, w, h, n, mode, v):
     dst = os.path.join(TMP, 'o.' + ('265' if enc == 'x265' else '264'))
     if os.path.exists(dst):
         os.remove(dst)
-    cpu, wall = timed(encode_cmd(cfg, clip, w, h, n, mode, v, dst))
+    cpu, wall = timed(encode_cmd(cfg, clip, w, h, n, mode, v, dst),
+                      split_env(cfg[2])[1] if enc == 'aeg' else None)
     bits = os.path.getsize(dst) * 8
     pf = 'yuv420p10le' if ten else 'yuv420p'
     dec = os.path.join(TMP, 'd.yuv')
     subprocess.run([FF, '-v', 'error', '-y', '-i', dst, '-f', 'rawvideo', '-pix_fmt', pf, dec],
                    check=True)
     dt = '<u2' if ten else np.uint8
-    a = np.fromfile(clip, dt).astype(np.int64)
-    b = np.fromfile(dec, dt).astype(np.int64)
+    # frame by frame through memory maps: whole-clip int64 copies of the long
+    # clips took 2.5 GB, and two runs side by side ran out of memory
+    a = np.memmap(clip, dt, 'r')
+    b = np.memmap(dec, dt, 'r')
     fs = w * h * 3 // 2
     m = min(len(a), len(b)) // fs
     if m != n:
         raise RuntimeError('%s: decoded %d of %d frames' % (clip, m, n))
-    a, b = a[:m * fs], b[:m * fs]
     peak = 1023 if ten else 255
-    d = (a - b).reshape(m, fs)
-    mse = float((d * d).mean())
-    mse_y = float((d[:, :w * h] ** 2).mean())
+    sse = sse_y = 0
+    for f in range(m):
+        d = a[f * fs:(f + 1) * fs].astype(np.int64) - b[f * fs:(f + 1) * fs]
+        d *= d
+        sse_y += int(d[:w * h].sum())
+        sse += int(d.sum())
+    del a, b
+    mse = sse / (m * fs)
+    mse_y = sse_y / (m * w * h)
     psnr = 10 * math.log10(peak * peak / max(mse, 1e-12))
     psnr_y = 10 * math.log10(peak * peak / max(mse_y, 1e-12))
     s = subprocess.run([FF, '-hide_banner', '-f', 'rawvideo', '-pix_fmt', pf, '-s', '%dx%d' % (w, h),
@@ -211,6 +233,8 @@ def key(name, cfg, clip, mode, v):
     k = '%s|%s|%d|%d|%s|%s' % (name, os.path.abspath(clip), st.st_size, int(st.st_mtime), mode, v)
     if cfg[0] == 'aeg':
         k += '|' + AEG_ID
+        if cfg[2]:
+            k += '|' + ' '.join(cfg[2])
     return k
 
 
@@ -355,7 +379,8 @@ def cmd_speed(a):
             for _ in range(a.runs):
                 dst = os.path.join(TMP, 's.out')
                 ts.append(timed(encode_cmd(cf[name], clip, w, h, n, 'qp', a.qp, dst,
-                                           threads=a.threads))[1])
+                                           threads=a.threads),
+                                split_env(cf[name][2])[1] if cf[name][0] == 'aeg' else None)[1])
             t = statistics.median(ts) - (base[tag] if cf[name][0] != 'aeg' else 0)
             cells.append('%.1f' % (n / t))
         print('| %s | %s |' % (name, ' | '.join(cells)), flush=True)
