@@ -13812,6 +13812,7 @@ static void picture_distortion(struct aeg_encoder *e)
 }
 
 static void rec_dev_store(struct aeg_encoder *e);
+static void deblock_frame_dispatch(struct aeg_encoder *e, int idc);
 
 static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                             int poc, int64_t pts, aeg_packet *pkt,
@@ -14054,14 +14055,7 @@ frecode:
                     for (y = e->rp_dbk; y < e->mb_h; y++)
                         rowpost_deblock_row(e, e->rp_mbs, y);
             } else if (e->p.deblock) {
-                const char *dq = getenv("AEG_DEBLOCK_DIAG");
-                if (dq && atoi(dq))
-                    aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
-                                           e->p.deblock_alpha,
-                                           e->p.deblock_beta, 1);
-                else
-                    aeg_deblock_frame(&e->pic, e->mbs, e->mb_w,
-                                      e->p.deblock_alpha, e->p.deblock_beta, 1);
+                deblock_frame_dispatch(e, 1);
             }
             if (is_ref) {
                 if (!e->rp_on)
@@ -14229,6 +14223,27 @@ static void rec_dev_store(struct aeg_encoder *e)
             e->rec_dev_uploads++;
             e->rec_dev_bytes += (int64_t)e->stride[0] * yrows;
         }
+    }
+}
+
+/* M-4a1 deblock dispatch.  All alternatives are diagnostic/opt-in; the
+ * default path is the normative raster walk. */
+static void deblock_frame_dispatch(struct aeg_encoder *e, int idc)
+{
+    const char *d = getenv("AEG_DEBLOCK_DIAG");
+    const char *s = getenv("AEG_DEBLOCK_SPLIT");
+    if (d && atoi(d)) {
+        aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
+                               e->p.deblock_alpha, e->p.deblock_beta, idc);
+    } else if (s && atoi(s) == 2) {
+        aeg_deblock_frame_batch(&e->pic, e->mbs, e->mb_w,
+                                e->p.deblock_alpha, e->p.deblock_beta, idc);
+    } else if (s && atoi(s) == 1) {
+        aeg_deblock_frame_split(&e->pic, e->mbs, e->mb_w,
+                                e->p.deblock_alpha, e->p.deblock_beta, idc);
+    } else {
+        aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
+                          e->p.deblock_beta, idc);
     }
 }
 
@@ -14538,13 +14553,7 @@ recode:
                 for (y = e->rp_dbk; y < e->mb_h; y++)
                     rowpost_deblock_row(e, e->rp_mbs, y);
         } else if (e->p.deblock) {
-            const char *dq = getenv("AEG_DEBLOCK_DIAG");
-            if (dq && atoi(dq))
-                aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
-                                       e->p.deblock_alpha, e->p.deblock_beta, 1);
-            else
-                aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
-                                  e->p.deblock_beta, 1);
+            deblock_frame_dispatch(e, 1);
         }
         if (e->cur_is_ref) {
             if (!e->rp_on)

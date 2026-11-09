@@ -285,13 +285,13 @@ static void chroma_edge_filter(pixel *pix, int xs, int step, int alpha,
  * filtered (picture or pair edge without a neighbour, or one filtered
  * separately).  `ki` is the first edge to filter (1: the macroblock edge is
  * done elsewhere). */
-static void dbk_dir(const aeg_picture *pic, pixel *Y, pixel *C[2], int ys,
-                    int cs, const aeg_mb *q, const aeg_mb *p_mb, int salpha,
-                    int sbeta, int vertical)
+static void dbk_dir_range(const aeg_picture *pic, pixel *Y, pixel *C[2], int ys,
+                          int cs, const aeg_mb *q, const aeg_mb *p_mb,
+                          int salpha, int sbeta, int vertical, int k0, int k1)
 {
     int k;
 
-    for (k = 0; k < 4; k++) {
+    for (k = k0; k <= k1; k++) {
         int pos = k * 4;              /* edge coordinate inside the MB       */
         int mb_edge = (k == 0);
         int bs[4], alpha, beta;
@@ -352,9 +352,16 @@ static void dbk_dir(const aeg_picture *pic, pixel *Y, pixel *C[2], int ys,
     }
 }
 
-/* Applies the four vertical (or horizontal) edges of one macroblock. */
-void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
-                        int mb_x, int mb_y, int salpha, int sbeta, int vertical)
+static void dbk_dir(const aeg_picture *pic, pixel *Y, pixel *C[2], int ys,
+                    int cs, const aeg_mb *q, const aeg_mb *p_mb, int salpha,
+                    int sbeta, int vertical)
+{
+    dbk_dir_range(pic, Y, C, ys, cs, q, p_mb, salpha, sbeta, vertical, 0, 3);
+}
+
+static void mb_dir_range(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                         int mb_x, int mb_y, int salpha, int sbeta,
+                         int vertical, int k0, int k1)
 {
     const aeg_mb *q = &mbs[mb_y * mb_stride + mb_x];
     const aeg_mb *p_mb = vertical ? (mb_x > 0 ? q - 1 : NULL)
@@ -363,8 +370,17 @@ void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
 
     C[0] = pic->plane[1] + mb_y * 8 * pic->stride[1] + mb_x * 8;
     C[1] = pic->plane[2] + mb_y * 8 * pic->stride[2] + mb_x * 8;
-    dbk_dir(pic, pic->plane[0] + mb_y * 16 * pic->stride[0] + mb_x * 16, C,
-            pic->stride[0], pic->stride[1], q, p_mb, salpha, sbeta, vertical);
+    dbk_dir_range(pic, pic->plane[0] + mb_y * 16 * pic->stride[0] + mb_x * 16,
+                  C, pic->stride[0], pic->stride[1], q, p_mb, salpha, sbeta,
+                  vertical, k0, k1);
+}
+
+/* Applies the four vertical (or horizontal) edges of one macroblock. */
+void aeg_deblock_mb_dir(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                        int mb_x, int mb_y, int salpha, int sbeta, int vertical)
+{
+    mb_dir_range(pic, mbs, mb_stride, mb_x, mb_y, salpha, sbeta, vertical,
+                 0, 3);
 }
 
 /* non-zero coefficients in luma 4x4 block `blk` of m, as the filter sees them
@@ -584,6 +600,92 @@ void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         aeg_deblock_mb_mbaff(pic, mbs, mb_stride, x, 2 * pair_y + 1,
                              slice_alpha, slice_beta);
     }
+}
+
+/* M-4a1: the normative per-macroblock walk split into four edge groups.
+ *
+ * Device plan for M-4a2 (one picture, one launch, one sync):
+ *  - Internal edges k=1..3 never read or write outside the macroblock, and
+ *    their bS uses only q's own nz/t8/mv/qp (edge_bs(q, q, ..., mb_edge=0)).
+ *    Chroma's only internal edge is luma k=2 and also uses q->qp.
+ *  - Edges inside one macroblock must stay ordered k=1,2,3 (vertical) and
+ *    then k=1,2,3 (horizontal): the 3-sample neighbourhoods of adjacent
+ *    edges overlap, so they cannot be filtered concurrently.  One work item
+ *    per macroblock loops them in this order.
+ *  - Internal edges of different macroblocks are independent, so a grid of
+ *    one work item per macroblock can process all of them in one kernel with
+ *    a single host sync after it.
+ *  - They are NOT independent of the MB-boundary edges: a boundary edge of
+ *    (x+1,y) reads samples that (x,y)'s internal edge changed, and an
+ *    internal edge of (x,y) reads (x,y)'s left/top boundary edge.  The
+ *    normative raster interleaving therefore has to be preserved.  A
+ *    picture-wide internal batch after a boundary pass is measured as
+ *    non-bit-exact by AEG_DEBLOCK_SPLIT=2; M-4a2 must either fuse both kinds
+ *    in one raster-ordered persistent kernel or accept one work item per MB
+ *    in raster order (M-4a-R). */
+ * Executed in the same order as aeg_deblock_mb():
+ *   vertical MB edge (k=0), vertical internal (k=1..3),
+ *   horizontal MB edge (k=0), horizontal internal (k=1..3).
+ * This is the CPU reference for the internal-edge kernel: the internal
+ * groups are exactly the edges that never write outside the macroblock. */
+static void deblock_mb_split(aeg_picture *pic, const aeg_mb *mbs,
+                             int mb_stride, int mb_x, int mb_y,
+                             int salpha, int sbeta)
+{
+    mb_dir_range(pic, mbs, mb_stride, mb_x, mb_y, salpha, sbeta, 1, 0, 0);
+    mb_dir_range(pic, mbs, mb_stride, mb_x, mb_y, salpha, sbeta, 1, 1, 3);
+    mb_dir_range(pic, mbs, mb_stride, mb_x, mb_y, salpha, sbeta, 0, 0, 0);
+    mb_dir_range(pic, mbs, mb_stride, mb_x, mb_y, salpha, sbeta, 0, 1, 3);
+}
+
+/* Bit-exact split reference: same raster walk, but every macroblock is
+ * expressed as MB-boundary and MB-internal edge groups.  Used by
+ * AEG_DEBLOCK_SPLIT=1.  MBAFF keeps the existing pair-row order because the
+ * mixed frame/field edge needs both macroblocks at once. */
+void aeg_deblock_frame_split(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                             int slice_alpha, int slice_beta, int deblock_idc)
+{
+    int x, y;
+    if (!deblock_idc)
+        return;
+    if (pic->mbaff) {
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+        return;
+    }
+    for (y = 0; y < pic->mb_h; y++)
+        for (x = 0; x < pic->mb_w; x++)
+            deblock_mb_split(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta);
+}
+
+/* M-4a1 negative control: try to batch all MB-boundary edges first and all
+ * MB-internal edges afterwards.  This is the obvious "one picture, one
+ * internal-edge batch" schedule, and it is NOT bit-exact: a boundary edge of
+ * MB (x+1,y) reads samples that the internal vertical edge of (x,y) would
+ * already have changed in the normative raster walk, and an internal edge of
+ * (x,y) reads the boundary edge of (x,y).  Kept as AEG_DEBLOCK_SPLIT=2 so the
+ * difference can be measured; never used by default. */
+void aeg_deblock_frame_batch(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                             int slice_alpha, int slice_beta, int deblock_idc)
+{
+    int x, y;
+    if (!deblock_idc)
+        return;
+    if (pic->mbaff) {
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+        return;
+    }
+    for (y = 0; y < pic->mb_h; y++)
+        for (x = 0; x < pic->mb_w; x++) {
+            mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 1, 0, 0);
+            mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 0, 0, 0);
+        }
+    for (y = 0; y < pic->mb_h; y++)
+        for (x = 0; x < pic->mb_w; x++) {
+            mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 1, 1, 3);
+            mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 0, 1, 3);
+        }
 }
 
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,

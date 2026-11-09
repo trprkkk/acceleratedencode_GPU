@@ -678,6 +678,12 @@ typedef struct aeg_deblock_info {
 void aeg_deblock_frame_diag(aeg_picture *pic, const aeg_mb *mbs,
                             int mb_stride, int slice_alpha, int slice_beta,
                             int deblock_idc);
+void aeg_deblock_frame_split(aeg_picture *pic, const aeg_mb *mbs,
+                             int mb_stride, int slice_alpha, int slice_beta,
+                             int deblock_idc);
+void aeg_deblock_frame_batch(aeg_picture *pic, const aeg_mb *mbs,
+                             int mb_stride, int slice_alpha, int slice_beta,
+                             int deblock_idc);
 
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc);
