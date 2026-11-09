@@ -512,7 +512,7 @@ static void check_params(void)
         CHECK(q.level_idc >= 10 && q.level_idc <= 62, "level %d", q.level_idc);
         CHECK(q.timebase_num == q.fps_den && q.timebase_den == q.fps_num,
               "timebase %d/%d", q.timebase_num, q.timebase_den);
-        CHECK(q.slices >= 1 && (q.frame_threads == 1 || q.frame_threads == 2),
+        CHECK(q.slices >= 1 && q.frame_threads >= 1 && q.frame_threads <= 8,
               "slices %d frame threads %d", q.slices, q.frame_threads);
         aeg_encoder_close(e);
     }

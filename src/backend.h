@@ -15,6 +15,7 @@
 typedef struct aeg_be_ops {
     void *priv;
     int   backend;          /* AEG_BACKEND_* actually in use             */
+    int   is_gpu;           /* the device is a real GPU (not a CPU one)   */
     char  desc[192];
 
     /* SAD of `count` block pairs.
@@ -153,6 +154,12 @@ static inline void aeg_sad_span_rebase(const int16_t *mv, int count, int bw,
 /* CPU implementations of every operation (always available). */
 void aeg_be_cpu_ops(aeg_be_ops *ops);
 
+/* Where the last batch operation of this thread ran: 1 = on the device, 0 =
+ * on the CPU (the CPU backend, or the guard's fallback after a device
+ * failure).  The statistics use it instead of the backend's identity, so a
+ * picture that fell back to the CPU is not reported as device work. */
+int  aeg_be_last_on_device(void);
+
 /* Create a backend.  `which` may be AEG_BACKEND_CPU/OPENCL/CUDA or AUTO.
  * Returns 0 on success and fills ops; on failure returns AEG_EBACKEND and
  * fills ops with the CPU implementation. */
@@ -161,7 +168,8 @@ int aeg_be_create(int which, aeg_be_ops *ops);
 /* Per-stage dispatch ------------------------------------------------- */
 typedef struct aeg_dispatcher {
     aeg_be_ops ops;                  /* accelerator (or CPU)            */
-    int        have_gpu;
+    int        have_gpu;             /* a device backend is available   */
+    int        have_real_gpu;        /* ... and it is a real GPU        */
     int        use_gpu[AEG_STAGE_COUNT];   /* current decision           */
     int        forced[AEG_STAGE_COUNT];    /* -1 auto, else forced       */
     int64_t    cpu_ns[AEG_STAGE_COUNT][2]; /* [stage][last/ema]          */
@@ -170,6 +178,18 @@ typedef struct aeg_dispatcher {
     int64_t    launch_ns;                  /* measured kernel launch cost */
     int64_t    min_items_for_gpu;
     int        frames_measured;
+    /* The placement trial of the stages that can run on a device in two
+     * interchangeable ways (the half-pel interpolation planes, for now): the
+     * first pictures alternate so that both sides are measured, then the
+     * faster side is kept and the other one is re-tried now and then. */
+    int        stage_probe_dev[AEG_STAGE_COUNT];  /* pictures on the device */
+    int        stage_probe_cpu[AEG_STAGE_COUNT];  /* pictures on the CPU    */
+    int        stage_decided[AEG_STAGE_COUNT];    /* the decision is made   */
+    int        stage_dev[AEG_STAGE_COUNT];        /* the decided placement  */
+    int        stage_retrial[AEG_STAGE_COUNT];    /* a re-trial is pending  */
+    int        stage_since[AEG_STAGE_COUNT];      /* pictures since it      */
+    int64_t    stage_dev_ns[AEG_STAGE_COUNT];     /* the measured times     */
+    int64_t    stage_cpu_ns[AEG_STAGE_COUNT];
     /* The coefficient stages (transform + inverse) are placed by trial, per
      * picture kind (aeg_dispatch_coef_pick / _done): [kind][0 cpu, 1 device]
      * picture time per macroblock (moving average), pictures measured,
@@ -201,6 +221,17 @@ void aeg_dispatch_destroy(aeg_dispatcher *d);
 void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns);
 /* Recompute the per-stage decisions from the measurements of the frame. */
 void aeg_dispatch_update(aeg_dispatcher *d);
+/* The placement of a stage for the picture that is about to be coded: 1 = the
+ * device, 0 = the CPU.  The stage has to be one whose device form produces
+ * the same bytes as its CPU form.  The first pictures of an undecided stage
+ * alternate (the device first), so that both sides are measured; after that
+ * the faster one is kept and the other one is re-tried every AEG_STAGE_RETRY
+ * pictures. */
+int  aeg_dispatch_stage_pick(aeg_dispatcher *d, int stage);
+/* The time a stage took and where it ran: the measurement the placement of
+ * the next pictures is made from. */
+void aeg_dispatch_stage_done(aeg_dispatcher *d, int stage, int on_gpu,
+                             int64_t ns);
 /* The coefficient stages of one picture of `kind` (0 I, 1 P, 2 B): 1 = run
  * them on the device.  While a kind is being measured this alternates, later it
  * returns the faster placement and re-tries the other one now and then. */

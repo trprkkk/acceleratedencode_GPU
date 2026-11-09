@@ -166,11 +166,22 @@ run_bcase() {
         fi
         prev=$a
     done
-    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt $pix \
+    # -vsync 0: the frame count comes from the stream, not from ffmpeg's own
+    # frame-rate model.  A stream whose r_frame_rate and avg_frame_rate differ
+    # (the encoder's timing is derived from the ones the user asked for) is
+    # otherwise duplicated or dropped to match, and the comparison would
+    # measure the muxer instead of the bitstream.
+    # The muxer then complains about the timestamps of a reordered (B) stream:
+    # that is a property of the output container, not of the decoded stream,
+    # and every such case still compares bit-exact below -- so it is filtered
+    # out and only the decoder's own messages count.
+    "$FF" -v error -y -vsync 0 -i "$TMP/$name.264" -f rawvideo -pix_fmt $pix \
         "$TMP/$name.dec" 2>"$TMP/$name.decerr"
-    if [ -s "$TMP/$name.decerr" ]; then
+    grep -v 'non monotonically increasing dts to muxer' \
+        < "$TMP/$name.decerr" > "$TMP/$name.decprob" || true
+    if [ -s "$TMP/$name.decprob" ]; then
         echo "   $name: decoder reported problems:"
-        sed 's/^/     /' "$TMP/$name.decerr" | head -3
+        sed 's/^/     /' "$TMP/$name.decprob" | head -3
         FAIL=1
     fi
     CMP_BPS=$bps python3 "$TMP/cmp_b.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" \
@@ -193,11 +204,13 @@ run_case() {
         echo "   $name: skipped (no ffmpeg; set FFMPEG=...)"
         return
     fi
-    "$FF" -v error -y -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
+    "$FF" -v error -y -vsync 0 -i "$TMP/$name.264" -f rawvideo -pix_fmt yuv420p \
         "$TMP/$name.dec" 2>"$TMP/$name.decerr"
-    if [ -s "$TMP/$name.decerr" ]; then
+    grep -v 'non monotonically increasing dts to muxer' \
+        < "$TMP/$name.decerr" > "$TMP/$name.decprob" || true
+    if [ -s "$TMP/$name.decprob" ]; then
         echo "   $name: decoder reported problems:"
-        sed 's/^/     /' "$TMP/$name.decerr" | head -3
+        sed 's/^/     /' "$TMP/$name.decprob" | head -3
         FAIL=1
     fi
     python3 "$TMP/cmp.py" "$TMP/$name.recon" "$TMP/$name.dec" "$w" "$h" "$n" "$name" || FAIL=1
@@ -551,11 +564,13 @@ $BUILD/aegenc -w 320 -h 192 -n 120 -q 26 -i "$TMP/seed_search.yuv" \
 if ! command -v "$FF" >/dev/null 2>&1; then
     echo "   scenecut: skipped (no ffmpeg)"
 else
-    "$FF" -v error -y -i "$TMP/cut.264" -f rawvideo -pix_fmt yuv420p \
+    "$FF" -v error -y -vsync 0 -i "$TMP/cut.264" -f rawvideo -pix_fmt yuv420p \
         "$TMP/cut.dec" 2>"$TMP/cut.decerr"
-    if [ -s "$TMP/cut.decerr" ]; then
+    grep -v 'non monotonically increasing dts to muxer' \
+        < "$TMP/cut.decerr" > "$TMP/cut.decprob" || true
+    if [ -s "$TMP/cut.decprob" ]; then
         echo "   cut clip: decoder reported problems:"
-        sed 's/^/     /' "$TMP/cut.decerr" | head -3
+        sed 's/^/     /' "$TMP/cut.decprob" | head -3
         FAIL=1
     fi
     python3 "$TMP/cmp.py" "$TMP/cut.recon" "$TMP/cut.dec" 320 192 60 cut || FAIL=1

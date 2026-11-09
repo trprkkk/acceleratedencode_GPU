@@ -306,6 +306,16 @@ static __thread struct {
     int             stride, w, h;
 } g_tls_ref[BE_LANES];
 
+/* Where the last batch operation of this thread ran.  The guard knows: a
+ * device call that failed falls back to the CPU reference, and a picture that
+ * fell back must not be reported as device work. */
+static __thread int g_last_on_device;
+
+int aeg_be_last_on_device(void)
+{
+    return g_last_on_device;
+}
+
 static int guard_failed(be_guard *g)
 {
     return __atomic_load_n(&g->failed, __ATOMIC_ACQUIRE);
@@ -314,6 +324,7 @@ static int guard_failed(be_guard *g)
 /* lock, or return 0 when the device is off and the CPU op has to run */
 static int guard_enter(be_lane *l)
 {
+    g_last_on_device = 0;
     if (guard_failed(l->g))
         return 0;
     pthread_mutex_lock(&l->mu);
@@ -327,6 +338,7 @@ static int guard_enter(be_lane *l)
 /* unlock; a failure switches the device off for good */
 static int guard_leave(be_lane *l, int rc, const char *op)
 {
+    g_last_on_device = rc == AEG_OK;
     if (rc != AEG_OK && !__atomic_exchange_n(&l->g->failed, 1, __ATOMIC_ACQ_REL))
         aeg_log(AEG_LOG_WARNING, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
     pthread_mutex_unlock(&l->mu);
@@ -464,6 +476,7 @@ static int g_satd_batch(void *priv, const pixel *cur, int cstride, int bw,
 {
     be_lane *l = (be_lane *)priv;
     int t = tls_slot(l);
+    g_last_on_device = 0;
     if (g_tls_ref[t].l == l && guard_enter(l)) {
         int rc = AEG_OK;
         if (g_tls_ref[t].seq != l->dev_seq) {
@@ -680,6 +693,8 @@ static int be_create_raw(int which, aeg_be_ops *ops)
 /* ------------------------------------------------------------------ */
 /* Dispatcher                                                          */
 /* ------------------------------------------------------------------ */
+static void coef_seed(aeg_dispatcher *d);
+
 void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
 {
     int i;
@@ -687,6 +702,7 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
     aeg_be_create(backend, &d->ops);
     d->have_gpu = d->ops.backend != AEG_BACKEND_CPU &&
                   d->ops.tq_batch != NULL;
+    d->have_real_gpu = d->have_gpu && d->ops.is_gpu;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         d->forced[i] = p ? p->stage_backend[i] : -1;
         d->use_gpu[i] = 0;
@@ -700,6 +716,9 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
         pthread_mutex_init((pthread_mutex_t *)d->mu, NULL);
     d->launch_ns = 5 * 1000;      /* refined by aeg_backend_calibrate() */
     d->min_items_for_gpu = 256;
+    /* the coefficient placement starts from a measurement (see coef_seed):
+     * it runs on the guarded ops of this dispatcher, so after the lanes exist */
+    coef_seed(d);
     aeg_log(AEG_LOG_INFO, "aeg: compute backend = %s (%s)", aeg_backend_name(d->ops.backend),
             d->ops.desc);
 }
@@ -764,16 +783,107 @@ void aeg_dispatch_record(aeg_dispatcher *d, int stage, int on_gpu, int64_t ns)
     disp_unlock(d);
 }
 
+/* ------------------------------------------------------------------ */
+/* The placement of a stage                                            */
+/* ------------------------------------------------------------------ */
+/* A stage whose device form computes the same bytes as its CPU form (the
+ * half-pel interpolation planes, the coefficient stages) can run on either.
+ * Which one is faster is not known before it has been measured on both, so
+ * the first pictures of an undecided stage alternate: the device first (its
+ * number is the missing one), then the CPU.  After AEG_STAGE_PROBE pictures
+ * on each side the faster one is kept, and the other one is re-tried every
+ * AEG_STAGE_RETRY pictures, in case the balance moved (another process on
+ * the device, a resolution change, a frame-thread worker taking over).
+ *
+ * The placement never changes the bitstream: both sides compute the same
+ * samples, so a picture coded on the device and the same picture coded on
+ * the CPU are byte-identical. */
+#define AEG_STAGE_PROBE 2      /* pictures measured per side */
+#define AEG_STAGE_RETRY 64     /* pictures between the re-trials */
+
+static int dispatch_stage_pick(aeg_dispatcher *d, int stage)
+{
+    if (stage < 0 || stage >= AEG_STAGE_COUNT)
+        return 0;
+    if (d->forced[stage] >= 0) {
+        int on = d->forced[stage] == AEG_BACKEND_OPENCL ||
+                 d->forced[stage] == AEG_BACKEND_CUDA;
+        return on && d->have_gpu;
+    }
+    if (!d->have_gpu)
+        return 0;
+    if (d->stage_decided[stage]) {
+        if (d->stage_retrial[stage]) {
+            d->stage_retrial[stage] = 0;
+            return !d->stage_dev[stage];
+        }
+        if (++d->stage_since[stage] >= AEG_STAGE_RETRY) {
+            d->stage_since[stage] = 0;
+            d->stage_retrial[stage] = 1;
+            return !d->stage_dev[stage];
+        }
+        return d->stage_dev[stage];
+    }
+    /* not decided yet: measure both sides, the device first */
+    if (d->stage_probe_dev[stage] < AEG_STAGE_PROBE)
+        return 1;
+    return 0;
+}
+
+int aeg_dispatch_stage_pick(aeg_dispatcher *d, int stage)
+{
+    aeg_dispatcher *r = disp_lock(d);
+    int dev = dispatch_stage_pick(r, stage);
+    disp_unlock(r);
+    return dev;
+}
+
+static void dispatch_stage_done(aeg_dispatcher *d, int stage, int on_gpu,
+                                int64_t ns)
+{
+    if (stage < 0 || stage >= AEG_STAGE_COUNT || ns <= 0)
+        return;
+    if (d->forced[stage] >= 0)
+        return;                 /* a forced stage is not measured */
+    if (on_gpu) {
+        d->stage_probe_dev[stage]++;
+        d->stage_dev_ns[stage] = d->stage_dev_ns[stage]
+            ? (d->stage_dev_ns[stage] * 3 + ns) / 4 : ns;
+    } else {
+        d->stage_probe_cpu[stage]++;
+        d->stage_cpu_ns[stage] = d->stage_cpu_ns[stage]
+            ? (d->stage_cpu_ns[stage] * 3 + ns) / 4 : ns;
+    }
+    if (!d->stage_decided[stage] &&
+        d->stage_probe_dev[stage] >= AEG_STAGE_PROBE &&
+        d->stage_probe_cpu[stage] >= AEG_STAGE_PROBE) {
+        int64_t c = d->stage_cpu_ns[stage], g = d->stage_dev_ns[stage];
+        d->stage_decided[stage] = 1;
+        /* the device has to be at least 10% faster to be worth its latency */
+        d->stage_dev[stage] = (g * 100 < c * 90) ? 1 : 0;
+        d->stage_since[stage] = 0;
+        aeg_log(AEG_LOG_DEBUG, "aeg: stage %d on the %s (%.3f ms on the CPU, "
+                "%.3f ms on the device)", stage,
+                d->stage_dev[stage] ? "device" : "CPU", c / 1e6, g / 1e6);
+    }
+}
+
+void aeg_dispatch_stage_done(aeg_dispatcher *d, int stage, int on_gpu,
+                             int64_t ns)
+{
+    aeg_dispatcher *r = disp_lock(d);
+    dispatch_stage_done(r, stage, on_gpu, ns);
+    disp_unlock(r);
+}
+
 static void dispatch_update(aeg_dispatcher *d)
 {
     int i;
     d->frames_measured++;
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         if (d->forced[i] >= 0) {
-            d->use_gpu[i] = d->forced[i] == AEG_BACKEND_OPENCL ||
-                            d->forced[i] == AEG_BACKEND_CUDA;
-            if (d->use_gpu[i] && !d->have_gpu)
-                d->use_gpu[i] = 0;
+            d->use_gpu[i] = (d->forced[i] == AEG_BACKEND_OPENCL ||
+                             d->forced[i] == AEG_BACKEND_CUDA) && d->have_gpu;
             continue;
         }
         if (!d->have_gpu || i == AEG_STAGE_DEBLOCK) {
@@ -784,25 +894,21 @@ static void dispatch_update(aeg_dispatcher *d)
          * whole-frame rounds), so placing it by timing would make the stream
          * depend on how fast the machine happened to be.  Only a -s override
          * (or AEG_SEED / AEG_PARFULL) puts it on a device. */
-        if (i == AEG_STAGE_MOTION_EST) {
+        if (i == AEG_STAGE_MOTION_EST || i == AEG_STAGE_SAD) {
             d->use_gpu[i] = 0;
             continue;
         }
         /* the coefficient stages are placed by aeg_dispatch_coef_pick() */
         if (i == AEG_STAGE_TRANSFORM || i == AEG_STAGE_IQUANT_IDCT)
             continue;
-        /* Only switch to the GPU when the measurement is unambiguous
-         * (>= 10% faster) and the frame had enough work to amortise a
-         * launch; this includes the launch cost in the comparison. */
-        if (d->gpu_ns[i][1] > 0 && d->cpu_ns[i][1] > 0) {
-            int64_t gpu = d->gpu_ns[i][1] + d->launch_ns;
-            if (gpu * 100 < d->cpu_ns[i][1] * 90)
-                d->use_gpu[i] = 1;
-            else if (d->cpu_ns[i][1] * 100 < gpu * 90)
-                d->use_gpu[i] = 0;
+        /* the intra prediction and the reconstruction are serial in the
+         * macroblock order: the prediction of a macroblock reads the
+         * reconstruction of its neighbours */
+        if (i == AEG_STAGE_INTRA_PRED || i == AEG_STAGE_RECON) {
+            d->use_gpu[i] = 0;
+            continue;
         }
-        d->cpu_ns[i][0] = 0;
-        d->gpu_ns[i][0] = 0;
+        d->use_gpu[i] = d->stage_decided[i] ? d->stage_dev[i] : 0;
     }
 }
 
@@ -836,23 +942,101 @@ void aeg_dispatch_update(aeg_dispatcher *d)
 #define AEG_COEF_PROBE 3        /* counted pictures per placement and kind */
 #define AEG_COEF_RETRY 64
 
+/* ------------------------------------------------------------------ */
+/* Placing the coefficient stages: the measurement that starts it off  */
+/* ------------------------------------------------------------------ */
+/* The per-picture trial needs a dozen pictures of the slower placement to
+ * learn the answer, and a device batch is a round trip: on a machine where one
+ * costs 60 us and the sixteen SSE2 transforms it replaces cost 700 ns, that is
+ * a dozen pictures at four times the encode.  So the two are measured once,
+ * here, at the encoder's open, on a batch of the shape the calls actually take
+ * (one macroblock's sixteen 4x4 blocks), and the answer seeds the trial.  The
+ * trial still runs: it re-tries the other side every AEG_COEF_RETRY pictures,
+ * so a machine where the balance moves (a warm clock, a shared GPU) is still
+ * followed. */
+static int64_t g_coef_cpu_ns, g_coef_dev_ns;
+static int g_coef_seeded;
+static int g_coef_seed_dev;
+
+/* One side's answer, in ns per MB-shaped batch: the fastest few of `reps`. */
+static int64_t coef_measure(const aeg_be_ops *ops, int intra)
+{
+    static const int reps = 12;
+    int16_t res[16 * 16], lev[16 * 16], rec[16 * 16];
+    int32_t nz[16];
+    int64_t best = 0;
+    int i, k;
+    for (k = 0; k < 16 * 16; k++)
+        res[k] = (int16_t)(k * 7 - 300);
+    for (i = 0; i < reps; i++) {
+        int64_t t0 = aeg_now_ns();
+        ops->tq_iq_batch(ops->priv, res, 16, 26, intra, lev, nz, rec);
+        {
+            int64_t dt = aeg_now_ns() - t0;
+            if (i >= 2 && (!best || dt < best))
+                best = dt;
+        }
+    }
+    return best;
+}
+
+static void coef_seed(aeg_dispatcher *d)
+{
+    aeg_be_ops cpu;
+
+    if (g_coef_seeded || !d->have_gpu || !d->ops.tq_iq_batch)
+        return;
+    aeg_be_cpu_ops(&cpu);
+    g_coef_cpu_ns = coef_measure(&cpu, 0);
+    g_coef_dev_ns = coef_measure(&d->ops, 0);
+    g_coef_seeded = 1;
+    g_coef_seed_dev = g_coef_dev_ns + g_coef_dev_ns / 4 < g_coef_cpu_ns;
+    aeg_log(AEG_LOG_DEBUG, "aeg: coefficient batch of one macroblock: %lld ns on "
+            "the CPU, %lld ns on the %s",
+            (long long)g_coef_cpu_ns, (long long)g_coef_dev_ns,
+            aeg_backend_name(d->ops.backend));
+}
+
+/* The placement an undecided kind uses: a sibling's measured verdict, or the
+ * broadside measurement's.  A kind that cannot be measured -- one IDR in a
+ * clip with a 250-picture GOP has no second I picture to compare against --
+ * would otherwise keep guessing "device first" for the whole encode. */
+static int coef_inherit(const aeg_dispatcher *d, int kind)
+{
+    int k;
+    for (k = 0; k < 3; k++)
+        if (k != kind && d->coef_decided[k])
+            return d->coef_dev[k];
+    if (g_coef_seeded)
+        return g_coef_seed_dev;
+    return -1;
+}
+
 static int dispatch_coef_pick(aeg_dispatcher *d, int kind)
 {
+    int it;
     if (kind < 0 || kind > 2)
         return 0;
     if (d->forced[AEG_STAGE_TRANSFORM] >= 0 ||
         d->forced[AEG_STAGE_IQUANT_IDCT] >= 0)
         return d->use_gpu[AEG_STAGE_TRANSFORM] &&
                d->use_gpu[AEG_STAGE_IQUANT_IDCT];
-    if (!d->have_gpu || kind == 0)
-        return 0;               /* an I picture has no inter candidates */
-    if (!d->coef_decided[kind])
-        return d->coef_n[kind][1] < d->coef_n[kind][0];
-    if (++d->coef_since[kind] >= AEG_COEF_RETRY) {
-        d->coef_since[kind] = 0;
-        return !d->coef_dev[kind];
+    if (!d->have_gpu)
+        return 0;
+    if (d->coef_decided[kind]) {
+        if (++d->coef_since[kind] >= AEG_COEF_RETRY) {
+            d->coef_since[kind] = 0;
+            return !d->coef_dev[kind];
+        }
+        return d->coef_dev[kind];
     }
-    return d->coef_dev[kind];
+    /* undecided: measure both sides (the CPU count is what is missing, so the
+     * device first), but a sibling kind that *has* decided is evidence this
+     * kind will never gather on its own */
+    it = coef_inherit(d, kind);
+    if (it >= 0)
+        return it;
+    return d->coef_n[kind][1] < d->coef_n[kind][0];
 }
 
 int aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind)
@@ -867,7 +1051,7 @@ static void dispatch_coef_done(aeg_dispatcher *d, int kind, int dev,
                                int64_t ns, int mbs)
 {
     int64_t per, *slot;
-    if (kind <= 0 || kind > 2 || mbs <= 0 || !d->have_gpu ||
+    if (kind < 0 || kind > 2 || mbs <= 0 || !d->have_gpu ||
         d->forced[AEG_STAGE_TRANSFORM] >= 0 ||
         d->forced[AEG_STAGE_IQUANT_IDCT] >= 0)
         return;
@@ -895,7 +1079,8 @@ static void dispatch_coef_done(aeg_dispatcher *d, int kind, int dev,
         if (d->coef_dev[kind] != was || first)
             aeg_log(AEG_LOG_DEBUG, "aeg: coefficient stages of %c pictures on the %s "
                     "(%.2f us/MB on the CPU, %.2f us/MB on the device)",
-                    kind == 1 ? 'P' : 'B', d->coef_dev[kind] ? "device" : "CPU",
+                    kind == 0 ? 'I' : (kind == 1 ? 'P' : 'B'),
+                    d->coef_dev[kind] ? "device" : "CPU",
                     c / 1000.0, g / 1000.0);
     }
 }

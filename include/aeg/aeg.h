@@ -248,10 +248,13 @@ typedef struct aeg_params {
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
     int slices;               /* slices per picture, 0/1 = one           */
-    /* Frame threads: 2 = a non-reference B picture is coded next to the
-     * picture after it (same bitstream as 1), 1 = off, 0 = auto (2 with more
-     * than one CPU unless threads == 1).  Constant QP or CRF (ABR and VBV
-     * code serially), one slice per picture, every field_coding. */
+    /* Frame threads: how many pictures are coded at once, in parallel.  The
+     * workers share one bitstream writer, so the output bytes are identical to
+     * a serial encode; only the wall time changes.  1 = off, 0 = auto (the CPU
+     * count plus one, capped at 8, unless threads == 1).  Needs more than one
+     * slice, no field coding, B pictures, constant QP or CRF (ABR and VBV code
+     * serially) and no whole-frame-search stage on a device, and falls back to
+     * 1 when those do not hold. */
     int frame_threads;
     int backend;              /* aeg_backend                            */
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */
@@ -328,6 +331,10 @@ typedef struct aeg_params {
     int chroma_me;            /* include chroma in motion SAD           */
     int verbose;              /* unused; see aeg_set_log_level()        */
     int force_cpu_reference;  /* also compute CPU path for validation   */
+    /* Compute the SSIM of the luma plane (aeg_stats.ssim_y).  The PSNR is
+     * always computed; the SSIM costs a second pass over the picture, so it
+     * is off unless it is asked for. */
+    int ssim;
     const char *dump_stats;   /* optional per-frame CSV path            */
 } aeg_params;
 
@@ -375,8 +382,13 @@ typedef struct aeg_stats {
     int64_t stage_gpu_ns[AEG_STAGE_COUNT];
     int64_t stage_cpu_ns[AEG_STAGE_COUNT];
     int     stage_use_gpu[AEG_STAGE_COUNT]; /* any of its work on a device */
+    /* The time the stages above do not cover: the coding of a macroblock
+     * outside its batched coefficient work (the gathers, the cost model, the
+     * reconstruction) and the entropy coder (CABAC/CAVLC). */
+    int64_t coding_ns;
+    int64_t entropy_ns;
     double  psnr_y, psnr_u, psnr_v, psnr_avg; /* reconstructed vs source  */
-    double  ssim_y;
+    double  ssim_y;                  /* 0 unless aeg_params.ssim was set   */
     /* VBV/HRD accounting (zero when the model is off): the lowest buffer level
      * the model reached, in bits, and how many pictures would have underflowed
      * it -- which the controller is supposed to have avoided. */
@@ -548,6 +560,10 @@ typedef struct aeg_device_info {
     int32_t     max_compute_units;
     int64_t     launch_overhead_ns; /* measured, if calibrated          */
     int64_t     bytes_per_ns;       /* measured upload bandwidth        */
+    /* The device's index inside its own backend, for a machine with more
+     * than one GPU: --list-devices prints it, and it is what
+     * AEG_CUDA_DEVICE=AEG_OPENCL_DEVICE take to pick one. */
+    int         ordinal;
 } aeg_device_info;
 
 AEG_API int aeg_query_devices(aeg_backend backend, aeg_device_info *out,

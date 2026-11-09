@@ -44,6 +44,102 @@ static inline double aeg_lambda_of(int qp)
 }
 #define AEG_LAMBDA(qp) aeg_lambda_of(qp)
 
+/* ------------------------------------------------------------------ */
+/* Distortion statistics                                               */
+/* ------------------------------------------------------------------ */
+/* The SSIM of a plane (Wang, Bovik, Sheikh and Simoncelli's measure) with
+ * the 8x8 uniform window and the usual constants, averaged over the windows:
+ * the number ffmpeg's ssim filter reports for the luma plane.
+ *
+ * The window sums are computed separably: the vertical sums of the five
+ * products the measure needs are kept per column and rolled as the rows
+ * come and go, and the horizontal sums are rolled over them.  That is two
+ * passes over the plane and O(width) memory -- a summed-area table would
+ * need five of them, which is 300 MB at 4K. */
+#define AEG_SSIM_WIN 8
+
+static double plane_ssim(const pixel *a, int astride, const pixel *b, int bstride,
+                         int w, int h, double peak)
+{
+    const int win = AEG_SSIM_WIN;
+    const double n = (double)win * win;
+    const double c1 = 0.01 * peak * 0.01 * peak;
+    const double c2 = 0.03 * peak * 0.03 * peak;
+    double *col[5];               /* the vertical sums, per column */
+    double *hsum[5];              /* the horizontal sums, per column */
+    double sum = 0.0;
+    int64_t windows = 0;
+    int x, y, k;
+
+    if (w < win || h < win)
+        return 1.0;
+    for (k = 0; k < 5; k++) {
+        col[k] = (double *)calloc((size_t)w, sizeof(double));
+        hsum[k] = (double *)calloc((size_t)w, sizeof(double));
+        if (!col[k] || !hsum[k]) {
+            for (x = 0; x < k; x++) {
+                free(col[x]);
+                free(hsum[x]);
+            }
+            free(col[k]);
+            free(hsum[k]);
+            return 0.0;
+        }
+    }
+    for (y = 0; y < h; y++) {
+        const pixel *ra = a + (size_t)y * astride;
+        const pixel *rb = b + (size_t)y * bstride;
+        const pixel *oa = (y >= win) ? a + (size_t)(y - win) * astride : NULL;
+        const pixel *ob = (y >= win) ? b + (size_t)(y - win) * bstride : NULL;
+        for (x = 0; x < w; x++) {
+            double da = ra[x], db = rb[x];
+            col[0][x] += da;
+            col[1][x] += db;
+            col[2][x] += da * da;
+            col[3][x] += db * db;
+            col[4][x] += da * db;
+            if (oa) {
+                double ea = oa[x], eb = ob[x];
+                col[0][x] -= ea;
+                col[1][x] -= eb;
+                col[2][x] -= ea * ea;
+                col[3][x] -= eb * eb;
+                col[4][x] -= ea * eb;
+            }
+        }
+        if (y < win - 1)
+            continue;
+        /* the horizontal sums over the window's columns */
+        for (x = 0; x < w; x++) {
+            for (k = 0; k < 5; k++)
+                hsum[k][x] += col[k][x];
+            if (x >= win) {
+                for (k = 0; k < 5; k++)
+                    hsum[k][x] -= col[k][x - win];
+            }
+            if (x < win - 1)
+                continue;
+            {
+                double sx = hsum[0][x], sy = hsum[1][x];
+                double sxx = hsum[2][x], syy = hsum[3][x], sxy = hsum[4][x];
+                double mux = sx / n, muy = sy / n;
+                double vx = (sxx - n * mux * mux) / (n - 1.0);
+                double vy = (syy - n * muy * muy) / (n - 1.0);
+                double cov = (sxy - n * mux * muy) / (n - 1.0);
+                double s = ((2.0 * mux * muy + c1) * (2.0 * cov + c2)) /
+                           ((mux * mux + muy * muy + c1) * (vx + vy + c2));
+                sum += s;
+                windows++;
+            }
+        }
+    }
+    for (k = 0; k < 5; k++) {
+        free(col[k]);
+        free(hsum[k]);
+    }
+    return windows ? sum / (double)windows : 1.0;
+}
+
 /* An integer tuning switch from the environment, read once. */
 #define ENV_INT(name, dflt) __extension__ ({ static _Atomic int v_ = -0x7fffffff; \
     if (v_ == -0x7fffffff) { const char *e_ = getenv(name);              \
@@ -373,6 +469,13 @@ struct aeg_encoder {
     uint8_t *out;   size_t out_cap;
 
     aeg_stats st;
+    /* the distortion statistics accumulate over the whole encode: the sums of
+     * squared differences per plane and the number of samples, and the SSIM
+     * values of the pictures (the mean of them is the SSIM of the clip) */
+    int64_t psnr_sse[3];
+    int64_t psnr_n[3];
+    double  ssim_sum;
+    int64_t ssim_n;
 
     /* Every macroblock's decision, kept until the picture's bitstream is
      * written.  The decision pass and the bitstream pass are separate so that
@@ -753,14 +856,26 @@ static void ft_free(struct aeg_encoder *e);
  * moving averages decide the placement) and to the statistics, whose per-stage
  * device / host totals say where the time actually went -- the copies a
  * picture's slice threads and frame threads run in sum theirs into the
- * encoder's. */
+ * encoder's.
+ *
+ * The placement is not the backend's identity: the guard may have switched a
+ * failing device off and run the CPU reference instead, and then the work did
+ * not happen on the device.  aeg_be_last_on_device() says which it was. */
 static void stage_rec(struct aeg_encoder *e, int stage, int on_gpu, int64_t ns)
 {
     aeg_dispatch_record(&e->d, stage, on_gpu, ns);
+    e->st.stage_ns[stage] += ns;
     if (on_gpu)
         e->st.stage_gpu_ns[stage] += ns;
     else
         e->st.stage_cpu_ns[stage] += ns;
+}
+
+/* The wall time of a stage that is not a batch operation (the searches, the
+ * filters): it goes to the stage's total, and to no device/host part. */
+static void stage_time(struct aeg_encoder *e, int stage, int64_t ns)
+{
+    e->st.stage_ns[stage] += ns;
 }
 
 /* Which of the two batched coefficient code paths to use for this picture.
@@ -1755,7 +1870,7 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         luma_inter_gather(e, src, pred, bres);
         e->d.ops.tq_dc_batch(e->d.ops.priv, bres, 16, qp, 1, &c->level[0][0],
                              bnz, bdc);
-        stage_rec(e, AEG_STAGE_TRANSFORM, e->d.ops.backend != AEG_BACKEND_CPU,
+        stage_rec(e, AEG_STAGE_TRANSFORM, aeg_be_last_on_device(),
                   aeg_now_ns() - t0);
         for (blk = 0; blk < 16; blk++)
             dc[blk] = (dctcoef)bdc[blk];
@@ -1786,7 +1901,7 @@ static void code_luma_i16(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         int64_t t0 = aeg_now_ns();
         e->d.ops.iq_dc_batch(e->d.ops.priv, &c->level[0][0], dchad, 16, qp,
                              brec);
-        stage_rec(e, AEG_STAGE_IQUANT_IDCT, e->d.ops.backend != AEG_BACKEND_CPU,
+        stage_rec(e, AEG_STAGE_IQUANT_IDCT, aeg_be_last_on_device(),
                   aeg_now_ns() - t0);
         for (blk = 0; blk < 16; blk++) {
             int bx = (blk & 3) * 4, by = (blk >> 2) * 4, dummy;
@@ -2399,7 +2514,7 @@ static int use_tq_iq(const struct aeg_encoder *e)
 
 static void tq_iq_rec(struct aeg_encoder *e, int64_t ns)
 {
-    int g = e->d.ops.backend != AEG_BACKEND_CPU;
+    int g = aeg_be_last_on_device();
     stage_rec(e, AEG_STAGE_TRANSFORM, g, ns / 2);
     stage_rec(e, AEG_STAGE_IQUANT_IDCT, g, ns - ns / 2);
 }
@@ -2427,7 +2542,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         e->d.ops.tq_batch(e->d.ops.priv, e->coef_res, 16, qp, 0,
                           e->coef_lev, e->coef_nz);
         stage_rec(e, AEG_STAGE_TRANSFORM,
-                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_be_last_on_device(),
                             aeg_now_ns() - t0);
         if (e->p.trellis > 0 && e->p.cabac) {
             /* The levels of the batch are in the same layout as the scalar
@@ -2445,7 +2560,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp,
                                    e->coef_rec);
             stage_rec(e, AEG_STAGE_IQUANT_IDCT,
-                                e->d.ops.backend != AEG_BACKEND_CPU,
+                                aeg_be_last_on_device(),
                                 aeg_now_ns() - t0);
             luma_inter_finish(e, mbx, mby, c, e->coef_lev, NULL,
                               e->coef_rec, pred);
@@ -2454,7 +2569,7 @@ static void code_luma_inter(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         t0 = aeg_now_ns();
         e->d.ops.iq_idct_batch(e->d.ops.priv, e->coef_lev, 16, qp, e->coef_rec);
         stage_rec(e, AEG_STAGE_IQUANT_IDCT,
-                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_be_last_on_device(),
                             aeg_now_ns() - t0);
         luma_inter_finish(e, mbx, mby, c, e->coef_lev, e->coef_nz, e->coef_rec,
                           pred);
@@ -2755,7 +2870,7 @@ static void code_chroma_batch(struct aeg_encoder *e, int mbx, int mby,
     }
     t0 = aeg_now_ns();
     e->d.ops.tq_dc_batch(e->d.ops.priv, res, 8, qpc, 1, lev, nzb, dc);
-    stage_rec(e, AEG_STAGE_TRANSFORM, e->d.ops.backend != AEG_BACKEND_CPU,
+    stage_rec(e, AEG_STAGE_TRANSFORM, aeg_be_last_on_device(),
               aeg_now_ns() - t0);
     for (pl = 0; pl < 2; pl++) {
         dctcoef d4[4], had[4], dclev[4];
@@ -2772,7 +2887,7 @@ static void code_chroma_batch(struct aeg_encoder *e, int mbx, int mby,
     }
     t0 = aeg_now_ns();
     e->d.ops.iq_dc_batch(e->d.ops.priv, lev, dcout, 8, qpc, rec);
-    stage_rec(e, AEG_STAGE_IQUANT_IDCT, e->d.ops.backend != AEG_BACKEND_CPU,
+    stage_rec(e, AEG_STAGE_IQUANT_IDCT, aeg_be_last_on_device(),
               aeg_now_ns() - t0);
     for (pl = 0; pl < 2; pl++) {
         pixel *base = e->recp[1 + pl] + mby * 8 * cs + mbx * 8;
@@ -5564,9 +5679,13 @@ static void me_seed_frame(struct aeg_encoder *e)
     }
 
     t0 = aeg_now_ns() - t0;
-    e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
-    stage_rec(e, AEG_STAGE_MOTION_EST,
-                        e->d.ops.backend != AEG_BACKEND_CPU, t0);
+    /* The rounds ran as batch operations (sad_batch / satd_batch), so the
+     * dispatcher gets the measurement; the stage's total gets the time.  The
+     * placement is the one the last call really had -- the seed search can
+     * run on the CPU even when the backend is a device (AEG_SEED=0). */
+    stage_time(e, AEG_STAGE_MOTION_EST, t0);
+    aeg_dispatch_record(&e->d, AEG_STAGE_MOTION_EST,
+                        aeg_be_last_on_device(), t0);
 }
 
 /* Fills e->mb_modes[] with the legal Intra_16x16 modes ordered by SAD, runs
@@ -7230,7 +7349,7 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
         e->d.ops.tq_batch(e->d.ops.priv, e->rd_res, 16 * nb, qp, 0, e->rd_lev,
                           e->rd_nz);
         stage_rec(e, AEG_STAGE_TRANSFORM,
-                            e->d.ops.backend != AEG_BACKEND_CPU,
+                            aeg_be_last_on_device(),
                             aeg_now_ns() - t0);
         /* The level selection runs on the host between the two launches, on
          * every candidate's levels exactly as code_luma_inter() runs it on
@@ -7256,7 +7375,7 @@ static int64_t rd_luma_inter_batch(struct aeg_encoder *e, int mbx, int mby,
             e->d.ops.iq_idct_batch(e->d.ops.priv, e->rd_lev, 16 * nb, qp,
                                    e->rd_rec);
             stage_rec(e, AEG_STAGE_IQUANT_IDCT,
-                                e->d.ops.backend != AEG_BACKEND_CPU,
+                                aeg_be_last_on_device(),
                                 aeg_now_ns() - t0);
         }
     }
@@ -11482,7 +11601,10 @@ static void decide_mb(struct aeg_encoder *e, int mbx, int mby)
     bfld_stamp(e, tmp);
     t0 = aeg_now_ns();
     code_mb(e, mbx, mby, tmp);
-    e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+    /* The coding of the macroblock is not a stage of its own: its batched
+     * parts are counted where they happen (the transform and the inverse
+     * inside code_mb()), the rest is the coding time. */
+    e->st.coding_ns += aeg_now_ns() - t0;
 
     /* store the decisions for the neighbour queries of the following
      * macroblocks (and for the deblocking filter) */
@@ -11921,7 +12043,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     m->nz[i] = tmp->nz[i];
                 for (i = 0; i < 4; i++)
                     m->nz8[i] = (int8_t)(tmp->nz8[i] != 0);
-                e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+                e->st.entropy_ns += aeg_now_ns() - t0;
             }
         }
         *rbsp_len = hdr + aeg_cabac_flush(&cab);
@@ -11999,7 +12121,7 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 if (e->mbaff)
                     mbf_syntax(e, 0);
             }
-            e->st.stage_ns[AEG_STAGE_TRANSFORM] += aeg_now_ns() - t0;
+            e->st.entropy_ns += aeg_now_ns() - t0;
         }
     }
     /* A skip run that reaches the end of the frame still has to be emitted:
@@ -13328,7 +13450,7 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                 ctx->cstride = e->stride[1];
                 umh_radii(e, ctx->umh, &ctx->umh_et);
             }
-            e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
+            stage_time(e, AEG_STAGE_INTER_PRED, aeg_now_ns() - t0);
         }
         me_seed_frame(e);
         lr_seed_frame(e);
@@ -13642,15 +13764,15 @@ recode:
          * 6-tap chain per block: the same samples, computed ~30x less often.
          * A B picture builds them for both lists. */
         int64_t t0 = aeg_now_ns();
+        int64_t t_plane = 0;      /* the plane building alone (the trial) */
         int list;
 
         /* a frame-thread worker's reference may still be being coded: its
          * rows are only there up to fsync->rows, and filtering the whole
          * plane would wait for all of them.  The planes built as the
          * reference was coded are the same samples, read row by row. */
-        int dev_ip = e->d.use_gpu[AEG_STAGE_INTER_PRED] &&
-                     e->d.ops.interp_plane &&
-                     e->d.ops.backend != AEG_BACKEND_CPU && !e->fsync;
+        int dev_ip = aeg_dispatch_stage_pick(&e->d, AEG_STAGE_INTER_PRED) &&
+                     e->d.ops.interp_plane && !e->fsync;
 
         if (dev_ip) {
             /* the planes are what the GPU stage is for: one launch per plane,
@@ -13672,10 +13794,14 @@ recode:
                 }
                 aeg_mc_ctx_own(ctx, e->h);
                 aeg_mc_ctx_setref(ctx, ref);
-                for (i = 1; i < 4; i++)
-                    e->d.ops.interp_plane(e->d.ops.priv, ref, e->stride[0],
-                                          e->w, e->h, i,
-                                          (pixel *)ctx->base[i], ctx->stride);
+                {
+                    int64_t t1 = aeg_now_ns();
+                    for (i = 1; i < 4; i++)
+                        e->d.ops.interp_plane(e->d.ops.priv, ref, e->stride[0],
+                                              e->w, e->h, i,
+                                              (pixel *)ctx->base[i], ctx->stride);
+                    t_plane += aeg_now_ns() - t1;
+                }
                 ctx->ready = 1;
             }
         } else {
@@ -13693,8 +13819,10 @@ recode:
                         ctx->base[i] = e->slot_mc[s].base[i];
                     ctx->ready = 1;
                 } else {
+                    int64_t t1 = aeg_now_ns();
                     aeg_mc_ctx_own(ctx, e->h);
                     aeg_mc_ctx_refresh(ctx, ref, e->w, e->h);
+                    t_plane += aeg_now_ns() - t1;
                 }
             }
         }
@@ -13715,7 +13843,9 @@ recode:
             }
         }
         stage_rec(e, AEG_STAGE_INTER_PRED, dev_ip, aeg_now_ns() - t0);
-        e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
+        /* the placement trial of the stage: the plane building alone, on the
+         * side that built it */
+        aeg_dispatch_stage_done(&e->d, AEG_STAGE_INTER_PRED, dev_ip, t_plane);
     }
     mbaff_field_refs(e);
     me_seed_frame(e);
@@ -13857,24 +13987,51 @@ recode:
     /* distortion statistics */
     {
         int64_t t0 = aeg_now_ns();
-        double sse = 0;
+        double mse[3];
         int i;
         for (i = 0; i < 3; i++) {
             /* the visible picture only: the cropped margin is not output */
             int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
             int x, y;
             int64_t acc = 0;
-            for (y = 0; y < h; y++)
+            for (y = 0; y < h; y++) {
+                const pixel *r = e->recp[i] + (size_t)y * e->stride[i];
+                const pixel *s = e->srcp[i] + (size_t)y * e->stride[i];
                 for (x = 0; x < w; x++) {
-                    int d = (int)e->recp[i][y * e->stride[i] + x] -
-                            (int)e->srcp[i][y * e->stride[i] + x];
+                    int d = (int)r[x] - (int)s[x];
                     acc += (int64_t)d * d;
                 }
-            sse = sse + (double)acc / (double)(w * h);
-            e->st.stage_ns[AEG_STAGE_PSNR] += 0;
+            }
+            e->psnr_sse[i] += acc;
+            e->psnr_n[i] += (int64_t)w * h;
+            mse[i] = e->psnr_n[i] ? (double)e->psnr_sse[i] / (double)e->psnr_n[i]
+                                  : 0.0;
+            {
+                double *dst = i == 0 ? &e->st.psnr_y
+                            : (i == 1 ? &e->st.psnr_u : &e->st.psnr_v);
+                *dst = mse[i] > 0.0
+                    ? 10.0 * log10((double)PIXEL_MAX * (double)PIXEL_MAX / mse[i])
+                    : 99.0;
+            }
         }
-        e->st.psnr_avg = sse > 0 ? 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
-        (void)t0;
+        {
+            double avg = (mse[0] + mse[1] + mse[2]) / 3.0;
+            e->st.psnr_avg = avg > 0.0
+                ? 10.0 * log10((double)PIXEL_MAX * (double)PIXEL_MAX / avg)
+                : 99.0;
+        }
+        if (e->p.ssim) {
+            /* the luma plane: Wang et al.'s measure with the 8x8 uniform
+             * window, the mean of the SSIM map (what ffmpeg's ssim filter
+             * reports) */
+            double sm = plane_ssim(e->recp[0], e->stride[0], e->srcp[0],
+                                   e->stride[0], e->vw, e->vh,
+                                   (double)PIXEL_MAX);
+            e->st.ssim_y = sm;
+            e->ssim_sum += sm;
+            e->ssim_n++;
+        }
+        e->st.stage_ns[AEG_STAGE_PSNR] += aeg_now_ns() - t0;
     }
 
     if (pkt) {
@@ -15521,9 +15678,9 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             if (aeg_lowres_alloc(&e->lr_pic[k], e->mb_w, e->mb_h))
                 e->lr_pic[k].mem = NULL;
     }
-    if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
-        !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost ||
-        !e->lr_scratch || !e->lr_mv[0] || !e->lr_mv[1] ||
+    if (!e->mb_encs || !e->seed_mv || !e->seed_cand || !e->seed_sad ||
+        !e->seed_cost || !e->prev_seed || !e->par_pos || !e->par_mv ||
+        !e->par_cost || !e->lr_scratch || !e->lr_mv[0] || !e->lr_mv[1] ||
         !e->lr_pic[0].mem || !e->lr_pic[1].mem || !e->lr_pic[2].mem) {
         aeg_set_last_error("out of memory");
         aeg_encoder_close(e);
@@ -16890,7 +17047,9 @@ int aeg_encoder_get_params(aeg_encoder *enc, aeg_params *out)
     *out = e->p;
     out->level_idc = e->level_out;
     out->slices = e->n_slices;
-    out->frame_threads = e->ft_on ? 2 : 1;
+    /* the frame threads the encoder really uses: 1 = none (the picture is
+     * coded in the calling thread), 2 = two pictures at a time, ... */
+    out->frame_threads = e->ft_on ? e->ft_nw : 1;
     return AEG_OK;
 }
 
@@ -16960,6 +17119,9 @@ int aeg_encoder_stats(aeg_encoder *enc, aeg_stats *out)
     out->scene_cuts = e->scene_cuts;
     out->macroblocks = e->stat_mbs;
     out->skipped = e->stat_skipped;
+    /* the SSIM of the clip: the mean of the pictures' values */
+    if (e->ssim_n > 0)
+        out->ssim_y = e->ssim_sum / (double)e->ssim_n;
     for (i = 0; i < AEG_MB_TYPE_COUNT; i++)
         out->mb_types[i] = e->stat_type[i];
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
