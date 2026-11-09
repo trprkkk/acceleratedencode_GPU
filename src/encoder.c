@@ -17,6 +17,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include "backend.h"
 #define AEG_IMPL_RENAME
 #include "api_impl.h"
@@ -13748,6 +13751,95 @@ static void field_mark(struct aeg_encoder *e, int fidr)
 static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
                        int tick);
 
+#if defined(__SSE2__)
+/* Exact integer metric kernels.  Every partial sum is an int32 lane; the
+ * lanes are reduced to int64 after at most one row (PSNR) or one 8x8 window
+ * (SSIM), so the integer results are exact and independent of the reduction
+ * order.  The floating-point SSIM arithmetic and the window order stay
+ * identical to the scalar reference, which makes the result bit-identical. */
+static int64_t metric_hsum32(__m128i v)
+{
+    int32_t t[4];
+    _mm_storeu_si128((__m128i *)t, v);
+    return (int64_t)t[0] + t[1] + t[2] + t[3];
+}
+
+static __m128i metric_load8(const pixel *p)
+{
+#if BIT_DEPTH == 8
+    return _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)p),
+                             _mm_setzero_si128());
+#else
+    return _mm_loadu_si128((const __m128i *)p);
+#endif
+}
+
+static int64_t metric_ssd(const pixel *a, const pixel *b, int w, int h,
+                          int stride)
+{
+    int64_t acc = 0;
+    int x, y;
+    for (y = 0; y < h; y++) {
+        __m128i sum = _mm_setzero_si128();
+        for (x = 0; x + 8 <= w; x += 8) {
+            __m128i d = _mm_sub_epi16(metric_load8(a + x),
+                                      metric_load8(b + x));
+            sum = _mm_add_epi32(sum, _mm_madd_epi16(d, d));
+            if ((x & 511) == 504) {
+                acc += metric_hsum32(sum);
+                sum = _mm_setzero_si128();
+            }
+        }
+        acc += metric_hsum32(sum);
+        for (; x < w; x++) {
+            int d = (int)a[x] - (int)b[x];
+            acc += (int64_t)d * d;
+        }
+        a += stride;
+        b += stride;
+    }
+    return acc;
+}
+
+static void metric_ssim8(const pixel *a, const pixel *b, int s, int64_t *sx,
+                         int64_t *sy, int64_t *sxx, int64_t *syy,
+                         int64_t *sxy)
+{
+    const __m128i one = _mm_set1_epi16(1);
+    __m128i vx = _mm_setzero_si128(), vy = _mm_setzero_si128();
+    __m128i vxx = _mm_setzero_si128(), vyy = _mm_setzero_si128();
+    __m128i vxy = _mm_setzero_si128();
+    int y;
+    for (y = 0; y < 8; y++) {
+        __m128i pa = metric_load8(a + y * s);
+        __m128i pb = metric_load8(b + y * s);
+        vx = _mm_add_epi32(vx, _mm_madd_epi16(pa, one));
+        vy = _mm_add_epi32(vy, _mm_madd_epi16(pb, one));
+        vxx = _mm_add_epi32(vxx, _mm_madd_epi16(pa, pa));
+        vyy = _mm_add_epi32(vyy, _mm_madd_epi16(pb, pb));
+        vxy = _mm_add_epi32(vxy, _mm_madd_epi16(pa, pb));
+    }
+    *sx = metric_hsum32(vx);
+    *sy = metric_hsum32(vy);
+    *sxx = metric_hsum32(vxx);
+    *syy = metric_hsum32(vyy);
+    *sxy = metric_hsum32(vxy);
+}
+#endif
+
+/* AEG_METRIC_SCALAR=1 keeps the original scalar loops as a bit-exact
+ * reference for the SIMD metric kernels.  It is a debug switch, not a
+ * production path. */
+static int metric_scalar_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_METRIC_SCALAR");
+        v = ev && atoi(ev) ? 1 : 0;
+    }
+    return v;
+}
+
 /* Distortion of one reconstructed picture against its source: the three
  * planes' PSNR, the combined PSNR, and luma SSIM over non-overlapping 8x8
  * windows (the windowed definition, averaged -- not the whole-picture
@@ -13763,12 +13855,19 @@ static void picture_distortion(struct aeg_encoder *e)
         const int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
         int x, y;
         int64_t acc = 0;
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++) {
-                int d = (int)e->recp[i][y * e->stride[i] + x] -
-                        (int)e->srcp[i][y * e->stride[i] + x];
-                acc += (int64_t)d * d;
-            }
+#if defined(__SSE2__)
+        if (!metric_scalar_mode()) {
+            acc = metric_ssd(e->recp[i], e->srcp[i], w, h, e->stride[i]);
+        } else
+#endif
+        {
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++) {
+                    int d = (int)e->recp[i][y * e->stride[i] + x] -
+                            (int)e->srcp[i][y * e->stride[i] + x];
+                    acc += (int64_t)d * d;
+                }
+        }
         sse += (double)acc / (double)(w * h);
         psnr[i] = acc > 0 ?
             10.0 * log10((double)PIXEL_MAX * PIXEL_MAX /
@@ -13789,16 +13888,25 @@ static void picture_distortion(struct aeg_encoder *e)
         for (wy = 0; wy + 8 <= h; wy += 8)
             for (wx = 0; wx + 8 <= w; wx += 8) {
                 int64_t sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-                int x, y;
                 double mx, my, vx, vy, cxy;
-                for (y = 0; y < 8; y++)
-                    for (x = 0; x < 8; x++) {
-                        int a = e->srcp[0][(wy + y) * s + wx + x];
-                        int b = e->recp[0][(wy + y) * s + wx + x];
-                        sx += a; sy += b;
-                        sxx += (int64_t)a * a; syy += (int64_t)b * b;
-                        sxy += (int64_t)a * b;
-                    }
+#if defined(__SSE2__)
+                if (!metric_scalar_mode()) {
+                    metric_ssim8(e->srcp[0] + wy * s + wx,
+                                 e->recp[0] + wy * s + wx, s,
+                                 &sx, &sy, &sxx, &syy, &sxy);
+                } else
+#endif
+                {
+                    int x, y;
+                    for (y = 0; y < 8; y++)
+                        for (x = 0; x < 8; x++) {
+                            int a = e->srcp[0][(wy + y) * s + wx + x];
+                            int b = e->recp[0][(wy + y) * s + wx + x];
+                            sx += a; sy += b;
+                            sxx += (int64_t)a * a; syy += (int64_t)b * b;
+                            sxy += (int64_t)a * b;
+                        }
+                }
                 mx = sx / 64.0; my = sy / 64.0;
                 vx = sxx / 64.0 - mx * mx;
                 vy = syy / 64.0 - my * my;

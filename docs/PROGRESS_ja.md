@@ -112,7 +112,9 @@
   - 現在は単一スレッドのイベントループ（ラスタ走査で最小インデックスの ready を選ぶ）。同じカウンタを device の persistent カーネルがスピン待ちに使う設計。
 - [ ] M-4a-R2（device 化の前提）: 現在の CPU 再構成パイプラインでは、deblock 入力の再構成 upload（luma+chroma 約 3.13 MB）+ MB メタデータ（約 0.56 MB）+ 出力 download（約 3.13 MB）= 約 6.8 MB/pic で M-1 の 4 MB ゲートを超える。M-1.2d の device 常駐再構成を入力にできれば upload 0、download 3.13 MB + メタデータ 0.56 MB = 3.7 MB/pic、起動 1 + 同期 1 = 2 calls/pic でゲート内。M-1.2d が凍結中のため、M-4a2 は「device 常駐再構成を入力にする」か、luma/chroma を分割する M-4a-R3（ストリップ分割）を先に決める。
 - [ ] M-4a2: 上記 M-4a-R の CUDA/OpenCL カーネルとビット一致テスト（M-4a-R2 の転送ゲート解決後）。
-- [x] M-4b（CPU）: PSNR per plane（`psnr_y/u/v`）と 8x8 窓の SSIM（`ssim_y`）、PSNR ステージ時間の計測。GPU 集計は未着手。
+- [x] M-4b（CPU SIMD）: PSNR per plane（`psnr_y/u/v`）と 8x8 窓 SSIM（`ssim_y`）の集計を SSE2 化。整数部分は int32 レーン→int64 の厳密累積、SSIM の浮動小数演算と窓順はスカラーと同一。`AEG_METRIC_SCALAR=1` の参照と 8bit/10bit で完全一致（全統計値がビット同一）。1080p 12f の PSNR ステージは **49.6 ms → 17.8 ms（約 2.8x、3回中央値）**。
+  - device 集計は現行パイプラインでは source 3.13 MB + recon 3.13 MB の追加 upload が必要で、M-1 の 4 MB/pic ゲートを超える。recon が device 常駐（M-1.2b）でも source 3.13 MB + rec upload 2.51 MB + stats download で 5.6 MB 超。
+- [ ] M-4b2（device 化の分割案）: M-1.2d で source と recon を同時に device 常駐させ、追加 upload を 0 にする。または luma-only SSIM/PSNR を 2.09 MB に絞っても往復 4.18 MB でゲート超過のため、変換（source upload）を再構成生成と同一カーネルに融合する必要がある。
 - [ ] M-4c: ビット深度テンプレート（10bit で GPU 有効化）
 - [ ] M-4d: `satd_batch` のサブブロック分割、`interp_plane` のインデックス最適化
 - [x] M-4e（部分）: `--device n` / `AEG_DEVICE` で CUDA・OpenCL のデバイスを選択（列挙は先頭のみ）
