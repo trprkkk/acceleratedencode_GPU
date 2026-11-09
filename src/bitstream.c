@@ -468,12 +468,35 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     return aeg_bw_finish(&bw);
 }
 
+/* scaling_list() (7.3.2.1.1.1): delta-coded from a running scale of 8. */
+static void write_scaling_list(aeg_bitwriter *bw, const uint8_t *list, int n)
+{
+    int last = 8, next = 8, i;
+    for (i = 0; i < n; i++) {
+        if (next != 0) {
+            int delta = (int)list[i] - next;
+            if (delta > 127) delta -= 256;
+            if (delta < -128) delta += 256;
+            aeg_bw_se(bw, delta);
+            next = (last + delta + 256) & 255;
+        }
+        last = next == 0 ? last : next;
+    }
+}
+
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8, int cabac,
-                     int weighted_pred, int bottom_poc)
+                     int weighted_pred, int bottom_poc,
+                     int cqm_on, const uint8_t *cqm8)
 {
+    uint8_t flat4[16], scan8[64];
     aeg_bitwriter bw;
+    int i;
     aeg_bw_init(&bw, rbsp, cap, 0);
+    for (i = 0; i < 16; i++)
+        flat4[i] = 16;
+    for (i = 0; i < 64; i++)
+        scan8[i] = cqm8 ? cqm8[i] : 16;
     /* PPS 1 is the weighted-prediction twin of PPS 0 (see the slice
      * header): only the pictures that use weights pay for the table. */
     aeg_bw_ue(&bw, weighted_pred ? 1u : 0u); /* pic_parameter_set_id      */
@@ -497,7 +520,18 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
      * then only to switch it on -- the scaling matrices stay flat (absent). */
     if (transform_8x8) {
         aeg_bw_put(&bw, 1, 1);  /* transform_8x8_mode_flag                 */
-        aeg_bw_put(&bw, 1, 0);  /* pic_scaling_matrix_present_flag          */
+        aeg_bw_put(&bw, 1, cqm_on ? 1u : 0u); /* pic_scaling_matrix */
+        if (cqm_on) {
+            for (i = 0; i < 6; i++) {
+                aeg_bw_put(&bw, 1, 1);      /* scaling_list_present */
+                write_scaling_list(&bw, flat4, 16);
+            }
+            for (i = 0; i < 2; i++) {
+                aeg_bw_put(&bw, 1, 1);      /* scaling_list_present */
+                aeg_bw_put(&bw, 1, 0);      /* useDefaultScalingMatrix8x8 */
+                write_scaling_list(&bw, scan8, 64);
+            }
+        }
         aeg_bw_se(&bw, chroma_qp_offset); /* second_..._offset (Cr = Cb)   */
     }
     return aeg_bw_finish(&bw);

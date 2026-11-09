@@ -350,7 +350,8 @@ typedef struct aeg_pwt {
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8,
-                     int cabac, int weighted_pred, int bottom_poc);
+                     int cabac, int weighted_pred, int bottom_poc,
+                     int cqm_on, const uint8_t *cqm8);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header.
  * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an
  * interlaced stream coded as frames), so the header carries field_pic_flag. */
@@ -424,6 +425,7 @@ void aeg_idct8_cache_set(aeg_idct8_cache *c, int pos, int lev);
  * (pos < 0: the current levels as they are). */
 int64_t aeg_idct8_cache_ssd(const aeg_idct8_cache *c, int pos, int lev,
                             const pixel *pred, int ps, const pixel *src, int ss);
+void aeg_cqm_set8(int on, const uint8_t *m);
 void aeg_dequant_8x8(const dctcoef *level, dctcoef *coef, int qp);
 /* The portable versions of the three above (the SSE2 ones must match them
  * bit for bit; tests/kernel_check.c compares them). */

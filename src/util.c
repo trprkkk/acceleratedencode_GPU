@@ -168,6 +168,8 @@ void aeg_params_default(aeg_params *p)
     p->aq_mode = 0;
     p->aq_strength = 10;
     p->transform_8x8 = 1;
+    for (i = 0; i < 64; i++)
+        p->cqm8[i] = 16;
     p->cabac = 1;
     /* the rate-distortion refinement of the winning motion vector follows the
      * preset (see aeg_encoder_create) */

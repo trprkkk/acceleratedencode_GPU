@@ -16,6 +16,18 @@
 #include "h264.h"
 #include <pthread.h>
 #include <string.h>
+/* Custom 8x8 scaling list (CQM).  Flat is 16; the encoder and the
+ * dequantiser read this one table so the reconstruction matches the PPS. */
+static uint8_t cqm8[64];
+static int cqm8_on;
+void aeg_cqm_set8(int on, const uint8_t *m)
+{
+    int i;
+    cqm8_on = on;
+    for (i = 0; i < 64; i++)
+        cqm8[i] = m ? m[i] : 16;
+}
+
 
 /* qp is QPY everywhere; the tables are indexed by QP'Y = QPY + QpBdOffsetY */
 #define QPM(q) (((q) + QP_BD_OFFSET) % 6)
@@ -1921,7 +1933,7 @@ static pthread_once_t dq8_once = PTHREAD_ONCE_INIT;
 void aeg_dequant_8x8(const dctcoef *level, dctcoef *coef, int qp)
 {
 #if AEG_SSE2
-    if (qp >= 0 && qp < 52) {
+    if (!cqm8_on && qp >= 0 && qp < 52) {
         const __m128i two = _mm_set1_epi32(2);
         int k;
         pthread_once(&dq8_once, dq8_init);
@@ -1938,7 +1950,7 @@ void aeg_dequant_8x8(const dctcoef *level, dctcoef *coef, int qp)
     }
 #endif
 #if defined(AEG_X86_AVX2) && BIT_DEPTH > 8
-    if (cpu_avx2() && dequant_8x8_px16(level, coef, qp))
+    if (!cqm8_on && cpu_avx2() && dequant_8x8_px16(level, coef, qp))
         return;
 #endif
     aeg_dequant_8x8_c(level, coef, qp);
@@ -1950,9 +1962,10 @@ void aeg_dequant_8x8_c(const dctcoef *level, dctcoef *coef, int qp)
     int x, y;
     for (y = 0; y < 8; y++)
         for (x = 0; x < 8; x++) {
+            const int ls = aeg_dequant8_ls[m][aeg_cls8[y][x]];
+            const int sc = cqm8_on ? cqm8[y * 8 + x] : 16;
             const int64_t v = ((int64_t)level[y * 8 + x] *
-                               (aeg_dequant8_ls[m][aeg_cls8[y][x]] << sh) * 16
-                               + 32) >> 6;
+                               (ls << sh) * sc + 32) >> 6;
             coef[y * 8 + x] = (dctcoef)(v < COEF_MIN ? COEF_MIN :
                                         (v > COEF_MAX ? COEF_MAX : v));
         }

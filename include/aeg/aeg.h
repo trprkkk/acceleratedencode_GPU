@@ -302,6 +302,11 @@ typedef struct aeg_params {
      * uses it needs profile_idc 100 (High).  On by default: it is the larger of
      * the two quality tools this encoder implements. */
     int transform_8x8;
+    /* Custom 8x8 quantisation matrix (H.264 scaling list).  cqm_on = 0 is
+     * flat (the default, identical to the old stream); cqm8 holds 64 values
+     * in raster order, 16 = flat.  The 4x4 lists stay flat in this version. */
+    int cqm_on;
+    uint8_t cqm8[64];
     /* CABAC (context-adaptive binary arithmetic coding).  The alternative is
      * CAVLC; CABAC codes the same decisions in ~10% fewer bits on typical
      * content, at a higher cost per macroblock.  On by default. */

@@ -138,6 +138,8 @@ static void usage(void)
 "                   little-endian samples at --bit-depth 10)\n"
 "  --dump-order <f> write each packet's display index, one per line\n"
 "  --psy-rd <rd>,<trellis>  psy-rd strength and psy-trellis strength (0 = off)\n"
+"  --cqm <flat|jvt|file>  custom 8x8 quantisation matrix (default flat)\n"
+
 
 "  --trellis <n>    rate-distortion level selection (x264's meaning): 0 = off,\n"
 "                   1 = the winning macroblock only (presets 1-2), 2 = every\n"
@@ -703,6 +705,7 @@ int main(int argc, char **argv)
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
     double psy_rd = -1.0, psy_trellis = 0.0;
+    const char *cqm = NULL;
 
     int mbtree = -1, rclookahead = -1;
     int trellis = -1;
@@ -936,6 +939,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+        else if (!strcmp(a, "--cqm")) cqm = next_arg(argc, argv, &i);
         else if (!strcmp(a, "--trellis")) trellis = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--partitions")) partitions = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--bitrate")) bitrate = int_arg(a, next_arg(argc, argv, &i));
@@ -1321,6 +1325,42 @@ int main(int argc, char **argv)
     if (psy_rd >= 0.0) {
         p.psy_rd = psy_rd;
         p.psy_trellis = psy_trellis;
+    }
+    if (cqm && strcmp(cqm, "flat")) {
+        static const unsigned char jvt8[64] = {
+             6, 13, 20, 28, 13, 20, 28, 32,
+            13, 20, 28, 32, 20, 28, 32, 37,
+            20, 28, 32, 37, 28, 32, 37, 42,
+            28, 32, 37, 42, 32, 37, 42, 48,
+            13, 20, 28, 32, 20, 28, 32, 37,
+            20, 28, 32, 37, 28, 32, 37, 42,
+            28, 32, 37, 42, 32, 37, 42, 48,
+            32, 37, 42, 48, 37, 42, 48, 53
+        };
+        if (!p.transform_8x8) {
+            fprintf(stderr, "error: --cqm needs the 8x8 transform\n");
+            return 2;
+        }
+        p.cqm_on = 1;
+        if (!strcmp(cqm, "jvt")) {
+            memcpy(p.cqm8, jvt8, sizeof(p.cqm8));
+        } else {
+            FILE *cf = fopen(cqm, "r");
+            int k, v;
+            if (!cf) {
+                fprintf(stderr, "cannot open CQM %s\n", cqm);
+                return 1;
+            }
+            for (k = 0; k < 64; k++) {
+                if (fscanf(cf, "%d", &v) != 1 || v < 1 || v > 255) {
+                    fclose(cf);
+                    fprintf(stderr, "CQM %s needs 64 values 1..255\n", cqm);
+                    return 2;
+                }
+                p.cqm8[k] = (uint8_t)v;
+            }
+            fclose(cf);
+        }
     }
     if (partitions >= 0) p.partitions = partitions;
     /* -v 0 = errors only, 1 = warnings and the encoder's summary (info),

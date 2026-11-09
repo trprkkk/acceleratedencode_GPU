@@ -2406,7 +2406,7 @@ static void trellis_luma8(struct aeg_encoder *e, const pixel *src, int stride,
  * inverse (-s iq=...) still runs where it was put. */
 static int batch_host_inverse(const struct aeg_encoder *e)
 {
-    return e->p.trellis > 0 && e->p.cabac &&
+    return e->p.cqm_on || (e->p.trellis > 0 && e->p.cabac) &&
            e->d.forced[AEG_STAGE_IQUANT_IDCT] < 0;
 }
 
@@ -2425,7 +2425,8 @@ static int use_tq_iq(const struct aeg_encoder *e)
         const char *ev = getenv("AEG_TQIQ");
         env = ev ? atoi(ev) != 0 : 1;
     }
-    return env && e->d.ops.tq_iq_batch && !(e->p.trellis > 0 && e->p.cabac);
+    return env && !e->p.cqm_on && e->d.ops.tq_iq_batch &&
+           !(e->p.trellis > 0 && e->p.cabac);
 }
 
 static void tq_iq_rec(struct aeg_encoder *e, int64_t ns)
@@ -15368,13 +15369,14 @@ static void copy_yuv(const struct aeg_encoder *e, pixel *p[3],
  * codes: what every IDR picture begins with. */
 static int write_param_sets(struct aeg_encoder *e)
 {
-    uint8_t sps[256], pps[64];
+    uint8_t sps[256], pps[512];
     size_t n = 0, cap = sizeof(e->hdr);
     size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                               e->p.transform_8x8, e->p.cabac, 0,
-                              e->p.field_coding == 2 || e->p.field_coding == 4);
+                              e->p.field_coding == 2 || e->p.field_coding == 4,
+                              e->p.cqm_on, e->p.cqm8);
     /* worst case of a NAL: start code, header, and an emulation prevention
      * byte every two payload bytes */
     if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
@@ -15392,7 +15394,8 @@ static int write_param_sets(struct aeg_encoder *e)
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                            e->p.transform_8x8, e->p.cabac, 1,
-                           e->p.field_coding == 2 || e->p.field_coding == 4);
+                           e->p.field_coding == 2 || e->p.field_coding == 4,
+                           e->p.cqm_on, e->p.cqm8);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
     }
     e->hdr_len = n;
@@ -16252,6 +16255,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     memcpy(&e->p, params, sizeof(e->p));
     pp = &e->p;
+    if (pp->cqm_on && !pp->transform_8x8) {
+        aeg_set_last_error("CQM needs the 8x8 transform");
+        aeg_free(e);
+        return NULL;
+    }
+    aeg_cqm_set8(pp->cqm_on, pp->cqm8);
     if (pp->bit_depth != 0 && pp->bit_depth != BIT_DEPTH) {
         aeg_set_last_error("bit_depth not supported by this build");
         aeg_free(e);
