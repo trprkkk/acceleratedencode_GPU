@@ -12814,6 +12814,14 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
     {
         int qoff = e->p.bframes > 0 ? e->in_qpoff[poc % in_slots(e)]
                                     : e->rc_qp_offset;
+        /* the zones override the controller's QP for the pictures they cover
+         * (a zone's offset is added to whatever the rate control decided) */
+        {
+            int k;
+            for (k = 0; k < e->p.zone_count; k++)
+                if (poc >= e->p.zone[k].start && poc <= e->p.zone[k].end)
+                    qoff += e->p.zone[k].qoff;
+        }
         e->cur_qp += qoff;
         if (e->cur_qp < QP_MIN) e->cur_qp = QP_MIN;
         if (e->cur_qp > 51) e->cur_qp = 51;

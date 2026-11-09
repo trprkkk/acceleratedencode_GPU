@@ -65,6 +65,11 @@ enum {
     AEG_EOF         = 1
 };
 
+/* How many QP zones one encoder may carry (aeg_params.zone[0..zone_count-1]).
+ * A zone can be given again by re-encoding with a bigger... none is needed:
+ * x264 allows any number and nobody uses more than a handful. */
+#define AEG_ZONE_MAX 16
+
 /* ------------------------------------------------------------------ */
 /* Compute backend selection                                           */
 /* ------------------------------------------------------------------ */
@@ -197,6 +202,19 @@ typedef struct aeg_params {
     int bit_depth;
     int level_idc;
     int qp_min, qp_max;
+    /* Per-picture QP zones: a range of picture numbers (in display order, the
+     * first picture is 0) whose quantiser is offset by qoff.  A picture that
+     * falls in two zones gets both offsets.  Together with the ranges this is
+     * the same knob x264's --zones exposes; the offsets are added *after* the
+     * rate control has decided, so a zone overrides what the controller would
+     * have done for those pictures, and the controller still sees what the
+     * zone made them cost (a zone that spends more bits is not fought by the
+     * next picture's QP going up). */
+    struct aeg_zone {
+        int start, end;        /* picture numbers, inclusive               */
+        int qoff;              /* added to the picture's QP                 */
+    } zone[AEG_ZONE_MAX];
+    int zone_count;
     int chroma_qp_offset;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */

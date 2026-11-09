@@ -1362,6 +1362,53 @@ else
     fi
 fi
 
+echo "== zones"
+# A zone has to move exactly the pictures it covers, by exactly its offset,
+# and --zones and --qpfile have to be the same thing.
+"$BUILD/genyuv" 320 192 60 "$TMP/zc.yuv" 3 >/dev/null
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/zc.yuv" -o "$TMP/z_ok.264" \
+    -q 30 -p 3 >/dev/null 2>&1
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/zc.yuv" -o "$TMP/z_zone.264" \
+    -q 30 -p 3 --zones 30,40,-6 >/dev/null 2>&1
+for p in $(seq 30 40); do echo "$p 24"; done > "$TMP/zqp.txt"
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/zc.yuv" -o "$TMP/z_qpf.264" \
+    -q 30 -p 3 --qpfile "$TMP/zqp.txt" >/dev/null 2>&1
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/zc.yuv" -o /dev/null -q 30 -p 3 \
+    -v 2 > "$TMP/z_ok.log" 2>&1
+$BUILD/aegenc -w 320 -h 192 -n 60 -i "$TMP/zc.yuv" -o /dev/null -q 30 -p 3 \
+    -v 2 --zones 30,40,-6 > "$TMP/z_zone.log" 2>&1
+python3 - "$TMP/z_ok.264" "$TMP/z_zone.264" "$TMP/z_qpf.264" \
+    "$TMP/z_ok.log" "$TMP/z_zone.log" <<'PY4' || FAIL=1
+import re, sys
+a, b, c = [open(p, 'rb').read() for p in sys.argv[1:4]]
+def qps(path):
+    d = {}
+    for line in open(path, errors='replace'):
+        m = re.search(r'picture (\d+) \w+ qp (\d+)', line)
+        if m:
+            d[int(m.group(1))] = int(m.group(2))
+    return d
+bad = 0
+if b == a:
+    print("   the zone changed nothing  FAIL"); bad += 1
+if c != b:
+    print("   --zones and --qpfile disagree  FAIL"); bad += 1
+base, zoned = qps(sys.argv[4]), qps(sys.argv[5])
+inside = [p for p in base if 30 <= p <= 40]
+outside = [p for p in base if not 30 <= p <= 40]
+moved = [p for p in inside if zoned.get(p) == base[p] - 6]
+kept = [p for p in outside if zoned.get(p) == base[p]]
+if len(moved) != len(inside) or len(kept) != len(outside):
+    print("   the zone moved the wrong pictures: %d of %d inside by 6, "
+          "%d of %d outside untouched  FAIL"
+          % (len(moved), len(inside), len(kept), len(outside)))
+    bad += 1
+if not bad:
+    print("   --zones 30,40,-6 moves the %d pictures in 30..40 by 6 QP and "
+          "leaves the other %d alone; --qpfile gives the same stream"
+          % (len(inside), len(outside)))
+sys.exit(1 if bad else 0)
+PY4
 echo "== device enumeration"
 $BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 

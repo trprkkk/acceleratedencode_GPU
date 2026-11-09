@@ -8,6 +8,7 @@
  * output is an H.264 Annex-B elementary stream.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -162,6 +163,13 @@ static void usage(void)
 "                   are bits 1-3 for B pictures -- 16x8 and 8x16 are\n"
 "                   the only B shapes so far)\n"
 "  -v <int>         verbosity (0 errors only, 1 normal, 2 every picture)\n"
+"  --zones <list>   per-picture QP: b,e,q[,b,e,q]... in picture numbers (the\n"
+"                   first picture is 0), q added to the picture's QP.  The QP\n"
+"                   override applies after the rate control has decided, so\n"
+"                   the controller still sees what the zone cost\n"
+"  --qpfile <path>  the same ranges from a file of \"<picture> <qp>\" lines\n"
+"                   (x264's format: the QP of that one picture, repeated\n"
+"                   until the next line)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
 "  --calibrate      measure the accelerator launch overhead and exit\n"
 "  --bench          encode three times (auto/cpu/accelerator) and report\n"
@@ -622,6 +630,7 @@ int main(int argc, char **argv)
     input_t inp;
     int bitrate = 0, aq = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
+    int qbase = -1;           /* the -q given, for --qpfile's reference QP */
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
     int mbtree = -1, rclookahead = -1;
@@ -647,7 +656,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-h")) height = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-i")) inpath = next_arg(argc, argv, &i);
         else if (!strcmp(a, "-o")) outpath = next_arg(argc, argv, &i);
-        else if (!strcmp(a, "-q")) qp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "-q")) qp = int_arg(a, next_arg(argc, argv, &i)), qbase = qp;
         else if (!strcmp(a, "-f") || !strcmp(a, "--fps")) {
             const char *v = next_arg(argc, argv, &i);
             if (parse_rate(v, &fps_num, &fps_den) < 0) {
@@ -764,6 +773,82 @@ int main(int argc, char **argv)
             p.frame_threads = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--scenecut")) p.scenecut = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--pass")) pass = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--zones")) {
+            /* x264 repeats the option once per zone; this takes them all in one
+             * argument anyway.  A zone is exactly three numbers, so groups of
+             * three need no separator of their own. */
+            const char *v = next_arg(argc, argv, &i);
+            char buf[512];
+            char *tok, *save = NULL;
+            int nums[3], k = 0;
+            snprintf(buf, sizeof(buf), "%s", v);
+            for (tok = strtok_r(buf, ", ", &save); tok;
+                 tok = strtok_r(NULL, ", ", &save)) {
+                char *end;
+                long n = strtol(tok, &end, 10);
+                if (end == tok || *end || n < -1000 || n > 100000) {
+                    fprintf(stderr, "error: --zones %s: %s is not a number\n", v,
+                            tok);
+                    return 2;
+                }
+                nums[k++] = (int)n;
+                if (k == 3) {
+                    if (p.zone_count >= AEG_ZONE_MAX) {
+                        fprintf(stderr, "error: --zones %s: more than %d zones\n",
+                                v, AEG_ZONE_MAX);
+                        return 2;
+                    }
+                    if (nums[0] < 0 || nums[1] < nums[0] || nums[2] < -51 ||
+                        nums[2] > 51) {
+                        fprintf(stderr, "error: --zones %s: wanted b,e,q with "
+                                "0 <= b <= e and -51 <= q <= 51, got %d,%d,%d\n",
+                                v, nums[0], nums[1], nums[2]);
+                        return 2;
+                    }
+                    p.zone[p.zone_count].start = nums[0];
+                    p.zone[p.zone_count].end = nums[1];
+                    p.zone[p.zone_count].qoff = nums[2];
+                    p.zone_count++;
+                    k = 0;
+                }
+            }
+            if (k) {
+                fprintf(stderr, "error: --zones %s: the numbers are not a whole "
+                        "number of b,e,q groups\n", v);
+                return 2;
+            }
+        }
+        else if (!strcmp(a, "--qpfile")) {
+            const char *path = next_arg(argc, argv, &i);
+            char line[128];
+            FILE *fp = fopen(path, "r");
+            if (!fp) {
+                fprintf(stderr, "error: --qpfile %s: %s\n", path, strerror(errno));
+                return 2;
+            }
+            /* x264's qpfile: "<picture> <qp>" on one line each, repeated until
+             * the next line.  It becomes a zone per picture with the QP the
+             * line gives, so the ranges and the file give the same result. */
+            while (fgets(line, sizeof(line), fp)) {
+                int pic, q;
+                if (sscanf(line, "%d %d", &pic, &q) != 2)
+                    continue;
+                if (p.zone_count >= AEG_ZONE_MAX) {
+                    fprintf(stderr, "error: --qpfile %s: more than %d zones\n",
+                            path, AEG_ZONE_MAX);
+                    fclose(fp);
+                    return 2;
+                }
+                p.zone[p.zone_count].start = pic;
+                p.zone[p.zone_count].end = pic;
+                /* the qpfile gives the picture's QP itself; x264 applies it
+                 * instead of the rate control's, so the offset is relative to
+                 * what CQP would have used.  The CLI's -q is that number. */
+                p.zone[p.zone_count].qoff = q - (qbase >= 0 ? qbase : 0);
+                p.zone_count++;
+            }
+            fclose(fp);
+        }
         else if (!strcmp(a, "--qcomp")) qcomp = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--crf")) {
             const char *v = next_arg(argc, argv, &i);
