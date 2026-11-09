@@ -14054,8 +14054,14 @@ frecode:
                     for (y = e->rp_dbk; y < e->mb_h; y++)
                         rowpost_deblock_row(e, e->rp_mbs, y);
             } else if (e->p.deblock) {
-            aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
-                                  e->p.deblock_beta, 1);
+                const char *dq = getenv("AEG_DEBLOCK_DIAG");
+                if (dq && atoi(dq))
+                    aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
+                                           e->p.deblock_alpha,
+                                           e->p.deblock_beta, 1);
+                else
+                    aeg_deblock_frame(&e->pic, e->mbs, e->mb_w,
+                                      e->p.deblock_alpha, e->p.deblock_beta, 1);
             }
             if (is_ref) {
                 if (!e->rp_on)
@@ -14532,8 +14538,13 @@ recode:
                 for (y = e->rp_dbk; y < e->mb_h; y++)
                     rowpost_deblock_row(e, e->rp_mbs, y);
         } else if (e->p.deblock) {
-            aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
-                              e->p.deblock_beta, 1);
+            const char *dq = getenv("AEG_DEBLOCK_DIAG");
+            if (dq && atoi(dq))
+                aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
+                                       e->p.deblock_alpha, e->p.deblock_beta, 1);
+            else
+                aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
+                                  e->p.deblock_beta, 1);
         }
         if (e->cur_is_ref) {
             if (!e->rp_on)

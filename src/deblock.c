@@ -612,3 +612,35 @@ void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
         for (x = 0; x < pic->mb_w; x++)
             aeg_deblock_mb(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta);
 }
+
+/* M-4a1 experiment: macroblock anti-diagonal order.  This is the obvious
+ * wavefront schedule (all macroblocks on a diagonal are independent at the
+ * macroblock level), but it is NOT equivalent to the normative raster walk:
+ * a vertical edge writes three columns into the left neighbour, including
+ * the bottom rows that the neighbour's lower macroblock reads for its top
+ * horizontal edge.  Exposed only as an opt-in diagnostic so the difference
+ * can be measured; the encoder's default stays raster order. */
+void aeg_deblock_frame_diag(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                            int slice_alpha, int slice_beta, int deblock_idc)
+{
+    int d, x, y;
+    if (!deblock_idc)
+        return;
+    if (pic->mbaff) {
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+        return;
+    }
+    for (d = 0; d <= pic->mb_w + pic->mb_h - 2; d++) {
+        int x0 = d - (pic->mb_h - 1);
+        int x1 = d;
+        if (x0 < 0)
+            x0 = 0;
+        if (x1 >= pic->mb_w)
+            x1 = pic->mb_w - 1;
+        for (x = x0; x <= x1; x++) {
+            y = d - x;
+            aeg_deblock_mb(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta);
+        }
+    }
+}

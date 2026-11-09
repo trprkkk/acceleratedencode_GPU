@@ -675,6 +675,10 @@ typedef struct aeg_deblock_info {
 
 /* Deblocks a whole frame in place.  Edge type: 0=internal vertical,
  * 1=internal horizontal, 2=MB left, 3=MB top. */
+void aeg_deblock_frame_diag(aeg_picture *pic, const aeg_mb *mbs,
+                            int mb_stride, int slice_alpha, int slice_beta,
+                            int deblock_idc);
+
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc);
 void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
