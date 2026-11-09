@@ -14295,6 +14295,28 @@ static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
     s->dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
 }
 
+/* M-1.2d probe: AEG_REC_GPU is intentionally not wired to a kernel yet.
+ * The transfer arithmetic is the reason, so print it once instead of silently
+ * doing nothing.  The current 1080p picture is 1920x1088 luma and 960x544
+ * chroma; a device reconstruction needs the source, the per-block modes and
+ * levels, and (for the CPU deblock that follows) the finished picture back. */
+static void rec_gpu_probe(struct aeg_encoder *e)
+{
+    static int done;
+    int64_t luma = (int64_t)e->w * e->h;
+    int64_t full = luma + 2 * (int64_t)e->cw * e->ch;
+    if (done || !getenv("AEG_REC_GPU") || !atoi(getenv("AEG_REC_GPU")))
+        return;
+    done = 1;
+    aeg_log(AEG_LOG_WARNING,
+            "aeg: AEG_REC_GPU is not implemented; full source+recon "
+            "%.2f MB/pic, luma-only %.2f MB/pic, levels+modes ~%.2f MB/pic "
+            "(M-1 gate 4 MB)",
+            2.0 * (double)full / (1024.0 * 1024.0),
+            2.0 * (double)luma / (1024.0 * 1024.0),
+            (double)e->mb_w * e->mb_h * 800.0 / (1024.0 * 1024.0));
+}
+
 /* M-1.2b (opt-in, AEG_REC_DEV=1): keep a finished reference picture's luma
  * and both chroma planes in a device DPB slot.  The CPU keeps its own
  * reconstruction (deblock and the entropy path need it), but the next
@@ -14363,6 +14385,7 @@ static void deblock_frame_dispatch(struct aeg_encoder *e, int idc)
 static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                       int64_t pts, aeg_packet *pkt, int64_t t_all)
 {
+    rec_gpu_probe(e);
     int is_p = e->cur_is_p;
     size_t out_len;
     int64_t dbg_type0[AEG_MB_TYPE_COUNT];

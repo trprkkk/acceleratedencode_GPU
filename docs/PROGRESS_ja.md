@@ -73,6 +73,12 @@
 - `AEG_SEED=1 AEG_REC_DEV=1` で CPU/CUDA/OpenCL **ビット一致**、既定（opt-in なし）ともバイト一致。
 - 既定 OFF。既定経路・`AEG_LA_BATCH=0`・`AEG_LA_DEV=1` は不変。デブロックの device 実行（M-4a）は未着手。OpenCL の chroma 常駐は `CL_DEVICE_TYPE_CPU` を検出して自動フォールバックし、警告を 1 行出力（PoCL 2.1 のクラッシュ回避）。実 OpenCL GPU はこの環境に存在しないため未検証。
 
+### M-1.2d persistent intra 再構成（今回も凍結）
+- `AEG_REC_GPU=1` の probe を追加: 実装せず、転送量を 1 行で報告する。1080p で full source+recon **5.98 MiB/pic**、luma-only **3.98 MiB/pic**、levels+modes 約 **6.23 MiB/pic**。M-1 の 4 MB ゲートは full で超過。
+- persistent カーネルで呼び出しを 2/pic にしても、再構成に必要な **source upload + levels/modes upload + recon download** が 4 MB を超える。luma-only でも levels/modes を加えると超過。
+- さらに現行 `code_mb()` はモード決定・量子化・再構成が密結合で、最終 MB の levels/modes を保持していない。device replay 用のコマンド記録を先に追加する必要があり、今回のタイムボックスでは閉じられない。
+- 次回は機能系（psy-rd/CQM/weighted B/4:2:2/12bit/lossless/コンテナ）へ切り替える。M-1.2d は「source/recon を device 常駐させる M-1.2d-R」として再設計する。
+
 ### M-3 ルックアヘッド + mbtree の GPU 化（H-Q2）
 - [x] **M-3.3a lowres リング常駐**
   - `aeg_be_ops.lowres_upload(slot, plane, stride, w, h, id)` と `lowres_sad_batch(cur_slot, ref_slot, ...)` を追加。
