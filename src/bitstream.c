@@ -545,24 +545,29 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
 /* pred_weight_table() (7.3.3.2) of a P slice: present whenever the PPS sets
  * weighted_pred_flag, one entry per active list 0 reference, 4:2:0 chroma. */
 static void write_pred_weight_table(aeg_bitwriter *bw, const aeg_pwt *t,
-                                    int nref)
+                                    int n0, int n1)
 {
-    int i, c;
+    int i, c, l;
 
     aeg_bw_ue(bw, (uint32_t)t->luma_denom);
     aeg_bw_ue(bw, (uint32_t)t->chroma_denom);
-    for (i = 0; i < nref; i++) {
-        aeg_bw_put(bw, 1, t->lflag[i] ? 1u : 0u);
-        if (t->lflag[i]) {
-            aeg_bw_se(bw, t->lw[i]);
-            aeg_bw_se(bw, t->lo[i]);
-        }
-        aeg_bw_put(bw, 1, t->cflag[i] ? 1u : 0u);
-        if (t->cflag[i])
-            for (c = 0; c < 2; c++) {
-                aeg_bw_se(bw, t->cw[i][c]);
-                aeg_bw_se(bw, t->co[i][c]);
+    for (l = 0; l < 2; l++) {
+        int n = l ? n1 : n0;
+        for (i = 0; i < n; i++) {
+            int flag = l ? t->l1flag[i] : t->lflag[i];
+            int cf = l ? t->c1flag[i] : t->cflag[i];
+            aeg_bw_put(bw, 1, flag ? 1u : 0u);
+            if (flag) {
+                aeg_bw_se(bw, l ? t->l1w[i] : t->lw[i]);
+                aeg_bw_se(bw, l ? t->l1o[i] : t->lo[i]);
             }
+            aeg_bw_put(bw, 1, cf ? 1u : 0u);
+            if (cf)
+                for (c = 0; c < 2; c++) {
+                    aeg_bw_se(bw, l ? t->c1w[i][c] : t->cw[i][c]);
+                    aeg_bw_se(bw, l ? t->c1o[i][c] : t->co[i][c]);
+                }
+        }
     }
 }
 
@@ -592,7 +597,7 @@ void aeg_write_slice_header(aeg_bitwriter *bw, int slice_type, int frame_num,
         }
         aeg_bw_put(bw, 1, 0);         /* ref_pic_list_modification_flag_l0  */
         if (pwt)
-            write_pred_weight_table(bw, pwt, num_ref_idx_l0_active);
+            write_pred_weight_table(bw, pwt, num_ref_idx_l0_active, 0);
     }
     if (idr) {
         aeg_bw_put(bw, 1, 0);         /* no_output_of_prior_pics_flag       */
@@ -688,8 +693,9 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         if (nos == 1)
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
     }
-    if (nos == 0 && pwt)
-        write_pred_weight_table(bw, pwt, num_ref_idx_l0_active);
+    if ((nos == 0 || nos == 1) && pwt)
+        write_pred_weight_table(bw, pwt, num_ref_idx_l0_active,
+                                nos == 1 ? num_ref_idx_l0_active : 0);
     if (is_ref) {
         if (idr) {
             aeg_bw_put(bw, 1, 0);     /* no_output_of_prior_pics_flag       */

@@ -476,6 +476,7 @@ struct aeg_encoder {
      * reference, which the exact prediction interpolates first and weights
      * afterwards, as the decoder does (8.4.2.3). */
     aeg_pwt wp;
+    aeg_pwt bwp;            /* explicit B weights (weightb == 2) */
     pixel *wp_mem, *wp_plane[3];
     const pixel *wp_orig0;
     int fwp;                /* field pictures send weights too (p.weightp
@@ -3024,6 +3025,12 @@ static int wp_used(const struct aeg_encoder *e)
     return e->cur_is_p && (e->wp.lflag[0] || e->wp.cflag[0]);
 }
 
+static int bwp_used(const struct aeg_encoder *e)
+{
+    return e->p.weightb == 2 &&
+           (e->bwp.lflag[0] || e->bwp.cflag[0] ||
+            e->bwp.l1flag[0] || e->bwp.c1flag[0]);
+}
 static void mc_rect_luma_to(struct aeg_encoder *e, int list, pixel *dl,
                             int mbx, int mby, int x, int y, int w, int h,
                             int mvx, int mvy)
@@ -3046,6 +3053,14 @@ static void mc_rect_luma_to(struct aeg_encoder *e, int list, pixel *dl,
     else
         aeg_mc_luma(dl + y * 16 + x, 16, r, e->stride[0], w, h,
                     mvx & 3, mvy & 3);
+    if (e->cur_is_b && e->p.weightb == 2) {
+        int fl = list ? e->bwp.l1flag[0] : e->bwp.lflag[0];
+        if (fl)
+            wp_apply(dl + y * 16 + x, 16, w, h,
+                     list ? e->bwp.l1w[0] : e->bwp.lw[0],
+                     list ? e->bwp.l1o[0] : e->bwp.lo[0],
+                     e->bwp.luma_denom);
+    }
 }
 
 static void mc_rect_chroma_to(struct aeg_encoder *e, int list, pixel *dc[2],
@@ -3063,6 +3078,14 @@ static void mc_rect_chroma_to(struct aeg_encoder *e, int list, pixel *dc[2],
                             mbx * 8 + cx + (mvx >> 3);
         aeg_mc_chroma(dc[pl] + cy * 8 + cx, 8, rc, e->stride[1],
                       cw, ch, mvx & 7, mvy & 7);
+        if (e->cur_is_b && e->p.weightb == 2) {
+            int fl = list ? e->bwp.c1flag[0] : e->bwp.cflag[0];
+            if (fl)
+                wp_apply(dc[pl] + cy * 8 + cx, 8, cw, ch,
+                         list ? e->bwp.c1w[0][pl] : e->bwp.cw[0][pl],
+                         list ? e->bwp.c1o[0][pl] : e->bwp.co[0][pl],
+                         e->bwp.chroma_denom);
+        }
         if (e->cur_is_p && e->wp.cflag[list])
             wp_apply(dc[pl] + cy * 8 + cx, 8, cw, ch, e->wp.cw[list][pl],
                      e->wp.co[list][pl], e->wp.chroma_denom);
@@ -12377,7 +12400,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                                    slice == AEG_SLICE_B ? (e->fld && e->bfp_on ? 2 : 1)
                                                         : e->cur_l0_active,
                                    e->p.direct == 1,
-                                   wp_used(e) ? &e->wp : NULL, &e->refctl);
+                                   wp_used(e) ? &e->wp : bwp_used(e) ? &e->bwp : NULL,
+                                   &e->refctl);
     } else {
         aeg_write_slice_header(&bw, slice ? 5 : 7,
                                e->frame_num & ((1 << e->frame_num_bits) - 1),
@@ -12858,6 +12882,70 @@ static int wp_threshold(void)
 
 #define WP_LUMA_PERMILLE 998
 
+/* Explicit B weights: mean-luminance ratio per list, denom 5.  This is a
+ * heuristic only for choosing the table; the encoder and the decoder use the
+ * same transmitted values, so bit-exactness does not depend on how good it
+ * is.  Offsets are in 8-bit units, as the syntax defines them. */
+static void bwp_analyse(struct aeg_encoder *e)
+{
+    const int w = e->vw, h = e->vh, s = e->stride[0];
+    const int cw = e->vcw, ch = e->vch, cs = e->stride[1];
+    int64_t ss = 0, sr[2] = { 0, 0 };
+    int64_t cs0[2] = { 0, 0 };
+    int64_t cr[2][2] = { { 0, 0 }, { 0, 0 } };
+    int x, y, pl, l;
+
+    memset(&e->bwp, 0, sizeof(e->bwp));
+    e->bwp.luma_denom = e->bwp.chroma_denom = 5;
+    if (e->p.weightb != 2 || !e->has_ref)
+        return;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int v = e->srcp[0][y * s + x];
+            ss += v;
+            for (l = 0; l < 2; l++)
+                if (e->refpl[l][0])
+                    sr[l] += e->refpl[l][0][y * s + x];
+        }
+    for (pl = 0; pl < 2; pl++)
+        for (y = 0; y < ch; y++)
+            for (x = 0; x < cw; x++) {
+                int v = e->srcp[1 + pl][y * cs + x];
+                cs0[pl] += v;
+                for (l = 0; l < 2; l++)
+                    if (e->refpl[l][1 + pl])
+                        cr[l][pl] += e->refpl[l][1 + pl][y * cs + x];
+            }
+    for (l = 0; l < 2; l++) {
+        int64_t sa = ss, ra = sr[l];
+        int wt, off;
+        if (!ra)
+            continue;
+        wt = (int)((sa * 32 + ra / 2) / ra);
+        if (wt < 1) wt = 1;
+        if (wt > 127) wt = 127;
+        off = (int)((sa - ((int64_t)wt * ra + 16) / 32) / (w * h));
+        if (off < -128) off = -128;
+        if (off > 127) off = 127;
+        if (l) { e->bwp.l1flag[0] = 1; e->bwp.l1w[0] = wt; e->bwp.l1o[0] = off; }
+        else   { e->bwp.lflag[0] = 1; e->bwp.lw[0] = wt; e->bwp.lo[0] = off; }
+        for (pl = 0; pl < 2; pl++) {
+            int64_t ca = cs0[pl], cra = cr[l][pl];
+            int cwt, coff;
+            if (!cra)
+                continue;
+            cwt = (int)((ca * 32 + cra / 2) / cra);
+            if (cwt < 1) cwt = 1;
+            if (cwt > 127) cwt = 127;
+            coff = (int)((ca - ((int64_t)cwt * cra + 16) / 32) / (cw * ch));
+            if (coff < -128) coff = -128;
+            if (coff > 127) coff = 127;
+            if (l) { e->bwp.c1flag[0] = 1; e->bwp.c1w[0][pl] = cwt; e->bwp.c1o[0][pl] = coff; }
+            else   { e->bwp.cflag[0] = 1; e->bwp.cw[0][pl] = cwt; e->bwp.co[0][pl] = coff; }
+        }
+    }
+}
+
 static void wp_analyse(struct aeg_encoder *e)
 {
     int lw = e->w / 2, lh = e->h / 2, ls = lw + 2 * WP_LPAD;
@@ -12871,6 +12959,10 @@ static void wp_analyse(struct aeg_encoder *e)
     double sg;
 
     memset(&e->wp, 0, sizeof(e->wp));
+    if (e->cur_is_b) {
+        bwp_analyse(e);
+        return;
+    }
     if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8 ||
         e->mbaff || (e->fld && (!e->fwp || !e->wp_mem)))
         return;
@@ -15402,7 +15494,7 @@ static int write_param_sets(struct aeg_encoder *e)
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                               e->p.transform_8x8, e->p.cabac, 0,
-                              e->p.weightb == 1 ? 2 : 0,
+                              (e->p.weightb == 1 ? 2 : e->p.weightb == 2 ? 1 : 0),
                               e->p.field_coding == 2 || e->p.field_coding == 4,
                               e->p.cqm_on, e->p.cqm8);
     /* worst case of a NAL: start code, header, and an emulation prevention
@@ -15416,13 +15508,14 @@ static int write_param_sets(struct aeg_encoder *e)
                 e->level_out % 10);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 7, sps, sl, 1);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
-    if (e->p.weightp && (e->p.field_coding == 0 || e->p.field_coding == 2 ||
+    if ((e->p.weightp || (e->p.weightb == 2 && e->p.bframes > 0)) &&
+        (e->p.field_coding == 0 || e->p.field_coding == 2 ||
                          e->fwp)) {
         /* PPS 1: the same with weighted_pred_flag, for the P pictures that
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                            e->p.transform_8x8, e->p.cabac, 1,
-                           e->p.weightb == 1 ? 2 : 0,
+                           (e->p.weightb == 1 ? 2 : e->p.weightb == 2 ? 1 : 0),
                            e->p.field_coding == 2 || e->p.field_coding == 4,
                            e->p.cqm_on, e->p.cqm8);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);

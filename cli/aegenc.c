@@ -111,7 +111,7 @@ static void usage(void)
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 1)\n"
-"  --weightb        implicit weighted prediction of B pictures (default off)\n"
+"  --weightb [implicit|explicit]  weighted prediction of B pictures (default off)\n"
 
 "  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
 "                   preset 4, 4 at preset 3, otherwise 1)\n"
@@ -919,7 +919,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--qp-rd")) qp_rd = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--ref")) refs = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--weightp")) weightp = int_arg(a, next_arg(argc, argv, &i));
-        else if (!strcmp(a, "--weightb")) weightb = 1;
+        else if (!strcmp(a, "--weightb")) {
+            const char *v = i + 1 < argc ? argv[i + 1] : NULL;
+            weightb = 1;
+            if (v && !strcmp(v, "explicit")) {
+                fprintf(stderr, "error: explicit weighted B is not implemented\n");
+                return 2;
+            }
+            if (v && !strcmp(v, "implicit")) i++;
+        }
         else if (!strcmp(a, "--b-pyramid")) bpyramid = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--mbtree")) mbtree = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--rc-lookahead")) rclookahead = int_arg(a, next_arg(argc, argv, &i));

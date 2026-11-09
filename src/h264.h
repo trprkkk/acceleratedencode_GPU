@@ -346,6 +346,8 @@ typedef struct aeg_pwt {
     /* one entry per active list0 reference (16 at most); only entry 0 is
      * ever weighted, the others keep flag 0 */
     int lflag[16], lw[16], lo[16];
+    int l1flag[16], l1w[16], l1o[16];
+    int c1flag[16], c1w[16][2], c1o[16][2];
     int cflag[16], cw[16][2], co[16][2];
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
