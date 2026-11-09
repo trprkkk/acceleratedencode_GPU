@@ -16,10 +16,13 @@ static int depth_of(const aeg_encoder *enc)
 }
 #endif
 
-#if defined(AEG_HAVE_12BIT)
+#if defined(AEG_HAVE_12BIT) && defined(AEG_HAVE_10BIT)
 #define DISPATCH(enc, fn, ...) \
     (depth_of(enc) == 12 ? fn##_12(__VA_ARGS__) : \
      depth_of(enc) == 10 ? fn##_10(__VA_ARGS__) : fn(__VA_ARGS__))
+#elif defined(AEG_HAVE_12BIT)
+#define DISPATCH(enc, fn, ...) \
+    (depth_of(enc) == 12 ? fn##_12(__VA_ARGS__) : fn(__VA_ARGS__))
 #elif defined(AEG_HAVE_10BIT)
 #define DISPATCH(enc, fn, ...) \
     (depth_of(enc) == 10 ? fn##_10(__VA_ARGS__) : fn(__VA_ARGS__))

@@ -51,7 +51,7 @@ INSTALL    ?= install
 # $(BUILD)/, BIT_DEPTH=10 into $(BUILD)/obj10/ with every symbol they define
 # renamed with a _10 suffix (objcopy), so both live in one library.  The rest
 # (SHARED_SRC) is compiled once; api.c dispatches on aeg_params.bit_depth.
-BIT_DEPTHS ?= 8 10 12
+BIT_DEPTHS ?= 8 10
 DEPTH_SRC  := src/transform.c src/intra.c src/mc.c src/deblock.c \
               src/cavlc.c src/cabac.c src/backend.c src/lowres.c \
               src/input.c src/encoder.c
