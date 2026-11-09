@@ -16255,11 +16255,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     memcpy(&e->p, params, sizeof(e->p));
     pp = &e->p;
-    if (pp->cqm_on) {
-        aeg_set_last_error("CQM scaling lists are experimental and disabled");
+    if (pp->cqm_on && !pp->transform_8x8) {
+        aeg_set_last_error("CQM needs the 8x8 transform");
         aeg_free(e);
         return NULL;
     }
+    aeg_cqm_set8(pp->cqm_on, pp->cqm8);
     if (pp->bit_depth != 0 && pp->bit_depth != BIT_DEPTH) {
         aeg_set_last_error("bit_depth not supported by this build");
         aeg_free(e);

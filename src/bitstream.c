@@ -440,7 +440,6 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
             }
             for (i = 0; i < 2; i++) {
                 aeg_bw_put(&bw, 1, 1);
-                aeg_bw_put(&bw, 1, 0);      /* useDefaultScalingMatrix8x8 */
                 write_scaling_list(&bw, scan8, 64);
             }
         }

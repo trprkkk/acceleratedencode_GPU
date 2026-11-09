@@ -134,7 +134,8 @@
   - 改善が出ない原因: psy-rd を最終 SSE ブレンドだけに適用し、SATD/intra モード決定/trellis/chroma に入れていない。マスクも量子化後残差で MB 単位。x264 の統合 psy-rd とは別物。→ opt-in 凍結。
   - 1080p 12f 速度: 既定 1.694s → psy 1.0 **2.150s（+27%）**、マスク前計算の最適化は未実施。
 - [x] M-5e: `--aq-mode 0..3`（1 = variance、2 = auto-variance、3 = dark bias）。既存の `--aq <tenths>` は mode 1 のまま
-- [ ] M-5f（CQM 未解決・無効化）: `--cqm` パーサ、PPS/SPS scaling list 書き込み、8x8 dequant を実装したが、**flat 64 値（全16）でもデコード再構成が一致しない**。PPS の全 list_present_flag=0 でも不一致、SPS に移すと `log2_max_frame_num` がずれてパースが崩れる。原因は scaling list のシンタックス配置/順序とみられ、CQM 有効時は `aeg_encoder_open` で明示エラーにして無効化。既定 flat は 197,721 バイトで不変。次回は x264 の CQM ストリームをバイト単位の参照にして PPS RBSP を比較する。
+- [x] M-5f（CQM 完成）: `--cqm flat|jvt|<file>`、SPS の `seq_scaling_matrix_present_flag` に 4x4 6 個 + 8x8 2 個、8x8 dequant 適用。**原因は SPS の 8x8 リストに PPS 専用の `useDefaultScalingMatrix8x8Flag` を書いていたこと**（SPS では不要、1 ビット余分で `log2_max_frame_num` 以降がずれる）。修正後、8bit CABAC/CAVLC・10bit で `--dump-recon` と FFmpeg デコードが一致。既定 flat は 197,721 バイト不変。
+  - flat vs jvt CQP 4点×長尺4クリップ BD-rate（jvt が flat 比、正=悪化）: PSNR **+10.10/+6.79/+7.00/+4.51%**（平均 **+7.10%**）、SSIM **+1.38/+3.18/+1.46/+2.49%**（平均 **+2.13%**）。JVT 行列はこの実装では明確に悪化。
 - [x] M-5g（部分）: HDR10 static metadata SEI（`--master-display`、`--max-cll`、payload 137/144）。weighted B、B16、ref16、Blu-ray 制約は未着手
 - [ ] M-5h: libavcodec wrapper、コンテナ連携
 
