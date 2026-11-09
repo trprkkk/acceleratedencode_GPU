@@ -458,6 +458,35 @@ static int ocl_mepic_find(ocl_ctx *o, uint64_t id, size_t bytes)
     return -1;
 }
 
+static int ocl_rec_upload(void *priv, int slot, const uint8_t *y,
+                          const uint8_t *u, const uint8_t *v, int ys,
+                          int cs, int w, int h, uint64_t id)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mu, mv;
+    size_t cbytes;
+    int rows = (h + 1) / 2 + 2 * AEG_PAD;
+    int st;
+    if (slot < 2 || slot >= AEG_ME_PIC_SLOTS)
+        return AEG_EINVAL;
+    st = ocl_me_pic_upload(o, slot, y, ys, w, h, h + 2 * AEG_PAD, id);
+    if (st != AEG_OK)
+        return st;
+    cbytes = (size_t)cs * (size_t)rows;
+    mu = ocl_buf(o, 24 + slot * 2, cbytes, CL_MEM_READ_ONLY);
+    mv = ocl_buf(o, 25 + slot * 2, cbytes, CL_MEM_READ_ONLY);
+    if (!mu || !mv)
+        return AEG_EBACKEND;
+    if (p_clEnqueueWriteBuffer(o->queue, mu, CL_TRUE, 0, cbytes,
+                               u - (ptrdiff_t)AEG_PAD * cs - AEG_PAD,
+                               0, NULL, NULL) != CL_SUCCESS ||
+        p_clEnqueueWriteBuffer(o->queue, mv, CL_TRUE, 0, cbytes,
+                               v - (ptrdiff_t)AEG_PAD * cs - AEG_PAD,
+                               0, NULL, NULL) != CL_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
 static int ocl_me_batch(void *priv, const uint8_t *cur, int cstride,
                         const uint8_t *ref, int rstride, int bw, int bh,
                         int range, const int16_t *job, int count,
@@ -1026,6 +1055,7 @@ static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
     ops->sad_batch = ocl_sad_batch;
     ops->me_batch = ocl_me_batch;
     ops->me_pic_upload = ocl_me_pic_upload;
+    ops->rec_upload = ocl_rec_upload;
     ops->lowres_upload = ocl_lowres_upload;
     ops->lowres_sad_batch = ocl_lowres_sad_batch;
     ops->lowres_batch_search = ocl_lowres_batch_search;

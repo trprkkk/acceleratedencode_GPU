@@ -14187,11 +14187,12 @@ static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
     s->dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
 }
 
-/* M-1.2 (opt-in, AEG_REC_DEV=1): keep a finished reference picture in a
- * device DPB slot.  The CPU keeps its own reconstruction (deblock and the
- * entropy path need it), but the next picture's motion search finds the
- * resident luma by content id and does not upload it again.  No download is
- * needed: the device copy is write-only for this stage. */
+/* M-1.2b (opt-in, AEG_REC_DEV=1): keep a finished reference picture's luma
+ * and both chroma planes in a device DPB slot.  The CPU keeps its own
+ * reconstruction (deblock and the entropy path need it), but the next
+ * picture's motion search finds the resident luma by content id and does not
+ * upload it again.  No download is needed: the device copy is write-only for
+ * this stage (the input of the future device deblock). */
 static void rec_dev_store(struct aeg_encoder *e)
 {
     const char *ev = getenv("AEG_REC_DEV");
@@ -14199,15 +14200,29 @@ static void rec_dev_store(struct aeg_encoder *e)
     uint64_t id;
     int rows;
     if (!ev || !atoi(ev) || !e->cur_is_ref || e->fld ||
-        !e->d.ops.me_pic_upload)
+        (!e->d.ops.rec_upload && !e->d.ops.me_pic_upload))
         return;
     slot = 2 + (e->role_cur % (AEG_ME_PIC_SLOTS - 2));
     id = ((uint64_t)(uint32_t)e->cur_poc << 32) ^ (uint64_t)(uintptr_t)e->recp[0];
-    rows = e->h + e->vpad + AEG_PAD;
-    if (e->d.ops.me_pic_upload(e->d.ops.priv, slot, e->recp[0], e->stride[0],
-                               e->w, e->h, rows, id) == AEG_OK) {
-        e->rec_dev_uploads++;
-        e->rec_dev_bytes += (int64_t)e->stride[0] * rows;
+    rows = e->h + 2 * AEG_PAD;
+    if (e->d.ops.rec_upload && e->recp[1] && e->recp[2] &&
+        !(e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.auto_ok)) {
+        int crows = (e->h + 1) / 2 + 2 * AEG_PAD;
+        if (e->d.ops.rec_upload(e->d.ops.priv, slot, e->recp[0], e->recp[1],
+                                e->recp[2], e->stride[0], e->stride[1],
+                                e->w, e->h, id) == AEG_OK) {
+            e->rec_dev_uploads++;
+            e->rec_dev_bytes += (int64_t)e->stride[0] * rows +
+                                2 * (int64_t)e->stride[1] * crows;
+        }
+    } else if (e->d.ops.me_pic_upload) {
+        int yrows = e->h + e->vpad + AEG_PAD;
+        if (e->d.ops.me_pic_upload(e->d.ops.priv, slot, e->recp[0],
+                                   e->stride[0], e->w, e->h, yrows,
+                                   id) == AEG_OK) {
+            e->rec_dev_uploads++;
+            e->rec_dev_bytes += (int64_t)e->stride[0] * yrows;
+        }
     }
 }
 

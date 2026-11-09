@@ -119,6 +119,13 @@ typedef struct aeg_be_ops {
     int (*me_pic_upload)(void *priv, int slot, const pixel *plane, int stride,
                          int w, int h, int rows, uint64_t id);
 
+    /* M-1.2b: keep the finished reconstruction (luma + both chroma planes)
+     * resident in a DPB slot.  No download; the device copy is for the next
+     * stage (deblock / ME). */
+    int (*rec_upload)(void *priv, int slot, const pixel *y, const pixel *u,
+                      const pixel *v, int ys, int cs, int w, int h,
+                      uint64_t id);
+
     /* Lowres ring (M-3.3a): upload one 8-bit lowres plane to a device slot,
      * then run SAD batches between two resident slots without re-uploading.
      * `id` identifies the content; the same id + size is a cache hit. */

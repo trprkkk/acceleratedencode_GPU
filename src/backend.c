@@ -505,6 +505,15 @@ static inline int me_sad_at(const pixel *cur, int cstride, const pixel *ref,
     return sad;
 }
 
+static int cpu_rec_upload(void *priv, int slot, const pixel *y,
+                          const pixel *u, const pixel *v, int ys, int cs,
+                          int w, int h, uint64_t id)
+{
+    (void)priv; (void)slot; (void)y; (void)u; (void)v;
+    (void)ys; (void)cs; (void)w; (void)h; (void)id;
+    return AEG_OK;          /* the host reconstruction already exists */
+}
+
 static int cpu_me_batch(void *priv, const pixel *cur, int cstride,
                         const pixel *ref, int rstride, int bw, int bh,
                         int range, const int16_t *job, int count,
@@ -601,6 +610,7 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->ref_upload = cpu_ref_upload;
     ops->satd_batch = cpu_satd_batch;
     ops->me_batch = cpu_me_batch;
+    ops->rec_upload = cpu_rec_upload;
     ops->lowres_upload = cpu_lowres_upload;
     ops->lowres_sad_batch = cpu_lowres_sad_batch;
     ops->lowres_batch_search = cpu_lowres_batch_search;
@@ -753,6 +763,18 @@ static int g_me_pic_upload(void *priv, int slot, const pixel *plane, int stride,
         guard_leave(l, l->dev.me_pic_upload(l->dev.priv, slot, plane, stride,
                                             w, h, rows, id), "me_pic_upload");
     return AEG_OK;                /* the host picture is still valid */
+}
+
+static int g_rec_upload(void *priv, int slot, const pixel *y, const pixel *u,
+                        const pixel *v, int ys, int cs, int w, int h,
+                        uint64_t id)
+{
+    be_lane *l = (be_lane *)priv;
+    l->g->cpu.rec_upload(l->g->cpu.priv, slot, y, u, v, ys, cs, w, h, id);
+    if (guard_enter(l))
+        guard_leave(l, l->dev.rec_upload(l->dev.priv, slot, y, u, v, ys, cs,
+                                         w, h, id), "rec_upload");
+    return AEG_OK;
 }
 
 static int g_lowres_upload(void *priv, int slot, const uint8_t *plane,
@@ -1054,6 +1076,7 @@ static int be_guard_wrap(aeg_be_ops *ops)
     if (ops->sad_batch) ops->sad_batch = g_sad_batch;
     if (ops->me_batch) ops->me_batch = g_me_batch;
     if (ops->me_pic_upload) ops->me_pic_upload = g_me_pic_upload;
+    if (ops->rec_upload) ops->rec_upload = g_rec_upload;
     if (ops->lowres_upload) ops->lowres_upload = g_lowres_upload;
     if (ops->lowres_sad_batch) ops->lowres_sad_batch = g_lowres_sad_batch;
     if (ops->lowres_batch_search) ops->lowres_batch_search = g_lowres_batch_search;

@@ -67,10 +67,11 @@
 - **未実装**: 次ピクチャの ME を現ピクチャの CPU 処理中に先出しするクロスピクチャ先読み。現状のオーバーラップはフレームスレッドが担う。
 - ゲート: 呼び出し ≤ 20 回/ピクチャ（達成: 2）、転送 ≤ 4 MB/ピクチャ（現フレーム 1 回＋新規参照のみ）。
 
-### M-1.2 デバイス常駐再構成（最小経路、opt-in）
-- [x] `AEG_REC_DEV=1`: 参照ピクチャの luma を deblock 終了時に device DPB slot（2..15）へ格納し、次の ME は content id でその slot を使う。CPU 再構成はそのまま保持し、download は 0。
-- 実測（1080p 12f, `AEG_SEED=1 -t1`）: **8 uploads / 19.00 MB / 0 MB download = 1.58 MB per picture**、0.67 calls/picture。`AEG_SEED=1` で CPU/CUDA/OpenCL **ビット一致**。
-- 既定 OFF。既定経路・`AEG_LA_BATCH=0`・`AEG_LA_DEV=1` は不変。デブロックの device 化（M-4a）は未着手。
+### M-1.2 デバイス常駐再構成（luma+chroma、opt-in）
+- [x] `AEG_REC_DEV=1`: deblock 終了後の参照ピクチャを device DPB slot（2..15）へ格納。CUDA は luma+chroma の 3 プレーン、OpenCL の CPU デバイス（PoCL）は luma のみにフォールバック。CPU 再構成は保持し、download は 0。
+- 実測（1080p 12f, `AEG_SEED=1 -t1`）: CUDA **8 uploads / 30.16 MB / 0 MB download = 2.51 MB per picture**、0.67 calls/picture。OpenCL/PoCL は 19.00 MB / 1.58 MB per picture。
+- `AEG_SEED=1 AEG_REC_DEV=1` で CPU/CUDA/OpenCL **ビット一致**、既定（opt-in なし）ともバイト一致。
+- 既定 OFF。既定経路・`AEG_LA_BATCH=0`・`AEG_LA_DEV=1` は不変。デブロックの device 実行（M-4a）は未着手。OpenCL の chroma 常駐は PoCL 2.1 のクラッシュのため未対応（実 GPU で再検証が必要）。
 
 ### M-3 ルックアヘッド + mbtree の GPU 化（H-Q2）
 - [x] **M-3.3a lowres リング常駐**

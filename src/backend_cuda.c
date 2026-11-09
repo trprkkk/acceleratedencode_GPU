@@ -514,6 +514,36 @@ static int cuda_mepic_find(cuda_ctx *o, uint64_t id, size_t bytes)
     return -1;
 }
 
+static int cuda_rec_upload(void *priv, int slot, const uint8_t *y,
+                           const uint8_t *u, const uint8_t *v, int ys,
+                           int cs, int w, int h, uint64_t id)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    size_t cbytes;
+    CUdeviceptr du, dv;
+    int rows = (h + 1) / 2 + 2 * AEG_PAD;
+    int st;
+    if (slot < 2 || slot >= AEG_ME_PIC_SLOTS)
+        return AEG_EINVAL;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    st = cuda_me_pic_upload(o, slot, y, ys, w, h,
+                            h + 2 * AEG_PAD, id);
+    if (st != AEG_OK)
+        return st;
+    cbytes = (size_t)cs * (size_t)rows;
+    du = cuda_buf(o, 24 + slot * 2, cbytes);
+    dv = cuda_buf(o, 25 + slot * 2, cbytes);
+    if (!du || !dv)
+        return AEG_EBACKEND;
+    if (p_cuMemcpyHtoD_v2(du, u - (ptrdiff_t)AEG_PAD * cs - AEG_PAD,
+                          cbytes) != CUDA_SUCCESS ||
+        p_cuMemcpyHtoD_v2(dv, v - (ptrdiff_t)AEG_PAD * cs - AEG_PAD,
+                          cbytes) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
 static int cuda_me_batch(void *priv, const uint8_t *cur, int cstride,
                          const uint8_t *ref, int rstride, int bw, int bh,
                          int range, const int16_t *job, int count,
@@ -1284,6 +1314,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     out->sad_batch = cuda_sad_batch;
     out->me_batch = cuda_me_batch;
     out->me_pic_upload = cuda_me_pic_upload;
+    out->rec_upload = cuda_rec_upload;
     out->lowres_upload = cuda_lowres_upload;
     out->lowres_sad_batch = cuda_lowres_sad_batch;
     out->lowres_batch_search = cuda_lowres_batch_search;
@@ -1412,6 +1443,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops)
     ops->sad_batch = cuda_sad_batch;
     ops->me_batch = cuda_me_batch;
     ops->me_pic_upload = cuda_me_pic_upload;
+    ops->rec_upload = cuda_rec_upload;
     ops->lowres_upload = cuda_lowres_upload;
     ops->lowres_sad_batch = cuda_lowres_sad_batch;
     ops->lowres_batch_search = cuda_lowres_batch_search;
