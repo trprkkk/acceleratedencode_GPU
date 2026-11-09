@@ -65,6 +65,9 @@ CLIPS = {
     # tools/real/longclips.sh: 240-300 pictures, for GOP-scale behaviour and speed
     'long': [('cockL', REAL + '/cockL.yuv', 640, 352), ('vtestL', REAL + '/vtestL.yuv', 384, 288),
              ('megaL', REAL + '/megaL.yuv', 352, 256)],
+    # validation for long: other content of the same sources at native size
+    'long2': [('cockL2', REAL + '/cockL2.yuv', 640, 352), ('vtestL2', REAL + '/vtestL2.yuv', 384, 288),
+              ('megaL2', REAL + '/megaL2.yuv', 352, 256), ('treeL', REAL + '/treeL.yuv', 320, 240)],
 }
 QPS = [22, 25, 28, 31, 34, 37]
 CRFS = [18, 21, 24, 27, 30, 33]

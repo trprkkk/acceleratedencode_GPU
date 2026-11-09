@@ -133,7 +133,7 @@ static void usage(void)
 "                   pictures predict from (default on from preset 1; needs\n"
 "                   B pictures)\n"
 "  --rc-lookahead <n> pictures the macroblock tree looks past the group\n"
-"                   being coded (default 20/20/30/40 at presets 1-4, max 60)\n"
+"                   being coded (default 40/40/60/60 at presets 1-4, max 60)\n"
 "  --iqp <n>        QP subtracted from I pictures at constant QP (default 3,\n"
 "                   x264's ipratio 1.4)\n"
 "  --direct <mode>  B direct prediction: spatial (default) or temporal\n"

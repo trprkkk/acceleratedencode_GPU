@@ -6955,3 +6955,79 @@ filterSamplesFlag condition and its p1 update.
   included.
 - **Tests:** `make test` passes, and ASan+UBSan encodes are clean.
 
+
+## Preset 3's CRF gap on the long clips: what preset 4 has that it lacks
+
+Preset 3 trailed x264 veryslow by +4.31 % on the long clips at CRF, preset 4
+by +0.03 %.  Each preset-4 setting was tried on preset 3 alone
+(`tools/x264cmp.py`, which now takes extra configurations through
+`X264CMP_CFGS`; CRF 18-33, `--aq 0` against x264 `--tune psnr`, PSNR
+BD-rate).  The time column is the summed CPU time of the 18 encodes with two
+runs side by side, so it is approximate:
+
+| preset 3 plus | cockL | vtestL | megaL | mean | change | time |
+|---|---|---|---|---|---|---|
+| (preset 3) | +4.23 | +5.65 | +3.06 | +4.31 | | |
+| `--qp-rd 1` | +3.73 | -0.39 | +2.60 | +1.98 | -2.33 | +14 % |
+| `--ref 8` | +4.26 | +3.76 | +2.19 | +3.41 | -0.90 | +5 % |
+| `--rc-lookahead 40` | +4.26 | +4.60 | +3.08 | +3.98 | -0.33 | +1 % |
+| `--rc-lookahead 60` | +4.24 | +2.48 | +2.90 | +3.21 | -1.10 | -1 % |
+| UMH 8x8 radius 8, early exit 500 | +4.14 | +5.60 | +2.80 | +4.18 | -0.13 | +2 % |
+| that and B_8x8, partition gate 64, two I16 modes, four refined vectors | +3.69 | +5.31 | +2.80 | +3.93 | -0.38 | +23 % |
+| lookahead 60 + `--ref 8` | +4.10 | +0.62 | +1.99 | +2.24 | -2.07 | +6 % |
+| lookahead 60 + `--qp-rd 1` | +3.59 | -3.76 | +2.70 | +0.85 | -3.46 | +14 % |
+| lookahead 60 + both | +3.64 | -5.44 | +1.96 | +0.06 | -4.25 | +26 % |
+| (preset 4) | +2.85 | -4.19 | +1.43 | +0.03 | | +41 % |
+| (preset 4, lookahead 60) | +2.82 | -5.93 | +1.62 | -0.50 | | +41 % |
+
+Measured one at a time, the minimum of three wall-clock runs (cockL / vtestL,
+CRF 24, seconds):
+
+| | serial (`-t 1`) | 3 frame threads |
+|---|---|---|
+| preset 3 | 17.86 / 9.12 | 11.84 / 6.63 |
+| lookahead 60 | 17.53 / 9.50 | 11.38 / 6.36 |
+| + `--ref 8` | 19.94 / 9.46 | |
+| + `--qp-rd 1` | 20.52 / 10.26 | |
+| + both | 22.50 / 10.57 | |
+| preset 4 | 26.00 / 13.53 | 16.18 / 9.60 |
+| preset 4, lookahead 60 | 27.06 / 13.43 | 16.28 / 9.58 |
+
+**The lookahead window was too short at every preset.**  The earlier choices
+(20 at presets 1-2, 30 at 3) were measured on the 30-picture clips, which
+are too short to show a longer window.  On the long clips:
+
+| CRF, against x264 veryslow | long, before | long, after | long2, before | long2, after |
+|---|---|---|---|---|
+| p1: 20 -> 40 | +14.84 | +13.44 | +6.39 | +5.99 |
+| p2: 20 -> 40 | +14.03 | +12.50 | +5.53 | +5.13 |
+| p3: 30 -> 60 | +4.31 | **+3.21** | +1.77 | +1.59 |
+| p4: 40 -> 60 | +0.03 | **-0.50** | +0.83 | +0.83 |
+
+(60 at presets 1-2 would take another 0.55 on long: +12.86 / +11.95.)
+Almost all of the gain is on the static surveillance clips (vtestL; p2 +18.60 to
++14.25, vtestL2 -1.7).  Every other clip moves by less than 0.13 either way.
+
+`long2` (new, `tools/real/longclips.sh`) is a validation set of other content
+from the same sources, at native size: cockatoo and Megamind cropped instead
+of scaled, vtest's later minute, and tree in full (240-300 pictures).
+
+The defaults are now 40 / 40 / 60 / 60 at presets 1-4, as in x264 (40 at
+medium, 60 at slower and veryslow).
+- **Time:** no measurable change, serial or threaded.
+- **Memory:** the ring costs about 2.5 MB per 720p picture (hdL with 3 frame
+  threads: peak RSS 361 / 387 / 437 MB at 30 / 40 / 60).
+- **Latency:** the window adds as many pictures.
+
+Streams are byte-identical to the previous build given the same
+`--rc-lookahead`, preset 0 is unchanged, frame threads stay identical, and
+`make test` passes.
+
+**What is left at preset 3** (+3.21 %) is QP-RD and the references, which
+together close it to +0.06 % for about +26 % of the time (preset 4 is +46 %).
+That is a decision about the preset ladder, so it is not made here.  The other
+preset-4 settings (+23 % for -0.38) are poor value at preset 3.
+
+`tools/x264cmp.py` now computes PSNR frame by frame through memory maps, with
+the same result.  Whole-clip int64 copies took 2.5 GB per run, and two runs
+side by side were killed for lack of memory.

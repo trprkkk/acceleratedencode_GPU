@@ -15826,9 +15826,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->mbtree = 0;
     pp->mbtree = pp->mbtree ? 1 : 0;
     if (pp->rc_lookahead < 0) {
-        /* preset 1 was 10; 20 measured -0.45 % there at no measurable time
-         * (30: another -0.13 % for up to 3 %, and nothing at preset 2) */
-        static const int la[5] = { 0, 20, 20, 30, 40 };
+        /* preset 1 was 10; 20 measured -0.45 % at no measurable time (on
+         * 30-picture clips, too short to show a longer window).  On the long
+         * clips (CRF, BD-rate against x264 veryslow, tools/x264cmp.py): 20 ->
+         * 40 at presets 1 / 2 -1.40 / -1.53 % (long2: -0.40 / -0.40 %), and
+         * 30 -> 60 at preset 3 -1.10 % (long2 -0.18 %), 40 -> 60 at preset 4
+         * -0.53 % (long2 0.00 %); almost all of it on the static surveillance
+         * clips (vtestL), the rest within +-0.13 % per clip.  No measurable
+         * time; the ring costs about 2.5 MB per 720p picture (+76 MB from 30
+         * to 60) and the window adds as many pictures of latency.  x264 uses
+         * 40 at medium and 60 at slower / veryslow. */
+        static const int la[5] = { 0, 40, 40, 60, 60 };
         pp->rc_lookahead = la[pp->preset];
     }
     if (pp->rc_lookahead > AEG_MAX_LOOKAHEAD)
