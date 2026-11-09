@@ -14206,7 +14206,7 @@ static void rec_dev_store(struct aeg_encoder *e)
     id = ((uint64_t)(uint32_t)e->cur_poc << 32) ^ (uint64_t)(uintptr_t)e->recp[0];
     rows = e->h + 2 * AEG_PAD;
     if (e->d.ops.rec_upload && e->recp[1] && e->recp[2] &&
-        !(e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.auto_ok)) {
+        !(e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.ops.is_gpu)) {
         int crows = (e->h + 1) / 2 + 2 * AEG_PAD;
         if (e->d.ops.rec_upload(e->d.ops.priv, slot, e->recp[0], e->recp[1],
                                 e->recp[2], e->stride[0], e->stride[1],
@@ -15712,7 +15712,7 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
             }
             if (np > 0) {
                 if (getenv("AEG_LA_CPU") ||
-                    (e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.auto_ok)) {
+                    (e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.ops.is_gpu)) {
                     /* PoCL is a CPU device: its queue path adds nothing over
                      * the CPU batch and PoCL 2.1 crashes in this combination;
                      * use the CPU reference so the stream is identical. */

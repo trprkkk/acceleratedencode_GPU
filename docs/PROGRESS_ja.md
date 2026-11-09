@@ -71,7 +71,7 @@
 - [x] `AEG_REC_DEV=1`: deblock 終了後の参照ピクチャを device DPB slot（2..15）へ格納。CUDA は luma+chroma の 3 プレーン、OpenCL の CPU デバイス（PoCL）は luma のみにフォールバック。CPU 再構成は保持し、download は 0。
 - 実測（1080p 12f, `AEG_SEED=1 -t1`）: CUDA **8 uploads / 30.16 MB / 0 MB download = 2.51 MB per picture**、0.67 calls/picture。OpenCL/PoCL は 19.00 MB / 1.58 MB per picture。
 - `AEG_SEED=1 AEG_REC_DEV=1` で CPU/CUDA/OpenCL **ビット一致**、既定（opt-in なし）ともバイト一致。
-- 既定 OFF。既定経路・`AEG_LA_BATCH=0`・`AEG_LA_DEV=1` は不変。デブロックの device 実行（M-4a）は未着手。OpenCL の chroma 常駐は PoCL 2.1 のクラッシュのため未対応（実 GPU で再検証が必要）。
+- 既定 OFF。既定経路・`AEG_LA_BATCH=0`・`AEG_LA_DEV=1` は不変。デブロックの device 実行（M-4a）は未着手。OpenCL の chroma 常駐は `CL_DEVICE_TYPE_CPU` を検出して自動フォールバックし、警告を 1 行出力（PoCL 2.1 のクラッシュ回避）。実 OpenCL GPU はこの環境に存在しないため未検証。
 
 ### M-3 ルックアヘッド + mbtree の GPU 化（H-Q2）
 - [x] **M-3.3a lowres リング常駐**

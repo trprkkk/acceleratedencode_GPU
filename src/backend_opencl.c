@@ -1195,6 +1195,12 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         cl_uint t = 0;
         p_clGetDeviceInfo(o->device, CL_DEVICE_TYPE, sizeof(t), &t, NULL);
         o->is_gpu = (t & CL_DEVICE_TYPE_GPU) != 0;
+        if (!o->is_gpu && getenv("AEG_REC_DEV") &&
+            atoi(getenv("AEG_REC_DEV"))) {
+            aeg_log(AEG_LOG_WARNING, "aeg: OpenCL device is a CPU device "
+                    "(CL_DEVICE_TYPE_CPU): chroma residency falls back to "
+                    "luma-only");
+        }
     }
     o->no_clone = ocl_pocl_unsafe_queues(o->device);
 
