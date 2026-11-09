@@ -130,8 +130,9 @@
 - [x] M-5b（部分）: `--intra-refresh n`（初回以外 IDR なし、n アンカーで全 MB を更新、recovery_point SEI）、`--slice-max-mbs n`、`--slice-max-size n`（上限超過で行数を半分にして再コード、最小 1 行）。
 - [x] M-5c: open-GOP（`--open-gop`）。キーフレームは非 IDR I スライス、B は前 GOP を参照可、各 I に recovery_point SEI
 - [x] M-5d（psy-rd 部分）: `--psy-rd <rd>,<trellis>` を追加。`psy_rd > 0` のとき、候補の輝度歪みを sqrt(|残差|) マスクで正規化して置換（`full_price()`、`psy_mb_sse()`）。既定 OFF はバイト一致。8bit/10bit、CABAC/CAVLC、FFmpeg 全数デコードを確認。psy-trellis は値のパースのみで未適用（M-5d2）。
-  - 長尺4クリップ CQP 4点の BD-rate（psy 0 比、正 = 悪化）: 0.5/1.0/2.0 の平均 PSNR **+0.05/+0.17/+0.79%**、SSIM **+0.20/+0.39/+1.99%**。全クリップで改善せず、既定 OFF を維持。
-  - 1080p 12f 速度: 既定 1.694s → psy 1.0 **2.150s（+27%）**。
+  - マスク式を `AEG_PSY_MODE` で 3 案比較（0=マスク平均正規化、1=逆マスクでテクスチャを減衰、2=比率補正）。CRF 4点×長尺4クリップの最良は mode 1: 平均 PSNR **+0.20/+0.60/+2.52%**（0.5/1.0/2.0）、SSIM **+0.52/-1.68/-4.08%**。treeL は 0.5 で **-0.65%** だが、平均は正で採用基準を満たさない。CQP は mode 1 でさらに悪化（cockL +0.49、vtestL +0.25）。
+  - 改善が出ない原因: psy-rd を最終 SSE ブレンドだけに適用し、SATD/intra モード決定/trellis/chroma に入れていない。マスクも量子化後残差で MB 単位。x264 の統合 psy-rd とは別物。→ opt-in 凍結。
+  - 1080p 12f 速度: 既定 1.694s → psy 1.0 **2.150s（+27%）**、マスク前計算の最適化は未実施。
 - [x] M-5e: `--aq-mode 0..3`（1 = variance、2 = auto-variance、3 = dark bias）。既存の `--aq <tenths>` は mode 1 のまま
 - [ ] M-5f: 4:2:2 / 4:4:4、12bit、lossless、CQM
 - [x] M-5g（部分）: HDR10 static metadata SEI（`--master-display`、`--max-cll`、payload 137/144）。weighted B、B16、ref16、Blu-ray 制約は未着手

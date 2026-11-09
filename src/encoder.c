@@ -7825,20 +7825,39 @@ static int64_t dbrdo_delta(struct aeg_encoder *e, int mbx, int mby,
  * form: it sees the residual the coder actually produced, not the pre-
  * quantisation one, so it can be computed after a candidate is reconstructed
  * and applied uniformly to every candidate in full_price(). */
+static int psy_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_PSY_MODE");
+        v = ev ? atoi(ev) : 1;
+    }
+    return v;
+}
+
 static int64_t psy_mb_sse(struct aeg_encoder *e, int mbx, int mby)
 {
     const int s = e->stride[0];
     const pixel *src = e->srcp[0] + mby * 16 * s + mbx * 16;
     const pixel *rec = e->recp[0] + mby * 16 * s + mbx * 16;
-    double num = 0.0, den = 0.0;
+    const int mode = psy_mode();
+    double num = 0.0, den = 0.0, sse = 0.0;
     int x, y;
     for (y = 0; y < 16; y++)
         for (x = 0; x < 16; x++) {
             double d = (double)src[y * s + x] - (double)rec[y * s + x];
             double w = sqrt(fabs(d) + 1.0);
-            num += w * d * d;
-            den += w;
+            sse += d * d;
+            if (mode == 1) {
+                num += d * d / w;      /* down-weight textured residual */
+                den += 1.0 / w;
+            } else {
+                num += w * d * d;      /* up-weight textured residual */
+                den += w;
+            }
         }
+    if (mode == 2)
+        return sse > 0.0 ? (int64_t)(num + 0.5) : 0;
     return den > 0.0 ? (int64_t)(num / den * 256.0 + 0.5) : 0;
 }
 
