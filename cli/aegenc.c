@@ -111,6 +111,8 @@ static void usage(void)
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 1)\n"
+"  --weightb        implicit weighted prediction of B pictures (default off)\n"
+
 "  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
 "                   preset 4, 4 at preset 3, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
@@ -704,6 +706,7 @@ int main(int argc, char **argv)
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
+    int weightb = 0;
     double psy_rd = -1.0, psy_trellis = 0.0;
     const char *cqm = NULL;
 
@@ -916,6 +919,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--qp-rd")) qp_rd = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--ref")) refs = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--weightp")) weightp = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--weightb")) weightb = 1;
         else if (!strcmp(a, "--b-pyramid")) bpyramid = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--mbtree")) mbtree = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--rc-lookahead")) rclookahead = int_arg(a, next_arg(argc, argv, &i));
@@ -1309,6 +1313,7 @@ int main(int argc, char **argv)
     if (qp_rd >= 0) p.qp_rd = qp_rd;
     if (refs >= 0) p.refs = refs;
     if (weightp >= 0) p.weightp = weightp;
+    p.weightb = weightb;
     if (bpyramid >= 0) p.b_pyramid = bpyramid;
     if (mbtree >= 0) p.mbtree = mbtree;
     if (rclookahead >= 0) p.rc_lookahead = rclookahead;

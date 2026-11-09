@@ -350,7 +350,8 @@ typedef struct aeg_pwt {
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8,
-                     int cabac, int weighted_pred, int bottom_poc,
+                     int cabac, int weighted_pred, int weighted_bipred_idc,
+                     int bottom_poc,
                      int cqm_on, const uint8_t *cqm8);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header.
  * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an

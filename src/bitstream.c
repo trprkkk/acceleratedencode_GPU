@@ -503,7 +503,7 @@ static void write_scaling_list(aeg_bitwriter *bw, const uint8_t *list, int n)
 
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
                      int transform_8x8, int cabac,
-                     int weighted_pred, int bottom_poc,
+                     int weighted_pred, int weighted_bipred_idc, int bottom_poc,
                      int cqm_on, const uint8_t *cqm8)
 {
     aeg_bitwriter bw;
@@ -522,7 +522,7 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l0_default_active_minus1    */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l1_default_active_minus1    */
     aeg_bw_put(&bw, 1, weighted_pred ? 1u : 0u); /* weighted_pred_flag */
-    aeg_bw_put(&bw, 2, 0);      /* weighted_bipred_idc                     */
+    aeg_bw_put(&bw, 2, (uint32_t)weighted_bipred_idc); /* weighted_bipred_idc */
     aeg_bw_se(&bw, 0);          /* pic_init_qp_minus26                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qs_minus26                     */
     aeg_bw_se(&bw, chroma_qp_offset); /* chroma_qp_index_offset            */

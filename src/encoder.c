@@ -2997,6 +2997,27 @@ static void wp_apply(pixel *d, int stride, int w, int h, int wt, int off,
 }
 
 /* Whether the current picture sends a pred_weight_table (and so refers to
+/* 8.4.2.3.1 implicit B weights: POC distances, denominator 5 and the
+ * two weights summing to 32.  With one list the decoder uses 32/0, i.e. the
+ * plain predictor, so only bi-predicted partitions change. */
+static void bw_weights(const struct aeg_encoder *e, int *w0, int *w1)
+{
+    int d0, d1, den;
+    *w0 = *w1 = 16;
+    if (e->p.weightb != 1)
+        return;
+    d0 = e->cur_poc - e->ref_poc[0];
+    d1 = e->ref_poc[1] - e->cur_poc;
+    if (d0 <= 0 || d1 <= 0)
+        return;
+    den = d0 + d1;
+    *w0 = (d1 * 32 + den / 2) / den;
+    if (*w0 < 0) *w0 = 0;
+    if (*w0 > 32) *w0 = 32;
+    *w1 = 32 - *w0;
+}
+
+/* Whether the current picture sends a pred_weight_table (and so refers to
  * the weighted twin of the picture parameter set). */
 static int wp_used(const struct aeg_encoder *e)
 {
@@ -3131,8 +3152,9 @@ static void b_predict_typed(struct aeg_encoder *e, int mbx, int mby,
     int p, n = mb_part_count(c);
     for (p = 0; p < n; p++) {
         int geo[4], b0, lists = mb_part_lists(c, p);
-        int x, y;
+        int x, y, iw0, iw1;
         mb_part_geom(c, p, geo, &b0);
+        bw_weights(e, &iw0, &iw1);
         if (lists & 1)
             mc_rect_luma_to(e, 0, e->pred_l, mbx, mby, geo[0], geo[1],
                             geo[2], geo[3], c->mv[b0][0], c->mv[b0][1]);
@@ -3144,7 +3166,8 @@ static void b_predict_typed(struct aeg_encoder *e, int mbx, int mby,
             for (y = 0; y < geo[3]; y++)
                 for (x = 0; x < geo[2]; x++) {
                     int o = (geo[1] + y) * 16 + geo[0] + x;
-                    e->pred_l[o] = (pixel)((e->pred_l[o] + e->pred_l2[o] + 1) >> 1);
+                    e->pred_l[o] = (pixel)((e->pred_l[o] * iw0 +
+                                            e->pred_l2[o] * iw1 + 16) >> 5);
                 }
         {
             pixel *d0[2] = { e->pred_c[0], e->pred_c[1] };
@@ -3166,7 +3189,8 @@ static void b_predict_typed(struct aeg_encoder *e, int mbx, int mby,
                     for (x = 0; x < geo[2] / 2; x++) {
                         int o = (geo[1] / 2 + y) * 8 + geo[0] / 2 + x;
                         e->pred_c[pl][o] =
-                            (pixel)((e->pred_c[pl][o] + e->pred_c2[pl][o] + 1) >> 1);
+                            (pixel)((e->pred_c[pl][o] * iw0 +
+                                     e->pred_c2[pl][o] * iw1 + 16) >> 5);
                     }
         }
     }
@@ -3180,8 +3204,9 @@ static void b_predict_typed(struct aeg_encoder *e, int mbx, int mby,
 static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
                              const mbenc *c)
 {
-    int g, x, y, pl;
+    int g, x, y, pl, iw0, iw1;
     const int lists = c->blist[0] ? c->blist[0] : 3;
+    bw_weights(e, &iw0, &iw1);
     /* The groups' vectors usually agree (they differ only through colZero);
      * then one 16x16 motion compensation per list gives the same samples as
      * four 8x8 ones -- the interpolation only depends on the position. */
@@ -3224,7 +3249,8 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
         for (y = 0; y < sz; y++)
             for (x = 0; x < sz; x++) {
                 int o = (y0 + y) * 16 + x0 + x;
-                e->pred_l[o] = (pixel)((e->pred_l[o] + e->pred_l2[o] + 1) >> 1);
+                e->pred_l[o] = (pixel)((e->pred_l[o] * iw0 +
+                                        e->pred_l2[o] * iw1 + 16) >> 5);
             }
         mc_rect_chroma_to(e, 0, d0, mbx, mby, x0 / 2, y0 / 2, sz / 2, sz / 2,
                           c->mv[b0][0], c->mv[b0][1]);
@@ -3235,7 +3261,8 @@ static void b_direct_predict(struct aeg_encoder *e, int mbx, int mby,
                 for (x = 0; x < sz / 2; x++) {
                     int o = (y0 / 2 + y) * 8 + x0 / 2 + x;
                     e->pred_c[pl][o] =
-                        (pixel)((e->pred_c[pl][o] + e->pred_c2[pl][o] + 1) >> 1);
+                        (pixel)((e->pred_c[pl][o] * iw0 +
+                                 e->pred_c2[pl][o] * iw1 + 16) >> 5);
                 }
     }
 }
@@ -15375,6 +15402,7 @@ static int write_param_sets(struct aeg_encoder *e)
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                               e->p.transform_8x8, e->p.cabac, 0,
+                              e->p.weightb == 1 ? 2 : 0,
                               e->p.field_coding == 2 || e->p.field_coding == 4,
                               e->p.cqm_on, e->p.cqm8);
     /* worst case of a NAL: start code, header, and an emulation prevention
@@ -15394,6 +15422,7 @@ static int write_param_sets(struct aeg_encoder *e)
          * send weights (the others keep referring to PPS 0) */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
                            e->p.transform_8x8, e->p.cabac, 1,
+                           e->p.weightb == 1 ? 2 : 0,
                            e->p.field_coding == 2 || e->p.field_coding == 4,
                            e->p.cqm_on, e->p.cqm8);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);

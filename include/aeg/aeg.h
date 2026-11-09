@@ -352,6 +352,9 @@ typedef struct aeg_params {
      * pictures too: each field against its list 0 field).  -1 = as the
      * preset says (on from preset 1 up). */
     int weightp;
+    /* B-slice weighted prediction: 0 = off, 1 = implicit (POC-derived,
+     * weighted_bipred_idc 2).  Explicit pred_weight_table is M-5h. */
+    int weightb;
     /* B pyramid: the middle B picture of a group of two or more is a
      * reference picture for the others (x264's b-pyramid "normal").  -1 = on
      * whenever it can be (B pictures, spatial direct, one P reference). */
