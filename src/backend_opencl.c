@@ -25,6 +25,7 @@ typedef void *cl_command_queue;
 typedef void *cl_program;
 typedef void *cl_kernel;
 typedef void *cl_mem;
+typedef void *cl_event;
 typedef int32_t cl_int;
 typedef uint32_t cl_uint;
 typedef uint64_t cl_ulong;
@@ -36,6 +37,7 @@ typedef intptr_t cl_context_properties;
 #define CL_MEM_WRITE_ONLY (1 << 1)
 #define CL_MEM_READ_WRITE (1 << 0)
 #define CL_TRUE 1
+#define CL_FALSE 0
 #define CL_PROGRAM_BUILD_LOG 0x1183
 #define CL_DEVICE_TYPE 0x1000
 #define CL_DEVICE_TYPE_GPU (1 << 2)
@@ -46,6 +48,11 @@ typedef intptr_t cl_context_properties;
 #define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
 #define CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
 #define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
+/* the queue this instance's work goes through: out of order, so the device may
+ * overlap the upload of one operation with the kernel of the previous one
+ * (the dependencies are passed as events, see ocl_write/ocl_launch/ocl_read) */
+#define CL_QUEUE_OUT_OF_ORDER_MODE (1 << 0)
+#define CL_QUEUE_PROFILING_ENABLE (1 << 1)
 
 /* The OpenCL entry points are resolved at run time so that the encoder keeps
  * building (and running on the CPU) on machines without an OpenCL loader. */
@@ -68,6 +75,9 @@ static void ocl_load_error(const char *name)
     X(cl_int, clEnqueueNDRangeKernel, (cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, const void *, void *)) \
     X(cl_int, clEnqueueWriteBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void *, cl_uint, const void *, void *)) \
     X(cl_int, clEnqueueReadBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, void *, cl_uint, const void *, void *)) \
+    X(cl_int, clWaitForEvents, (cl_uint, const void *)) \
+    X(cl_int, clReleaseEvent, (void *)) \
+    X(cl_int, clFinish, (cl_command_queue)) \
     X(cl_mem, clCreateBuffer, (cl_context, cl_ulong, size_t, void *, cl_int *)) \
     X(cl_int, clReleaseMemObject, (cl_mem)) \
     X(cl_int, clReleaseKernel, (cl_kernel)) \
@@ -75,8 +85,7 @@ static void ocl_load_error(const char *name)
     X(cl_int, clReleaseCommandQueue, (cl_command_queue)) \
     X(cl_int, clReleaseContext, (cl_context)) \
     X(cl_int, clRetainContext, (cl_context)) \
-    X(cl_int, clRetainProgram, (cl_program)) \
-    X(cl_int, clFinish, (cl_command_queue))
+    X(cl_int, clRetainProgram, (cl_program))
 
 #define DECL(ret, name, args) typedef ret (*fn_##name) args; static fn_##name p_##name;
 OCL_SYMS(DECL)
@@ -133,6 +142,99 @@ static int ocl_pocl_unsafe_queues(cl_device_id dev)
 }
 
 /* ------------------------------------------------------------------ */
+/* The data flow                                                        */
+/* ------------------------------------------------------------------ */
+/* One host round trip per operation instead of one per transfer: the uploads
+ * are enqueued without waiting, the kernel waits on their events, the reads
+ * wait on the kernel's, and a single clFinish() brings the results back.  The
+ * queue is out of order (each instance has its own), so the device can overlap
+ * this operation's upload with the previous one's kernel on a real GPU; on a
+ * runtime that refuses the flag the queue is in order and the events are
+ * simply satisfied in the order they were enqueued.
+ *
+ * An operation that returns a failure code may leave events behind: the ones
+ * it enqueued are still owned by the queue, and the next clFinish() releases
+ * them, so nothing is leaked and nothing waits. */
+#define OCL_EV 16
+
+typedef struct {
+    cl_event e[OCL_EV];
+    int n;
+} ocl_evlist;
+
+static void ocl_ev_release(ocl_evlist *l)
+{
+    int i;
+    for (i = 0; i < l->n; i++)
+        if (l->e[i])
+            p_clReleaseEvent(l->e[i]);
+    l->n = 0;
+}
+
+/* The dependencies of the next enqueue are everything this operation has
+ * emitted so far, and its own event goes after them.  When the list is full
+ * the enqueue waits for all of it and the list restarts: everything emitted is
+ * then complete, so the rest of the operation is still ordered after it. */
+static cl_event *ocl_emit(ocl_evlist *l, int *nwait, const void **w)
+{
+    cl_event *out;
+
+    *w = l->n ? (const void *)l->e : NULL;
+    *nwait = l->n;
+    if (l->n >= OCL_EV) {
+        l->n = 0;
+        return NULL;
+    }
+    out = &l->e[l->n];
+    l->n++;
+    return out;
+}
+
+static int ocl_write(ocl_ctx *o, cl_mem m, size_t off, size_t bytes,
+                     const void *src, ocl_evlist *ev)
+{
+    int nw;
+    const void *w;
+    cl_event *out = ev ? ocl_emit(ev, &nw, &w) : NULL;
+    if (p_clEnqueueWriteBuffer(o->queue, m, CL_FALSE, off, bytes, src, nw, w,
+                               out) != CL_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+static int ocl_launch(ocl_ctx *o, cl_kernel k, size_t n, ocl_evlist *ev)
+{
+    int nw;
+    const void *w;
+    cl_event *out = ev ? ocl_emit(ev, &nw, &w) : NULL;
+    if (p_clEnqueueNDRangeKernel(o->queue, k, 1, NULL, &n, NULL, nw, w, out) !=
+        CL_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+static int ocl_read(ocl_ctx *o, cl_mem m, size_t off, size_t bytes, void *dst,
+                    ocl_evlist *ev)
+{
+    int nw;
+    const void *w;
+    cl_event *out = ev ? ocl_emit(ev, &nw, &w) : NULL;
+    if (p_clEnqueueReadBuffer(o->queue, m, CL_FALSE, off, bytes, dst, nw, w,
+                              out) != CL_SUCCESS)
+        return AEG_EBACKEND;
+    return AEG_OK;
+}
+
+/* The one synchronisation of an operation: everything enqueued on this queue,
+ * and nothing another instance enqueued on its own. */
+static int ocl_wait(ocl_ctx *o, ocl_evlist *ev)
+{
+    cl_int st = p_clFinish(o->queue);
+    ocl_ev_release(ev);
+    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+}
+
+/* ------------------------------------------------------------------ */
 /* Buffer cache                                                        */
 /* ------------------------------------------------------------------ */
 static cl_mem ocl_buf(ocl_ctx *o, int slot, size_t bytes, int flags)
@@ -159,7 +261,7 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
     cl_mem mcur, mref, mmv, mout;
     size_t nthreads = (size_t)count;
     aeg_sad_span sp;
-    cl_int st = CL_SUCCESS;
+    ocl_evlist ev;
 
     if (count <= 0)
         return AEG_OK;
@@ -180,14 +282,11 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
     mout = ocl_buf(o, 3, (size_t)count * 4, CL_MEM_WRITE_ONLY);
     if (!mcur || !mref || !mmv || !mout)
         return AEG_EBACKEND;
-    st |= p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, sp.cbytes,
-                                 cur + sp.coff, 0, NULL, NULL);
-    st |= p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, sp.rbytes,
-                                 ref + sp.roff, 0, NULL, NULL);
-    st |= p_clEnqueueWriteBuffer(o->queue, mmv, CL_TRUE, 0, (size_t)count * 8,
-                                 o->pos, 0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
+    ev.n = 0;
+    if (ocl_write(o, mcur, 0, sp.cbytes, cur + sp.coff, &ev) != AEG_OK ||
+        ocl_write(o, mref, 0, sp.rbytes, ref + sp.roff, &ev) != AEG_OK ||
+        ocl_write(o, mmv, 0, (size_t)count * 8, o->pos, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
 
     p_clSetKernelArg(o->k_sad, 0, sizeof(cl_mem), &mcur);
     p_clSetKernelArg(o->k_sad, 1, sizeof(int), &cstride);
@@ -198,14 +297,11 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
     p_clSetKernelArg(o->k_sad, 6, sizeof(int), &count);
     p_clSetKernelArg(o->k_sad, 7, sizeof(cl_mem), &mmv);
     p_clSetKernelArg(o->k_sad, 8, sizeof(cl_mem), &mout);
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_sad, 1, NULL, &nthreads, NULL,
-                                  0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    if (p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4,
-                              out, 0, NULL, NULL) != CL_SUCCESS)
-        return AEG_EBACKEND;
-    return AEG_OK;
+    if (ocl_launch(o, o->k_sad, nthreads, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mout, 0, (size_t)count * 4, out, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
@@ -220,13 +316,18 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     int mf0 = aeg_quant_mf[qp % 6][0], mf1 = aeg_quant_mf[qp % 6][1],
         mf2 = aeg_quant_mf[qp % 6][2];
     cl_int st;
+    ocl_evlist ev;
 
+    if (nblk <= 0)
+        return AEG_OK;
     mres = ocl_buf(o, 0, bytes, CL_MEM_READ_ONLY);
     mlev = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
     mnz = ocl_buf(o, 2, (size_t)nblk * 4, CL_MEM_WRITE_ONLY);
     if (!mres || !mlev || !mnz)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mres, 0, bytes, res, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     p_clSetKernelArg(o->k_tq, 0, sizeof(cl_mem), &mres);
     p_clSetKernelArg(o->k_tq, 1, sizeof(int), &nblk);
     p_clSetKernelArg(o->k_tq, 2, sizeof(int), &qbits);
@@ -236,15 +337,12 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
     p_clSetKernelArg(o->k_tq, 6, sizeof(int), &mf2);
     p_clSetKernelArg(o->k_tq, 7, sizeof(cl_mem), &mlev);
     p_clSetKernelArg(o->k_tq, 8, sizeof(cl_mem), &mnz);
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_tq, 1, NULL, &nthreads, NULL,
-                                  0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL);
-    if (nz)
-        p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0, (size_t)nblk * 4, nz,
-                              0, NULL, NULL);
-    return AEG_OK;
+    if (ocl_launch(o, o->k_tq, nthreads, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mlev, 0, bytes, level, &ev) != AEG_OK ||
+        (nz && ocl_read(o, mnz, 0, (size_t)nblk * 4, nz, &ev) != AEG_OK))
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
@@ -258,12 +356,17 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
     int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
         ls2 = aeg_dequant_ls[qp % 6][2];
     cl_int st;
+    ocl_evlist ev;
 
+    if (nblk <= 0)
+        return AEG_OK;
     mlev = ocl_buf(o, 0, bytes, CL_MEM_READ_ONLY);
     mres = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
     if (!mlev || !mres)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0, NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mlev, 0, bytes, level, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     p_clSetKernelArg(o->k_iq, 0, sizeof(cl_mem), &mlev);
     p_clSetKernelArg(o->k_iq, 1, sizeof(int), &nblk);
     p_clSetKernelArg(o->k_iq, 2, sizeof(int), &sh);
@@ -271,12 +374,10 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
     p_clSetKernelArg(o->k_iq, 4, sizeof(int), &ls1);
     p_clSetKernelArg(o->k_iq, 5, sizeof(int), &ls2);
     p_clSetKernelArg(o->k_iq, 6, sizeof(cl_mem), &mres);
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_iq, 1, NULL, &nthreads, NULL,
-                                  0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL, NULL);
-    return AEG_OK;
+    if (ocl_launch(o, o->k_iq, nthreads, &ev) != AEG_OK ||
+        ocl_read(o, mres, 0, bytes, res, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
@@ -294,7 +395,8 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     int sh = qp / 6;
     int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
         ls2 = aeg_dequant_ls[qp % 6][2];
-    cl_int st = CL_SUCCESS;
+    cl_int st;
+    ocl_evlist ev;
 
     if (nblk <= 0)
         return AEG_OK;
@@ -304,8 +406,9 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     mrec = ocl_buf(o, 3, bytes, CL_MEM_WRITE_ONLY);
     if (!mres || !mlev || !mnz || !mrec)
         return AEG_EBACKEND;
-    st |= p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0,
-                                 NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mres, 0, bytes, res, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     st |= p_clSetKernelArg(o->k_tqiq, 0, sizeof(cl_mem), &mres);
     st |= p_clSetKernelArg(o->k_tqiq, 1, sizeof(int), &nblk);
     st |= p_clSetKernelArg(o->k_tqiq, 2, sizeof(int), &qbits);
@@ -322,19 +425,15 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     st |= p_clSetKernelArg(o->k_tqiq, 13, sizeof(cl_mem), &mrec);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_tqiq, 1, NULL, &nthreads,
-                                  NULL, 0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    /* blocking reads in order: the last one returns when all are done */
-    st |= p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0,
-                                NULL, NULL);
-    if (nz)
-        st |= p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0,
-                                    (size_t)nblk * 4, nz, 0, NULL, NULL);
-    st |= p_clEnqueueReadBuffer(o->queue, mrec, CL_TRUE, 0, bytes, rec, 0,
-                                NULL, NULL);
-    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+    if (ocl_launch(o, o->k_tqiq, nthreads, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    /* one read back per output, all of them ordered after the kernel, and a
+     * single clFinish to bring them home */
+    if (ocl_read(o, mlev, 0, bytes, level, &ev) != AEG_OK ||
+        (nz && ocl_read(o, mnz, 0, (size_t)nblk * 4, nz, &ev) != AEG_OK) ||
+        ocl_read(o, mrec, 0, bytes, rec, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
@@ -349,6 +448,7 @@ static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
     int mf0 = aeg_quant_mf[qp % 6][0], mf1 = aeg_quant_mf[qp % 6][1],
         mf2 = aeg_quant_mf[qp % 6][2];
     cl_int st = CL_SUCCESS;
+    ocl_evlist ev;
 
     if (nblk <= 0)
         return AEG_OK;
@@ -358,8 +458,9 @@ static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
     mdc = ocl_buf(o, 3, (size_t)nblk * 4, CL_MEM_WRITE_ONLY);
     if (!mres || !mlev || !mnz || !mdc)
         return AEG_EBACKEND;
-    st |= p_clEnqueueWriteBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0,
-                                 NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mres, 0, bytes, res, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     st |= p_clSetKernelArg(o->k_tqdc, 0, sizeof(cl_mem), &mres);
     st |= p_clSetKernelArg(o->k_tqdc, 1, sizeof(int), &nblk);
     st |= p_clSetKernelArg(o->k_tqdc, 2, sizeof(int), &qbits);
@@ -372,18 +473,13 @@ static int ocl_tq_dc_batch(void *priv, const int16_t *res, int nblk, int qp,
     st |= p_clSetKernelArg(o->k_tqdc, 9, sizeof(cl_mem), &mdc);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_tqdc, 1, NULL, &nthreads,
-                                  NULL, 0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    st |= p_clEnqueueReadBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0,
-                                NULL, NULL);
-    if (nz)
-        st |= p_clEnqueueReadBuffer(o->queue, mnz, CL_TRUE, 0,
-                                    (size_t)nblk * 4, nz, 0, NULL, NULL);
-    st |= p_clEnqueueReadBuffer(o->queue, mdc, CL_TRUE, 0, (size_t)nblk * 4,
-                                dc, 0, NULL, NULL);
-    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+    if (ocl_launch(o, o->k_tqdc, nthreads, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mlev, 0, bytes, level, &ev) != AEG_OK ||
+        (nz && ocl_read(o, mnz, 0, (size_t)nblk * 4, nz, &ev) != AEG_OK) ||
+        (dc && ocl_read(o, mdc, 0, (size_t)nblk * 4, dc, &ev) != AEG_OK))
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
@@ -397,6 +493,7 @@ static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
     int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
         ls2 = aeg_dequant_ls[qp % 6][2];
     cl_int st = CL_SUCCESS;
+    ocl_evlist ev;
 
     if (nblk <= 0)
         return AEG_OK;
@@ -405,10 +502,10 @@ static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
     mres = ocl_buf(o, 2, bytes, CL_MEM_WRITE_ONLY);
     if (!mlev || !mdc || !mres)
         return AEG_EBACKEND;
-    st |= p_clEnqueueWriteBuffer(o->queue, mlev, CL_TRUE, 0, bytes, level, 0,
-                                 NULL, NULL);
-    st |= p_clEnqueueWriteBuffer(o->queue, mdc, CL_TRUE, 0, (size_t)nblk * 4,
-                                 dc, 0, NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mlev, 0, bytes, level, &ev) != AEG_OK ||
+        ocl_write(o, mdc, 0, (size_t)nblk * 4, dc, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     st |= p_clSetKernelArg(o->k_iqdc, 0, sizeof(cl_mem), &mlev);
     st |= p_clSetKernelArg(o->k_iqdc, 1, sizeof(cl_mem), &mdc);
     st |= p_clSetKernelArg(o->k_iqdc, 2, sizeof(int), &nblk);
@@ -419,13 +516,11 @@ static int ocl_iq_dc_batch(void *priv, const int16_t *level, const int32_t *dc,
     st |= p_clSetKernelArg(o->k_iqdc, 7, sizeof(cl_mem), &mres);
     if (st != CL_SUCCESS)
         return AEG_EBACKEND;
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_iqdc, 1, NULL, &nthreads,
-                                  NULL, 0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    st = p_clEnqueueReadBuffer(o->queue, mres, CL_TRUE, 0, bytes, res, 0, NULL,
-                               NULL);
-    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+    if (ocl_launch(o, o->k_iqdc, nthreads, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mres, 0, bytes, res, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
@@ -438,35 +533,46 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     uint64_t *tmp;
     size_t i, acc = 0;
     cl_int st;
+    ocl_evlist ev;
 
     ma = ocl_buf(o, 0, abytes, CL_MEM_READ_ONLY);
     mb = ocl_buf(o, 1, (size_t)sb * h, CL_MEM_READ_ONLY);
     mout = ocl_buf(o, 2, count * 8, CL_MEM_WRITE_ONLY);
     if (!ma || !mb || !mout)
         return AEG_EBACKEND;
-    p_clEnqueueWriteBuffer(o->queue, ma, CL_TRUE, 0, abytes, a, 0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mb, CL_TRUE, 0, (size_t)sb * h, b, 0, NULL, NULL);
-    if (!count)
-        return AEG_OK;
-    p_clSetKernelArg(o->k_sse, 0, sizeof(cl_mem), &ma);
-    p_clSetKernelArg(o->k_sse, 1, sizeof(int), &sa);
-    p_clSetKernelArg(o->k_sse, 2, sizeof(cl_mem), &mb);
-    p_clSetKernelArg(o->k_sse, 3, sizeof(int), &sb);
-    {
-        int itw = (int)tw, ith = (int)th, icount = (int)count;
-        p_clSetKernelArg(o->k_sse, 4, sizeof(int), &itw);
-        p_clSetKernelArg(o->k_sse, 5, sizeof(int), &ith);
-        p_clSetKernelArg(o->k_sse, 6, sizeof(int), &icount);
+    ev.n = 0;
+    if (ocl_write(o, ma, 0, abytes, a, &ev) != AEG_OK ||
+        ocl_write(o, mb, 0, (size_t)sb * h, b, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (!count) {
+        /* an empty batch still has an answer, or the caller keeps the value it
+         * happened to have and reports a PSNR from the wrong number */
+        *out = 0;
+        return ocl_wait(o, &ev);
     }
-    p_clSetKernelArg(o->k_sse, 7, sizeof(cl_mem), &mout);
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_sse, 1, NULL, &count, NULL,
-                                  0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
     tmp = (uint64_t *)malloc(count * 8);
     if (!tmp)
         return AEG_ENOMEM;
-    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, count * 8, tmp, 0, NULL, NULL);
+    {
+        int itw = (int)tw, ith = (int)th, icount = (int)count;
+        st |= p_clSetKernelArg(o->k_sse, 0, sizeof(cl_mem), &ma);
+        st |= p_clSetKernelArg(o->k_sse, 1, sizeof(int), &sa);
+        st |= p_clSetKernelArg(o->k_sse, 2, sizeof(cl_mem), &mb);
+        st |= p_clSetKernelArg(o->k_sse, 3, sizeof(int), &sb);
+        st |= p_clSetKernelArg(o->k_sse, 4, sizeof(int), &itw);
+        st |= p_clSetKernelArg(o->k_sse, 5, sizeof(int), &ith);
+        st |= p_clSetKernelArg(o->k_sse, 6, sizeof(int), &icount);
+        st |= p_clSetKernelArg(o->k_sse, 7, sizeof(cl_mem), &mout);
+    }
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    if (ocl_launch(o, o->k_sse, count, &ev) != AEG_OK ||
+        ocl_read(o, mout, 0, count * 8, tmp, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_wait(o, &ev) != AEG_OK) {
+        free(tmp);
+        return AEG_EBACKEND;
+    }
     for (i = 0; i < count; i++)
         acc += tmp[i];
     free(tmp);
@@ -487,6 +593,7 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
     size_t rbytes = (size_t)rstride * rows, dbytes = (size_t)dstride * rows;
     int pad = AEG_PAD;
     cl_int st;
+    ocl_evlist ev;
 
     /* `ref` and `dst` point at the picture origins; the kernel takes the
      * whole padded allocations (rows * stride bytes from pad rows and pad
@@ -495,10 +602,10 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
     mdst = ocl_buf(o, 1, dbytes, CL_MEM_WRITE_ONLY);
     if (!mref || !mdst)
         return AEG_EBACKEND;
-    if (p_clEnqueueWriteBuffer(o->queue, mref, CL_TRUE, 0, rbytes,
-                               ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD, 0,
-                               NULL, NULL) != CL_SUCCESS)
-        return AEG_EBACKEND;
+    ev.n = 0;
+    if (ocl_write(o, mref, 0, rbytes,
+                  ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     p_clSetKernelArg(o->k_intp, 0, sizeof(cl_mem), &mref);
     p_clSetKernelArg(o->k_intp, 1, sizeof(int), &rstride);
     p_clSetKernelArg(o->k_intp, 2, sizeof(int), &w);
@@ -507,15 +614,12 @@ static int ocl_interp_plane(void *priv, const uint8_t *ref, int rstride,
     p_clSetKernelArg(o->k_intp, 5, sizeof(int), &which);
     p_clSetKernelArg(o->k_intp, 6, sizeof(cl_mem), &mdst);
     p_clSetKernelArg(o->k_intp, 7, sizeof(int), &dstride);
-    st = p_clEnqueueNDRangeKernel(o->queue, o->k_intp, 1, NULL, &count, NULL,
-                                  0, NULL, NULL);
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    if (p_clEnqueueReadBuffer(o->queue, mdst, CL_TRUE, 0, dbytes,
-                              dst - (ptrdiff_t)AEG_PAD * dstride - AEG_PAD, 0,
-                              NULL, NULL) != CL_SUCCESS)
-        return AEG_EBACKEND;
-    return AEG_OK;
+    if (ocl_launch(o, o->k_intp, count, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mdst, 0, dbytes,
+                 dst - (ptrdiff_t)AEG_PAD * dstride - AEG_PAD, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 /* Register the reference picture: its four planes go to device memory once and
@@ -527,21 +631,26 @@ static int ocl_ref_upload(void *priv, const uint8_t *const planes[4],
     ocl_ctx *o = (ocl_ctx *)priv;
     size_t rows = (size_t)h + 2 * AEG_PAD;
     size_t bytes = (size_t)pstride * rows;
+    ocl_evlist ev;
     int k;
 
+    ev.n = 0;
     for (k = 0; k < 4; k++) {
         cl_mem m = ocl_buf(o, 4 + k, bytes, CL_MEM_READ_ONLY);
         if (!m)
-            return AEG_EBACKEND;
-        p_clEnqueueWriteBuffer(o->queue, m, CL_TRUE, 0, bytes,
-                               planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
-                               0, NULL, NULL);
+            return ocl_wait(o, &ev);
+        if (ocl_write(o, m, 0, bytes,
+                      planes[k] - (ptrdiff_t)AEG_PAD * pstride - AEG_PAD,
+                      &ev) != AEG_OK)
+            return ocl_wait(o, &ev);
     }
     o->ref_stride = pstride;
     o->ref_w = w;
     o->ref_h = h;
     o->ref_valid = 1;
-    return AEG_OK;
+    /* the uploads leave on this queue's stream; the searches that read them
+     * wait here, so nothing may re-pack the staging buffers in between */
+    return ocl_wait(o, &ev);
 }
 
 static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
@@ -553,6 +662,7 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     size_t cbytes = (size_t)cstride * rows;
     int pad = AEG_PAD, k;
     cl_int st;
+    ocl_evlist ev;
 
     if (!o->ref_valid || !count)
         return AEG_EBACKEND;
@@ -563,11 +673,11 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
         return AEG_EBACKEND;
     for (k = 0; k < 4; k++)
         mref[k] = o->buf[4 + k];
-    p_clEnqueueWriteBuffer(o->queue, mcur, CL_TRUE, 0, cbytes,
-                           cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD,
-                           0, NULL, NULL);
-    p_clEnqueueWriteBuffer(o->queue, mpos, CL_TRUE, 0, (size_t)count * 8, pos,
-                           0, NULL, NULL);
+    ev.n = 0;
+    if (ocl_write(o, mcur, 0, cbytes,
+                  cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD, &ev) != AEG_OK ||
+        ocl_write(o, mpos, 0, (size_t)count * 8, pos, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
     p_clSetKernelArg(o->k_satd, 0, sizeof(cl_mem), &mcur);
     p_clSetKernelArg(o->k_satd, 1, sizeof(int), &cstride);
     for (k = 0; k < 4; k++)
@@ -579,16 +689,11 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     p_clSetKernelArg(o->k_satd, 10, sizeof(cl_mem), &mpos);
     p_clSetKernelArg(o->k_satd, 11, sizeof(int), &count);
     p_clSetKernelArg(o->k_satd, 12, sizeof(cl_mem), &mout);
-    {
-        size_t n = (size_t)count;
-        st = p_clEnqueueNDRangeKernel(o->queue, o->k_satd, 1, NULL, &n, NULL,
-                                      0, NULL, NULL);
-    }
-    if (st != CL_SUCCESS)
-        return AEG_EBACKEND;
-    p_clEnqueueReadBuffer(o->queue, mout, CL_TRUE, 0, (size_t)count * 4, out,
-                          0, NULL, NULL);
-    return AEG_OK;
+    if (ocl_launch(o, o->k_satd, (size_t)count, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    if (ocl_read(o, mout, 0, (size_t)count * 4, out, &ev) != AEG_OK)
+        return ocl_wait(o, &ev);
+    return ocl_wait(o, &ev);
 }
 
 static void ocl_sync(void *priv)
@@ -669,6 +774,32 @@ static int ocl_kernels(ocl_ctx *o)
                                                              : AEG_EBACKEND;
 }
 
+/* One instance's queue.  Out of order, so the device may overlap the upload
+ * of one operation with the kernel of the previous one (the dependencies are
+ * events, see the data flow above); a runtime that refuses the flag gets an
+ * in-order queue, where the events are satisfied in the order they were
+ * enqueued and the whole operation is simply sequential. */
+static cl_command_queue ocl_queue(cl_context ctx, cl_device_id dev, cl_int *st)
+{
+    cl_command_queue q;
+    cl_ulong props = CL_QUEUE_OUT_OF_ORDER_MODE;
+    static _Atomic int ooo = -1;
+
+    if (ooo < 0) {
+        const char *ev = getenv("AEG_OCL_OOO");
+        ooo = ev ? atoi(ev) != 0 : 1;
+    }
+    q = ooo ? p_clCreateCommandQueue(ctx, dev, props, st) : NULL;
+    if (q && *st == CL_SUCCESS)
+        return q;
+    *st = CL_SUCCESS;
+    q = p_clCreateCommandQueue(ctx, dev, 0, st);
+    if (q && *st == CL_SUCCESS)
+        aeg_log(AEG_LOG_DEBUG, "aeg: the OpenCL runtime refused an out-of-order "
+                "queue, using an in-order one");
+    return q;
+}
+
 static int ocl_clone(void *priv, aeg_be_ops *out);
 
 static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
@@ -730,7 +861,7 @@ static int ocl_clone(void *priv, aeg_be_ops *out)
         return AEG_EBACKEND;
     }
     o->prog = src->prog;
-    o->queue = p_clCreateCommandQueue(o->ctx, o->device, 0, &st);
+    o->queue = ocl_queue(o->ctx, o->device, &st);
     if (!o->queue || st != CL_SUCCESS || ocl_kernels(o) != AEG_OK) {
         ocl_destroy(o);
         return AEG_EBACKEND;
@@ -784,7 +915,7 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         ocl_destroy(o);
         return AEG_EBACKEND;
     }
-    o->queue = p_clCreateCommandQueue(o->ctx, o->device, 0, &st);
+    o->queue = ocl_queue(o->ctx, o->device, &st);
     if (!o->queue) {
         ocl_destroy(o);
         return AEG_EBACKEND;
