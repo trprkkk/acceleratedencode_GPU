@@ -296,8 +296,46 @@ struct be_guard {
     aeg_be_ops      cpu;
     pthread_mutex_t mk;         /* lane creation                            */
     be_lane        *lane[BE_LANES];
-    int             failed;     /* a device call failed: CPU from now on    */
+    /* A device call that failed does not change the stream: the guard runs
+     * the CPU reference instead, which computes the same bytes.  What it must
+     * not do is take the device away for the whole encode on one bad call --
+     * a picture whose arena could not be reserved, a picture the device could
+     * not take at that instant -- so the failures are counted, and only after
+     * AEG_DEV_STRIKES of them is the device put off.  While it is off, one
+     * cautious re-try is taken every AEG_DEV_RETRY pictures: a device that
+     * comes back (the other process on it finished, the arena fits now) is
+     * used again, and one that fails again simply waits for the next interval.
+     * AEG_DEV_OFF=1 keeps the old behaviour of never retrying. */
+    int             failed;     /* the device is off for now                */
+    int             strikes;    /* failures since the last success          */
+    int             dead;       /* kept off for the rest of the process     */
+    int             since_off;  /* pictures coded since the device went off */
 };
+
+#define AEG_DEV_STRIKES 3
+#define AEG_DEV_RETRY 256
+
+static int guard_failed(const be_guard *g)
+{
+    return __atomic_load_n(&g->failed, __ATOMIC_ACQUIRE);
+}
+
+/* one cautious re-try of the device, from the root's per-picture update */
+static void guard_retry(be_guard *g)
+{
+    static _Atomic int off = -1;
+    if (off < 0) {
+        const char *ev = getenv("AEG_DEV_OFF");
+        off = ev ? atoi(ev) : 0;
+    }
+    if (off || !guard_failed(g) || __atomic_load_n(&g->dead, __ATOMIC_ACQUIRE))
+        return;
+    if (++g->since_off < AEG_DEV_RETRY)
+        return;
+    g->since_off = 0;
+    __atomic_store_n(&g->failed, 0, __ATOMIC_RELEASE);
+    aeg_log(AEG_LOG_DEBUG, "aeg: device is being tried again");
+}
 
 static __thread struct {
     const be_lane  *l;
@@ -316,11 +354,6 @@ int aeg_be_last_on_device(void)
     return g_last_on_device;
 }
 
-static int guard_failed(be_guard *g)
-{
-    return __atomic_load_n(&g->failed, __ATOMIC_ACQUIRE);
-}
-
 /* lock, or return 0 when the device is off and the CPU op has to run */
 static int guard_enter(be_lane *l)
 {
@@ -335,12 +368,25 @@ static int guard_enter(be_lane *l)
     return 1;
 }
 
-/* unlock; a failure switches the device off for good */
+/* unlock; a failure is counted, and after AEG_DEV_STRIKES of them the device
+ * is put off (see be_guard).  A success resets the count, so a device that
+ * works but has the occasional bad picture is not put away at all. */
 static int guard_leave(be_lane *l, int rc, const char *op)
 {
     g_last_on_device = rc == AEG_OK;
-    if (rc != AEG_OK && !__atomic_exchange_n(&l->g->failed, 1, __ATOMIC_ACQ_REL))
-        aeg_log(AEG_LOG_WARNING, "aeg: device %s failed (%d), continuing on the CPU", op, rc);
+    if (rc == AEG_OK) {
+        __atomic_store_n(&l->g->strikes, 0, __ATOMIC_RELAXED);
+    } else {
+        int st = __atomic_add_fetch(&l->g->strikes, 1, __ATOMIC_ACQ_REL);
+        if (st >= AEG_DEV_STRIKES &&
+            !__atomic_exchange_n(&l->g->failed, 1, __ATOMIC_ACQ_REL))
+            aeg_log(AEG_LOG_WARNING,
+                    "aeg: device %s failed %d times, continuing on the CPU",
+                    op, st);
+        else if (st == 1)
+            aeg_log(AEG_LOG_DEBUG, "aeg: device %s failed (%d), this operation "
+                    "ran on the CPU", op, rc);
+    }
     pthread_mutex_unlock(&l->mu);
     return rc == AEG_OK;
 }
@@ -876,10 +922,17 @@ void aeg_dispatch_stage_done(aeg_dispatcher *d, int stage, int on_gpu,
     disp_unlock(r);
 }
 
+static void guard_retry(be_guard *g);
+
 static void dispatch_update(aeg_dispatcher *d)
 {
     int i;
     d->frames_measured++;
+    /* one cautious re-try of a device that was put off, every AEG_DEV_RETRY
+     * pictures: a re-tried picture that fails again costs nothing but its own
+     * time, and one that works saves the rest of the encode */
+    if (d->ops.priv)
+        guard_retry(((be_lane *)d->ops.priv)->g);
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         if (d->forced[i] >= 0) {
             d->use_gpu[i] = (d->forced[i] == AEG_BACKEND_OPENCL ||

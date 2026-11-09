@@ -615,6 +615,66 @@ if ok:
 sys.exit(0 if ok else 1)
 PY2
 
+echo "== device failure and recovery"
+# A device that stops answering for a moment must not change a byte: the guard
+# runs the CPU reference on the same batch (either side computes the same
+# samples), and only the timing moves.  It must not take the device away for
+# the whole encode on one bad call either, so a device that comes back is used
+# again -- which AEG_DEV_FAIL lets the suite produce, and AEG_DEV_OFF turns off
+# for the old behaviour.
+if ! "$BUILD/aegenc" --list-devices 2>/dev/null | grep -q '\[2\] cuda'; then
+    echo "   recovery: skipped (no CUDA device)"
+else
+    "$BUILD/genyuv" 320 192 12 "$TMP/rec.yuv" 3 >/dev/null
+    # -s tq=cuda -s iq=cuda: the coefficient stages are forced to the device,
+    # which is where the batched calls (and their failures) come from
+    DEVFORCE="-s tq=cuda -s iq=cuda"
+    $BUILD/aegenc -w 320 -h 192 -n 12 -i "$TMP/rec.yuv" \
+        -o "$TMP/rec_ok.264" --bframes 0 -b cuda -q 26 $DEVFORCE >/dev/null 2>&1
+    AEG_DEV_FAIL=2 $BUILD/aegenc -w 320 -h 192 -n 12 -i "$TMP/rec.yuv" \
+        -o "$TMP/rec_t.264" --bframes 0 -b cuda -q 26 -v 3 $DEVFORCE \
+        > "$TMP/rec_t.log" 2>&1
+    AEG_DEV_FAIL=100000 $BUILD/aegenc -w 320 -h 192 -n 12 -i "$TMP/rec.yuv" \
+        -o "$TMP/rec_off.264" --bframes 0 -b cuda -q 26 -v 3 $DEVFORCE \
+        > "$TMP/rec_off.log" 2>&1
+    AEG_DEV_FAIL=100000 AEG_DEV_OFF=1 $BUILD/aegenc -w 320 -h 192 -n 12 \
+        -i "$TMP/rec.yuv" -o "$TMP/rec_noff.264" --bframes 0 -b cuda -q 26 \
+        $DEVFORCE >/dev/null 2>&1
+    python3 - "$TMP/rec_ok.264" "$TMP/rec_t.264" "$TMP/rec_off.264" \
+        "$TMP/rec_noff.264" "$TMP/rec_t.log" "$TMP/rec_off.log" <<'PY3' || FAIL=1
+import sys
+ok, t, off, noff, tlog, offlog = sys.argv[1:7]
+d = [open(p, 'rb').read() for p in (ok, t, off, noff)]
+bad = 0
+if d[1] != d[0]:
+    print("   two failed calls change the stream  FAIL"); bad += 1
+if d[2] != d[0]:
+    print("   a device put off changes the stream  FAIL"); bad += 1
+if d[3] != d[0]:
+    print("   AEG_DEV_OFF changes the stream  FAIL"); bad += 1
+if 'continuing on the CPU' in open(tlog).read():
+    print("   two failures put the device away (it should have stayed on)  FAIL")
+    bad += 1
+if 'continuing on the CPU' not in open(offlog).read():
+    print("   the device was never put away after 3 strikes  FAIL"); bad += 1
+if not bad:
+    print("   2 failed calls, 3 strikes and a device kept off all give the "
+          "same bytes")
+sys.exit(1 if bad else 0)
+PY3
+    # and a long enough clip that the re-try interval elapses
+    "$BUILD/genyuv" 320 192 300 "$TMP/recL.yuv" 3 >/dev/null
+    AEG_DEV_FAIL=100000 $BUILD/aegenc -w 320 -h 192 -n 300 -i "$TMP/recL.yuv" \
+        -o "$TMP/recL.264" --bframes 0 -b cuda -q 26 -v 3 $DEVFORCE \
+        > "$TMP/recL.log" 2>&1
+    if grep -q 'device is being tried again' "$TMP/recL.log"; then
+        echo "   after 256 pictures the device is tried again"
+    else
+        echo "   the device was never re-tried  FAIL"
+        FAIL=1
+    fi
+fi
+
 echo "== rate"
 sed -n 's/^bitrate /   bitrate /p' "$TMP/h264_320x192.log"
 

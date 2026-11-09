@@ -735,6 +735,8 @@ static int ocl_load(void **lib)
 {
     static const char *names[] = {
         "libOpenCL.so.1", "libOpenCL.so", "libOpenCL.dylib",
+        /* Windows: the ICD loader, next to the vendor's install */
+        "OpenCL.dll",
         "/usr/lib/x86_64-linux-gnu/libOpenCL.so.1", NULL
     };
     int i;

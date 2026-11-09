@@ -371,12 +371,32 @@ static int cuda_ctx_bind(cuda_ctx *o)
     return p_cuCtxSetCurrent(o->ctx);
 }
 
+/* AEG_DEV_FAIL=n: fail the first n device calls.  This is the hook the
+ * recovery test needs -- a device that stops answering for a moment must not
+ * change a byte, and a device that stays off must come back.  It changes
+ * nothing but the return code: the guard runs the CPU reference on the very
+ * same batch, so the output is the stream the CPU path would have produced. */
+static int cuda_dev_fail(void)
+{
+    static _Atomic int left = -1;
+    if (left < 0) {
+        const char *ev = getenv("AEG_DEV_FAIL");
+        left = ev ? atoi(ev) : 0;
+    }
+    if (left > 0 &&
+        __atomic_sub_fetch(&left, 1, __ATOMIC_ACQ_REL) >= 0)
+        return 1;
+    return 0;
+}
+
 /* A driver-API context is current on the thread that created it only, and the
  * operations are called from slice threads too (one at a time: the backend
  * guard in backend.c serialises them), so every entry point makes it current
  * on the calling thread first. */
 static int cuda_bind(cuda_ctx *o)
 {
+    if (cuda_dev_fail())
+        return AEG_EBACKEND;
     return cuda_ctx_bind(o) == CUDA_SUCCESS ? AEG_OK : AEG_EBACKEND;
 }
 
@@ -903,8 +923,11 @@ static void cuda_destroy(void *priv)
 static int cuda_load(void **lib)
 {
     static const char *names[] = {
-        "libcuda.so.1", "libcuda.so", "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-        NULL
+        "libcuda.so.1", "libcuda.so",
+        /* Windows: the driver's loader is nvcuda.dll, and a CUDA install
+         * puts a copy of it on the DLL search path */
+        "nvcuda.dll",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1", NULL
     };
     int i;
     /* AEG_CUDA_LIB: a library outside the loader's search path (a pip-installed
@@ -928,6 +951,10 @@ static int nvrtc_load(void **lib)
 {
     static const char *names[] = {
         "libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11",
+        /* Windows: one dll per CUDA version (nvrtc64_120_0.dll, ...), all on
+         * the toolkit's bin directory */
+        "nvrtc64_130_0.dll", "nvrtc64_128_0.dll", "nvrtc64_124_0.dll",
+        "nvrtc64_120_0.dll", "nvrtc64_112_0.dll",
         "/usr/local/cuda/lib64/libnvrtc.so", NULL
     };
     int i;
