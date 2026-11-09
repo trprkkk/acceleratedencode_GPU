@@ -922,10 +922,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--weightb")) {
             const char *v = i + 1 < argc ? argv[i + 1] : NULL;
             weightb = 1;
-            if (v && !strcmp(v, "explicit")) {
-                fprintf(stderr, "error: explicit weighted B is not implemented\n");
-                return 2;
-            }
+            if (v && !strcmp(v, "explicit")) { weightb = 2; i++; }
             if (v && !strcmp(v, "implicit")) i++;
         }
         else if (!strcmp(a, "--b-pyramid")) bpyramid = int_arg(a, next_arg(argc, argv, &i));

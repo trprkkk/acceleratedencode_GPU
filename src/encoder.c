@@ -3027,9 +3027,7 @@ static int wp_used(const struct aeg_encoder *e)
 
 static int bwp_used(const struct aeg_encoder *e)
 {
-    return e->p.weightb == 2 &&
-           (e->bwp.lflag[0] || e->bwp.cflag[0] ||
-            e->bwp.l1flag[0] || e->bwp.c1flag[0]);
+    return e->p.weightb == 2;
 }
 static void mc_rect_luma_to(struct aeg_encoder *e, int list, pixel *dl,
                             int mbx, int mby, int x, int y, int w, int h,

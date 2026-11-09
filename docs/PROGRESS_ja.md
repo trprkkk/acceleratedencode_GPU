@@ -137,7 +137,10 @@
 - [x] M-5f（CQM 完成）: `--cqm flat|jvt|<file>`、SPS の `seq_scaling_matrix_present_flag` に 4x4 6 個 + 8x8 2 個、8x8 dequant 適用。**原因は SPS の 8x8 リストに PPS 専用の `useDefaultScalingMatrix8x8Flag` を書いていたこと**（SPS では不要、1 ビット余分で `log2_max_frame_num` 以降がずれる）。修正後、8bit CABAC/CAVLC・10bit で `--dump-recon` と FFmpeg デコードが一致。既定 flat は 197,721 バイト不変。
   - flat vs jvt CQP 4点×長尺4クリップ BD-rate（jvt が flat 比、正=悪化）: PSNR **+10.10/+6.79/+7.00/+4.51%**（平均 **+7.10%**）、SSIM **+1.38/+3.18/+1.46/+2.49%**（平均 **+2.13%**）。JVT 行列はこの実装では明確に悪化。
 - [x] M-5g（部分）: HDR10 static metadata SEI（`--master-display`、`--max-cll`、payload 137/144）。weighted B、B16、ref16、Blu-ray 制約は未着手
-- [x] M-5h（implicit weighted B / explicit 凍結）: `--weightb` で `weighted_bipred_idc=2`、POC 距離比の重み（denom 5、w0+w1=32）を bi-pred の luma/chroma に適用。8bit/10bit、CABAC/CAVLC、B-pyramid 0 で `--dump-recon` と FFmpeg デコードが一致。CPU/CUDA ビット一致。explicit は B 用 `pred_weight_table` を実装したが、スライスヘッダの PWT 長が合わず（deblocking_filter_idc 6）、`--weightb explicit` は明示エラーで無効化。既定 OFF は 197,721 バイト不変。BD-rate は未完了。
+- [x] M-5h（weighted B）: `--weightb [implicit|explicit]`。implicit は `weighted_bipred_idc=2` と POC 距離比（denom 5、w0+w1=32）。explicit は B 用 `pred_weight_table`（l0/l1 の flag/weight/offset、chroma 込み）。8bit/10bit、CABAC/CAVLC、B-pyramid 0/通常 GOP で `--dump-recon` と FFmpeg デコードが一致。CPU/CUDA ビット一致。
+  - explicit の旧バグ: ヘッダ時点で `bwp_used()` が重みフラグ未計算のため false になり、PWT を省略したのに PPS は `weighted_bipred_idc=1` で PWT を期待していた。`bwp_used()` を `weightb==2` で常に true にして修正。
+  - CQP 4点×長尺4クリップ BD-rate（off 比、正=悪化）: implicit は cockL **-0.95/-1.21%**、vtestL **-3.51/-5.44%**、megaL **-2.43/-4.13%**、treeL 0.00/0.00（PSNR/SSIM）。explicit は平均 **+30%** 前後で、平均輝度比ヒューリスティックが悪い。
+  - 既定 OFF は 197,721 バイト不変。CRF は未完了。
 - [ ] M-5i: libavcodec wrapper、コンテナ連携
 
 ### M-7 移植性（Windows / MSVC / ARM）
