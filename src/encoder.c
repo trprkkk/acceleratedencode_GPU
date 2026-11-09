@@ -16393,6 +16393,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     memcpy(&e->p, params, sizeof(e->p));
     pp = &e->p;
+    if (pp->lossless) {
+        aeg_set_last_error("lossless coding is not implemented yet");
+        aeg_free(e);
+        return NULL;
+    }
     if (pp->cqm_on && !pp->transform_8x8) {
         aeg_set_last_error("CQM needs the 8x8 transform");
         aeg_free(e);

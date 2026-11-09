@@ -222,6 +222,7 @@ typedef struct aeg_params {
     int qp_min, qp_max;
     int chroma_qp_offset;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
+    int lossless;             /* --lossless: 0/1 (not implemented yet) */
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
     /* AEG_RC_CRF: the quality to hold, on x264's scale (lower is better;

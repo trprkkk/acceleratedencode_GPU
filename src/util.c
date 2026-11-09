@@ -148,6 +148,7 @@ void aeg_params_default(aeg_params *p)
     p->max_cll = p->max_fall = -1;
     p->qp_max = 51;
     p->qp = 23;
+    p->lossless = 0;
     p->bit_depth = 8;
     p->crf = 23.0;
     p->qcomp = 60;

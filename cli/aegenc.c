@@ -40,6 +40,8 @@ static void usage(void)
 "                   profile, CPU only; x264 --output-depth 10)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
+"  --lossless       lossless coding (experimental; not implemented yet)\n"
+
 "  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
 "                   -12..51 at 10 bits)\n"
 "                   0..51; 18..28 is the usual range).  The QP follows each\n"
@@ -699,7 +701,7 @@ int main(int argc, char **argv)
     aeg_image layout;
     size_t poff[3];
     double crf = -1.0;
-    int crf_given = 0, bit_depth = 8;
+    int crf_given = 0, bit_depth = 8, lossless = 0;
     double fps;
     input_t inp;
     int bitrate = 0, aq = -1, aq_mode = -1;
@@ -962,6 +964,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-8x8dct")) p.transform_8x8 = 0;
         else if (!strcmp(a, "--no-cabac")) p.cabac = 0;
         else if (!strcmp(a, "--open-gop")) p.open_gop = 1;
+        else if (!strcmp(a, "--lossless")) lossless = 1;
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--qpfile")) qpfilepath = next_arg(argc, argv, &i);
@@ -1310,6 +1313,7 @@ int main(int argc, char **argv)
     p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
     p.qcomp = qcomp;
     p.bit_depth = bit_depth;
+    p.lossless = lossless;
     if (crf_given) {
         p.rc_mode = AEG_RC_CRF;
         p.crf = crf;
