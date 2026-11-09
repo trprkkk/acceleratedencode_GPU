@@ -1087,8 +1087,8 @@ int main(int argc, char **argv)
     {
         int bad = 0;
         bad |= range_bad("-q", qp, 0, 51);
-        if (bit_depth != 8 && bit_depth != 10) {
-            fprintf(stderr, "error: --bit-depth %d: expected 8 or 10\n", bit_depth);
+        if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) {
+            fprintf(stderr, "error: --bit-depth %d: expected 8, 10 or 12\n", bit_depth);
             bad = 1;
         }
         if (crf_given && crf < 0.0 && bit_depth == 8) {

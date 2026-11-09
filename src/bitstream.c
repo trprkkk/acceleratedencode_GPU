@@ -419,7 +419,7 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
     const int main = !high && (p->cabac || p->interlaced);
 
     aeg_bw_init(&bw, rbsp, cap, 0);
-    aeg_bw_put(&bw, 8, bd > 8 ? 110 : high ? 100 : (main ? 77 : 66)); /* profile_idc */
+    aeg_bw_put(&bw, 8, bd > 10 ? 244 : bd > 8 ? 110 : high ? 100 : (main ? 77 : 66)); /* profile_idc */
     aeg_bw_put(&bw, 8, (high || main || bd > 8) ? 0x00 : 0xc0); /* constraint_set0/1 */
     aeg_bw_put(&bw, 8, (uint32_t)level_idc);
     aeg_bw_ue(&bw, 0);                   /* seq_parameter_set_id            */
