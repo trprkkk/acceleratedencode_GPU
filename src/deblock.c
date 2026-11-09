@@ -622,7 +622,7 @@ void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
  *    picture-wide internal batch after a boundary pass is measured as
  *    non-bit-exact by AEG_DEBLOCK_SPLIT=2; M-4a2 must either fuse both kinds
  *    in one raster-ordered persistent kernel or accept one work item per MB
- *    in raster order (M-4a-R). */
+ *    in raster order (M-4a-R).
  * Executed in the same order as aeg_deblock_mb():
  *   vertical MB edge (k=0), vertical internal (k=1..3),
  *   horizontal MB edge (k=0), horizontal internal (k=1..3).
@@ -686,6 +686,101 @@ void aeg_deblock_frame_batch(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
             mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 1, 1, 3);
             mb_dir_range(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta, 0, 1, 3);
         }
+}
+
+/* M-4a-R CPU reference: persistent raster scheduler.
+ *
+ * Exact dependency model (writes are what force it):
+ *   MB(x,y) waits for
+ *     (x-1,y)   left      -- its vertical boundary reads/writes the left
+ *                            macroblock's rightmost three columns;
+ *     (x,y-1)   top       -- its horizontal boundary reads/writes the top
+ *                            macroblock's bottom three rows;
+ *     (x-1,y-1) top-left  -- the top macroblock's left boundary modifies
+ *                            the bottom-left samples this MB reads;
+ *     (x+1,y-1) top-right -- the top macroblock's right boundary modifies
+ *                            the bottom-right samples this MB reads.
+ * A macroblock releases its successor only after ALL of its own vertical
+ * and horizontal edges (boundary and internal) are done.  The top-right
+ * edge is the non-obvious one: MB(x+1,y-1)'s left boundary writes into
+ * MB(x,y-1)'s bottom-right, which MB(x,y)'s top edge reads.  Omitting it
+ * (or using only left/top) lets a lower-right macroblock run too early.
+ *
+ * The scheduler keeps one counter per macroblock and a raster scan for a
+ * ready job.  It is single-threaded here so the reference stays simple; the
+ * same counters are what a persistent device kernel would spin on.  The
+ * order is still the normative raster order because the scan picks the
+ * lowest-index ready macroblock and every dependency points to a lower row
+ * or the same row's left neighbour. */
+void aeg_deblock_frame_persistent(aeg_picture *pic, const aeg_mb *mbs,
+                                  int mb_stride, int slice_alpha,
+                                  int slice_beta, int deblock_idc)
+{
+    int w = pic->mb_w, h = pic->mb_h, n, i, rem;
+    unsigned char *done;
+    int *pred;
+
+    if (!deblock_idc)
+        return;
+    if (pic->mbaff) {
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+        return;
+    }
+    n = w * h;
+    done = (unsigned char *)calloc((size_t)n, 1);
+    pred = (int *)calloc((size_t)n, sizeof(*pred));
+    if (!done || !pred) {
+        free(done);
+        free(pred);
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        int x = i % w, y = i / w;
+        if (x > 0) pred[i]++;
+        if (y > 0) pred[i]++;
+        if (x > 0 && y > 0) pred[i]++;
+        if (x + 1 < w && y > 0) pred[i]++;
+    }
+    rem = n;
+    while (rem > 0) {
+        int progress = 0;
+        for (i = 0; i < n; i++) {
+            int x, y;
+            if (done[i] || pred[i])
+                continue;
+            x = i % w;
+            y = i / w;
+            aeg_deblock_mb(pic, mbs, mb_stride, x, y, slice_alpha, slice_beta);
+            done[i] = 1;
+            rem--;
+            progress = 1;
+#define REL(dx, dy) do { \
+            int nx = x + (dx), ny = y + (dy); \
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h) { \
+                int ni = ny * w + nx; \
+                if (!done[ni] && pred[ni] > 0) pred[ni]--; \
+            } \
+        } while (0)
+            REL(1, 0);    /* left predecessor */
+            REL(0, 1);    /* top predecessor */
+            REL(1, 1);    /* top-left predecessor */
+            REL(-1, 1);   /* top-right predecessor */
+#undef REL
+        }
+        if (!progress)
+            break;       /* cycle: caller falls back below */
+    }
+    if (rem > 0) {
+        /* Should not happen; keep the frame correct rather than partially
+         * filtered if the dependency model ever misses an edge. */
+        aeg_deblock_frame(pic, mbs, mb_stride, slice_alpha, slice_beta,
+                          deblock_idc);
+    }
+    free(done);
+    free(pred);
 }
 
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,

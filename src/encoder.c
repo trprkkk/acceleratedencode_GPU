@@ -14232,6 +14232,7 @@ static void deblock_frame_dispatch(struct aeg_encoder *e, int idc)
 {
     const char *d = getenv("AEG_DEBLOCK_DIAG");
     const char *s = getenv("AEG_DEBLOCK_SPLIT");
+    const char *p = getenv("AEG_DEBLOCK_PERSIST");
     if (d && atoi(d)) {
         aeg_deblock_frame_diag(&e->pic, e->mbs, e->mb_w,
                                e->p.deblock_alpha, e->p.deblock_beta, idc);
@@ -14241,6 +14242,10 @@ static void deblock_frame_dispatch(struct aeg_encoder *e, int idc)
     } else if (s && atoi(s) == 1) {
         aeg_deblock_frame_split(&e->pic, e->mbs, e->mb_w,
                                 e->p.deblock_alpha, e->p.deblock_beta, idc);
+    } else if (p && atoi(p)) {
+        aeg_deblock_frame_persistent(&e->pic, e->mbs, e->mb_w,
+                                     e->p.deblock_alpha, e->p.deblock_beta,
+                                     idc);
     } else {
         aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
                           e->p.deblock_beta, idc);
