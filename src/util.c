@@ -197,6 +197,8 @@ void aeg_params_default(aeg_params *p)
     p->direct = -1;
     p->b_adapt = -1;
     p->trellis = -1;
+    p->psy_rd = 0.0;
+    p->psy_trellis = 0.0;
     p->refs = -1;
     p->weightp = -1;
     p->b_pyramid = -1;

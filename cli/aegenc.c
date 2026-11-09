@@ -137,6 +137,8 @@ static void usage(void)
 "  --dump-recon <f> write the reconstruction (coding order, I420; 16-bit\n"
 "                   little-endian samples at --bit-depth 10)\n"
 "  --dump-order <f> write each packet's display index, one per line\n"
+"  --psy-rd <rd>,<trellis>  psy-rd strength and psy-trellis strength (0 = off)\n"
+
 "  --trellis <n>    rate-distortion level selection (x264's meaning): 0 = off,\n"
 "                   1 = the winning macroblock only (presets 1-2), 2 = every\n"
 "                   candidate of the decision as well (presets 3-4)\n"
@@ -700,6 +702,8 @@ int main(int argc, char **argv)
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
+    double psy_rd = -1.0, psy_trellis = 0.0;
+
     int mbtree = -1, rclookahead = -1;
     int trellis = -1;
     int bframes = -1, bqp = -1000, iqp = -1000, direct = -1, badapt = -1;
@@ -924,6 +928,14 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+        else if (!strcmp(a, "--psy-rd")) {
+            const char *v = next_arg(argc, argv, &i);
+            if (sscanf(v, "%lf,%lf", &psy_rd, &psy_trellis) != 2 &&
+                sscanf(v, "%lf:%lf", &psy_rd, &psy_trellis) != 2) {
+                fprintf(stderr, "error: --psy-rd <rd>,<trellis>\n");
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--trellis")) trellis = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--partitions")) partitions = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--bitrate")) bitrate = int_arg(a, next_arg(argc, argv, &i));
@@ -1079,6 +1091,11 @@ int main(int argc, char **argv)
         if (bqp > -1000) bad |= range_bad("--bqp", bqp, -51, 51);
         if (iqp > -1000) bad |= range_bad("--iqp", iqp, -51, 51);
         if (trellis >= 0) bad |= range_bad("--trellis", trellis, 0, 2);
+        if (psy_rd >= 0.0 && (psy_rd > 2.0 || psy_trellis < 0.0 ||
+            psy_trellis > 2.0)) {
+            fprintf(stderr, "error: --psy-rd strengths must be 0..2\n");
+            bad = 1;
+        }
         if (partitions >= 0) bad |= range_bad("--partitions", partitions, 0, 31);
         if (in_depth >= 0) bad |= range_bad("--input-depth", in_depth, 8, 16);
         if (bad)
@@ -1301,6 +1318,10 @@ int main(int argc, char **argv)
         return 1;
     }
     if (trellis >= 0) p.trellis = trellis;
+    if (psy_rd >= 0.0) {
+        p.psy_rd = psy_rd;
+        p.psy_trellis = psy_trellis;
+    }
     if (partitions >= 0) p.partitions = partitions;
     /* -v 0 = errors only, 1 = warnings and the encoder's summary (info),
      * 2 and up = every picture (debug) */

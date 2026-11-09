@@ -7818,12 +7818,45 @@ static int64_t dbrdo_delta(struct aeg_encoder *e, int mbx, int mby,
     return aeg_ssd(16, 16, blk, 16, src, s) - aeg_ssd(16, 16, rec, s, src, s);
 }
 
+/* Psy-rd: x264's idea is that an error in a textured residual is less
+ * visible than the same error in a flat one.  The mask is sqrt(|residual|),
+ * normalised so its mean is one; it multiplies the squared error and leaves
+ * the rate term untouched.  This is the luma-only, reconstruction-based
+ * form: it sees the residual the coder actually produced, not the pre-
+ * quantisation one, so it can be computed after a candidate is reconstructed
+ * and applied uniformly to every candidate in full_price(). */
+static int64_t psy_mb_sse(struct aeg_encoder *e, int mbx, int mby)
+{
+    const int s = e->stride[0];
+    const pixel *src = e->srcp[0] + mby * 16 * s + mbx * 16;
+    const pixel *rec = e->recp[0] + mby * 16 * s + mbx * 16;
+    double num = 0.0, den = 0.0;
+    int x, y;
+    for (y = 0; y < 16; y++)
+        for (x = 0; x < 16; x++) {
+            double d = (double)src[y * s + x] - (double)rec[y * s + x];
+            double w = sqrt(fabs(d) + 1.0);
+            num += w * d * d;
+            den += w;
+        }
+    return den > 0.0 ? (int64_t)(num / den * 256.0 + 0.5) : 0;
+}
+
 static int64_t full_price(struct aeg_encoder *e, int mbx, int mby,
                           const mbenc *t, int64_t est, int cmode, double lambda,
                           int64_t bound)
 {
     mbenc f;
 
+    if (e->p.psy_rd > 0.0) {
+        int64_t psy = psy_mb_sse(e, mbx, mby);
+        int64_t ns = t->sse + (int64_t)(e->p.psy_rd *
+                                        ((double)psy - (double)t->sse));
+        f = *t;
+        f.sse = ns;
+        return full_price_inner(e, mbx, mby, &f, est + (ns - t->sse),
+                                cmode, lambda, bound);
+    }
     if (dbrdo_on(e)) {
         /* the filtered distortion stands in for the plain one (the price is
          * the distortion plus lambda times the rate, so the change adds) */

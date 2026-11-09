@@ -364,6 +364,12 @@ typedef struct aeg_params {
      * 2 = inside every candidate of the decision too.  -1 means "as the
      * preset says" (1 at presets 1-2, 2 at 3-4). */
     int trellis;
+    /* Psy-rd (x264's --psy-rd): weight the luma distortion of a candidate by
+     * a sqrt(residual) energy mask.  `psy_rd` is the strength (0 = off,
+     * 1.0 = x264's usual value, up to 2.0); `psy_trellis` is reserved for the
+     * quantiser-side variant (M-5b), currently parsed but not applied. */
+    double psy_rd;
+    double psy_trellis;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8, 16=8x8 split further */
     int chroma_me;            /* include chroma in motion SAD           */
     int verbose;              /* informational; logging is aeg_set_log_level() */
