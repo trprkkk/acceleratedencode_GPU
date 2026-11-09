@@ -139,8 +139,8 @@
 - [x] M-5g（部分）: HDR10 static metadata SEI（`--master-display`、`--max-cll`、payload 137/144）。weighted B、B16、ref16、Blu-ray 制約は未着手
 - [x] M-5h（weighted B）: `--weightb [implicit|explicit]`。implicit は `weighted_bipred_idc=2` と POC 距離比（denom 5、w0+w1=32）。explicit は B 用 `pred_weight_table`（l0/l1 の flag/weight/offset、chroma 込み）。8bit/10bit、CABAC/CAVLC、B-pyramid 0/通常 GOP で `--dump-recon` と FFmpeg デコードが一致。CPU/CUDA ビット一致。
   - explicit の旧バグ: ヘッダ時点で `bwp_used()` が重みフラグ未計算のため false になり、PWT を省略したのに PPS は `weighted_bipred_idc=1` で PWT を期待していた。`bwp_used()` を `weightb==2` で常に true にして修正。
-  - CQP 4点×長尺4クリップ BD-rate（off 比、正=悪化）: implicit は cockL **-0.95/-1.21%**、vtestL **-3.51/-5.44%**、megaL **-2.43/-4.13%**、treeL 0.00/0.00（PSNR/SSIM）。explicit は平均 **+30%** 前後で、平均輝度比ヒューリスティックが悪い。
-  - 既定 OFF は 197,721 バイト不変。CRF は未完了。
+  - CQP 4点×長尺4クリップ BD-rate（off 比、正=悪化）: implicit は cockL **-0.95/-1.21%**、vtestL **-3.51/-5.44%**、megaL **-2.43/-4.13%**、treeL 0.00/0.00（PSNR/SSIM）。explicit は最小二乗＋SSE 安全弁（1% 未満改善、重み 31..33/offset ±2 の外は flag=0）に変更し、通常クリップではほぼ全 ref が flag=0。1080p 12f で off 197,174 → explicit 197,192 バイト（PWT の数ビットのみ）で、旧 +30% は解消し実質 0%。
+  - CRF 4点×長尺4クリップ BD-rate（off 比）: implicit は cockL **-1.13/-2.06%**、vtestL **-3.23/-6.09%**、megaL **-2.19/-4.67%**、treeL 0.00/0.00、平均 **-1.64/-3.20%**。explicit は平均 **+0.27/+0.27%** で ≤+0.5% を満たす。既定 OFF は 197,721 バイト不変。
 - [ ] M-5i: libavcodec wrapper、コンテナ連携
 
 ### M-7 移植性（Windows / MSVC / ARM）

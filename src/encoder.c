@@ -12884,62 +12884,80 @@ static int wp_threshold(void)
  * heuristic only for choosing the table; the encoder and the decoder use the
  * same transmitted values, so bit-exactness does not depend on how good it
  * is.  Offsets are in 8-bit units, as the syntax defines them. */
+/* Fit one plane's explicit weight by least squares (x = reference,
+ * y = current): w = cov/var, o = mean(y) - w*mean(x).  The integer form
+ * transmitted is w*32 with denom 5.  A plane whose weighted prediction is not
+ * better in SSE keeps its flag clear, so explicit prediction can never be
+ * worse than no weighting. */
+static void bwp_fit(const struct aeg_encoder *e, int l, int pl, int w, int h,
+                    int stride, int *wt_out, int *off_out)
+{
+    const pixel *src = e->srcp[pl];
+    const pixel *ref = e->refpl[l][pl];
+    const int scale = 1 << (BIT_DEPTH - 8);
+    double sx = 0, sy = 0, sxx = 0, sxy = 0, sw = 0, s0 = 0;
+    double n = (double)w * h;
+    int x, y, wt, off;
+
+    *wt_out = 32;
+    *off_out = 0;
+    if (!ref)
+        return;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            double a = ref[y * stride + x], b = src[y * stride + x];
+            double d0 = a - b;
+            sx += a; sy += b; sxx += a * a; sxy += a * b;
+            s0 += d0 * d0;
+        }
+    {
+        double den = n * sxx - sx * sx;
+        double wf = den > 1e-9 ? (n * sxy - sx * sy) / den : 1.0;
+        double of = (sy - wf * sx) / n;
+        wt = (int)(wf * 32.0 + (wf >= 0 ? 0.5 : -0.5));
+        off = (int)(of / scale + (of >= 0 ? 0.5 : -0.5));
+    }
+    if (wt < 29) wt = 29;
+    if (wt > 35) wt = 35;
+    if (off < -8) off = -8;
+    if (off > 8) off = 8;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            double a = e->refpl[l][pl][y * stride + x];
+            double b = src[y * stride + x];
+            double d = ((wt * a + 16.0) / 32.0 + off * scale) - b;
+            sw += d * d;
+        }
+    if (sw >= s0 * 0.99 || wt < 31 || wt > 33 || off < -2 || off > 2)
+        return;
+    *wt_out = wt;
+    *off_out = off;
+}
+
 static void bwp_analyse(struct aeg_encoder *e)
 {
-    const int w = e->vw, h = e->vh, s = e->stride[0];
-    const int cw = e->vcw, ch = e->vch, cs = e->stride[1];
-    int64_t ss = 0, sr[2] = { 0, 0 };
-    int64_t cs0[2] = { 0, 0 };
-    int64_t cr[2][2] = { { 0, 0 }, { 0, 0 } };
-    int x, y, pl, l;
+    int l, pl, wt, off;
 
     memset(&e->bwp, 0, sizeof(e->bwp));
     e->bwp.luma_denom = e->bwp.chroma_denom = 5;
     if (e->p.weightb != 2 || !e->has_ref)
         return;
-    for (y = 0; y < h; y++)
-        for (x = 0; x < w; x++) {
-            int v = e->srcp[0][y * s + x];
-            ss += v;
-            for (l = 0; l < 2; l++)
-                if (e->refpl[l][0])
-                    sr[l] += e->refpl[l][0][y * s + x];
-        }
-    for (pl = 0; pl < 2; pl++)
-        for (y = 0; y < ch; y++)
-            for (x = 0; x < cw; x++) {
-                int v = e->srcp[1 + pl][y * cs + x];
-                cs0[pl] += v;
-                for (l = 0; l < 2; l++)
-                    if (e->refpl[l][1 + pl])
-                        cr[l][pl] += e->refpl[l][1 + pl][y * cs + x];
-            }
     for (l = 0; l < 2; l++) {
-        int64_t sa = ss, ra = sr[l];
-        int wt, off;
-        if (!ra)
+        if (!e->refpl[l][0])
             continue;
-        wt = (int)((sa * 32 + ra / 2) / ra);
-        if (wt < 1) wt = 1;
-        if (wt > 127) wt = 127;
-        off = (int)((sa - ((int64_t)wt * ra + 16) / 32) / (w * h));
-        if (off < -128) off = -128;
-        if (off > 127) off = 127;
+        bwp_fit(e, l, 0, e->vw, e->vh, e->stride[0], &wt, &off);
+        if (wt == 32 && off == 0)
+            continue;
         if (l) { e->bwp.l1flag[0] = 1; e->bwp.l1w[0] = wt; e->bwp.l1o[0] = off; }
         else   { e->bwp.lflag[0] = 1; e->bwp.lw[0] = wt; e->bwp.lo[0] = off; }
-        for (pl = 0; pl < 2; pl++) {
-            int64_t ca = cs0[pl], cra = cr[l][pl];
-            int cwt, coff;
-            if (!cra)
+        for (pl = 1; pl <= 2; pl++) {
+            if (!e->refpl[l][pl])
                 continue;
-            cwt = (int)((ca * 32 + cra / 2) / cra);
-            if (cwt < 1) cwt = 1;
-            if (cwt > 127) cwt = 127;
-            coff = (int)((ca - ((int64_t)cwt * cra + 16) / 32) / (cw * ch));
-            if (coff < -128) coff = -128;
-            if (coff > 127) coff = 127;
-            if (l) { e->bwp.c1flag[0] = 1; e->bwp.c1w[0][pl] = cwt; e->bwp.c1o[0][pl] = coff; }
-            else   { e->bwp.cflag[0] = 1; e->bwp.cw[0][pl] = cwt; e->bwp.co[0][pl] = coff; }
+            bwp_fit(e, l, pl, e->vcw, e->vch, e->stride[1], &wt, &off);
+            if (wt == 32 && off == 0)
+                continue;
+            if (l) { e->bwp.c1flag[0] = 1; e->bwp.c1w[0][pl - 1] = wt; e->bwp.c1o[0][pl - 1] = off; }
+            else   { e->bwp.cflag[0] = 1; e->bwp.cw[0][pl - 1] = wt; e->bwp.co[0][pl - 1] = off; }
         }
     }
 }
