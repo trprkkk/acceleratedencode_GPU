@@ -9,12 +9,18 @@
 #include "h264.h"
 #include "api_impl.h"
 
-#ifdef AEG_HAVE_10BIT
+#if defined(AEG_HAVE_10BIT) || defined(AEG_HAVE_12BIT)
 static int depth_of(const aeg_encoder *enc)
 {
     return ((const aeg_params *)(const void *)enc)->bit_depth;
 }
+#endif
 
+#if defined(AEG_HAVE_12BIT)
+#define DISPATCH(enc, fn, ...) \
+    (depth_of(enc) == 12 ? fn##_12(__VA_ARGS__) : \
+     depth_of(enc) == 10 ? fn##_10(__VA_ARGS__) : fn(__VA_ARGS__))
+#elif defined(AEG_HAVE_10BIT)
 #define DISPATCH(enc, fn, ...) \
     (depth_of(enc) == 10 ? fn##_10(__VA_ARGS__) : fn(__VA_ARGS__))
 #else
@@ -34,8 +40,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         return NULL;
 #endif
     }
+    if (params->bit_depth == 12) {
+#ifdef AEG_HAVE_12BIT
+        return aeg_enc_open_12(params);
+#else
+        aeg_set_last_error("bit_depth 12: library built without the 12-bit "
+                           "encoder (BIT_DEPTHS=8 10)");
+        return NULL;
+#endif
+    }
     if (params->bit_depth != 0 && params->bit_depth != 8) {
-        aeg_set_last_error("bit_depth must be 8 or 10");
+        aeg_set_last_error("bit_depth must be 8, 10 or 12");
         return NULL;
     }
     return aeg_enc_open(params);

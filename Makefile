@@ -51,7 +51,7 @@ INSTALL    ?= install
 # $(BUILD)/, BIT_DEPTH=10 into $(BUILD)/obj10/ with every symbol they define
 # renamed with a _10 suffix (objcopy), so both live in one library.  The rest
 # (SHARED_SRC) is compiled once; api.c dispatches on aeg_params.bit_depth.
-BIT_DEPTHS ?= 8 10
+BIT_DEPTHS ?= 8 10 12
 DEPTH_SRC  := src/transform.c src/intra.c src/mc.c src/deblock.c \
               src/cavlc.c src/cabac.c src/backend.c src/lowres.c \
               src/input.c src/encoder.c
@@ -67,6 +67,14 @@ DEPTH_NAMES := $(basename $(notdir $(DEPTH_SRC)))
 RAW10   := $(patsubst %,$(BUILD)/obj10/raw/%.o,$(DEPTH_NAMES))
 OBJ10   := $(patsubst %,$(BUILD)/obj10/%.o,$(DEPTH_NAMES))
 OBJ     += $(OBJ10)
+endif
+
+ifneq ($(filter 12,$(BIT_DEPTHS)),)
+CFLAGS  += -DAEG_HAVE_12BIT
+DEPTH_NAMES := $(basename $(notdir $(DEPTH_SRC)))
+RAW12   := $(patsubst %,$(BUILD)/obj12/raw/%.o,$(DEPTH_NAMES))
+OBJ12   := $(patsubst %,$(BUILD)/obj12/%.o,$(DEPTH_NAMES))
+OBJ     += $(OBJ12)
 endif
 
 ifeq ($(OPENCL),1)
@@ -103,6 +111,21 @@ $(BUILD)/obj10/syms: $(RAW10)
 
 $(BUILD)/obj10/%.o: $(BUILD)/obj10/raw/%.o $(BUILD)/obj10/syms
 	$(OBJCOPY) --redefine-syms=$(BUILD)/obj10/syms $< $@
+
+ifneq ($(filter 12,$(BIT_DEPTHS)),)
+$(BUILD)/obj12/raw:
+	mkdir -p $@
+
+$(BUILD)/obj12/raw/%.o: src/%.c | $(BUILD)/obj12/raw
+	$(CC) $(CFLAGS) -DBIT_DEPTH=12 -c $< -o $@
+
+$(BUILD)/obj12/syms: $(RAW12)
+	$(NM) -A -P -g --defined-only $(RAW12) | \
+	    awk '{ print $$2 " " $$2 "_12" }' | sort -u > $@
+
+$(BUILD)/obj12/%.o: $(BUILD)/obj12/raw/%.o $(BUILD)/obj12/syms
+	$(OBJCOPY) --redefine-syms=$(BUILD)/obj12/syms $< $@
+endif
 
 $(BUILD)/aegenc.o: cli/aegenc.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@

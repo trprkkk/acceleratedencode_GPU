@@ -25,11 +25,11 @@
 #if BIT_DEPTH == 8
 typedef uint8_t pixel;
 typedef int16_t dctcoef;
-#elif BIT_DEPTH == 10
+#elif BIT_DEPTH == 10 || BIT_DEPTH == 12
 typedef uint16_t pixel;
 typedef int32_t dctcoef;
 #else
-#error "BIT_DEPTH must be 8 or 10"
+#error "BIT_DEPTH must be 8, 10 or 12"
 #endif
 #define PIXEL_MAX     ((1 << BIT_DEPTH) - 1)
 #define PIXEL_MID     (1 << (BIT_DEPTH - 1))
@@ -43,7 +43,7 @@ typedef int32_t dctcoef;
 #else
 #define AEG_SSE2 0
 #endif
-#if defined(__SSE2__)
+#if defined(__SSE2__) && BIT_DEPTH != 12
 #define AEG_SIMD 1
 #else
 #define AEG_SIMD 0

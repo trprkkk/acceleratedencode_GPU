@@ -35,6 +35,7 @@
 
 AEG_IMPL_DECLARE()
 AEG_IMPL_DECLARE(_10)
+AEG_IMPL_DECLARE(_12)
 
 /* encoder.c: its definitions of the public names are this build's */
 #ifdef AEG_IMPL_RENAME

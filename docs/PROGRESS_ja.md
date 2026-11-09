@@ -143,7 +143,7 @@
   - CRF 4点×長尺4クリップ BD-rate（off 比）: implicit は cockL **-1.13/-2.06%**、vtestL **-3.23/-6.09%**、megaL **-2.19/-4.67%**、treeL 0.00/0.00、平均 **-1.64/-3.20%**。explicit は平均 **+0.27/+0.27%** で ≤+0.5% を満たす。**既定は implicit**。`--weightb 0` は旧既定 197,721 バイト（1080p 12f）と一致。
 - [ ] M-5j（lossless 未実装・無効化）: `--lossless` と `lossless` パラメータを追加したが、I_PCM / transform bypass の再構成経路が未実装。`--lossless` は `aeg_encoder_open` で明示エラーにして無効なストリームを防止。既定 lossy は不変。
 - [x] M-5i（コンテナ出力）: `--mux mp4|mkv|ts <out>` を追加。raw Annex B を ffmpeg に渡して `-c copy` で多重化。mp4 は直接パイプ、mkv/ts は一時 mp4 経由で remux（ffmpeg 3.4 の MKV/TS が raw pipe の未設定タイムスタンプを拒否するため）。`--fps` は既存。`--mux` なしの raw 出力はバイト不変。MP4/MKV/TS の 8bit/10bit、open-GOP、implicit weighted B を ffmpeg で全数デコード確認。ES を取り出すと avcC 経由の SPS/PPS 再配置で raw とバイト一致しない（デコードは一致）。
-- [ ] M-5k（12bit 未実装・方針確定）: `--bit-depth 12` を受け付けるが、ビルド済み 8/10bit エンコーダでは `bit_depth must be 8 or 10` で停止。SPS の profile は `bd>10` で **244 (High 4:4:4 Predictive)**、`bit_depth_*_minus8=4` を書くよう一般化済み。12bit 4:2:0 の実機デコード検証には 12bit ビルド（BIT_DEPTH=12 + API dispatch + QP 範囲 0..75 + transfer 関数群）が必要。
+- [ ] M-5k（12bit ビルド途中）: `BIT_DEPTH=12` の obj12 と `_12` シンボル、`api.c` dispatch、`bitdepth.h` 12 許可、QP offset 24、SPS profile 244 を実装。`--bit-depth 12` で enc は開き、FFprobe は **High 4:4:4 Predictive / yuv420p12le / 320x192** を認識（**4:2:0 12bit は profile 244 で構文上通る**）。ただしエンコード後 `aeg_enc_close` で segfault（mc バッファ破損）し、FFmpeg デコードも MB エラー。12bit の実用化にはヒープ破損の修正が必要。
 
 ### M-7 移植性（Windows / MSVC / ARM）
 - [ ] M-7a: `src/thread.h`（pthread/Win32）、`aeg_dl`（Windows ライブラリ名）
