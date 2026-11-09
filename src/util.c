@@ -203,6 +203,7 @@ void aeg_params_default(aeg_params *p)
     p->psy_trellis = 0.0;
     p->refs = -1;
     p->weightp = -1;
+    p->weightb = 1;         /* implicit weighted B by default */
     p->b_pyramid = -1;
     p->mbtree = -1;
     p->rc_lookahead = -1;

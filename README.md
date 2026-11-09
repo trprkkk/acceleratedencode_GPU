@@ -94,7 +94,7 @@ veryslow: the macroblock tree over long GOPs is the largest remaining quality
 gap.  High 10 keeps the same standing (p3 -4.9 % against x264 medium 10-bit).
 
 Since the quoted status at the top was written the encoder gained B pyramid
-(`--b-pyramid`), explicit weighted P prediction (`--weightp`), a macroblock
+(`--b-pyramid`), explicit weighted P prediction (`--weightp`), implicit weighted B by default (`--weightb 0` disables), a macroblock
 tree over a lookahead window (`--mbtree`, `--rc-lookahead`), two P
 references, joint refinement of the bi-predictive vectors, a motion search
 seeded by a half-resolution pre-search with a multi-hexagon stage, coder-priced
