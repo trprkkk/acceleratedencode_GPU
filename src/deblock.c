@@ -36,78 +36,129 @@ void aeg_deblock_thresholds(int qp, int slice_alpha, int slice_beta,
 /* ------------------------------------------------------------------ */
 /* Edge filters                                                        */
 /* ------------------------------------------------------------------ */
+/* The filtering of one line of samples across an edge (8.7.2.3, 8.7.2.4).
+ * `pix` is q0, the first sample past the edge; p_k is pix[-(k+1) * xs] and
+ * q_k is pix[k * xs].  Every filter reads the original samples and writes
+ * only after all of them are read.
+ *
+ * (The standard writes the x4 of the edge delta as a left shift; it is a
+ * multiplication here, since q0 - p0 is often negative.)
+ *
+ * Both filters are symmetric in the two sides: what p_k becomes is the same
+ * expression as what q_k becomes with p and q swapped.  So each side is
+ * computed by one helper from that side's samples s0, s1, ... (s0 at the
+ * edge) and the other side's t0, t1. */
+
+/* The edge is filtered at all (filterSamplesFlag, 8.7.2.2):
+ * |p0 - q0| < alpha, |p1 - p0| < beta, |q1 - q0| < beta. */
+static inline int edge_active(int p1, int p0, int q0, int q1, int alpha, int beta)
+{
+    return abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta;
+}
+
+/* bS < 4, luma, the second sample of one side (8.7.2.3, applied when
+ * |s2 - s0| < beta): s1 moves towards the mean of s2 and the edge average,
+ * by at most tC0.  It lands between s1 and that mean, so it needs no clip
+ * to the sample range. */
+static inline int bs_lt4_s1(int s2, int s1, int s0, int t0, int tc0)
+{
+    return s1 + clip3(-tc0, tc0, (s2 + ((s0 + t0 + 1) >> 1) - (s1 << 1)) >> 1);
+}
+
+/* bS < 4 (8.7.2.3), luma: the edge samples move by delta, at most tC, where
+ * tC is tC0 plus one for each side whose inner samples are smooth
+ * (|s2 - s0| < beta); those sides also get their second sample filtered. */
 static void filter_luma_edge(pixel *pix, int xs, int alpha, int beta, int tc0)
 {
-    int p2 = pix[-3 * xs], p1 = pix[-2 * xs], p0 = pix[-1 * xs];
-    int q0 = pix[0], q1 = pix[1 * xs], q2 = pix[2 * xs];
+    const int p0 = pix[-xs], p1 = pix[-2 * xs], p2 = pix[-3 * xs];
+    const int q0 = pix[0], q1 = pix[xs], q2 = pix[2 * xs];
+    int smooth_p, smooth_q, tc, delta;
 
-    if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
-        int tc = tc0, delta;
-        if (abs(p2 - p0) < beta) {
-            if (tc0)
-                pix[-2 * xs] = aeg_clip_pixel(p1 + clip3(-tc0, tc0,
-                                   ((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1));
-            tc++;
-        }
-        if (abs(q2 - q0) < beta) {
-            if (tc0)
-                pix[1 * xs] = aeg_clip_pixel(q1 + clip3(-tc0, tc0,
-                                  ((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1));
-            tc++;
-        }
-        delta = clip3(-tc, tc, (((q0 - p0) * 4) + (p1 - q1) + 4) >> 3);
-        pix[-1 * xs] = aeg_clip_pixel(p0 + delta);
-        pix[0] = aeg_clip_pixel(q0 - delta);
+    if (!edge_active(p1, p0, q0, q1, alpha, beta))
+        return;
+    smooth_p = abs(p2 - p0) < beta;            /* a_p < beta */
+    smooth_q = abs(q2 - q0) < beta;            /* a_q < beta */
+    tc = tc0 + smooth_p + smooth_q;
+    delta = clip3(-tc, tc, (4 * (q0 - p0) + (p1 - q1) + 4) >> 3);
+
+    pix[-xs] = aeg_clip_pixel(p0 + delta);
+    pix[0] = aeg_clip_pixel(q0 - delta);
+    if (smooth_p)
+        pix[-2 * xs] = (pixel)bs_lt4_s1(p2, p1, p0, q0, tc0);
+    if (smooth_q)
+        pix[xs] = (pixel)bs_lt4_s1(q2, q1, q0, p0, tc0);
+}
+
+/* bS < 4, chroma (chromaStyleFilteringFlag): only the edge samples, by at
+ * most tC = tC0 + 1 (the caller passes tC). */
+static void filter_chroma_edge(pixel *pix, int xs, int alpha, int beta, int tc)
+{
+    const int p0 = pix[-xs], p1 = pix[-2 * xs];
+    const int q0 = pix[0], q1 = pix[xs];
+    int delta;
+
+    if (!edge_active(p1, p0, q0, q1, alpha, beta))
+        return;
+    delta = clip3(-tc, tc, (4 * (q0 - p0) + (p1 - q1) + 4) >> 3);
+    pix[-xs] = aeg_clip_pixel(p0 + delta);
+    pix[0] = aeg_clip_pixel(q0 - delta);
+}
+
+/* bS = 4, the edge sample of one side when only it is filtered (always for
+ * chroma; for luma when the strong filter does not apply): a 3-tap
+ * average of s1, s0 and the other side's t1, weighted 2:1:1. */
+static inline int bs4_weak_s0(int s1, int s0, int t1)
+{
+    return (2 * s1 + s0 + t1 + 2) >> 2;
+}
+
+/* bS = 4, luma, one side (8.7.2.4).  The strong filter -- three samples of
+ * the side rewritten from a 5-tap neighbourhood -- applies when the side is
+ * smooth (|s2 - s0| < beta) and the step across the edge is small
+ * (|p0 - q0| < alpha / 4 + 2); otherwise only s0 changes.  out[] gets the
+ * new s0, s1, s2; returns how many of them changed. */
+static inline int bs4_luma_side(const int s[4], int t0, int t1, int small_step,
+                                int beta, int out[3])
+{
+    if (small_step && abs(s[2] - s[0]) < beta) {
+        out[0] = (s[2] + 2 * s[1] + 2 * s[0] + 2 * t0 + t1 + 4) >> 3;
+        out[1] = (s[2] + s[1] + s[0] + t0 + 2) >> 2;
+        out[2] = (2 * s[3] + 3 * s[2] + s[1] + s[0] + t0 + 4) >> 3;
+        return 3;
     }
+    out[0] = bs4_weak_s0(s[1], s[0], t1);
+    return 1;
 }
 
 static void filter_luma_intra_edge(pixel *pix, int xs, int alpha, int beta)
 {
-    int p2 = pix[-3 * xs], p1 = pix[-2 * xs], p0 = pix[-1 * xs];
-    int q0 = pix[0], q1 = pix[1 * xs], q2 = pix[2 * xs];
+    int ps[4], qs[4], pout[3], qout[3], np, nq, k, small_step;
 
-    if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
-        if (abs(p0 - q0) < ((alpha >> 2) + 2)) {
-            if (abs(p2 - p0) < beta) {
-                int p3 = pix[-4 * xs];
-                pix[-1 * xs] = (pixel)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
-                pix[-2 * xs] = (pixel)((p2 + p1 + p0 + q0 + 2) >> 2);
-                pix[-3 * xs] = (pixel)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-            } else {
-                pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
-            }
-            if (abs(q2 - q0) < beta) {
-                int q3 = pix[3 * xs];
-                pix[0] = (pixel)((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
-                pix[1 * xs] = (pixel)((p0 + q0 + q1 + q2 + 2) >> 2);
-                pix[2 * xs] = (pixel)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
-            } else {
-                pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
-            }
-        } else {
-            pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
-            pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
-        }
+    for (k = 0; k < 4; k++) {
+        ps[k] = pix[-(k + 1) * xs];
+        qs[k] = pix[k * xs];
     }
+    if (!edge_active(ps[1], ps[0], qs[0], qs[1], alpha, beta))
+        return;
+    small_step = abs(ps[0] - qs[0]) < ((alpha >> 2) + 2);
+    np = bs4_luma_side(ps, qs[0], qs[1], small_step, beta, pout);
+    nq = bs4_luma_side(qs, ps[0], ps[1], small_step, beta, qout);
+    for (k = 0; k < np; k++)
+        pix[-(k + 1) * xs] = (pixel)pout[k];
+    for (k = 0; k < nq; k++)
+        pix[k * xs] = (pixel)qout[k];
 }
 
-static void filter_chroma_edge(pixel *pix, int xs, int alpha, int beta, int tc)
-{
-    int p1 = pix[-2 * xs], p0 = pix[-1 * xs], q0 = pix[0], q1 = pix[1 * xs];
-    if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
-        int delta = clip3(-tc, tc, (((q0 - p0) * 4) + (p1 - q1) + 4) >> 3);
-        pix[-1 * xs] = aeg_clip_pixel(p0 + delta);
-        pix[0] = aeg_clip_pixel(q0 - delta);
-    }
-}
-
+/* bS = 4, chroma: the edge sample of each side, weak form. */
 static void filter_chroma_intra_edge(pixel *pix, int xs, int alpha, int beta)
 {
-    int p1 = pix[-2 * xs], p0 = pix[-1 * xs], q0 = pix[0], q1 = pix[1 * xs];
-    if (abs(p0 - q0) < alpha && abs(p1 - p0) < beta && abs(q1 - q0) < beta) {
-        pix[-1 * xs] = (pixel)((2 * p1 + p0 + q1 + 2) >> 2);
-        pix[0] = (pixel)((2 * q1 + q0 + p1 + 2) >> 2);
-    }
+    const int p0 = pix[-xs], p1 = pix[-2 * xs];
+    const int q0 = pix[0], q1 = pix[xs];
+
+    if (!edge_active(p1, p0, q0, q1, alpha, beta))
+        return;
+    pix[-xs] = (pixel)bs4_weak_s0(p1, p0, q1);
+    pix[0] = (pixel)bs4_weak_s0(q1, q0, p1);
 }
 
 /* ------------------------------------------------------------------ */

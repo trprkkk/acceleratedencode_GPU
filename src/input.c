@@ -7,9 +7,11 @@
  * Every plane goes through a 16-bit stage (a sample of depth d is scaled by
  * 2^(16 - d), as x264's input filters do), the chroma planes are resampled
  * to 4:2:0 in that precision, and the result is dithered down to the output
- * depth with x264's Sierra-2-4A error diffusion (filters/video/depth.c),
- * reproduced exactly: the error buffer is cleared at the start of every
- * plane, and a source that was itself scaled up from the output depth comes
+ * depth by Sierra Lite ("Sierra-2-4A") error diffusion -- the filter x264's
+ * depth conversion uses, with the same rounding, so the output matches x264's
+ * for the same input (aeg_dither_plane, written here from the filter's
+ * definition; docs/PROVENANCE.md).  The error buffer is cleared at the
+ * start of every plane, and a source that was itself scaled up from the output depth comes
  * back unchanged (so 8-bit input to the 10-bit encoder is exactly scaled
  * by 4).  8-bit 4:2:0 input to the 8-bit encoder does not come here at all.
  *
@@ -49,27 +51,51 @@ int aeg_csp_info(int csp, aeg_csp_info_t *ci)
     return AEG_OK;
 }
 
-/* x264's dither_plane_1/_2 (filters/video/depth.c) with BIT_DEPTH = depth:
- * src holds 16-bit samples, dst gets depth-bit ones (depth <= BIT_DEPTH). */
+/* Error-diffusion dither of 16-bit samples down to `depth` bits, with the
+ * Sierra Lite kernel ("Sierra-2-4A"): the quantisation error of a sample
+ * goes 2/4 to the sample on its right, 1/4 to the one below-left and 1/4 to
+ * the one below.  Written here in the gathering form: what a sample
+ * receives is
+ *
+ *     incoming = (2 * E(x-1, y) + E(x, y-1) + E(x+1, y-1)) / 4
+ *
+ * with E = 0 outside the plane.  Errors are kept in input units (1/65536
+ * of full scale); the sample becomes the nearest depth-bit level of
+ * value + incoming, clipped to the range.
+ *
+ * `row_err` (width + 1 entries, the last one always 0) holds E of the row
+ * above at x and beyond, and of the current row before x: entry x is read
+ * as "above" just before the current row's error replaces it.  Entries are
+ * 16-bit; an error never exceeds one output step plus the incoming share,
+ * far inside that range for every depth this is used with (>= 8 bits out).
+ */
 void aeg_dither_plane(pixel *dst, int dst_stride, const uint16_t *src,
                       int src_stride, int width, int height, int depth,
-                      int16_t *errors)
+                      int16_t *row_err)
 {
-    const int lshift = 16 - depth;
-    const int rshift = 16 - depth + 2;
-    const int half = 1 << (16 - depth + 1);
-    const int pixel_max = (1 << depth) - 1;
-    int x, y;
-    memset(errors, 0, (size_t)(width + 1) * sizeof(int16_t));
-    for (y = 0; y < height; y++, src += src_stride, dst += dst_stride) {
-        int err = 0;
-        for (x = 0; x < width; x++) {
-            int v;
-            err = err * 2 + errors[x] + errors[x + 1];
-            v = ((src[x] << 2) + err + half) >> rshift;
-            v = v < 0 ? 0 : v > pixel_max ? pixel_max : v;
-            dst[x] = (pixel)v;
-            errors[x] = (int16_t)(err = src[x] - (v << lshift));
+    const int step_log2 = 16 - depth;          /* one output level, in input units */
+    const int max_level = (1 << depth) - 1;
+    /* value + incoming in quarter units, rounded to the nearest level:
+     * (4 * value + 4 * incoming + 2 * step) / (4 * step) */
+    const int round_q = 2 << step_log2;
+    int row, col;
+
+    for (col = 0; col <= width; col++)
+        row_err[col] = 0;
+    for (row = 0; row < height; row++) {
+        const uint16_t *in = src + (size_t)row * src_stride;
+        pixel *out = dst + (size_t)row * dst_stride;
+        int left_err = 0;                      /* E(x-1, y) */
+        for (col = 0; col < width; col++) {
+            const int incoming4 = 2 * left_err + row_err[col] + row_err[col + 1];
+            int level = (4 * (int)in[col] + incoming4 + round_q) >> (step_log2 + 2);
+            if (level < 0)
+                level = 0;
+            else if (level > max_level)
+                level = max_level;
+            out[col] = (pixel)level;
+            left_err = (int)in[col] - (level << step_log2);
+            row_err[col] = (int16_t)left_err;
         }
     }
 }

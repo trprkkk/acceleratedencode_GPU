@@ -541,8 +541,15 @@ tests/              synthetic clip generator, single-MB probe, test runner
 
 ## Licence
 
-MIT (see `LICENSE`). Several algorithms follow x264 (GPL) closely, and one
-small function (`aeg_dither_plane`, the high-bit-depth input dither) is
-x264 code re-typed. `docs/PROVENANCE.md` lists what follows which source,
-with a token-similarity scan (`tools/simscan.py`). The licence review is
-the owner's decision; it is not settled here.
+MIT (see `LICENSE`). Several algorithms follow x264 (GPL) closely: its
+methods and its tuned constants, in this project's own code.
+`docs/PROVENANCE.md` lists what follows which source, with a
+token-similarity scan (`tools/simscan.py`).
+
+The three code-level correspondences the scan found have been rewritten
+from their definitions, with no change in output:
+- the input dither;
+- the motion-search lambda table;
+- the deblocking edge filters.
+
+The licence review is the owner's decision; it is not settled here.

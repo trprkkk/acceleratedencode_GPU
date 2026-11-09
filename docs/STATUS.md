@@ -6930,3 +6930,28 @@ encoder uses) and FFmpeg n7.0.2.
 
 **Corrected along the way:** the deblock-aware RD stage does follow x264
 (`b_deblock_rdo`, subme ≥ 9), as the source comment says.
+
+### Rewrites of the three correspondences
+
+The three code correspondences were rewritten. The output did not change.
+
+| function | rewrite | x264 scan, raw (normalised) |
+|---|---|---|
+| `aeg_dither_plane` | from the Sierra Lite definition, in the gathering form; same rounding, so it still equals x264's output | 14.5 % (28.4 %) → 0.8 % (5.8 %) |
+| `aeg_me_lambda` | computed from round(2^((qp−12)/6)), at least 1, instead of a written-out copy of `x264_lambda_tab` | — |
+| the four deblocking edge filters | restated from 8.7.2.3/8.7.2.4 as per-side helpers, since the filters are symmetric in p and q | 21–25 % → 0.4–0.7 % |
+
+Only two one-line helpers still match x264: the standard's
+filterSamplesFlag condition and its p1 update.
+
+**Checks:**
+- **Old against new, unit level** (ASan/UBSan):
+  - dither: 30 000 planes;
+  - filters: 4 M lines per bit depth.
+
+  All identical. UBSan flagged the standard's `(q0 − p0) << 2` (undefined
+  for negative values in C), now written `* 4`.
+- **Streams:** 25 encodes byte-identical to `ef9024f`, 10/16-bit Y4M input
+  included.
+- **Tests:** `make test` passes, and ASan+UBSan encodes are clean.
+

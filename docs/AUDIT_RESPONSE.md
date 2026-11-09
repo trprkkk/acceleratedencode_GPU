@@ -239,6 +239,16 @@ against FFmpeg n7.0.2. The findings:
 
 The memo is not a legal judgement; it is meant to make the review quick.
 
+**After that: the three code correspondences were rewritten**, with no
+change in output:
+- `aeg_dither_plane` was written from the Sierra Lite filter's definition;
+- the lambda table is computed from its formula;
+- the deblocking edge filters were restated from 8.7.2.3/8.7.2.4.
+
+Against x264 they now scan at 0.4–0.8 % raw, down from 14–25 %. What is
+left for the review is the algorithm level: x264's methods and tuned
+constants, followed on purpose, in different code.
+
 **"Untested areas."** *Partly confirmed.*
 
 - Not covered:
@@ -267,4 +277,5 @@ The memo is not a legal judgement; it is meant to make the review quick.
 4. **CMake / Windows / ARM** support.
 5. ~~**Fuzzing**~~: done (`tests/fuzz/`; see above).
 6. **Licence review** of the x264-derived algorithms. The facts are in
-   `docs/PROVENANCE.md`; start with `aeg_dither_plane`.
+   `docs/PROVENANCE.md`. The code correspondences are rewritten; what
+   remains is the methods and constants.

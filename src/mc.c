@@ -14,6 +14,8 @@
  * GPU and compare against these CPU versions.
  */
 #include "h264.h"
+#include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1002,20 +1004,31 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
     return best;
 }
 
-/* x264's lambda for motion search (SAD/SATD scale): 2^((qp-12)/6), at least 1.
- * Exposed so that every caller prices vectors the same way. */
+/* The motion-search lambda (SAD/SATD scale): 2^((qp - 12) / 6) rounded to
+ * the nearest integer, at least 1 -- a factor of 2 per 6 QP, the step size's
+ * own growth, with 1 at QP 12.  (This is the lambda x264 uses; the values
+ * are computed from that definition here.  Every one of them is at least
+ * 0.008 away from a rounding boundary, so pow() cannot tip any.)  Exposed so
+ * that every caller prices vectors the same way. */
+static int me_lambda_tab[52];
+static pthread_once_t me_lambda_once = PTHREAD_ONCE_INIT;
+
+static void me_lambda_init(void)
+{
+    int qp;
+    for (qp = 0; qp < 52; qp++) {
+        const int v = (int)floor(pow(2.0, (qp - 12) / 6.0) + 0.5);
+        me_lambda_tab[qp] = v < 1 ? 1 : v;
+    }
+}
+
 int aeg_me_lambda(int qp)
 {
-    static const uint8_t tab[52] = {
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9,
-        10, 11, 13, 14, 16, 18, 20, 23, 25, 29, 32, 36, 40, 45, 51, 57,
-        64, 72, 81, 91
-    };
+    pthread_once(&me_lambda_once, me_lambda_init);
     if (qp < 0) qp = 0;
     if (qp > 51) qp = 51;
     /* a SAD at high bit depth is 2^(BIT_DEPTH-8) times the 8-bit one */
-    return tab[qp] << (BIT_DEPTH - 8);
+    return me_lambda_tab[qp] << (BIT_DEPTH - 8);
 }
 
 int aeg_me_block(const pixel *ref, int rstride, const pixel *cur,

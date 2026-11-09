@@ -28,8 +28,9 @@ pools whatever the code's licence, and nothing here addresses them.
    development. The x264 behaviour came from its documentation, its
    command-line semantics, and the developer's prior knowledge of x264. That
    developer is an AI model, and prior knowledge of this kind can reproduce
-   code closely: `aeg_dither_plane` below shows it. So the absence of a
-   record is not evidence of independent writing.
+   code closely: the old `aeg_dither_plane` (see *Rewritten after the first
+   scan*) showed it. So the absence of a record is not evidence of
+   independent writing.
 3. **A mechanical scan** (`tools/simscan.py`). Every C function here, after
    stripping comments and strings, is cut into runs of *k* consecutive tokens,
    and each run is looked up in the other code base. This is what MOSS-like
@@ -62,6 +63,10 @@ pools whatever the code's licence, and nothing here addresses them.
    closely in different code.
 
 ## Scan results in brief
+
+The numbers in this section are from the first scan, before the three
+rewrites described in the next section. The results after the rewrites are
+given there.
 
 **Against x264, raw tokens (k = 12).** The highest function is 25 %. The
 only pairs above 15 % are:
@@ -99,16 +104,45 @@ Everything else is under 15 %, and most of the list is noise.
 prediction and loop-filter kernels, plus generic runs. Nothing points at a
 copied decoder routine.
 
-## Close code correspondence
+## Rewritten after the first scan
 
-These are the places worth the owner's attention first.
+The first scan found three close correspondences, all cheap to remove
+without changing the output. All three were rewritten, and the output
+stayed byte-identical; how that was checked is listed after the table.
+
+| where | was | now |
+|---|---|---|
+| `src/input.c` `aeg_dither_plane` (the input dither, used when the input has more bits than the encode) | x264's `filters/video/depth.c` `DITHER_PLANE` re-typed: same variable names (`lshift`, `rshift`, `half`, `pixel_max`, `err`, `errors`), same statements in the same order. Scan: 14.5 % raw, 28.4 % normalised against `DITHER_PLANE`. | Written from the definition of the Sierra Lite ("Sierra-2-4A") kernel: weights 2/4 right, 1/4 below-left, 1/4 below, in the gathering form. Scan: **0.8 % raw, 5.8 % normalised**. The rounding is kept the same as before (nearest level of value + incoming error), so the output still equals x264's for the same input. That is the point of keeping it, and it means the *method and its rounding* are still x264's. |
+| `src/mc.c` `aeg_me_lambda` | A written-out table of 52 values equal to `x264_lambda_tab`. | Computed once at start-up from its definition, round(2^((qp − 12)/6)), at least 1. Every value is at least 0.008 from a rounding boundary, so `pow()` cannot tip any. Scan: no correspondence (6 %, against an unrelated function). |
+| `src/deblock.c` `filter_luma_edge`, `filter_luma_intra_edge`, `filter_chroma_edge`, `filter_chroma_intra_edge` | The idiom x264 (marked "From ffmpeg" there) and FFmpeg use for the standard's equations: both sides written out, `if (tc0) ... tc++`. Scan: 21–25 % raw against x264's `deblock_edge_*_c`. | Restated from clauses 8.7.2.3/8.7.2.4. Because the filters are symmetric in p and q, each side is computed by one helper from its own samples and the other side's (`bs_lt4_s1`, `bs4_luma_side`, `bs4_weak_s0`), and all samples are read before any is written. Scan: the four filters are **0.4–0.7 % raw**. What still matches is two one-line helpers that *are* the standard's expressions, and match whoever writes them: `edge_active` (25 % raw), the filterSamplesFlag condition \|p0−q0\| < α && \|p1−p0\| < β && \|q1−q0\| < β; and `bs_lt4_s1` (11 %), the p1/q1 update. |
+
+**Verification:**
+- **Unit equivalence**, old function against new, with ASan/UBSan:
+  - the dither: 30 000 random, extreme, gradient and checkerboard planes at
+    output depths 8–10, identical; the largest error seen was 312, far
+    inside the 16-bit error buffer;
+  - the edge filters: 4 million lines per bit depth (8 and 10) across all
+    four filters, about half of them actually filtered, identical.
+
+  UBSan also caught one point in the restatement. The standard writes
+  `(q0 − p0) << 2`, which is undefined in C for negative values, so the
+  code multiplies by 4.
+- **Streams:** 25 encodes byte-identical to the previous build. They
+  include:
+  - presets 0–4; CRF, ABR and VBV;
+  - frame and slice threads;
+  - 10-bit, CAVLC, PAFF, MBAFF and PAFF+MBAFF;
+  - QP 12–51;
+  - 10- and 16-bit Y4M input to 8- and 10-bit encodes (the dither path).
+- **Tests:** `make test` (every conformance case bit-exact), and ASan+UBSan
+  encodes over the field, MBAFF and deblock-RD paths.
+
+## What still corresponds
 
 | where | corresponds to | what matches | notes |
 |---|---|---|---|
-| `src/input.c` `aeg_dither_plane` (the >8-bit → 8/10-bit input dither) | x264 `filters/video/depth.c`, `DITHER_PLANE` (Sierra-2-4A error diffusion) | Effectively the same code: same variable names (`lshift`, `rshift`, `half`, `pixel_max`, `err`, `errors`), same statements in the same order. The comment says so: "x264's dither_plane_1/_2". | The **clearest case** of x264 code in the tree. It runs only when the input has more bits than the encode. Options: rewrite it from a description of the Sierra-2-4A filter (the result may stay bit-identical; the arithmetic is the filter's); replace it with a different dither (input > encode depth would then change); or keep it and settle the licence question. |
-| `src/mc.c` `aeg_me_lambda` table | x264 `x264_lambda_tab` | The 52 values are the same. | They are round(2^((qp−12)/6)), floored at 1, so they could be computed at start-up from the formula instead of written out. The output is identical either way. |
-| `src/deblock.c` `filter_luma_edge`, `filter_luma_intra_edge`, `filter_chroma_edge`, `filter_chroma_intra_edge` | x264 `common/deblock.c` `deblock_edge_*_c` (marked "From ffmpeg" there) and FFmpeg `h264dsp_template.c` | The idiom of the standard's equations (8.7.2.3/8.7.2.4): `if (tc0) ... tc++`, the delta clip. | The arithmetic is normative. Rewriting it in another form would be cheap if wanted; it is verified bit-exact by the conformance suite. |
-| `src/encoder.c` `la_group_cost` | x264 `slicetype_path_cost` | The B-pyramid pricing: anchor, middle B, then the Bs on each side from the nearer pair. | About 15 lines; the same cost structure in different code. |
+| `src/encoder.c` `la_group_cost` | x264 `slicetype_path_cost` | The B-pyramid pricing: anchor, middle B, then the Bs on each side from the nearer pair. | About 15 lines; the same cost structure in different code (19 % normalised). |
+| `src/input.c` `aeg_dither_plane` | x264's dither, by method | The Sierra Lite kernel and its rounding, kept so that the output equals x264's | The code is new (above); the method is a published filter. |
 
 ## Algorithms that follow x264 (method and constants, own code)
 
@@ -119,7 +153,7 @@ quality was the goal. "Constants" lists the x264-specific numbers used.
 | area | where | follows | constants / specifics taken | differences |
 |---|---|---|---|---|
 | RD lambda | `encoder.c` `lambda_init`, `aeg_lambda_of` | x264's `lambda2` | 0.85·2^((qp−12)/3); high-bit-depth scaling by QP'Y | — |
-| ME lambda | `mc.c` `aeg_me_lambda` | x264 `lambda_tab` | the table, see above | — |
+| ME lambda | `mc.c` `aeg_me_lambda` | x264 `lambda_tab` | its definition, round(2^((qp−12)/6)); now computed, see above | — |
 | CABAC trellis | `encoder.c` `struct trel`, `trel_viterbi`, `tv_level_bits`, `trel_descent*`, `trellis_*_dc`; `transform.c` `aeg_trel_levels`, `aeg_trel_dc_levels` | x264 `quant_trellis_cabac` | Candidates round(x), round(x)−1, 0; contexts frozen inside the block; the node transitions `tv_next` (these are the standard's level-context state machine, 9.3.3.1.3, so x264's table holds the same values). `--trellis 0/1/2` uses x264's meaning. | Exact-pricing descent pass after the Viterbi (`trel_descent_kn`); own distortion model; DC/chroma DC variants; lambda scaling tuned here. |
 | Macroblock tree | `encoder.c` `mbt_propagate`, `mbt_add`, `mbt_group`, `mbt_run`, `mbt_apply`, `mbt_strength` | x264 `macroblock_tree`, `mbtree_propagate_cost` | Propagate fraction 1 − inter/intra; offset −strength·log2((intra+prop)/intra); strength 5·(1−qcomp) | Strength 1.6 by default, measured here (x264's 5·(1−qcomp) is 2.0 at its default qcomp); own lowres estimator; runs on this encoder's group structure. |
 | Adaptive quantisation | `encoder.c` `aq_compute` | x264 "variance AQ" (the idea) | `aq_strength` 10 = x264 1.0 | **Different formula:** offset = strength·(mean log2 var − log2 var), zero-mean per picture, clamped ±12. x264 uses a fixed log2 reference instead. |
@@ -186,11 +220,13 @@ None of them is linked into `libaeg` or `aegenc`, or shipped with it.
 
 ## Suggested order for the review
 
-1. **`aeg_dither_plane`:** decide first. It is a re-typed x264 function and
-   small enough to rewrite or replace in an hour.
-2. **The x264 lambda table and the deblock idiom:** cheap to regenerate or
-   restate, with the output byte-identical.
-3. **The algorithm table above:** this is where the real question lies.
+1. **The algorithm table above:** this is where the real question lies.
    These parts follow x264's methods and tuned constants on purpose, in
    different code. Whether that matters under the GPL is the legal question
    this memo does not answer.
+2. **The dither's method:** the code is new, but the output deliberately
+   equals x264's. If even that is unwanted, a different dither would change
+   the output only for input deeper than the encode.
+
+The three code correspondences the first scan found have been rewritten
+(see *Rewritten after the first scan*).
