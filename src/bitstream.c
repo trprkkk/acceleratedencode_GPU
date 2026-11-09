@@ -255,6 +255,41 @@ size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s)
             aeg_bw_align_one(&pb);
         sei_message(&bw, 1, pl, pb.len);
     }
+    if (s->recovery) {
+        aeg_bw_init(&pb, pl, sizeof(pl), 0);
+        aeg_bw_ue(&pb, s->recovery_cnt);
+        aeg_bw_put(&pb, 1, 0);                 /* exact_match_flag        */
+        aeg_bw_put(&pb, 1, 0);                 /* broken_link_flag        */
+        aeg_bw_put(&pb, 2, 0);                 /* changing_slice_group_idc */
+        if (pb.bits)
+            aeg_bw_align_one(&pb);
+        sei_message(&bw, 6, pl, pb.len);
+    }
+    if (s->hdr && s->md_primaries) {
+        uint8_t buf[24];
+        int i;
+        for (i = 0; i < 8; i++) {
+            buf[2 * i] = (uint8_t)(s->md_primaries[i] >> 8);
+            buf[2 * i + 1] = (uint8_t)s->md_primaries[i];
+        }
+        buf[16] = (uint8_t)(s->md_max_lum >> 24);
+        buf[17] = (uint8_t)(s->md_max_lum >> 16);
+        buf[18] = (uint8_t)(s->md_max_lum >> 8);
+        buf[19] = (uint8_t)s->md_max_lum;
+        buf[20] = (uint8_t)(s->md_min_lum >> 24);
+        buf[21] = (uint8_t)(s->md_min_lum >> 16);
+        buf[22] = (uint8_t)(s->md_min_lum >> 8);
+        buf[23] = (uint8_t)s->md_min_lum;
+        sei_message(&bw, 137, buf, sizeof(buf));
+    }
+    if (s->hdr && s->max_cll >= 0) {
+        uint8_t buf[4];
+        buf[0] = (uint8_t)(s->max_cll >> 8);
+        buf[1] = (uint8_t)s->max_cll;
+        buf[2] = (uint8_t)(s->max_fall >> 8);
+        buf[3] = (uint8_t)s->max_fall;
+        sei_message(&bw, 144, buf, sizeof(buf));
+    }
     if (s->info) {
         uint8_t buf[1024];
         n = strlen(s->info) + 1;               /* with its NUL, as x264   */

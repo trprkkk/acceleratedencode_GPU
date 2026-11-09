@@ -226,6 +226,14 @@ $(BUILD)/nvrtc_check: tests/nvrtc_check.c $(BUILD)/libaeg.a | $(BUILD)
 $(BUILD)/api_check: tests/api_check.c $(BUILD)/libaeg.a | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
 
+# What each batched device operation costs on the device next to the CPU
+# reference (not run by `make test`: it is a measurement, not an assertion; see
+# docs/DESIGN_ja.md).  `make OPENCL=1 CUDA=1 dev_bench` for both backends.
+$(BUILD)/dev_bench: tests/dev_bench.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
+dev_bench: $(BUILD)/dev_bench
+
 # The input conversion (dither, chroma resampling, layouts) against
 # references written in the test.
 $(BUILD)/input_check: tests/input_check.c $(BUILD)/libaeg.a | $(BUILD)
@@ -274,7 +282,7 @@ test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean shared install uninstall examples install-check
+.PHONY: all test clean shared install uninstall examples install-check dev_bench
 # every object's header dependencies (-MMD), the CLI's and the tests' too:
 # a changed struct in aeg.h has to rebuild everything that includes it
 -include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d) \

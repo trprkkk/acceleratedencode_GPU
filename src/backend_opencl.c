@@ -29,6 +29,7 @@ typedef int32_t cl_int;
 typedef uint32_t cl_uint;
 typedef uint64_t cl_ulong;
 typedef intptr_t cl_context_properties;
+typedef struct { size_t origin; size_t size; } cl_buffer_region;
 
 #define CL_SUCCESS 0
 #define CL_DEVICE_TYPE_ALL 0xFFFFFFFF
@@ -36,7 +37,9 @@ typedef intptr_t cl_context_properties;
 #define CL_MEM_WRITE_ONLY (1 << 1)
 #define CL_MEM_READ_WRITE (1 << 0)
 #define CL_TRUE 1
+#define CL_FALSE 0
 #define CL_PROGRAM_BUILD_LOG 0x1183
+#define CL_BUFFER_CREATE_TYPE_REGION 0x1220
 #define CL_DEVICE_TYPE 0x1000
 #define CL_DEVICE_TYPE_GPU (1 << 2)
 #define CL_DEVICE_NAME 0x102B
@@ -69,6 +72,7 @@ static void ocl_load_error(const char *name)
     X(cl_int, clEnqueueWriteBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void *, cl_uint, const void *, void *)) \
     X(cl_int, clEnqueueReadBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, void *, cl_uint, const void *, void *)) \
     X(cl_mem, clCreateBuffer, (cl_context, cl_ulong, size_t, void *, cl_int *)) \
+    X(cl_mem, clCreateSubBuffer, (cl_mem, cl_ulong, cl_uint, const void *, cl_int *)) \
     X(cl_int, clReleaseMemObject, (cl_mem)) \
     X(cl_int, clReleaseKernel, (cl_kernel)) \
     X(cl_int, clReleaseProgram, (cl_program)) \
@@ -82,7 +86,7 @@ static void ocl_load_error(const char *name)
 OCL_SYMS(DECL)
 #undef DECL
 
-#define NBUF 12
+#define NBUF 32
 
 typedef struct ocl_ctx {
     void *lib;
@@ -92,11 +96,26 @@ typedef struct ocl_ctx {
     cl_command_queue queue;
     cl_program prog;
     cl_kernel k_sad, k_tq, k_iq, k_tqiq, k_sse, k_intp, k_satd, k_tqdc, k_iqdc;
+    cl_kernel k_me;
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
     /* the registered reference picture (see ref_upload) */
     int ref_stride, ref_w, ref_h, ref_valid;
+    /* device-resident luma pictures for me_batch (see aeg_be_ops) */
+    cl_mem mepic[AEG_ME_PIC_SLOTS];
+    size_t mepic_sz[AEG_ME_PIC_SLOTS];
+    uint64_t mepic_id[AEG_ME_PIC_SLOTS];
+    int mepic_ok[AEG_ME_PIC_SLOTS];
+    /* lowres ring (M-3.3a) */
+    cl_mem lo_ring;
+    size_t lo_ring_sz, lo_slot_bytes;
+    cl_mem lo_work[4];
+    size_t lo_work_sz[4];
+    cl_kernel k_lowres;
+    int lo_stride, lo_w, lo_h;
+    uint64_t lo_id[AEG_LOWRES_SLOTS];
+    int lo_ok[AEG_LOWRES_SLOTS];
     char name[96];
     char vendor[48];
     uint64_t mem;
@@ -208,6 +227,317 @@ static int ocl_sad_batch(void *priv, const uint8_t *cur, int cstride,
     return AEG_OK;
 }
 
+/* Whole-picture integer motion search (see aeg_be_ops.me_batch): one work item
+ * per block, the reference and the source transferred whole. */
+static int ocl_me_pic_upload(void *priv, int slot, const uint8_t *plane,
+                             int stride, int w, int h, int rows, uint64_t id)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem m;
+    size_t bytes;
+    (void)w; (void)h;
+    if (slot < 0 || slot >= AEG_ME_PIC_SLOTS)
+        return AEG_EINVAL;
+    if (rows <= 0)
+        return AEG_EINVAL;
+    bytes = (size_t)stride * (size_t)rows;
+    {
+        int k;
+        for (k = 0; k < AEG_ME_PIC_SLOTS; k++)
+            if (o->mepic_ok[k] && o->mepic_id[k] == id &&
+                o->mepic_sz[k] >= bytes)
+                return AEG_OK;
+    }
+    m = ocl_buf(o, 8 + slot, bytes, CL_MEM_READ_ONLY);
+    if (!m)
+        return AEG_EBACKEND;
+    if (p_clEnqueueWriteBuffer(o->queue, m, CL_TRUE, 0, bytes,
+                               plane - (ptrdiff_t)AEG_PAD * stride - AEG_PAD,
+                               0, NULL, NULL) != CL_SUCCESS)
+        return AEG_EBACKEND;
+    o->mepic[slot] = m;
+    o->mepic_sz[slot] = bytes;
+    o->mepic_id[slot] = id;
+    o->mepic_ok[slot] = 1;
+    return AEG_OK;
+}
+
+static int ocl_lowres_upload(void *priv, int slot, const uint8_t *plane,
+                             int stride, int w, int h, uint64_t id)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    size_t bytes;
+    cl_int st;
+    int k;
+    if (slot < 0 || slot >= AEG_LOWRES_SLOTS)
+        return AEG_EINVAL;
+    bytes = (size_t)stride * (size_t)(h + 2 * AEG_LA_PAD);
+    if (bytes != o->lo_slot_bytes || stride != o->lo_stride) {
+        if (o->lo_ring)
+            p_clReleaseMemObject(o->lo_ring);
+        o->lo_ring = p_clCreateBuffer(o->ctx, CL_MEM_READ_ONLY,
+                                      bytes * AEG_LOWRES_SLOTS, NULL, &st);
+        o->lo_ring_sz = o->lo_ring ? bytes * AEG_LOWRES_SLOTS : 0;
+        o->lo_slot_bytes = o->lo_ring ? bytes : 0;
+        o->lo_stride = stride;
+        o->lo_w = w;
+        o->lo_h = h;
+        for (k = 0; k < AEG_LOWRES_SLOTS; k++)
+            o->lo_ok[k] = 0;
+        if (!o->lo_ring)
+            return AEG_EBACKEND;
+    }
+    if (o->lo_ok[slot] && o->lo_id[slot] == id)
+        return AEG_OK;
+    st = p_clEnqueueWriteBuffer(o->queue, o->lo_ring, CL_TRUE,
+                                (size_t)slot * o->lo_slot_bytes, bytes,
+                                plane - (ptrdiff_t)AEG_LA_PAD * stride - AEG_LA_PAD,
+                                0, NULL, NULL);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    o->lo_id[slot] = id;
+    o->lo_ok[slot] = 1;
+    return AEG_OK;
+}
+
+static int ocl_lowres_sad_batch(void *priv, int cur_slot, int ref_slot, int bw,
+                                int bh, const int16_t *mv, int count,
+                                int32_t *out)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mmv, mout, mcur, mref;
+    cl_buffer_region reg;
+    size_t nthreads = (size_t)count;
+    cl_int st = CL_SUCCESS;
+    int16_t *pos = NULL;
+    int i;
+    if (cur_slot < 0 || cur_slot >= AEG_LOWRES_SLOTS ||
+        ref_slot < 0 || ref_slot >= AEG_LOWRES_SLOTS ||
+        !o->lo_ok[cur_slot] || !o->lo_ok[ref_slot])
+        return AEG_EINVAL;
+    if (count <= 0)
+        return AEG_OK;
+    mmv = ocl_buf(o, 2, (size_t)count * 8, CL_MEM_READ_ONLY);
+    mout = ocl_buf(o, 3, (size_t)count * 4, CL_MEM_WRITE_ONLY);
+    if (!mmv || !mout)
+        return AEG_EBACKEND;
+    reg.origin = (size_t)cur_slot * o->lo_slot_bytes;
+    reg.size = o->lo_slot_bytes;
+    mcur = p_clCreateSubBuffer(o->lo_ring, CL_MEM_READ_ONLY,
+                               CL_BUFFER_CREATE_TYPE_REGION, &reg, &st);
+    reg.origin = (size_t)ref_slot * o->lo_slot_bytes;
+    mref = p_clCreateSubBuffer(o->lo_ring, CL_MEM_READ_ONLY,
+                               CL_BUFFER_CREATE_TYPE_REGION, &reg, &st);
+    if (!mcur || !mref) {
+        if (mcur) p_clReleaseMemObject(mcur);
+        if (mref) p_clReleaseMemObject(mref);
+        return AEG_EBACKEND;
+    }
+    /* the resident buffer starts at the padding: shift the positions by it
+     * (CUDA offsets the pointer instead) */
+    pos = (int16_t *)malloc((size_t)count * 8);
+    if (!pos)
+        return AEG_ENOMEM;
+    for (i = 0; i < count; i++) {
+        pos[4 * i + 0] = (int16_t)(mv[4 * i + 0] + AEG_LA_PAD);
+        pos[4 * i + 1] = (int16_t)(mv[4 * i + 1] + AEG_LA_PAD);
+        pos[4 * i + 2] = (int16_t)(mv[4 * i + 2] + AEG_LA_PAD);
+        pos[4 * i + 3] = (int16_t)(mv[4 * i + 3] + AEG_LA_PAD);
+    }
+    st |= p_clEnqueueWriteBuffer(o->queue, mmv, CL_FALSE, 0, (size_t)count * 8,
+                                 pos, 0, NULL, NULL);
+    p_clSetKernelArg(o->k_sad, 0, sizeof(cl_mem), &mcur);
+    p_clSetKernelArg(o->k_sad, 1, sizeof(int), &o->lo_stride);
+    p_clSetKernelArg(o->k_sad, 2, sizeof(cl_mem), &mref);
+    p_clSetKernelArg(o->k_sad, 3, sizeof(int), &o->lo_stride);
+    p_clSetKernelArg(o->k_sad, 4, sizeof(int), &bw);
+    p_clSetKernelArg(o->k_sad, 5, sizeof(int), &bh);
+    p_clSetKernelArg(o->k_sad, 6, sizeof(int), &count);
+    p_clSetKernelArg(o->k_sad, 7, sizeof(cl_mem), &mmv);
+    p_clSetKernelArg(o->k_sad, 8, sizeof(cl_mem), &mout);
+    st = p_clEnqueueNDRangeKernel(o->queue, o->k_sad, 1, NULL, &nthreads, NULL,
+                                  0, NULL, NULL);
+    if (st != CL_SUCCESS) {
+        free(pos);
+        p_clReleaseMemObject(mcur);
+        p_clReleaseMemObject(mref);
+        return AEG_EBACKEND;
+    }
+    st |= p_clEnqueueReadBuffer(o->queue, mout, CL_FALSE, 0, (size_t)count * 4,
+                                out, 0, NULL, NULL);
+    if (st == CL_SUCCESS)
+        st = p_clFinish(o->queue);
+    free(pos);
+    p_clReleaseMemObject(mcur);
+    p_clReleaseMemObject(mref);
+    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+}
+
+static cl_mem ocl_lo_work(ocl_ctx *o, int slot, size_t bytes)
+{
+    cl_int st;
+    if (o->lo_work[slot] && o->lo_work_sz[slot] >= bytes)
+        return o->lo_work[slot];
+    if (o->lo_work[slot])
+        p_clReleaseMemObject(o->lo_work[slot]);
+    o->lo_work[slot] = p_clCreateBuffer(o->ctx, CL_MEM_READ_WRITE, bytes, NULL, &st);
+    o->lo_work_sz[slot] = o->lo_work[slot] ? bytes : 0;
+    return o->lo_work[slot];
+}
+
+static int ocl_lowres_batch_search(void *priv, const int32_t *pairs, int npairs,
+                                   int mb_w, int mb_h, int iters,
+                                   int32_t *mv, int32_t *cost)
+{
+    static const int steps[] = { 16, 16, 8, 8, 4, 4, 2, 2, 1, 1 };
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mpairs, mprev, mnext, mcost;
+    int32_t *zero = NULL;
+    int nblk = mb_w * mb_h, n = npairs * nblk, it, istep = 0, ilast = 0;
+    int slot_bytes = (int)o->lo_slot_bytes;
+    size_t nthreads = (size_t)n;
+    cl_int st = CL_SUCCESS;
+    if (!o->lo_ring || npairs <= 0 || nblk <= 0)
+        return AEG_EINVAL;
+    if (iters <= 0 || iters > (int)(sizeof(steps) / sizeof(steps[0])))
+        iters = 5;
+    mpairs = ocl_lo_work(o, 0, (size_t)npairs * 8);
+    mprev = ocl_lo_work(o, 1, (size_t)n * 8);
+    mnext = ocl_lo_work(o, 2, (size_t)n * 8);
+    mcost = ocl_lo_work(o, 3, (size_t)n * 4);
+    if (!mpairs || !mprev || !mnext || !mcost)
+        return AEG_EBACKEND;
+    zero = (int32_t *)calloc((size_t)n * 2, sizeof(int32_t));
+    if (!zero)
+        return AEG_ENOMEM;
+    st |= p_clEnqueueWriteBuffer(o->queue, mpairs, CL_FALSE, 0,
+                                 (size_t)npairs * 8, pairs, 0, NULL, NULL);
+    st |= p_clEnqueueWriteBuffer(o->queue, mprev, CL_FALSE, 0, (size_t)n * 8,
+                                 zero, 0, NULL, NULL);
+    free(zero);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    p_clSetKernelArg(o->k_lowres, 0, sizeof(cl_mem), &o->lo_ring);
+    p_clSetKernelArg(o->k_lowres, 1, sizeof(int), &o->lo_stride);
+    p_clSetKernelArg(o->k_lowres, 2, sizeof(int), &slot_bytes);
+    p_clSetKernelArg(o->k_lowres, 3, sizeof(int), &mb_w);
+    p_clSetKernelArg(o->k_lowres, 4, sizeof(int), &mb_h);
+    p_clSetKernelArg(o->k_lowres, 6, sizeof(int), &ilast);
+    p_clSetKernelArg(o->k_lowres, 7, sizeof(cl_mem), &mpairs);
+    p_clSetKernelArg(o->k_lowres, 8, sizeof(int), &npairs);
+    p_clSetKernelArg(o->k_lowres, 11, sizeof(cl_mem), &mcost);
+    for (it = 0; it < iters; it++) {
+        cl_mem tmp;
+        istep = steps[it];
+        ilast = it == iters - 1;
+        p_clSetKernelArg(o->k_lowres, 5, sizeof(int), &istep);
+        p_clSetKernelArg(o->k_lowres, 6, sizeof(int), &ilast);
+        p_clSetKernelArg(o->k_lowres, 9, sizeof(cl_mem), &mprev);
+        p_clSetKernelArg(o->k_lowres, 10, sizeof(cl_mem), &mnext);
+        st = p_clEnqueueNDRangeKernel(o->queue, o->k_lowres, 1, NULL, &nthreads,
+                                      NULL, 0, NULL, NULL);
+        if (st != CL_SUCCESS)
+            return AEG_EBACKEND;
+        tmp = mprev; mprev = mnext; mnext = tmp;
+    }
+    st |= p_clEnqueueReadBuffer(o->queue, mprev, CL_FALSE, 0, (size_t)n * 8,
+                                mv, 0, NULL, NULL);
+    st |= p_clEnqueueReadBuffer(o->queue, mcost, CL_FALSE, 0, (size_t)n * 4,
+                                cost, 0, NULL, NULL);
+    if (st == CL_SUCCESS)
+        st = p_clFinish(o->queue);
+    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+}
+
+static int ocl_mepic_find(ocl_ctx *o, uint64_t id, size_t bytes)
+{
+    int i;
+    for (i = 0; i < AEG_ME_PIC_SLOTS; i++)
+        if (o->mepic_ok[i] && o->mepic_id[i] == id && o->mepic_sz[i] >= bytes)
+            return i;
+    return -1;
+}
+
+static int ocl_me_batch(void *priv, const uint8_t *cur, int cstride,
+                        const uint8_t *ref, int rstride, int bw, int bh,
+                        int range, const int16_t *job, int count,
+                        int avail_rows, int16_t *out_mv, int32_t *out_sad,
+                        uint64_t cur_id, uint64_t ref_id)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    cl_mem mcur, mref, mjob, mmv, msad;
+    size_t nthreads, cbytes, rbytes;
+    int hi, pad = AEG_PAD;
+    cl_int st = CL_SUCCESS;
+
+    if (count <= 0)
+        return AEG_OK;
+    /* the job list gives the picture geometry its blocks span */
+    hi = 0;
+    {
+        int i;
+        for (i = 0; i < count; i++)
+            if (job[4 * i + 1] > hi)
+                hi = job[4 * i + 1];
+    }
+    hi = hi + bh + 2 * AEG_PAD;
+    if (avail_rows > 0 && hi > avail_rows)
+        hi = avail_rows;
+    cbytes = (size_t)cstride * (size_t)hi;
+    rbytes = cbytes;
+    nthreads = (size_t)count;
+    {
+        int ci = ocl_mepic_find(o, cur_id, cbytes);
+        int ri = ocl_mepic_find(o, ref_id, rbytes);
+        mcur = ci >= 0 ? o->mepic[ci]
+                       : ocl_buf(o, 0, cbytes, CL_MEM_READ_ONLY);
+        mref = ri >= 0 ? o->mepic[ri]
+                       : ocl_buf(o, 1, rbytes, CL_MEM_READ_ONLY);
+        if (!mcur || !mref)
+            return AEG_EBACKEND;
+        if (ci < 0)
+            st |= p_clEnqueueWriteBuffer(o->queue, mcur, CL_FALSE, 0, cbytes,
+                                         cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD,
+                                         0, NULL, NULL);
+        if (ri < 0)
+            st |= p_clEnqueueWriteBuffer(o->queue, mref, CL_FALSE, 0, rbytes,
+                                         ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD,
+                                         0, NULL, NULL);
+    }
+    mjob = ocl_buf(o, 2, (size_t)count * 8, CL_MEM_READ_ONLY);
+    mmv = ocl_buf(o, 3, (size_t)count * 4, CL_MEM_WRITE_ONLY);
+    msad = ocl_buf(o, 4, (size_t)count * 4, CL_MEM_WRITE_ONLY);
+    if (!mjob || !mmv || !msad)
+        return AEG_EBACKEND;
+    st |= p_clEnqueueWriteBuffer(o->queue, mjob, CL_FALSE, 0, (size_t)count * 8,
+                                 job, 0, NULL, NULL);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    p_clSetKernelArg(o->k_me, 0, sizeof(cl_mem), &mcur);
+    p_clSetKernelArg(o->k_me, 1, sizeof(int), &cstride);
+    p_clSetKernelArg(o->k_me, 2, sizeof(cl_mem), &mref);
+    p_clSetKernelArg(o->k_me, 3, sizeof(int), &rstride);
+    p_clSetKernelArg(o->k_me, 4, sizeof(int), &pad);
+    p_clSetKernelArg(o->k_me, 5, sizeof(int), &bw);
+    p_clSetKernelArg(o->k_me, 6, sizeof(int), &bh);
+    p_clSetKernelArg(o->k_me, 7, sizeof(int), &range);
+    p_clSetKernelArg(o->k_me, 8, sizeof(cl_mem), &mjob);
+    p_clSetKernelArg(o->k_me, 9, sizeof(int), &count);
+    p_clSetKernelArg(o->k_me, 10, sizeof(cl_mem), &mmv);
+    p_clSetKernelArg(o->k_me, 11, sizeof(cl_mem), &msad);
+    st = p_clEnqueueNDRangeKernel(o->queue, o->k_me, 1, NULL, &nthreads, NULL,
+                                  0, NULL, NULL);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    st |= p_clEnqueueReadBuffer(o->queue, mmv, CL_FALSE, 0, (size_t)count * 4,
+                                out_mv, 0, NULL, NULL);
+    st |= p_clEnqueueReadBuffer(o->queue, msad, CL_FALSE, 0, (size_t)count * 4,
+                                out_sad, 0, NULL, NULL);
+    if (st == CL_SUCCESS)
+        st = p_clFinish(o->queue);
+    return st == CL_SUCCESS ? AEG_OK : AEG_EBACKEND;
+}
+
 static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
                         int intra, int16_t *level, int32_t *nz)
 {
@@ -221,6 +551,8 @@ static int ocl_tq_batch(void *priv, const int16_t *res, int nblk, int qp,
         mf2 = aeg_quant_mf[qp % 6][2];
     cl_int st;
 
+    if (nblk <= 0)
+        return AEG_OK;
     mres = ocl_buf(o, 0, bytes, CL_MEM_READ_ONLY);
     mlev = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
     mnz = ocl_buf(o, 2, (size_t)nblk * 4, CL_MEM_WRITE_ONLY);
@@ -259,6 +591,8 @@ static int ocl_iq_idct_batch(void *priv, const int16_t *level, int nblk, int qp,
         ls2 = aeg_dequant_ls[qp % 6][2];
     cl_int st;
 
+    if (nblk <= 0)
+        return AEG_OK;
     mlev = ocl_buf(o, 0, bytes, CL_MEM_READ_ONLY);
     mres = ocl_buf(o, 1, bytes, CL_MEM_WRITE_ONLY);
     if (!mlev || !mres)
@@ -439,6 +773,9 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     size_t i, acc = 0;
     cl_int st;
 
+    *out = 0;
+    if (count == 0 || !w || !h)
+        return AEG_OK;
     ma = ocl_buf(o, 0, abytes, CL_MEM_READ_ONLY);
     mb = ocl_buf(o, 1, (size_t)sb * h, CL_MEM_READ_ONLY);
     mout = ocl_buf(o, 2, count * 8, CL_MEM_WRITE_ONLY);
@@ -606,8 +943,15 @@ static void ocl_destroy(void *priv)
     for (i = 0; i < NBUF; i++)
         if (o->buf[i])
             p_clReleaseMemObject(o->buf[i]);
+    if (o->lo_ring)
+        p_clReleaseMemObject(o->lo_ring);
+    for (i = 0; i < 4; i++)
+        if (o->lo_work[i])
+            p_clReleaseMemObject(o->lo_work[i]);
     free(o->pos);
     if (o->k_sad) p_clReleaseKernel(o->k_sad);
+    if (o->k_me) p_clReleaseKernel(o->k_me);
+    if (o->k_lowres) p_clReleaseKernel(o->k_lowres);
     if (o->k_tq) p_clReleaseKernel(o->k_tq);
     if (o->k_iq) p_clReleaseKernel(o->k_iq);
     if (o->k_tqiq) p_clReleaseKernel(o->k_tqiq);
@@ -656,6 +1000,8 @@ static int ocl_kernels(ocl_ctx *o)
 {
     cl_int st;
     o->k_sad = p_clCreateKernel(o->prog, "sad_batch", &st);
+    o->k_me = p_clCreateKernel(o->prog, "me_search", &st);
+    o->k_lowres = p_clCreateKernel(o->prog, "lowres_batch", &st);
     o->k_tq = p_clCreateKernel(o->prog, "tq_batch", &st);
     o->k_iq = p_clCreateKernel(o->prog, "iq_idct_batch", &st);
     o->k_tqiq = p_clCreateKernel(o->prog, "tq_iq_batch", &st);
@@ -665,8 +1011,8 @@ static int ocl_kernels(ocl_ctx *o)
     o->k_tqdc = p_clCreateKernel(o->prog, "tq_dc_batch", &st);
     o->k_iqdc = p_clCreateKernel(o->prog, "iq_dc_batch", &st);
     return o->k_sad && o->k_tq && o->k_iq && o->k_tqiq && o->k_sse &&
-           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc ? AEG_OK
-                                                             : AEG_EBACKEND;
+           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc && o->k_me &&
+           o->k_lowres ? AEG_OK : AEG_EBACKEND;
 }
 
 static int ocl_clone(void *priv, aeg_be_ops *out);
@@ -676,7 +1022,13 @@ static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
     memset(ops, 0, sizeof(*ops));
     ops->priv = o;
     ops->backend = AEG_BACKEND_OPENCL;
+    ops->is_gpu = o->is_gpu;
     ops->sad_batch = ocl_sad_batch;
+    ops->me_batch = ocl_me_batch;
+    ops->me_pic_upload = ocl_me_pic_upload;
+    ops->lowres_upload = ocl_lowres_upload;
+    ops->lowres_sad_batch = ocl_lowres_sad_batch;
+    ops->lowres_batch_search = ocl_lowres_batch_search;
     ops->tq_batch = ocl_tq_batch;
     ops->iq_idct_batch = ocl_iq_idct_batch;
     ops->tq_iq_batch = ocl_tq_iq_batch;
@@ -762,11 +1114,48 @@ int aeg_be_opencl_create(aeg_be_ops *ops)
         return AEG_ENOMEM;
     }
     o->lib = lib;
-    if (p_clGetPlatformIDs(1, &o->platform, NULL) != CL_SUCCESS ||
-        p_clGetDeviceIDs(o->platform, CL_DEVICE_TYPE_ALL, 1, &o->device,
-                         NULL) != CL_SUCCESS) {
-        ocl_destroy(o);
-        return AEG_EBACKEND;
+    /* AEG_DEVICE=n picks the n-th OpenCL device in platform/device order
+     * (--device n on the command line sets it).  Without it the first is
+     * used, as before, so no existing invocation changes behaviour. */
+    {
+        cl_platform_id plats[16];
+        cl_device_id devs[64];
+        cl_uint np = 0, pi, di;
+        int idx = 0, want = -1, found = 0;
+        const char *ev = getenv("AEG_DEVICE");
+        if (ev && *ev)
+            want = atoi(ev);
+        if (p_clGetPlatformIDs(16, plats, &np) != CL_SUCCESS || !np) {
+            ocl_destroy(o);
+            return AEG_EBACKEND;
+        }
+        for (pi = 0; pi < np && !found; pi++) {
+            cl_uint nd = 0;
+            if (p_clGetDeviceIDs(plats[pi], CL_DEVICE_TYPE_ALL, 64, devs,
+                                 &nd) != CL_SUCCESS)
+                continue;
+            for (di = 0; di < nd; di++, idx++) {
+                if (want < 0 || idx == want) {
+                    o->platform = plats[pi];
+                    o->device = devs[di];
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            /* the requested index does not exist: the first device is a
+             * better answer than failing, and the log says why */
+            if (want >= 0)
+                aeg_log(AEG_LOG_WARNING, "aeg: OpenCL device %d not found, "
+                        "using device 0", want);
+            if (p_clGetPlatformIDs(1, &o->platform, NULL) != CL_SUCCESS ||
+                p_clGetDeviceIDs(o->platform, CL_DEVICE_TYPE_ALL, 1, &o->device,
+                                 NULL) != CL_SUCCESS) {
+                ocl_destroy(o);
+                return AEG_EBACKEND;
+            }
+        }
     }
     p_clGetDeviceInfo(o->device, CL_DEVICE_NAME, sizeof(o->name), o->name, &got);
     p_clGetDeviceInfo(o->device, CL_DEVICE_VENDOR, sizeof(o->vendor), o->vendor, &got);

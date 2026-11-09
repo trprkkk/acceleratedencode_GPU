@@ -12,9 +12,18 @@
 
 #include "h264.h"
 
+#define AEG_ME_PIC_CUR 0
+#define AEG_ME_PIC_REF 1
+#define AEG_ME_PIC_SLOTS 16
+
+/* Device-resident lookahead pictures (M-3.3a): the lowres ring is at most
+ * AEG_RING entries; the backend keeps one luma plane per slot. */
+#define AEG_LOWRES_SLOTS 96
+
 typedef struct aeg_be_ops {
     void *priv;
     int   backend;          /* AEG_BACKEND_* actually in use             */
+    int   is_gpu;           /* a real GPU (0: a CPU device such as PoCL)  */
     char  desc[192];
 
     /* SAD of `count` block pairs.
@@ -83,6 +92,52 @@ typedef struct aeg_be_ops {
      * planes, i.e. this is exactly aeg_mc_luma_p() followed by aeg_satd(). */
     int (*satd_batch)(void *priv, const pixel *cur, int cstride, int bw,
                       int bh, const int16_t *pos, int count, int32_t *out);
+
+    /* Whole-picture integer motion search: `count` blocks of bw x bh, each
+     * searched on its own (no block depends on another's result), so one call
+     * covers a picture instead of one call per block.  job holds four int16
+     * per block: block x, block y (picture coordinates of the block origin),
+     * and the start vector in whole samples.  out_mv receives two int16 (the
+     * vector, whole samples) and out_sad one int32 (its SAD) per block.
+     *
+     * The walk is defined by the CPU reference in backend.c and reproduced
+     * exactly by the device kernel (tests/backend_check.c compares them on
+     * random pictures): a nine-point descent at steps range/2 .. 1 followed by
+     * a one-pel descent, strict comparison in a fixed order.  Because the two
+     * are the same function, the encoder can place this stage on either side
+     * without changing the stream. */
+    int (*me_batch)(void *priv, const pixel *cur, int cstride,
+                    const pixel *ref, int rstride, int bw, int bh, int range,
+                    const int16_t *job, int count, int avail_rows,
+                    int16_t *out_mv, int32_t *out_sad,
+                    uint64_t cur_id, uint64_t ref_id);
+
+    /* Device-resident luma pictures for me_batch (slot 0 = current source,
+     * 1 = reference).  `id` identifies the content: the same id means the
+     * bytes already on the device can be reused, a new one re-uploads.  A
+     * backend without this op simply transfers in me_batch as before. */
+    int (*me_pic_upload)(void *priv, int slot, const pixel *plane, int stride,
+                         int w, int h, int rows, uint64_t id);
+
+    /* Lowres ring (M-3.3a): upload one 8-bit lowres plane to a device slot,
+     * then run SAD batches between two resident slots without re-uploading.
+     * `id` identifies the content; the same id + size is a cache hit. */
+    int (*lowres_upload)(void *priv, int slot, const uint8_t *plane, int stride,
+                         int w, int h, uint64_t id);
+    int (*lowres_sad_batch)(void *priv, int cur_slot, int ref_slot, int bw,
+                            int bh, const int16_t *mv, int count, int32_t *out);
+    /* M-3.3b: every (pair, block) in one grid.  pairs holds two slot numbers
+     * per entry; one host call launches `iters` kernels (one per step) on
+     * the lane stream and waits once.  mv/cost are npairs * mb_w * mb_h. */
+    int (*lowres_batch_search)(void *priv, const int32_t *pairs, int npairs,
+                               int mb_w, int mb_h, int iters,
+                               int32_t *mv, int32_t *cost);
+    /* M-3.2: fixed-point mbtree propagation for a whole planned list, one
+     * host call and one sync.  prop is npics*nmb int32 (in/out). */
+    int (*mbt_batch)(void *priv, int npics, int mb_w, int mb_h,
+                     const int *intra, const int *inter, const uint8_t *kind,
+                     const int *mv, const int *r0, const int *r1, int w0,
+                     int32_t *prop);
 
     void (*sync)(void *priv);
     void (*destroy)(void *priv);
@@ -161,7 +216,10 @@ int aeg_be_create(int which, aeg_be_ops *ops);
 /* Per-stage dispatch ------------------------------------------------- */
 typedef struct aeg_dispatcher {
     aeg_be_ops ops;                  /* accelerator (or CPU)            */
-    int        have_gpu;
+    int        have_gpu;             /* a device is present             */
+    int        auto_ok;              /* ... and it may be chosen by timing
+                                      *     (a real GPU: a CPU device is
+                                      *     only ever used when forced)  */
     int        use_gpu[AEG_STAGE_COUNT];   /* current decision           */
     int        forced[AEG_STAGE_COUNT];    /* -1 auto, else forced       */
     int64_t    cpu_ns[AEG_STAGE_COUNT][2]; /* [stage][last/ema]          */

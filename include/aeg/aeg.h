@@ -110,6 +110,20 @@ typedef enum aeg_rcmode {
     AEG_RC_CRF = 2    /* constant rate factor (constant quality)    */
 } aeg_rcmode;
 
+/* One --zones entry: display pictures start..end inclusive get qp. */
+typedef struct aeg_zone {
+    int start;
+    int end;
+    int qp;
+} aeg_zone;
+
+/* One --roi entry: macroblocks touching the rectangle (pixel coordinates)
+ * get qp_offset added to their QP (negative = finer). */
+typedef struct aeg_roi {
+    int x, y, w, h;
+    int qp_offset;
+} aeg_roi;
+
 typedef struct aeg_params {
     int width, height;        /* luma dimensions, >= 16, any value      */
     int fps_num, fps_den;     /* frame rate (e.g. 30/1, 30000/1001)     */
@@ -127,6 +141,15 @@ typedef struct aeg_params {
     int sar_w, sar_h;
     int fullrange;
     int colorprim, transfer, colormatrix;
+    /* HDR10 static metadata (SEI, off by default): `master_display` signals
+     * mastering_display_colour_volume with R/G/B and white-point x,y in
+     * 0.00002 units (md_primaries[0..7]) and the luminance in 0.0001 cd/m2
+     * (md_max_lum / md_min_lum); `max_cll` / `max_fall` signal
+     * content_light_level_info in cd/m2 (-1 = absent). */
+    int master_display;
+    int md_primaries[8];
+    unsigned md_max_lum, md_min_lum;
+    int max_cll, max_fall;
     /* Supplemental information, off by default (neither changes a coding
      * decision).  nal_hrd: with the VBV model on (vbv_maxrate/vbv_bufsize),
      * signal it as the NAL HRD (hrd_parameters in the VUI) with a buffering
@@ -245,9 +268,26 @@ typedef struct aeg_params {
      * A scene change is exactly where a P picture costs more than the IDR it
      * would replace, and it is the one place where a fixed GOP is measurable. */
     int scenecut;
+    /* x264's --open-gop: a keyframe boundary is an I slice that does not
+     * reset the decoder state (no IDR), so the B pictures before it in
+     * display order may keep predicting from the previous GOP.  A recovery
+     * point SEI marks each such I. */
+    int open_gop;
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
     int slices;               /* slices per picture, 0/1 = one           */
+    /* x264's --slice-max-mbs: no slice holds more macroblocks than this
+     * (the row granularity of this encoder is kept; 0 = unlimited). */
+    int slice_max_mbs;
+    /* x264's --slice-max-size: no slice's payload may exceed this many
+     * bytes.  The picture is coded again with half as many rows per slice
+     * while it does (down to one row); 0 = unlimited. */
+    int slice_max_size;
+    /* x264's --intra-refresh: no IDR after the first picture; instead a
+     * vertical band of macroblocks is coded intra, moving across the
+     * picture so that every macroblock is refreshed once per this many
+     * frames.  0 = off.  Implies --keyint infinite and no scene cuts. */
+    int intra_refresh;
     /* Frame threads: 2 = a non-reference B picture is coded next to the
      * picture after it (same bitstream as 1), 1 = off, 0 = auto (2 with more
      * than one CPU unless threads == 1).  Constant QP or CRF (ABR and VBV
@@ -326,9 +366,21 @@ typedef struct aeg_params {
     int trellis;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8, 16=8x8 split further */
     int chroma_me;            /* include chroma in motion SAD           */
-    int verbose;              /* unused; see aeg_set_log_level()        */
+    int verbose;              /* informational; logging is aeg_set_log_level() */
     int force_cpu_reference;  /* also compute CPU path for validation   */
     const char *dump_stats;   /* optional per-frame CSV path            */
+    /* Per-picture QP overrides (x264's --qpfile): frame_qp[k] is the QP of
+     * display picture k, -1 = the rate controller's choice.  The table is
+     * borrowed, not copied, and must stay valid for the encoder's lifetime. */
+    const int *frame_qp;
+    int        n_frame_qp;
+    /* x264's --zones: per-frame-range QP overrides.  A frame_qp entry wins
+     * when both are given.  Borrowed for the encoder's lifetime. */
+    const aeg_zone *zones;
+    int             n_zones;
+    /* ROI: per-rectangle QP offsets, applied after AQ/mbtree. */
+    const aeg_roi *rois;
+    int            n_rois;
 } aeg_params;
 
 AEG_API void aeg_params_default(aeg_params *p);

@@ -37,14 +37,40 @@ rate-distortion decisions and transforms, not by a vendor ASIC.
 > two cores at 320x192 QP 24, and 68 % of the CPU time is now the
 > transform/quantise/reconstruct work of the rate-distortion pass with 31 % in
 > the motion search (80 %/19 % at preset 4), which is exactly what the GPU
-> backends exist for.  The GPU backends sit behind a measured dispatcher.  There
-> is no GPU in this environment, but every device path runs end to end on a
-> real OpenCL device (PoCL, a CPU implementation of OpenCL: `tools/pocl_env.sh`)
-> and writes the CPU encoder's stream byte for byte, and the CUDA kernels are
-> compiled by NVRTC for every architecture it supports (`tests/nvrtc_check.c`).
-> What still needs GPU hardware is the speed: whether the device side ever wins.
-> See *GPU groundwork on a real OpenCL device* in
-> [`docs/STATUS.md`](docs/STATUS.md).
+> backends exist for.  The GPU backends sit behind a measured dispatcher.
+> Every device path runs end to end on a real OpenCL device (PoCL, a CPU
+> implementation of OpenCL: `tools/pocl_env.sh`) and writes the CPU encoder's
+> stream byte for byte, and the CUDA kernels are compiled by NVRTC for every
+> architecture it supports (`tests/nvrtc_check.c`).
+>
+> **Measured on real GPU hardware as well** (GeForce RTX 2060 SUPER, CUDA):
+> `tests/backend_check.c` agrees with the CPU reference on all 348 device
+> operations (1080-line pictures included), and `AEG_SEED=1` makes the
+> CPU and CUDA whole-picture searches write **byte-identical** streams for all
+> 12 pictures of a 1080p clip with B pictures.  The default CUDA encode of
+> that clip is 202,923 bytes at PSNR 49.48 dB against 204,071 bytes at
+> 49.45 dB for `-b cpu`; the two streams differ because the device path uses
+> the whole-picture search and the CPU-only path keeps the original hex walk.
+> Single-threaded the GPU path is 1.2-1.4x faster (2.37-2.54 s vs 2.94-3.38 s).
+> The device pictures are resident (`me_pic_upload`: the source once per
+> picture and each reference once per group), each lane has its own CUDA
+> stream, the job and result staging is page-locked, and one call waits once
+> (M-1a/b/d).  With frame threads the CPU path still scales further on a
+> 12-core host (1.03 s vs 1.72-1.82 s): overlapping the *next* picture's
+> search with the current picture's CPU work is the remaining M-1.1 step.
+> `make dev_bench` reproduces the kernel numbers, and now also the lowres
+> ring (M-3.3a/b): 1080p, 64 resident slots and 100 pair searches take 38 MB
+> of uploads and 28.6 ms on the device, against 118.75 MB and 70.2 ms when
+> both planes are transferred every call.  The batched search (8 pairs x 8160
+> blocks, ten iteration kernels, one host sync) takes 6.56 ms on CUDA against
+> 372.67 ms for the same CPU reference, and the batched search is the
+> **default** macroblock-tree planner (`AEG_LA_BATCH=0` restores the scalar
+> lowres search; 4 calls / 4.39 MB for 12 pictures).  Its quality gate on
+> four 240-300 picture clips, four CQP and four CRF points, is against the
+> scalar path CQP **-0.262% PSNR / -0.083% SSIM** and CRF **-0.955% PSNR /
+> -0.840% SSIM** (negative = fewer bits), for 1.688 s against 1.661 s at
+> 1080p/12f.
+> [`docs/PROGRESS_ja.md`](docs/PROGRESS_ja.md) is the current task board.
 
 **Against x264 and x265** (the final comparison, `f52e4af`; full tables and
 method under *The final comparison with x264 and x265* in `docs/STATUS.md`).
@@ -110,13 +136,13 @@ control) are not.  This project therefore splits the encoder into two classes:
 
 | Stage | Where it runs | Why |
 |---|---|---|
-| Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
-| Whole-frame parallel search rounds (8 neighbours of every macroblock's best vector, four rounds) | GPU (`sad_batch`, one launch per round) | a whole picture's search as four batched calls instead of a serial hex walk per macroblock |
-| Fractional refinement as rounds (8 quarter/half-pel neighbours of every macroblock, up to three rounds at each step) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | each round is independent across macroblocks; replaces the per-macroblock subpel walk outright |
+| Motion estimation (whole picture, every macroblock, one work item per block) | GPU (`me_batch`: one launch per list; the same nine-point descent as the CPU reference) | tens of thousands of independent SADs, no per-macroblock round trip |
+| Fractional refinement (half/quarter-pel rounds over the whole shape) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | every macroblock refines independently |
+| Per-macroblock local refinement around the whole-picture vector | CPU (`aeg_me_refine_around`, `src/mc.c`) | needs the block's MV predictor and its mvd cost, and is cheap next to the full search |
 | Fractional-pel planes (the four luma planes a quarter-pel position is built from) | GPU (`interp_plane`, one launch per plane) when the dispatcher assigns `inter`, CPU reference otherwise | every output sample independent; removes the per-candidate 6-tap filters |
 | Inter partition search (16x16 / 16x8 / 8x16 / P_8x8 candidates) | GPU for the SAD batches, CPU for the MV prediction | the four 8x8 searches of one macroblock are independent |
-| Forward transform (4x4 DCT) + forward quantisation | GPU (`tq_batch`: one launch per inter candidate, or one per macroblock over *all* its candidates, `AEG_RD_BATCH`) | per-block, no dependencies; the candidates of a macroblock are independent of each other |
-| Inverse quantisation + inverse transform | GPU (`iq_idct_batch`, same blocks as above); in the batched paths with trellis (presets 3-4) the host reconstructs instead, from the levels it has just selected -- one launch per macroblock instead of two, unless `-s iq=` places it explicitly | per-block, no dependencies |
+| Forward transform (4x4 DCT) + forward quantisation | CPU by default; GPU (`tq_batch`) only when forced with `-s tq=` or `AEG_COEF_PROBE=1` | one full-frame batch is 3.6x, but the current per-macroblock dependency makes the round trip cost 98 us for 0.4 us of work |
+| Inverse quantisation + inverse transform | CPU by default, same as above; the batched trellis path keeps the host reconstruction | per-block, no dependencies |
 | SSE / SATD cost accumulation | GPU (batched kernel) | pure reduction |
 | Distortion metrics on the CPU reference (`aeg_sad`, 4x4 Hadamard `aeg_satd`) | CPU, SSE2 | exact integer sums, so a 13x / 2.2x faster vector path cannot change a decision |
 | Chroma and Intra_16x16 coefficient blocks | CPU | their DC coefficients are replaced by the 4x4 / 2x2 Hadamard of the neighbouring DCs, so they are not independent blocks |
@@ -127,16 +153,15 @@ control) are not.  This project therefore splits the encoder into two classes:
 | Entropy coding (CABAC by default, CAVLC with `--no-cabac`) | CPU | inherently serial: every bin depends on the arithmetic coder's state and on context states the previous macroblocks left behind |
 | Bitstream assembly / rate decisions | CPU | serial |
 
-The dispatcher is *measured*, not guessed.  The coefficient stages are placed
-by trial: the first pictures of each kind alternate between the CPU and the
-device, and since both placements write the same stream, the difference in a
-picture's time per macroblock is exactly the cost of the placement (transfers,
-launches and the batch's host work included); the faster side stays, with 10%
-hysteresis, and the slower one is re-tried every 64 pictures.  The motion
-search is never placed by timing, because its device form is a different
-search and the stream would then depend on the machine's speed; `-s est=`
-forces it.  `aeg_backend_calibrate()` measures a kernel launch + transfer
-round trip on its own.
+The dispatcher uses measured placement where a measurement can converge: the
+coefficient stages are kept on the CPU by default (per-macroblock round trips
+lose 2.9-21x on real hardware; `AEG_COEF_PROBE=1` re-enables the trial), and
+the motion search is placed on a real GPU automatically because its device
+form is now the *same algorithm* as the CPU reference (`me_batch`), so placing
+it cannot change the stream.  PoCL and other CPU OpenCL devices are excluded
+from automatic placement.  `-s stage=` still forces any stage, and
+`AEG_SEED=1` forces the whole-picture search on the CPU too, which is how the
+bit-exactness test compares the two backends with B pictures.
 
 Quality goal: the encoder must be *decision equivalent* to a CPU implementation
 of the same algorithm — same transforms, same quantiser, same integer
@@ -184,9 +209,26 @@ without a GPU simply reports no CUDA device at run time.
                --dump-recon recon.yuv --bench
 ```
 
-`-b cpu|opencl|cuda|auto` selects the backend (rate control: see below), `--aq <tenths>` turns on variance-based adaptive
-quantisation (off by default: it is worth its PSNR cost only perceptually, see
-`docs/STATUS.md`), `--frame-threads 0|1|2` codes each non-reference B
+`-b cpu|opencl|cuda|auto` selects the backend; on a real GPU `auto`/`cuda`
+use the whole-picture motion search (`me_batch`), while `-b cpu` keeps the
+original per-macroblock walk.  `--device n` (or `AEG_DEVICE=n`) selects a
+compute device, `--qpfile <file>` sets per-picture QPs in x264's
+`frame qp` format (`-1` leaves a picture to the rate controller), and
+`--zones start,end,qp` (repeatable) does the same over a frame range, and
+`--roi x,y,w,h,qp_offset` (repeatable) biases the QP of the macroblocks that
+cover a rectangle.
+`--master-display "G(...)B(...)R(...)WP(...)L(max,min)"` and `--max-cll
+max,fall` write the HDR10 mastering-display / content-light-level SEI.
+`--intra-refresh n` replaces periodic IDRs after the first picture with a
+moving intra band (recovery-point SEI every n anchors), `--open-gop` makes
+keyframes non-IDR I slices (leading B pictures may keep predicting from the
+previous GOP), `--slice-max-mbs n` caps a slice at n macroblocks, and
+`--slice-max-size n` caps its payload at n bytes (the picture is re-coded with
+fewer rows per slice until every slice fits, down to one row).  Rate
+control: see below.  `--aq <tenths>` turns on variance-based adaptive
+quantisation and `--aq-mode 1|2|3` picks variance, auto-variance or
+auto-variance with dark-scene bias (off by default: it is worth its PSNR cost
+only perceptually, see `docs/STATUS.md`), `--frame-threads 0|1|2` codes each non-reference B
 picture on a second thread next to the following picture (0 = auto, on with
 more than one CPU unless `-t 1`; the stream is byte-identical to the serial
 one; constant QP, one slice), `-p 0..4` is the speed/quality

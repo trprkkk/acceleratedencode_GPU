@@ -429,7 +429,26 @@ struct aeg_encoder {
     int16_t *par_mv;       /* quarter-pel result per macroblock          */
     int32_t *par_cost;
     int      par_valid;
+    /* The whole-picture search of each partition shape (me_rounds_shape()):
+     * [0] 16x16, [1] 16x8, [2] 8x16, [3] 8x8, each on its own block grid.
+     * [0] is par_mv/par_cost above; [1..3] are here.  `par_full` says whether
+     * the per-macroblock searches may be replaced by a local refinement
+     * around these vectors. */
+    int16_t *par_sh_mv[4];
+    int32_t *par_sh_cost[4];
+    int16_t *par_imv;      /* scratch: integer vectors of one shape      */
+    int32_t *par_icost;    /* scratch: their SAD                        */
+    int16_t *par_job;      /* scratch: me_batch jobs (x, y, seed x, y)   */
+    int16_t *par_cand;     /* scratch: ME_ROUND_CAND candidates/block    */
+    int32_t *par_sad;      /* scratch: their costs                       */
     int      par_full;
+    /* B pictures: the same whole-picture search, once per list.  Both are
+     * quarter-pel vectors per macroblock, and par_valid_b says they may
+     * replace the two per-macroblock searches of analyse_mb_b(). */
+    int16_t *b_par_mv[2];
+    int32_t *b_par_cost[2];
+    int16_t *b_prev_mv;    /* the previous B picture's list 0 vectors */
+    int      par_valid_b;
     int16_t *seed_cand;   /* 2 * ME_ROUND_CAND per macroblock */
     int16_t *prev_seed;   /* the same, as of the previous picture  */
     int32_t *seed_sad;
@@ -575,6 +594,11 @@ struct aeg_encoder {
     pixel *in_plane[AEG_RING][3];
     int64_t *in_pts;
     aeg_lowres in_low[AEG_RING];   /* b_adapt / mbtree: lowres of the ring */
+    uint64_t la_dev_id[AEG_RING];  /* content id resident in that device slot */
+    int64_t la_dev_uploads, la_dev_bytes;
+    int64_t la_batch_calls, la_batch_bytes;
+    int64_t rec_dev_uploads, rec_dev_bytes;
+
     int *la_scratch;
     /* the lookahead's per-picture fields (la_field): the intra estimate of
      * the picture in each ring slot, and its searches against up to LA_SF
@@ -597,6 +621,7 @@ struct aeg_encoder {
         int *intra, *inter, *mv;
         uint8_t *kind;
         float *prop, *qp;
+        int64_t *prop_q;         /* fixed-point propagation for AEG_LA_BATCH */
         int qd;
     } mbt[AEG_RING];
     int in_count;           /* pictures pushed so far        */
@@ -618,6 +643,7 @@ struct aeg_encoder {
      * slice per picture it is 0 and nothing changes. */
     int top_row;            /* first macroblock row of the current slice */
     int slice_rows;         /* rows per slice, 0 = one slice per picture   */
+    size_t max_slice_bytes; /* largest slice of the last code_slices()    */
     int n_slices;
     int cur_qp;             /* QP of the picture being coded         */
 
@@ -733,6 +759,8 @@ struct aeg_encoder {
      * that codes non-reference B pictures next to the main thread, and the
      * queue that hands the packets out in coding order. */
     int    ft_on;
+    int    ft_worker;       /* this is a frame-thread worker's copy */
+    int    ir_index;        /* intra-refresh band index (P pictures) */
     /* The device lane this copy's thread uses (aeg_be_lane): 0 for the
      * encoder itself, 1 + k * (slice threads) for frame-thread worker k, plus
      * the slice index for the copies of a picture's slice threads -- so that
@@ -4307,6 +4335,17 @@ static int ppfs_on(void)
     return v;
 }
 
+/* The partition shapes of the whole-picture search: definitions are with
+ * me_rounds_shape() below. */
+typedef struct me_shape {
+    int bw, bh;
+    int nbx, nby, nblk;
+} me_shape;
+static void me_shape_of(const struct aeg_encoder *e, int s, me_shape *sh);
+static int me_shape_of_geo(const int geo[4]);
+static int me_shape_index(const me_shape *sh, int mbx, int mby,
+                          const int geo[4], int *ok);
+
 static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                          int p, const int geo[4], int pmvx, int pmvy, int ref,
                          int *mvx, int *mvy, int *sad, int refine)
@@ -4337,6 +4376,45 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
     const int fs16[2] = { e->mb_mv[0], e->mb_mv[1] };
     const int use_fs = !ref && e->mb_inter_ok && !(geo[2] == 16 && geo[3] == 16) &&
                        ppfs_on();
+    /* The whole-picture rounds already searched this partition's shape: all
+     * that is left per block is a local refinement around that vector (the
+     * rounds do not know the block's MV predictor, and the predictor is what
+     * the mvd costs).  Same on both backends -- the rounds' results are
+     * bit-identical, so this is one algorithm with two implementations. */
+    if (!ref && e->par_full && e->par_valid && !e->cfld) {
+        int s = me_shape_of_geo(geo);
+        if (s >= 0) {
+            /* Only the 16x16 and 8x8 grids run whole-frame rounds: a 16x8 or
+             * 8x16 partition is half of each, and its own grid doubles the
+             * batched work for a vector the half-size result already gives.
+             * It starts from the macroblock's 16x16 vector instead and the
+             * local refinement fixes the half-pel of the boundary. */
+            me_shape sh;
+            int ok = 1, idx;
+            if (s == 1 || s == 2) {
+                idx = mby * e->mb_w + mbx;
+                s = 0;
+            } else {
+                me_shape_of(e, s, &sh);
+                idx = me_shape_index(&sh, mbx, mby, geo, &ok);
+            }
+            if (ok) {
+                e->me_last_satd = -1;
+                aeg_me_refine_around(rp, e->stride[0],
+                                     e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
+                                         mbx * 16 + geo[0],
+                                     e->stride[0], geo[2], geo[3], 1,
+                                     e->p.search_range ? e->p.search_range : 16,
+                                     0,
+                                     pmvx, pmvy,
+                                     e->par_sh_mv[s][idx * 2 + 0],
+                                     e->par_sh_mv[s][idx * 2 + 1],
+                                     e->me_lambda, mc, mvx, mvy, sad);
+                e->me_pruned = 0;
+                return;
+            }
+        }
+    }
     e->me_pruned =
         aeg_me_block_fs(rp,
                  e->stride[0],
@@ -5275,135 +5353,208 @@ static void me_candidate_p8x8(struct aeg_encoder *e, int mbx, int mby)
 /* Candidate grid of one round, laid out per macroblock: (dx,dy) relative to the
  * macroblock origin, so that a single sad_batch() call covers the whole picture
  * (the backend applies dy through the reference stride). */
-static void me_fill_round(struct aeg_encoder *e, const int16_t *mv, int step,
-                          int range)
+/* ------------------------------------------------------------------ */
+/* The whole-picture search of one partition *shape*                  */
+/* ------------------------------------------------------------------ */
+/* A picture is tiled by the four partition shapes the P slice may use --
+ * 16x16, 16x8, 8x16 and 8x8 -- and each tiling is a regular grid, so the
+ * rounds above generalise to any of them by taking the block size and the
+ * grid instead of the macroblock geometry.  Searching all four shapes in one
+ * pass is what makes the device worth using: a per-macroblock search is a
+ * dependent walk of a few dozen SADs, while a shape's whole picture is one
+ * batch of tens of thousands of independent ones (measured: 11x the CPU's
+ * rate, docs/DESIGN_ja.md §2.1). */
+#define ME_SHAPES 4
+
+/* 0 = 16x16, 1 = 16x8, 2 = 8x16, 3 = 8x8. */
+static void me_shape_of(const struct aeg_encoder *e, int s, me_shape *sh)
+{
+    switch (s) {
+    case 1:  sh->bw = 16; sh->bh = 8;
+             sh->nbx = e->mb_w;     sh->nby = 2 * e->mb_h; break;
+    case 2:  sh->bw = 8;  sh->bh = 16;
+             sh->nbx = 2 * e->mb_w; sh->nby = e->mb_h;     break;
+    case 3:  sh->bw = 8;  sh->bh = 8;
+             sh->nbx = 2 * e->mb_w; sh->nby = 2 * e->mb_h; break;
+    default: sh->bw = 16; sh->bh = 16;
+             sh->nbx = e->mb_w;     sh->nby = e->mb_h;     break;
+    }
+    sh->nblk = sh->nbx * sh->nby;
+}
+
+/* The shape a partition geometry belongs to, or -1 when it is none of the
+ * four (a 4x4 or 8x4 / 4x8 sub-partition of P_8x8, which inherits its 8x8
+ * shape's vector). */
+static int me_shape_of_geo(const int geo[4])
+{
+    if (geo[2] == 16 && geo[3] == 16) return 0;
+    if (geo[2] == 16 && geo[3] == 8)  return 1;
+    if (geo[2] == 8  && geo[3] == 16) return 2;
+    if (geo[2] == 8  && geo[3] == 8)  return 3;
+    return -1;
+}
+
+/* Index of the block a partition occupies in its shape's grid. */
+static int me_shape_index(const me_shape *sh, int mbx, int mby,
+                          const int geo[4], int *ok)
+{
+    int x = mbx * 16 + geo[0], y = mby * 16 + geo[1];
+    int bx = x / sh->bw, by = y / sh->bh;
+    *ok = x % sh->bw == 0 && y % sh->bh == 0 &&
+          bx < sh->nbx && by < sh->nby;
+    return by * sh->nbx + bx;
+}
+
+/* Candidate grid of one round for a shape: (dx,dy) relative to the block
+ * origin, so that a single sad_batch() call covers the whole picture. */
+/* Round 0 of a shape: zero, and the previous picture's vector of the
+ * containing macroblock (integer pel) where it is inside the window. */
+/* One batched SAD round over the whole shape; returns the number of blocks
+ * whose winner changed. */
+/* One batched SATD round at the fractional stage. */
+static void me_satd_round_sh(struct aeg_encoder *e, const me_shape *sh,
+                             int step, int range4, int centre_only,
+                             int16_t *mv4, int32_t *cost, int16_t *pos,
+                             int32_t *sad)
 {
     static const int8_t d[ME_ROUND_CAND][2] = {
         { 0, 0}, {-1, 0}, { 1, 0}, { 0,-1}, { 0, 1},
         {-1,-1}, { 1,-1}, {-1, 1}, { 1, 1}
     };
-    int mb, k;
-    for (mb = 0; mb < e->mb_count; mb++) {
-        int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
-        int cx = mv[mb * 2 + 0], cy = mv[mb * 2 + 1];
-        for (k = 0; k < ME_ROUND_CAND; k++) {
-            int nx = cx + d[k][0] * step, ny = cy + d[k][1] * step;
-            if (nx < -range || nx > range || ny < -range || ny > range) {
-                nx = cx;    /* outside the window: repeat the centre */
-                ny = cy;
+    int i = 0, k, bx, by;
+    int16_t *q = pos;
+    for (by = 0; by < sh->nby; by++) {
+        int oy = by * sh->bh;
+        for (bx = 0; bx < sh->nbx; bx++, i++) {
+            const int ox = bx * sh->bw;
+            const int cx = mv4[i * 2 + 0], cy = mv4[i * 2 + 1];
+            for (k = 0; k < ME_ROUND_CAND; k++, q += 4) {
+                int nx = cx + (centre_only ? 0 : d[k][0] * step);
+                int ny = cy + (centre_only ? 0 : d[k][1] * step);
+                if (nx < -range4 || nx > range4 || ny < -range4 || ny > range4) {
+                    nx = cx;
+                    ny = cy;
+                }
+                q[0] = (int16_t)ox;
+                q[1] = (int16_t)oy;
+                q[2] = (int16_t)nx;
+                q[3] = (int16_t)ny;
             }
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
-            /* the op takes the two block positions, not a relative vector */
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)(ox + nx);
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)(oy + ny);
+        }
+    }
+    e->d.ops.satd_batch(e->d.ops.priv, e->srcp[0], e->stride[0], sh->bw, sh->bh,
+                        pos, sh->nblk * ME_ROUND_CAND, sad);
+    for (i = 0; i < sh->nblk; i++) {
+        int bestk = -1, bv = cost[i];
+        for (k = 0; k < ME_ROUND_CAND; k++) {
+            int32_t v = sad[i * ME_ROUND_CAND + k];
+            if (v < bv) { bv = v; bestk = k; }
+        }
+        if (bestk >= 0) {
+            cost[i] = bv;
+            mv4[i * 2 + 0] = pos[(i * ME_ROUND_CAND + bestk) * 4 + 2];
+            mv4[i * 2 + 1] = pos[(i * ME_ROUND_CAND + bestk) * 4 + 3];
+        }
+    }
+}
+
+/* The whole search of one shape: integer rounds (step range/2 .. 1) and,
+ * when `subpel`, the fractional ones (half-pel, then quarter-pel).  Fills
+ * mv4[] (quarter-pel) and cost[] (SATD) for every block of the grid. */
+/* One shape of one list (0 = list 0, 1 = list 1). */
+static void me_rounds_shape(struct aeg_encoder *e, int s, const int16_t *seed_mb,
+                            int walk, int range, int subpel, int iters,
+                            int list)
+{
+    me_shape sh;
+    int i, pass, iters_max, bx, by;
+    int16_t *mv4 = s ? e->par_sh_mv[s] : e->par_mv;
+    int32_t *cost = s ? e->par_sh_cost[s] : e->par_cost;
+
+    (void)walk;
+    me_shape_of(e, s, &sh);
+    /* The integer search is one batched call over the whole shape (one work
+     * item per block): from the better of the start vector and zero, a
+     * nine-point descent -- see aeg_be_ops.me_batch.  Shape 0 starts from the
+     * previous picture's vector; the finer shape 3 starts from this picture's
+     * 16x16 result, which is already known and is within a pel or two of every
+     * sub-partition's optimum. */
+    i = 0;
+    for (by = 0; by < sh.nby; by++) {
+        int oy = by * sh.bh;
+        for (bx = 0; bx < sh.nbx; bx++, i++) {
+            int ox = bx * sh.bw;
+            int mb = (oy >> 4) * e->mb_w + (ox >> 4);
+            int sx = 0, sy = 0;
+            if (s == 0) {
+                if (seed_mb) {
+                    sx = seed_mb[mb * 2 + 0];
+                    sy = seed_mb[mb * 2 + 1];
+                }
+            } else {
+                sx = e->par_mv[mb * 2 + 0] >> 2;
+                sy = e->par_mv[mb * 2 + 1] >> 2;
+            }
+            e->par_job[4 * i + 0] = (int16_t)ox;
+            e->par_job[4 * i + 1] = (int16_t)oy;
+            e->par_job[4 * i + 2] = (int16_t)sx;
+            e->par_job[4 * i + 3] = (int16_t)sy;
+        }
+    }
+    {
+        const int rows = e->h + e->vpad + AEG_PAD;
+        const uint64_t cur_id = ((uint64_t)(uint32_t)e->frame_count << 32) ^
+                                (uint64_t)(uintptr_t)e->srcp[0];
+        const uint64_t ref_id = ((uint64_t)(uint32_t)e->ref_poc[list] << 32) ^
+                                (uint64_t)(uintptr_t)e->refpl[list][0];
+        if (e->d.ops.me_pic_upload) {
+            e->d.ops.me_pic_upload(e->d.ops.priv, AEG_ME_PIC_CUR, e->srcp[0],
+                                   e->stride[0], e->w, e->h, rows, cur_id);
+            e->d.ops.me_pic_upload(e->d.ops.priv, AEG_ME_PIC_REF,
+                                   e->refpl[list][0], e->stride[0], e->w, e->h,
+                                   rows, ref_id);
+        }
+        e->d.ops.me_batch(e->d.ops.priv, e->srcp[0], e->stride[0],
+                          e->refpl[list][0], e->stride[0], sh.bw, sh.bh, range,
+                          e->par_job, sh.nblk, rows, e->par_imv, e->par_icost,
+                          cur_id, ref_id);
+    }
+    for (i = 0; i < sh.nblk; i++) {
+        mv4[i * 2 + 0] = (int16_t)(e->par_imv[i * 2 + 0] * 4);
+        mv4[i * 2 + 1] = (int16_t)(e->par_imv[i * 2 + 1] * 4);
+        cost[i] = 1 << 30;
+    }
+    if (!subpel)
+        return;
+    /* the fractional stage, as rounds over the whole shape: the samples come
+     * from the reference's interpolated planes, which stay resident */
+    me_satd_round_sh(e, &sh, 1, range * 4, 1, mv4, cost, e->par_pos, e->par_sad);
+    iters_max = iters;
+    for (pass = 0; pass < (iters > 0 ? 2 : 1); pass++) {
+        const int step = pass ? 1 : 2;
+        int n = 0, improved = 1;
+        while (improved && n++ < iters_max) {
+            int32_t before = 0, after = 0;
+            for (i = 0; i < sh.nblk; i++)
+                before += cost[i];
+            me_satd_round_sh(e, &sh, step, range * 4, 0, mv4, cost, e->par_pos,
+                             e->par_sad);
+            for (i = 0; i < sh.nblk; i++)
+                after += cost[i];
+            improved = after < before;
         }
     }
 }
 
 /* One batched SAD round over the whole picture; returns the number of
  * macroblocks whose winner changed shape. */
-static int me_run_round(struct aeg_encoder *e, int16_t *best, int32_t *cost)
-{
-    int mb, k, improved = 0;
-    e->d.ops.sad_batch(e->d.ops.priv, e->srcp[0], e->stride[0],
-                       e->refpl[0][0], e->stride[0], 16, 16,
-                       e->seed_cand, e->mb_count * ME_ROUND_CAND, e->seed_sad);
-    for (mb = 0; mb < e->mb_count; mb++) {
-        int bestk = 0, bv = cost[mb];
-        for (k = 0; k < ME_ROUND_CAND; k++) {
-            int32_t v = e->seed_sad[mb * ME_ROUND_CAND + k];
-            if (v < bv) { bv = v; bestk = k; }
-        }
-        if (bv < cost[mb]) {
-            cost[mb] = bv;
-            best[mb * 2 + 0] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 4 + 2] -
-                                         (mb % e->mb_w) * 16);
-            best[mb * 2 + 1] = (int16_t)(e->seed_cand[(mb * ME_ROUND_CAND + bestk) * 4 + 3] -
-                                         (mb / e->mb_w) * 16);
-            improved++;
-        }
-    }
-    return improved;
-}
-
 /* One batched SATD round: every macroblock evaluates the nine candidates of
  * e->par_pos[] and keeps the best one.  `mode` selects what the candidates mean
  * (0 = the centre only, used to establish the cost of the current vector). */
-static void me_satd_round(struct aeg_encoder *e, int step, int range4,
-                          int centre_only)
-{
-    static const int8_t d[ME_ROUND_CAND][2] = {
-        { 0, 0}, {-1, 0}, { 1, 0}, { 0,-1}, { 0, 1},
-        {-1,-1}, { 1,-1}, {-1, 1}, { 1, 1}
-    };
-    int mb;
-    for (mb = 0; mb < e->mb_count; mb++) {
-        const int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
-        const int cx = e->par_mv[mb * 2 + 0], cy = e->par_mv[mb * 2 + 1];
-        int k;
-        for (k = 0; k < ME_ROUND_CAND; k++) {
-            int nx = cx + (centre_only ? 0 : d[k][0] * step);
-            int ny = cy + (centre_only ? 0 : d[k][1] * step);
-            if (nx < -range4 || nx > range4 || ny < -range4 || ny > range4) {
-                nx = cx;
-                ny = cy;
-            }
-            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
-            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
-            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)nx;
-            e->par_pos[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)ny;
-        }
-    }
-    e->d.ops.satd_batch(e->d.ops.priv, e->srcp[0], e->stride[0], 16, 16,
-                        e->par_pos, e->mb_count * ME_ROUND_CAND, e->seed_sad);
-    for (mb = 0; mb < e->mb_count; mb++) {
-        int bestk = -1, bv = e->par_cost[mb], k;
-        for (k = 0; k < ME_ROUND_CAND; k++) {
-            int32_t v = e->seed_sad[mb * ME_ROUND_CAND + k];
-            if (v < bv) { bv = v; bestk = k; }
-        }
-        if (bestk >= 0) {
-            e->par_cost[mb] = bv;
-            e->par_mv[mb * 2 + 0] = e->par_pos[(mb * ME_ROUND_CAND + bestk) * 4 + 2];
-            e->par_mv[mb * 2 + 1] = e->par_pos[(mb * ME_ROUND_CAND + bestk) * 4 + 3];
-        }
-    }
-}
-
 /* Fractional-pel refinement of the whole picture, as two sets of batched rounds
  * (half-pel steps, then quarter-pel steps) instead of a serial walk per
  * macroblock.  This is the second half of the motion search and, like the
  * integer rounds, it is one launch per round on a GPU. */
-static void me_par_subpel(struct aeg_encoder *e, int range4)
-{
-    int pass, mb;
-
-    for (mb = 0; mb < e->mb_count; mb++) {
-        e->par_mv[mb * 2 + 0] = (int16_t)(e->seed_mv[mb * 2 + 0] * 4);
-        e->par_mv[mb * 2 + 1] = (int16_t)(e->seed_mv[mb * 2 + 1] * 4);
-        e->par_cost[mb] = 1 << 30;
-    }
-    me_satd_round(e, 1, range4, 1);      /* cost of the integer position */
-
-    for (pass = 0; pass < 2; pass++) {
-        const int step = pass ? 1 : 2;
-        int iters = 0, improved = 1;
-        while (improved && iters++ < AEG_SUBPEL_ITERS) {
-            int32_t before = 0;
-            for (mb = 0; mb < e->mb_count; mb++)
-                before += e->par_cost[mb];
-            me_satd_round(e, step, range4, 0);
-            {
-                int32_t after = 0;
-                for (mb = 0; mb < e->mb_count; mb++)
-                    after += e->par_cost[mb];
-                improved = after < before;
-            }
-        }
-    }
-}
-
 static int lr_seed_on(const struct aeg_encoder *e)
 {
     static _Atomic int v = -2;
@@ -5454,7 +5605,7 @@ static void lr_seed_frame(struct aeg_encoder *e)
 
     e->lr_valid = 0;
     e->lr_rows = 0;
-    if (e->par_valid || !lr_seed_on(e) || e->p.subme <= 0 || !e->has_ref ||
+    if (e->par_valid || e->par_valid_b || !lr_seed_on(e) || e->p.subme <= 0 || !e->has_ref ||
         !(e->cur_is_p || e->cur_is_b) || (e->cur_is_b && !e->has_ref2))
         return;
     aeg_lowres_build(&e->lr_pic[0], e->srcp[0], e->stride[0], e->w, e->h);
@@ -5481,6 +5632,83 @@ static void lr_seed_frame(struct aeg_encoder *e)
     e->lr_valid = e->cur_is_p && e->cur_l0_active > 1 ? 2 : 1;
 }
 
+static int b_rounds_subpel(void)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_BROUNDSUB");
+        /* On by default: the whole-frame fractional rounds cost two extra
+         * batched calls per list, but doing the fraction per block instead
+         * (AEG_BROUNDSUB=0) serializes the two-list subpel walk on the CPU
+         * and measured 6.1 s against 2.1 s at 1080p, for 5 bytes. */
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
+/* Whole-picture search of a B picture, once for each list.  B is three out
+ * of four pictures at the default --bframes and its per-macroblock analysis
+ * runs two full searches, so this is where the device search pays the most.
+ * The lists are searched one after the other into par_mv/par_cost and copied
+ * out: list 0 starts from the previous B picture's list 0 vector, list 1 from
+ * this picture's list 0 result (the same start the per-macroblock search
+ * uses).  The per-macroblock stage then only refines locally around each
+ * vector (analyse_mb_b), which is where the MV predictor and its mvd cost
+ * come in. */
+static void me_seed_frame_b(struct aeg_encoder *e)
+{
+    const int range = e->p.search_range ? e->p.search_range : 16;
+    const int n = e->mb_count;
+    int list, mb, subpel;
+    int64_t t0;
+
+    e->par_valid_b = 0;
+    if (!e->has_ref || !e->has_ref2 || !e->cur_is_b || e->p.subme <= 0)
+        return;
+    {
+        const char *ev = getenv("AEG_SEED");
+        if (!(ev ? atoi(ev) != 0
+                : (e->d.use_gpu[AEG_STAGE_MOTION_EST] || e->d.auto_ok)))
+            return;
+    }
+    subpel = e->d.ops.satd_batch && e->d.ops.ref_upload && e->mcr[0].ready &&
+             e->mcr[1].ready && b_rounds_subpel();
+    t0 = aeg_now_ns();
+    for (list = 0; list < 2; list++) {
+        int mb2;
+        /* the rounds take whole-sample starts: the B vectors kept between
+         * pictures (and list 0's result for list 1) are quarter-pel */
+        for (mb2 = 0; mb2 < n; mb2++) {
+            const int16_t *src = list ? e->b_par_mv[0]
+                                  : e->ft_worker ? NULL : e->b_prev_mv;
+            e->seed_mv[mb2 * 2 + 0] = src ? (int16_t)(src[mb2 * 2 + 0] >> 2) : 0;
+            e->seed_mv[mb2 * 2 + 1] = src ? (int16_t)(src[mb2 * 2 + 1] >> 2) : 0;
+        }
+        if (subpel)
+            e->d.ops.ref_upload(e->d.ops.priv, e->mcr[list].base,
+                                e->mcr[list].stride, e->w, e->h);
+        me_rounds_shape(e, 0, e->seed_mv, range, range, subpel,
+                        AEG_SUBPEL_ITERS, list);
+        for (mb = 0; mb < n; mb++) {
+            e->b_par_mv[list][mb * 2 + 0] = e->par_mv[mb * 2 + 0];
+            e->b_par_mv[list][mb * 2 + 1] = e->par_mv[mb * 2 + 1];
+            e->b_par_cost[list][mb] = e->par_cost[mb];
+        }
+        /* the list 0 vectors of this picture start the next B picture */
+        if (!list)
+            memcpy(e->b_prev_mv, e->b_par_mv[0],
+                   (size_t)n * 2 * sizeof(int16_t));
+    }
+    e->par_valid_b = 1;
+    t0 = aeg_now_ns() - t0;
+    if (getenv("AEG_ME_TIME"))
+        fprintf(stderr, "aeg: me_seed_b %lld us v%d\n",
+                (long long)(t0 / 1000), e->par_valid_b);
+    e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
+    stage_rec(e, AEG_STAGE_MOTION_EST,
+              e->par_valid_b && e->d.ops.backend != AEG_BACKEND_CPU, t0);
+}
+
 /* Search every macroblock of the current P picture in parallel and remember the
  * resulting integer vectors in e->seed_mv[].  Runs on the GPU when the
  * dispatcher puts motion estimation there and on the CPU otherwise -- the same
@@ -5489,13 +5717,14 @@ static void me_seed_frame(struct aeg_encoder *e)
 {
     int range = e->p.search_range ? e->p.search_range : 16;
     int mb, n = e->mb_count;
-    int step;
     int64_t t0;
 
     e->par_valid = 0;
     e->par_full = 0;
     if (!e->has_ref || !e->cur_is_p || e->p.subme <= 0) {
         memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
+        if (e->cur_is_b)
+            me_seed_frame_b(e);
         return;
     }
     /* On a GPU the rounds are a handful of launches, so they shorten the hex
@@ -5507,66 +5736,68 @@ static void me_seed_frame(struct aeg_encoder *e)
      * seed_search conformance case does. */
     {
         const char *ev = getenv("AEG_SEED");
-        int on = ev ? atoi(ev) != 0 : e->d.use_gpu[AEG_STAGE_MOTION_EST];
+        int on = ev ? atoi(ev) != 0
+                 : (e->d.use_gpu[AEG_STAGE_MOTION_EST] || e->d.auto_ok);
         if (!on) {
             memset(e->seed_mv, 0, (size_t)n * 2 * sizeof(int16_t));
             return;
         }
-        /* The fractional half of the search is the same idea -- all
-         * macroblocks refine in quarter-pel rounds, one launch per round -- and
-         * replaces the per-macroblock walk outright.  Same gate (a GPU that
-         * wins the motion stage runs it), AEG_PARFULL=1/0 for the tests. */
+        /* par_full: the rounds *replace* the per-macroblock searches instead
+         * of only seeding them.  Without it the per-macroblock walk still
+         * runs from the rounds' vector as a start, which is a different (and
+         * more expensive) algorithm; AEG_PARFULL=1/0 for the tests. */
         ev = getenv("AEG_PARFULL");
-        e->par_full = ev ? atoi(ev) != 0 : e->d.use_gpu[AEG_STAGE_MOTION_EST];
+        e->par_full = ev ? atoi(ev) != 0 : on;
     }
     /* the vectors of the previous picture are the temporal predictor of this
      * one; e->seed_mv still holds them, so copy before overwriting */
     memcpy(e->prev_seed, e->seed_mv, (size_t)n * 2 * sizeof(int16_t));
     t0 = aeg_now_ns();
 
-    /* round 0: the predictor candidates, zero and the previous picture's vector
-     * at the same macroblock (rounded to integer pel) */
-    for (mb = 0; mb < n; mb++) {
-        int ox = (mb % e->mb_w) * 16, oy = (mb / e->mb_w) * 16;
-        /* the previous picture's rounded vector, in whole samples */
-        int tx = e->prev_seed[mb * 2 + 0];
-        int ty = e->prev_seed[mb * 2 + 1];
-        int k;
-        if (tx < -range || tx > range) tx = 0;
-        if (ty < -range || ty > range) ty = 0;
-        for (k = 0; k < ME_ROUND_CAND; k++) {
-            int dx = (k == 1) ? tx : 0, dy = (k == 1) ? ty : 0;
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 0] = (int16_t)ox;
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 1] = (int16_t)oy;
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 2] = (int16_t)(ox + dx);
-            e->seed_cand[(mb * ME_ROUND_CAND + k) * 4 + 3] = (int16_t)(oy + dy);
+    /* the 16x16 shape always runs: its result is the start the per-macroblock
+     * searches use when they are not replaced, and the skip candidate's
+     * source.  The other three shapes only when par_full, because that is
+     * what consumes them. */
+    {
+        int subpel = e->par_full && e->d.ops.satd_batch &&
+                     e->d.ops.ref_upload && e->mcr[0].ready;
+        if (subpel)
+            e->d.ops.ref_upload(e->d.ops.priv, e->mcr[0].base, e->mcr[0].stride,
+                                e->w, e->h);
+        me_rounds_shape(e, 0, e->prev_seed, range, range, subpel,
+                        AEG_SUBPEL_ITERS, 0);
+        for (mb = 0; mb < n; mb++) {
+            e->seed_mv[mb * 2 + 0] = (int16_t)(e->par_mv[mb * 2 + 0] >> 2);
+            e->seed_mv[mb * 2 + 1] = (int16_t)(e->par_mv[mb * 2 + 1] >> 2);
+            e->seed_cost[mb] = e->par_cost[mb];
         }
-        e->seed_mv[mb * 2 + 0] = 0;
-        e->seed_mv[mb * 2 + 1] = 0;
-        e->seed_cost[mb] = 1 << 30;
-    }
-    me_run_round(e, e->seed_mv, e->seed_cost);
-
-    for (step = range / 2; step >= 1; step /= 2) {
-        me_fill_round(e, e->seed_mv, step, range);
-        if (!me_run_round(e, e->seed_mv, e->seed_cost))
-            break;      /* nothing improved: the walk has converged */
-    }
-
-    /* The fractional half of the search, as rounds too -- but only where a
-     * satd_batch() backend can work from the registered reference: the CPU
-     * operation and both GPU backends provide it, and the vectors it produces
-     * are the same samples the serial walk sees. */
-    if (e->par_full && e->d.ops.satd_batch && e->d.ops.ref_upload && e->mcr[0].ready) {
-        e->d.ops.ref_upload(e->d.ops.priv, e->mcr[0].base, e->mcr[0].stride, e->w, e->h);
-        me_par_subpel(e, range * 4);
-        e->par_valid = 1;
+        if (subpel) {
+            /* Only the finest and the coarsest grid: a 16x8 / 8x16 partition
+             * starts from the macroblock's 16x16 vector (me_partition_ref),
+             * and the 8x8 grid only when the P_8x8 shape is enabled. */
+            if (e->p.partitions & 8)
+                me_rounds_shape(e, 3, NULL, 4, range, getenv("AEG_S3SUB") ? atoi(getenv("AEG_S3SUB")) : 0, 2, 0);
+            e->par_valid = 1;
+            e->par_full = 1;
+        }
     }
 
     t0 = aeg_now_ns() - t0;
+    if (getenv("AEG_ME_TIME")) {
+        int64_t amv = 0, acost = 0;
+        for (mb = 0; mb < n; mb++) {
+            int x = e->par_mv[mb * 2], y = e->par_mv[mb * 2 + 1];
+            amv += (x < 0 ? -x : x) + (y < 0 ? -y : y);
+            acost += e->par_cost[mb];
+        }
+        fprintf(stderr, "aeg: me_seed %lld us mv %.2f qpel cost %.1f mb0 (%d,%d) v%d f%d\n",
+                (long long)(t0 / 1000), n ? amv / 2.0 / n : 0.0,
+                n ? (double)acost / n : 0.0, e->par_mv[0], e->par_mv[1],
+                e->par_valid, e->par_full);
+    }
     e->st.stage_ns[AEG_STAGE_MOTION_EST] += t0;
     stage_rec(e, AEG_STAGE_MOTION_EST,
-                        e->d.ops.backend != AEG_BACKEND_CPU, t0);
+              e->par_valid && e->d.ops.backend != AEG_BACKEND_CPU, t0);
 }
 
 /* Fills e->mb_modes[] with the legal Intra_16x16 modes ordered by SAD, runs
@@ -5780,6 +6011,27 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
             seed[0] = e->lr_mv[list][(mby * e->mb_w + mbx) * 2];
             seed[1] = e->lr_mv[list][(mby * e->mb_w + mbx) * 2 + 1];
         }
+        /* The whole-frame search of this list has already run (me_seed_frame_b):
+         * all that is left per block is the local refinement around its
+         * vector, which unlike the rounds knows the block's MV predictor and
+         * therefore prices the mvd correctly.  Same function on both backends,
+         * so the stream does not depend on where the rounds ran. */
+        if (e->par_valid_b && !e->cfld) {
+            const int idx = mby * e->mb_w + mbx;
+            e->me_last_satd = -1;
+            aeg_me_refine_around(ref, e->stride[0], src, e->stride[0], 16, 16, 1,
+                                 range, b_rounds_subpel() ? 0 : 1,
+                                 pmv[list][0], pmv[list][1],
+                                 e->b_par_mv[list][idx * 2 + 0],
+                                 e->b_par_mv[list][idx * 2 + 1],
+                                 e->me_lambda, mc, &mv[list][0], &mv[list][1],
+                                 &sad[list]);
+            if (!list) {
+                e->mb_frac[0] = mv[0][0] & 3;
+                e->mb_frac[1] = mv[0][1] & 3;
+            }
+            continue;
+        }
         aeg_me_block_l(ref, e->stride[0], src, e->stride[0], 16, 16, range,
                      SUBME_F(e, 4), pmv[list][0], pmv[list][1], seed,
                      (const int (*)[2])nb, nnb, e->me_lambda, mc,
@@ -5937,6 +6189,27 @@ static int part_gate_pct(const struct aeg_encoder *e)
     return v >= 0 ? v : e->p.preset == 1 ? 100 : 0;
 }
 
+/* Intra refresh (x264's --intra-refresh): a vertical band of macroblocks is
+ * coded intra in every P picture, moving one band per picture so that every
+ * column is refreshed once per `intra_refresh` pictures.  The band is part
+ * of a normal P slice -- there is no IDR -- so the stream keeps decoding and
+ * a receiver joining late recovers within one cycle.  Only P pictures carry
+ * it: a B picture is not a reference, so refreshing there would not help. */
+static int ir_mb_forced(const struct aeg_encoder *e, int mbx)
+{
+    int period = e->p.intra_refresh;
+    int band, start;
+
+    if (period <= 0 || !e->cur_is_p)
+        return 0;
+    band = (e->mb_w + period - 1) / period;
+    if (band < 1) band = 1;
+    start = (e->ir_index % period) * band;
+    if (start >= e->mb_w)
+        start = e->mb_w > band ? e->mb_w - band : 0;
+    return mbx >= start && mbx < start + band;
+}
+
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     int mode, n = 0, sad_of[4];
@@ -5970,14 +6243,15 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     /* A B picture has its own candidate list: two searches, bi-prediction and
      * direct mode (see analyse_mb_b). */
     if (e->p.partitions != 0 && c->qp >= QP_MIN && e->cur_is_b &&
-        e->has_ref && e->has_ref2) {
+        e->has_ref && e->has_ref2 && !ir_mb_forced(e, mbx)) {
         if (analyse_mb_b(e, mbx, mby))
             return;
     }
     /* The motion search needs a reference picture *and* a P slice: an IDR
      * picture is always an I slice, so inter candidates there could never be
      * coded (writing them as an I macroblock desynchronises the decoder). */
-    if (e->p.partitions != 0 && c->qp >= QP_MIN && e->has_ref && e->cur_is_p) {
+    if (e->p.partitions != 0 && c->qp >= QP_MIN && e->has_ref && e->cur_is_p &&
+        !ir_mb_forced(e, mbx)) {
         int mvx, mvy, sad;
         aeg_mv_predict(e->mbs, e->mb_w, e->mb_w, mbx, mby, e->top_row,
                        &e->mb_pmv[0], &e->mb_pmv[1]);
@@ -9748,25 +10022,57 @@ static int mb_variance(const struct aeg_encoder *e, int mbx, int mby)
  * QP (and therefore the rate-control target) is unaffected.  `aq_strength`
  * is in tenths, 10 being x264's aq-strength=1.0. */
 #define AQ_MAX_DQP 12
+
+/* 16x16 luma mean of a macroblock, in 8-bit units. */
+static int mb_luma_mean(const struct aeg_encoder *e, int mbx, int mby)
+{
+    const pixel *p = e->srcp[0] + (ptrdiff_t)mby * 16 * e->stride[0] + mbx * 16;
+    int x, y, sum = 0;
+    for (y = 0; y < 16; y++)
+        for (x = 0; x < 16; x++)
+            sum += p[y * e->stride[0] + x];
+    return (sum / 256) >> (BIT_DEPTH - 8);
+}
+
 static void aq_compute(struct aeg_encoder *e)
 {
     double strength = e->p.aq_strength / 10.0;
     int n = e->mb_count, i, x, y, mean = 0, adj;
+    int mode = e->p.aq_mode;
 
-    if (e->p.aq_mode <= 0 || strength <= 0.0) {
+    if (mode <= 0 || strength <= 0.0) {
         for (i = 0; i < n; i++)
             e->mb_dqp[i] = 0;
         return;
     }
     {
-        double logsum = 0.0;
+        double logsum = 0.0, mean_abs = 0.0, scale = strength;
         for (i = 0; i < n; i++)
             logsum += log2((double)mb_variance(e, i % e->mb_w, i / e->mb_w) + 1.0);
         {
             double avg = logsum / n;
+            /* Auto-variance (x264 aq-mode 2/3): the strength is rescaled so
+             * that the picture's mean |offset| is 2 QP steps per unit of
+             * aq-strength, whatever the content's variance spread is.  Mode
+             * 1 keeps the fixed log relationship. */
+            if (mode >= 2) {
+                for (i = 0; i < n; i++) {
+                    int v = mb_variance(e, i % e->mb_w, i / e->mb_w);
+                    double d = avg - log2((double)v + 1.0);
+                    mean_abs += d < 0 ? -d : d;
+                }
+                mean_abs /= n;
+                if (mean_abs > 0.01)
+                    scale = (2.0 * strength) / mean_abs;
+            }
             for (i = 0; i < n; i++) {
                 int v = mb_variance(e, i % e->mb_w, i / e->mb_w);
-                double d = strength * (avg - log2((double)v + 1.0));
+                double d = scale * (avg - log2((double)v + 1.0));
+                /* aq-mode 3 (dark-scene bias): a flat dark block is where
+                 * banding is most visible, so its coarsening is halved. */
+                if (mode == 3 && d > 0.0 &&
+                    mb_luma_mean(e, i % e->mb_w, i / e->mb_w) < 64)
+                    d *= 0.5;
                 /* a block that is already flat to within noise gets a little
                  * less than the log suggests: the deadzone of the quantiser
                  * already removes it, and pushing it further only spends
@@ -9789,6 +10095,39 @@ static void aq_compute(struct aeg_encoder *e)
         }
     }
     (void)x; (void)y;
+}
+
+/* ROI: add each rectangle's QP offset to the macroblocks it touches.  This
+ * runs after AQ and the macroblock tree, so a region can be kept finer (a
+ * face, a logo, a subtitle) without disabling the tools that shape the rest
+ * of the picture.  Pixel coordinates; a partial macroblock counts. */
+static void roi_apply(struct aeg_encoder *e)
+{
+    int r;
+
+    if (!e->p.rois || e->p.n_rois <= 0)
+        return;
+    for (r = 0; r < e->p.n_rois; r++) {
+        const aeg_roi *roi = &e->p.rois[r];
+        int x0, y0, x1, y1, x, y;
+        if (roi->w <= 0 || roi->h <= 0)
+            continue;
+        x0 = roi->x / 16;
+        y0 = roi->y / 16;
+        x1 = (roi->x + roi->w + 15) / 16;
+        y1 = (roi->y + roi->h + 15) / 16;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > e->mb_w) x1 = e->mb_w;
+        if (y1 > e->mb_h) y1 = e->mb_h;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                int d = e->mb_dqp[y * e->mb_w + x] + roi->qp_offset;
+                if (d > 51) d = 51;
+                if (d < -51) d = -51;
+                e->mb_dqp[y * e->mb_w + x] = (int8_t)d;
+            }
+    }
 }
 
 /* Macroblock tree (x264's mbtree): how much of each macroblock's information
@@ -9840,6 +10179,106 @@ static void mbt_propagate(int mb_w, int mb_h, const int *intra,
 #undef MBT_ADD
             }
         }
+}
+
+#define MBT_Q 65536            /* fixed-point scale of prop_q (Q16) */
+
+/* One list's propagation as a deterministic gather: every source block's
+ * contribution is first put in a per-destination bucket (in raster-source
+ * order), then each destination sums its bucket in that fixed order.  The
+ * arithmetic is integer throughout, so the result is the same on the CPU and
+ * on a device whatever order the device happens to append in. */
+static void mbt_gather_list_q(int mb_w, int mb_h, const int *intra,
+                              const int *inter, const uint8_t *kind,
+                              const int *mv, const int64_t *prop_in,
+                              int64_t *out, int list, int w0)
+{
+    const int n = mb_w * mb_h;
+    int *cnt, *off, *cur, x, y, i, k;
+    int64_t *val;
+
+    if (!out)
+        return;
+    cnt = (int *)calloc((size_t)n, sizeof(int));
+    off = (int *)malloc(((size_t)n + 1) * sizeof(int));
+    cur = (int *)calloc((size_t)n, sizeof(int));
+    val = (int64_t *)malloc((size_t)n * 4 * sizeof(int64_t));
+    if (!cnt || !off || !cur || !val) {
+        free(cnt); free(off); free(cur); free(val);
+        return;
+    }
+    /* count the destinations of every source block */
+    for (y = 0; y < mb_h; y++)
+        for (x = 0; x < mb_w; x++) {
+            int ic = intra[y * mb_w + x];
+            int pc = inter[y * mb_w + x] < ic ? inter[y * mb_w + x] : ic;
+            int px, py, mx, my, fx, fy;
+            if (ic <= 0 || pc >= ic || (kind[y * mb_w + x] != 2 &&
+                                        kind[y * mb_w + x] != list))
+                continue;
+            px = 16 * x + mv[4 * (y * mb_w + x) + 2 * list];
+            py = 16 * y + mv[4 * (y * mb_w + x) + 2 * list + 1];
+            mx = px >> 4; my = py >> 4; fx = px & 15; fy = py & 15;
+#define MBT_CNT(X, Y, W) do {                                           \
+            if ((X) >= 0 && (X) < mb_w && (Y) >= 0 && (Y) < mb_h && ((W) != 0)) \
+                cnt[(Y) * mb_w + (X)]++;                                 \
+        } while (0)
+            MBT_CNT(mx, my, (16 - fx) * (16 - fy));
+            MBT_CNT(mx + 1, my, fx * (16 - fy));
+            MBT_CNT(mx, my + 1, (16 - fx) * fy);
+            MBT_CNT(mx + 1, my + 1, fx * fy);
+#undef MBT_CNT
+        }
+    off[0] = 0;
+    for (i = 0; i < n; i++) {
+        off[i + 1] = off[i] + cnt[i];
+        cur[i] = off[i];
+    }
+    /* fill the buckets, in source raster order */
+    for (y = 0; y < mb_h; y++)
+        for (x = 0; x < mb_w; x++) {
+            int i2 = y * mb_w + x;
+            int ic = intra[i2];
+            int pc = inter[i2] < ic ? inter[i2] : ic;
+            int64_t amount;
+            int px, py, mx, my, fx, fy;
+            if (ic <= 0 || pc >= ic ||
+                (kind[i2] != 2 && kind[i2] != list))
+                continue;
+            amount = ((int64_t)prop_in[i2] + (int64_t)ic * MBT_Q) *
+                     (ic - pc) / ic;
+            if (kind[i2] == 2)
+                amount = amount * (list ? 64 - w0 : w0) / 64;
+            px = 16 * x + mv[4 * i2 + 2 * list];
+            py = 16 * y + mv[4 * i2 + 2 * list + 1];
+            mx = px >> 4; my = py >> 4; fx = px & 15; fy = py & 15;
+#define MBT_PUT(X, Y, W) do {                                           \
+            if ((X) >= 0 && (X) < mb_w && (Y) >= 0 && (Y) < mb_h && ((W) != 0)) \
+                val[cur[(Y) * mb_w + (X)]++] = amount * (W) / 256; \
+        } while (0)
+            MBT_PUT(mx, my, (16 - fx) * (16 - fy));
+            MBT_PUT(mx + 1, my, fx * (16 - fy));
+            MBT_PUT(mx, my + 1, (16 - fx) * fy);
+            MBT_PUT(mx + 1, my + 1, fx * fy);
+#undef MBT_PUT
+        }
+    /* gather: each destination sums its bucket in the fixed append order */
+    for (i = 0; i < n; i++) {
+        int64_t s = 0;
+        for (k = off[i]; k < off[i + 1]; k++)
+            s += val[k];
+        out[i] = s;
+    }
+    free(cnt); free(off); free(cur); free(val);
+}
+
+static void mbt_propagate_q(int mb_w, int mb_h, const int *intra,
+                            const int *inter, const uint8_t *kind,
+                            const int *mv, const int64_t *prop_in,
+                            int64_t *in0, int64_t *in1, int w0)
+{
+    mbt_gather_list_q(mb_w, mb_h, intra, inter, kind, mv, prop_in, in0, 0, w0);
+    mbt_gather_list_q(mb_w, mb_h, intra, inter, kind, mv, prop_in, in1, 1, w0);
 }
 
 static int in_slots(const struct aeg_encoder *e);
@@ -12684,6 +13123,15 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         e->cur_is_p = is_p;
         set_current_refs(e);
     }
+    if (e->p.intra_refresh > 0) {
+        /* the band counts refreshes, not display pictures: with B pictures
+         * only the anchors carry one, and skipping the B's keeps the cycle
+         * at `intra_refresh` anchors. */
+        if (is_idr)
+            e->ir_index = 0;
+        else if (e->cur_is_p)
+            e->ir_index++;
+    }
     /* direct mode reads the decisions of list1[0], whichever buffer that is
      * (the next anchor, or the group's reference B picture) */
     if (e->cur_is_b && e->cur_l1_slot >= 0 && e->slot_mbs[e->cur_l1_slot]) {
@@ -12797,10 +13245,37 @@ static int frame_prologue(struct aeg_encoder *e, int *slice_io, int *idr_io,
         vbv_clamp_qp(e);
     if (e->cur_qp < e->p.qp_min) e->cur_qp = e->p.qp_min;
     if (e->cur_qp > e->p.qp_max) e->cur_qp = e->p.qp_max;
+    /* x264's --qpfile / --zones: an explicit QP for this display picture
+     * replaces the controller's, after the picture/B offsets.  Macroblock
+     * tools (AQ, trellis, the macroblock tree) still work from it, which is
+     * what x264 does; a -1 entry leaves the picture to the controller.  A
+     * qpfile entry wins over a zone. */
+    {
+        int q = -1;
+        if (e->p.frame_qp && poc >= 0 && poc < e->p.n_frame_qp)
+            q = e->p.frame_qp[poc];
+        if (q < 0 && e->p.zones && poc >= 0) {
+            int z;
+            for (z = 0; z < e->p.n_zones; z++)
+                if (poc >= e->p.zones[z].start && poc <= e->p.zones[z].end) {
+                    q = e->p.zones[z].qp;
+                    break;
+                }
+        }
+        if (q >= 0) {
+            if (q < QP_MIN) q = QP_MIN;
+            if (q > 51) q = 51;
+            e->cur_qp = q;
+            e->crf_frac = 0.0;
+            e->mode_lambda_off = 0;
+            e->abr_qpre = q;
+        }
+    }
 
     resolve_coef_stages(e);
     aq_compute(e);
     mbt_apply(e);
+    roi_apply(e);
     crf_dither(e, poc);
     if (aeg_log_level >= AEG_LOG_DEBUG) {
         long t = 0;
@@ -12931,9 +13406,12 @@ static int code_slices(struct aeg_encoder *e, int slice, int is_idr,
             }
         }
 
+        e->max_slice_bytes = 0;
         for (si = 0; si < e->n_slices; si++) {
             if (!lens[si])
                 break;
+            if (lens[si] > e->max_slice_bytes)
+                e->max_slice_bytes = lens[si];
             /* A B picture is not used as a reference, so its nal_ref_idc is 0
              * and the decoder is free to drop it as soon as it is output. */
             *out_len += aeg_nal_write(e->out + *out_len, e->out_cap - *out_len,
@@ -13270,6 +13748,71 @@ static void field_mark(struct aeg_encoder *e, int fidr)
 static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
                        int tick);
 
+/* Distortion of one reconstructed picture against its source: the three
+ * planes' PSNR, the combined PSNR, and luma SSIM over non-overlapping 8x8
+ * windows (the windowed definition, averaged -- not the whole-picture
+ * approximation).  This is the reconstruction the decoder produces, so the
+ * numbers are the encoder's real output quality, not an estimate from the
+ * residual. */
+static void picture_distortion(struct aeg_encoder *e)
+{
+    double psnr[3];
+    double sse = 0;
+    int i;
+    for (i = 0; i < 3; i++) {
+        const int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
+        int x, y;
+        int64_t acc = 0;
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                int d = (int)e->recp[i][y * e->stride[i] + x] -
+                        (int)e->srcp[i][y * e->stride[i] + x];
+                acc += (int64_t)d * d;
+            }
+        sse += (double)acc / (double)(w * h);
+        psnr[i] = acc > 0 ?
+            10.0 * log10((double)PIXEL_MAX * PIXEL_MAX /
+                         ((double)acc / ((double)w * h))) : 99.0;
+    }
+    e->st.psnr_y = psnr[0];
+    e->st.psnr_u = psnr[1];
+    e->st.psnr_v = psnr[2];
+    e->st.psnr_avg = sse > 0 ?
+        10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
+    /* luma SSIM, 8x8 windows with the standard constants */
+    {
+        const int w = e->vw, h = e->vh, s = e->stride[0];
+        const double c1 = (0.01 * PIXEL_MAX) * (0.01 * PIXEL_MAX);
+        const double c2 = (0.03 * PIXEL_MAX) * (0.03 * PIXEL_MAX);
+        double sum = 0.0;
+        int nw = 0, wy, wx;
+        for (wy = 0; wy + 8 <= h; wy += 8)
+            for (wx = 0; wx + 8 <= w; wx += 8) {
+                int64_t sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+                int x, y;
+                double mx, my, vx, vy, cxy;
+                for (y = 0; y < 8; y++)
+                    for (x = 0; x < 8; x++) {
+                        int a = e->srcp[0][(wy + y) * s + wx + x];
+                        int b = e->recp[0][(wy + y) * s + wx + x];
+                        sx += a; sy += b;
+                        sxx += (int64_t)a * a; syy += (int64_t)b * b;
+                        sxy += (int64_t)a * b;
+                    }
+                mx = sx / 64.0; my = sy / 64.0;
+                vx = sxx / 64.0 - mx * mx;
+                vy = syy / 64.0 - my * my;
+                cxy = sxy / 64.0 - mx * my;
+                sum += ((2 * mx * my + c1) * (2 * cxy + c2)) /
+                       ((mx * mx + my * my + c1) * (vx + vy + c2));
+                nw++;
+            }
+        e->st.ssim_y = nw ? sum / nw : 1.0;
+    }
+}
+
+static void rec_dev_store(struct aeg_encoder *e);
+
 static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
                             int poc, int64_t pts, aeg_packet *pkt,
                             int64_t t_all)
@@ -13331,6 +13874,7 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
         }
         aq_compute(e);
         mbt_apply(e);
+        roi_apply(e);
         crf_dither(e, e->cur_poc);
         if (e->fwp && e->cur_is_p && e->has_ref) {
             /* explicit weighted prediction of list 0's first field, from
@@ -13390,6 +13934,19 @@ static int field_frame_body(struct aeg_encoder *e, int slice, int is_idr,
             }
             e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
         }
+        /* The whole-picture search reads the reference as one picture, not a
+         * row at a time: with frame threads it has to wait until the
+         * reference is whole (otherwise its vectors, and the stream, would
+         * depend on how far the other thread had got). */
+        if (e->fsync && (e->d.auto_ok ||
+                         e->d.use_gpu[AEG_STAGE_MOTION_EST])) {
+            int l;
+            for (l = 0; l < AEG_MAX_REFS; l++)
+                if (ref_valid(e, l) && e->ref_slot[l] >= 0 &&
+                    ref_wait(e, e->ref_slot[l], e->mb_h < e->fsv.mb_h
+                                                     ? e->fsv.mb_h : e->mb_h))
+                    return FT_RESTART;
+        }
         me_seed_frame(e);
         lr_seed_frame(e);
         pz_setup(e);
@@ -13423,6 +13980,14 @@ frecode:
             s.pt_struct = 1 + (e->fld_par ? 2 : 1);
             if (e->p.info_sei && e->frame_count == 0 && f == 0)
                 s.info = e->info;
+            if (fidr && f == 0 && (e->p.master_display || e->p.max_cll >= 0)) {
+                s.hdr = 1;
+                s.md_primaries = e->p.master_display ? e->p.md_primaries : NULL;
+                s.md_max_lum = e->p.md_max_lum;
+                s.md_min_lum = e->p.md_min_lum;
+                s.max_cll = e->p.max_cll;
+                s.max_fall = e->p.max_fall;
+            }
             sn = aeg_write_sei(sei, sizeof(sei), &s);
             out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 0, 6,
                                      sei, sn, 0);
@@ -13521,31 +14086,17 @@ frecode:
     for (f = 0; f < AEG_MAX_REFS; f++)
         e->mcr[f].stride = mstride[f];
 
+    rec_dev_store(e);
     /* distortion statistics, of the frame */
-    {
-        double sse = 0;
-        int i;
-        for (i = 0; i < 3; i++) {
-            int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
-            int x, y;
-            int64_t acc = 0;
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    int d = (int)e->recp[i][y * e->stride[i] + x] -
-                            (int)e->srcp[i][y * e->stride[i] + x];
-                    acc += (int64_t)d * d;
-                }
-            sse = sse + (double)acc / (double)(w * h);
-        }
-        e->st.psnr_avg = sse > 0 ? 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
-    }
+    picture_distortion(e);
     if (pkt) {
         int64_t t = 0;
         int i;
         pkt->data = e->out;
         pkt->size = out_len;
         pkt->pts = pts;
-        pkt->keyframe = is_idr;
+        pkt->keyframe = is_idr ||
+                        (e->p.open_gop && slice == AEG_SLICE_I);
         pkt->qp = e->cur_qp;
         pkt->type = is_idr || slice == AEG_SLICE_I ? 0
                   : fb ? (e->cur_bref ? 3 : 2) : 1;
@@ -13636,6 +14187,30 @@ static void hrd_timing(struct aeg_encoder *e, aeg_sei *s, int is_idr, int poc,
     s->dpb_delay = (uint32_t)(dpb > 0 ? dpb : 0);
 }
 
+/* M-1.2 (opt-in, AEG_REC_DEV=1): keep a finished reference picture in a
+ * device DPB slot.  The CPU keeps its own reconstruction (deblock and the
+ * entropy path need it), but the next picture's motion search finds the
+ * resident luma by content id and does not upload it again.  No download is
+ * needed: the device copy is write-only for this stage. */
+static void rec_dev_store(struct aeg_encoder *e)
+{
+    const char *ev = getenv("AEG_REC_DEV");
+    int slot;
+    uint64_t id;
+    int rows;
+    if (!ev || !atoi(ev) || !e->cur_is_ref || e->fld ||
+        !e->d.ops.me_pic_upload)
+        return;
+    slot = 2 + (e->role_cur % (AEG_ME_PIC_SLOTS - 2));
+    id = ((uint64_t)(uint32_t)e->cur_poc << 32) ^ (uint64_t)(uintptr_t)e->recp[0];
+    rows = e->h + e->vpad + AEG_PAD;
+    if (e->d.ops.me_pic_upload(e->d.ops.priv, slot, e->recp[0], e->stride[0],
+                               e->w, e->h, rows, id) == AEG_OK) {
+        e->rec_dev_uploads++;
+        e->rec_dev_bytes += (int64_t)e->stride[0] * rows;
+    }
+}
+
 static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
                       int64_t pts, aeg_packet *pkt, int64_t t_all)
 {
@@ -13643,6 +14218,7 @@ static int frame_body(struct aeg_encoder *e, int slice, int is_idr, int poc,
     size_t out_len;
     int64_t dbg_type0[AEG_MB_TYPE_COUNT];
     int vbv_retry = 0;
+    int slice_retry = 0;
 
     (void)poc;
     memcpy(dbg_type0, e->stat_type, sizeof(dbg_type0));
@@ -13778,6 +14354,14 @@ recode:
         e->st.stage_ns[AEG_STAGE_INTER_PRED] += aeg_now_ns() - t0;
     }
     mbaff_field_refs(e);
+    if (e->fsync && (e->d.auto_ok ||
+                     e->d.use_gpu[AEG_STAGE_MOTION_EST])) {
+        int l;
+        for (l = 0; l < AEG_MAX_REFS; l++)
+            if (ref_valid(e, l) && e->ref_slot[l] >= 0 &&
+                ref_wait(e, e->ref_slot[l], e->mb_h))
+                return FT_RESTART;
+    }
     me_seed_frame(e);
     lr_seed_frame(e);
     pz_setup(e);
@@ -13813,7 +14397,11 @@ recode:
      * stream), and the info text on the first picture.  A frame lasts two
      * clock ticks (time_scale = 2 * fps_num). */
     if (e->hrd_on || e->p.interlaced ||
-        (e->p.info_sei && e->frame_count == 0)) {
+        (e->p.info_sei && e->frame_count == 0) ||
+        (e->p.intra_refresh > 0 && (e->cur_is_p || is_idr) &&
+         e->ir_index % e->p.intra_refresh == 0) ||
+        (e->p.open_gop && slice == AEG_SLICE_I && !is_idr) ||
+        (is_idr && (e->p.master_display || e->p.max_cll >= 0))) {
         aeg_sei s;
         uint8_t sei[1200];
         size_t sn;
@@ -13828,6 +14416,23 @@ recode:
         }
         if (e->p.info_sei && e->frame_count == 0)
             s.info = e->info;
+        if (e->p.intra_refresh > 0 && (e->cur_is_p || is_idr) &&
+            e->ir_index % e->p.intra_refresh == 0) {
+            s.recovery = 1;
+            s.recovery_cnt = 0;     /* the band has just become whole */
+        }
+        if (e->p.open_gop && slice == AEG_SLICE_I && !is_idr) {
+            s.recovery = 1;
+            s.recovery_cnt = 0;
+        }
+        if (is_idr && (e->p.master_display || e->p.max_cll >= 0)) {
+            s.hdr = 1;
+            s.md_primaries = e->p.master_display ? e->p.md_primaries : NULL;
+            s.md_max_lum = e->p.md_max_lum;
+            s.md_min_lum = e->p.md_min_lum;
+            s.max_cll = e->p.max_cll;
+            s.max_fall = e->p.max_fall;
+        }
         sn = aeg_write_sei(sei, sizeof(sei), &s);
         out_len += aeg_nal_write(e->out + out_len, e->out_cap - out_len, 0, 6,
                                  sei, sn, 0);
@@ -13849,6 +14454,20 @@ recode:
         int rc = code_slices(e, slice, is_idr, &out_len);
         if (rc != AEG_OK)
             return rc;
+    }
+    /* x264's --slice-max-size: a slice over the byte limit is split in half
+     * and the picture coded again (the slice header bits are part of what
+     * made it big, so this converges quickly).  One macroblock row is the
+     * smallest slice; if it still does not fit, the picture is emitted as it
+     * is rather than looping. */
+    if (e->p.slice_max_size > 0 && !e->fsync && e->slice_rows > 1 &&
+        e->max_slice_bytes > (size_t)e->p.slice_max_size && slice_retry < 8) {
+        e->slice_rows = (e->slice_rows + 1) / 2;
+        e->n_slices = (e->mb_h + e->slice_rows - 1) / e->slice_rows;
+        slice_retry++;
+        memcpy(e->stat_type, dbg_type0, sizeof(dbg_type0));
+        wp_finish(e);
+        goto recode;
     }
     e->top_row = 0;
     if (e->fsync && (ft_wp_check(e, 1) || e->ft_abort))
@@ -13917,31 +14536,17 @@ recode:
     /* distortion statistics */
     {
         int64_t t0 = aeg_now_ns();
-        double sse = 0;
-        int i;
-        for (i = 0; i < 3; i++) {
-            /* the visible picture only: the cropped margin is not output */
-            int w = i ? e->vcw : e->vw, h = i ? e->vch : e->vh;
-            int x, y;
-            int64_t acc = 0;
-            for (y = 0; y < h; y++)
-                for (x = 0; x < w; x++) {
-                    int d = (int)e->recp[i][y * e->stride[i] + x] -
-                            (int)e->srcp[i][y * e->stride[i] + x];
-                    acc += (int64_t)d * d;
-                }
-            sse = sse + (double)acc / (double)(w * h);
-            e->st.stage_ns[AEG_STAGE_PSNR] += 0;
-        }
-        e->st.psnr_avg = sse > 0 ? 10.0 * log10((double)PIXEL_MAX * PIXEL_MAX / (sse / 3.0)) : 99.0;
-        (void)t0;
+        rec_dev_store(e);
+        picture_distortion(e);
+        e->st.stage_ns[AEG_STAGE_PSNR] += aeg_now_ns() - t0;
     }
 
     if (pkt) {
         pkt->data = e->out;
         pkt->size = out_len;
         pkt->pts = pts;
-        pkt->keyframe = is_idr;
+        pkt->keyframe = is_idr ||
+                        (e->p.open_gop && slice == AEG_SLICE_I);
         pkt->qp = e->cur_qp;
         pkt->type = is_idr || slice == AEG_SLICE_I ? 0
                   : e->cur_is_b ? (e->cur_bref ? 3 : 2) : 1;
@@ -14578,14 +15183,50 @@ static void bind_source(struct aeg_encoder *e, int display)
         e->srcp[i] = e->in_plane[slot][i];
 }
 
+/* M-3.3a: keep the lookahead ring's lowres planes resident.  A debug switch
+ * (AEG_LA_DEV=1) drives it until the batched search consumer (M-3.3b) is in
+ * place; the upload itself is one call per picture and idempotent. */
+static void la_dev_upload_picture(struct aeg_encoder *e, int d)
+{
+    const aeg_lowres *l;
+    const char *ev;
+    int on;
+    int slots, slot;
+    uint64_t id;
+    ev = getenv("AEG_LA_DEV");
+    on = ev ? atoi(ev) != 0 : 0;
+    if (!on) {
+        ev = getenv("AEG_LA_BATCH");
+        on = ev ? atoi(ev) != 0 : 1;   /* batched search is the default */
+    }
+    if (!on || !e->d.ops.lowres_upload)
+        return;
+    slots = in_slots(e);
+    slot = d % slots;
+    l = &e->in_low[slot];
+    if (!l->mem)
+        return;
+    id = (uint64_t)(uint32_t)d + 1;
+    if (e->la_dev_id[slot] == id)
+        return;
+    if (e->d.ops.lowres_upload(e->d.ops.priv, slot, l->plane, l->stride, l->w,
+                               l->h, id) == AEG_OK) {
+        e->la_dev_id[slot] = id;
+        e->la_dev_uploads++;
+        e->la_dev_bytes += (int64_t)l->stride * (l->h + 2 * AEG_LA_PAD);
+    }
+}
+
 static void push_input(struct aeg_encoder *e, const aeg_src *in,
                        int64_t pts)
 {
     int slot = e->in_count % in_slots(e);
     copy_yuv(e, e->in_plane[slot], in);
-    if (e->in_low[slot].mem)
+    if (e->in_low[slot].mem) {
         aeg_lowres_build(&e->in_low[slot], e->in_plane[slot][0], e->stride[0],
                          e->w, e->h);
+        la_dev_upload_picture(e, e->in_count);
+    }
     e->in_pts[slot] = pts;
     e->in_qpoff[slot] = e->rc_qp_offset;
     e->in_count++;
@@ -14927,7 +15568,7 @@ static int mbt_add(struct mbt_ent *pl, int n, int d, int r0, int r1, int ref)
 
 /* the pictures of the group a -> nxt in the order schedule() queues them */
 static int mbt_group(const struct aeg_encoder *e, struct mbt_ent *pl, int n,
-                     int a, int nxt, int idr)
+                     int a, int nxt, int idr, int open_i)
 {
     int d;
 
@@ -14936,7 +15577,8 @@ static int mbt_group(const struct aeg_encoder *e, struct mbt_ent *pl, int n,
             n = mbt_add(pl, n, d, d - 1, -1, 1);
         return mbt_add(pl, n, nxt, -1, -1, 1);
     }
-    n = mbt_add(pl, n, nxt, a, -1, 1);
+    /* an open-GOP keyframe is an I picture: nothing to predict from */
+    n = mbt_add(pl, n, nxt, open_i ? -1 : a, -1, 1);
     if (e->p.b_pyramid && nxt - a - 1 >= 2) {
         int mid = a + (nxt - a) / 2;
         n = mbt_add(pl, n, mid, a, nxt, 1);
@@ -14950,6 +15592,18 @@ static int mbt_group(const struct aeg_encoder *e, struct mbt_ent *pl, int n,
     return n;
 }
 
+/* M-3.1: the batched lowres search is the default (quality-gated in
+ * docs/PROGRESS_ja.md); AEG_LA_BATCH=0 restores the scalar search. */
+static int la_batch_on(void)
+{
+    static _Atomic int v = -2;
+    if (v == -2) {
+        const char *ev = getenv("AEG_LA_BATCH");
+        __atomic_store_n(&v, ev ? atoi(ev) != 0 : 1, __ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&v, __ATOMIC_ACQUIRE);
+}
+
 static double mbt_strength(void)
 {
     static _Atomic double v = -1.0;
@@ -14961,7 +15615,14 @@ static double mbt_strength(void)
          * -0.40% vs x264 veryslow) and 1.5 points ahead at CRF on the long
          * clips, where x264's own 2.0 would be 1.3 more but costs cock and
          * tree 1-3 points at constant QP (docs/STATUS.md). */
-        v = ev ? atoi(ev) / 10.0 : 1.6;
+        if (ev) {
+            v = atoi(ev) / 10.0;
+        } else {
+            /* the batched lowres search propagates slightly less through the
+             * held-frame/texture clips; 1.5 closes the CQP treeL outlier
+             * (M-3.1a), measured in docs/PROGRESS_ja.md */
+            v = la_batch_on() ? 1.5 : 1.6;
+        }
     }
     return v;
 }
@@ -14974,6 +15635,10 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
 {
     int slots = in_slots(e), n = nq, nmb = e->mb_count, k, i;
     int G = e->p.bframes + 1, end = e->in_count - 1;
+    /* fixed-point mbtree (M-3.2) is opt-in until its quality gate is closed;
+     * the float path is the measured M-3.1a/b baseline */
+    int use_la = la_batch_on();
+    int use_q = getenv("AEG_MBT_FIXED") ? atoi(getenv("AEG_MBT_FIXED")) != 0 : 0;
     double strength = mbt_strength();
 
     /* the rest of the window, as schedule() will see it */
@@ -14989,17 +15654,93 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
         nx = e->p.b_adapt == 2 ? b_adapt_trellis(e, a, last)
            : e->p.b_adapt ? b_adapt_decide(e, a, last) : last;
         idr = e->p.gop_size > 0 && nx - lidr >= e->p.gop_size;
-        n = mbt_group(e, pl, n, a, nx, idr);
-        if (idr)
-            lidr = nx;
+        {
+            int open_i = idr && e->p.open_gop;
+            if (open_i)
+                idr = 0;
+            n = mbt_group(e, pl, n, a, nx, idr, open_i);
+            if (idr || open_i)
+                lidr = nx;
+        }
         a = nx;
     }
-    if (root >= 0)
+    if (root >= 0) {
         memset(e->mbt[root % slots].prop, 0, sizeof(float) * (size_t)nmb);
+        memset(e->mbt[root % slots].prop_q, 0, sizeof(int64_t) * (size_t)nmb);
+    }
+    if (use_la && e->p.field_coding == 0 &&
+        e->d.ops.lowres_batch_search) {
+        int *pi0 = (int *)malloc((size_t)n * sizeof(int));
+        int *pi1 = (int *)malloc((size_t)n * sizeof(int));
+        int *icost = (int *)malloc((size_t)nmb * sizeof(int));
+        int32_t *pairs = (int32_t *)malloc((size_t)n * 4 * sizeof(int32_t));
+        int32_t *bmv = (int32_t *)malloc((size_t)n * 2 * nmb * 2 * sizeof(int32_t));
+        int32_t *bcost = (int32_t *)malloc((size_t)n * 2 * nmb * sizeof(int32_t));
+        int np = 0;
+        if (pi0 && pi1 && icost && pairs && bmv && bcost) {
+            for (k = 0; k < n; k++) {
+                int d = pl[k].d, r0 = pl[k].r0, r1 = pl[k].r1;
+                pi0[k] = pi1[k] = -1;
+                if (d < 0)
+                    continue;
+                la_dev_upload_picture(e, d);
+                if (r0 >= 0) {
+                    la_dev_upload_picture(e, r0);
+                    pairs[2 * np] = d % slots; pairs[2 * np + 1] = r0 % slots;
+                    pi0[k] = np++;
+                }
+                if (r1 >= 0) {
+                    la_dev_upload_picture(e, r1);
+                    pairs[2 * np] = d % slots; pairs[2 * np + 1] = r1 % slots;
+                    pi1[k] = np++;
+                }
+            }
+            if (np > 0) {
+                if (getenv("AEG_LA_CPU") ||
+                    (e->d.ops.backend == AEG_BACKEND_OPENCL && !e->d.auto_ok)) {
+                    /* PoCL is a CPU device: its queue path adds nothing over
+                     * the CPU batch and PoCL 2.1 crashes in this combination;
+                     * use the CPU reference so the stream is identical. */
+                    aeg_be_ops cpuops;
+                    aeg_be_cpu_ops(&cpuops);
+                    cpuops.lowres_batch_search(cpuops.priv, pairs, np, e->mb_w,
+                                               e->mb_h, 10, bmv, bcost);
+                } else {
+                    e->d.ops.lowres_batch_search(e->d.ops.priv, pairs, np,
+                                                 e->mb_w, e->mb_h, 10, bmv,
+                                                 bcost);
+                }
+                e->la_batch_calls++;
+                e->la_batch_bytes += (int64_t)np * 8 +
+                    (int64_t)np * nmb * 12;
+            }
+            for (k = 0; k < n; k++) {
+                struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+                int d = pl[k].d, r0 = pl[k].r0, r1 = pl[k].r1;
+                const aeg_lowres *l0 = r0 >= 0 ? &e->in_low[r0 % slots] : NULL;
+                const aeg_lowres *l1 = r1 >= 0 ? &e->in_low[r1 % slots] : NULL;
+                memset(m->prop, 0, sizeof(float) * (size_t)nmb);
+                memset(m->prop_q, 0, sizeof(int64_t) * (size_t)nmb);
+                if (d < 0 || (m->d == d && m->p0 == r0 && m->p1 == r1))
+                    continue;
+                aeg_lowres_intra(&e->in_low[d % slots], icost);
+                aeg_lowres_mbcosts_fields(&e->in_low[d % slots], l0, l1, icost,
+                    pi0[k] >= 0 ? bmv + (size_t)pi0[k] * nmb * 2 : NULL,
+                    pi0[k] >= 0 ? bcost + (size_t)pi0[k] * nmb : NULL,
+                    pi1[k] >= 0 ? bmv + (size_t)pi1[k] * nmb * 2 : NULL,
+                    pi1[k] >= 0 ? bcost + (size_t)pi1[k] * nmb : NULL,
+                    m->intra, m->inter, m->kind, m->mv);
+                m->d = d; m->p0 = r0; m->p1 = r1;
+            }
+        }
+        free(pi0); free(pi1); free(icost); free(pairs); free(bmv); free(bcost);
+        goto mbt_planned;
+    }
     for (k = 0; k < n; k++) {
         struct mbt_slot *m = &e->mbt[pl[k].d % slots];
 
         memset(m->prop, 0, sizeof(float) * (size_t)nmb);
+        memset(m->prop_q, 0, sizeof(int64_t) * (size_t)nmb);
         if (m->d != pl[k].d || m->p0 != pl[k].r0 || m->p1 != pl[k].r1) {
             int d = pl[k].d, r0 = pl[k].r0, r1 = pl[k].r1;
             const aeg_lowres *l0 = r0 >= 0 ? &e->in_low[r0 % slots] : NULL;
@@ -15021,24 +15762,118 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
             m->p1 = pl[k].r1;
         }
     }
+mbt_planned:
+    if (getenv("AEG_MBT_COMPARE") && n > 0) {
+        float *fprop = (float *)calloc((size_t)slots * nmb, sizeof(float));
+        int64_t *iprop = (int64_t *)calloc((size_t)slots * nmb, sizeof(int64_t));
+        if (fprop && iprop) {
+            for (k = n - 1; k >= 0; k--) {
+                const struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+                float *fo = fprop + (size_t)(pl[k].d % slots) * nmb;
+                int64_t *io = iprop + (size_t)(pl[k].d % slots) * nmb;
+                float *fr0 = pl[k].r0 >= 0 ? fprop + (size_t)(pl[k].r0 % slots) * nmb : NULL;
+                float *fr1 = pl[k].r1 >= 0 ? fprop + (size_t)(pl[k].r1 % slots) * nmb : NULL;
+                int64_t *ir0 = pl[k].r0 >= 0 ? iprop + (size_t)(pl[k].r0 % slots) * nmb : NULL;
+                int64_t *ir1 = pl[k].r1 >= 0 ? iprop + (size_t)(pl[k].r1 % slots) * nmb : NULL;
+                if (pl[k].r0 < 0)
+                    continue;
+                mbt_propagate(e->mb_w, e->mb_h, m->intra, m->inter, m->kind,
+                              m->mv, fo, fr0, fr1, 32);
+                mbt_propagate_q(e->mb_w, e->mb_h, m->intra, m->inter, m->kind,
+                                m->mv, io, ir0, ir1, 32);
+            }
+            {
+                double maxrel = 0.0, sumf = 0.0, sumi = 0.0;
+                for (k = 0; k < n; k++) {
+                    const float *fo = fprop + (size_t)(pl[k].d % slots) * nmb;
+                    const int64_t *io = iprop + (size_t)(pl[k].d % slots) * nmb;
+                    for (i = 0; i < nmb; i++) {
+                        double fv = fo[i], iv = io[i] / (double)MBT_Q;
+                        double rel = fabs(iv - fv) / (fabs(fv) + 1.0);
+                        if (rel > maxrel) maxrel = rel;
+                        sumf += fv; sumi += iv;
+                    }
+                }
+                fprintf(stderr, "mbt compare: n=%d maxrel=%.6f sum float=%.1f fixed=%.1f ratio=%.6f\n",
+                        n, maxrel, sumf, sumi, sumf != 0 ? sumi / sumf : 0.0);
+            }
+            free(fprop); free(iprop);
+        }
+    }
+    if (use_q && e->d.ops.mbt_batch && n > 0 && !getenv("AEG_MBT_CPU") &&
+        getenv("AEG_MBT_DEV")) {
+        int *bi = (int *)malloc((size_t)n * nmb * sizeof(int));
+        int *bn = (int *)malloc((size_t)n * nmb * sizeof(int));
+        int *bmv = (int *)malloc((size_t)n * nmb * 4 * sizeof(int));
+        uint8_t *bk = (uint8_t *)malloc((size_t)n * nmb);
+        int *br0 = (int *)malloc((size_t)n * sizeof(int));
+        int *br1 = (int *)malloc((size_t)n * sizeof(int));
+        int32_t *bp = (int32_t *)calloc((size_t)n * nmb, sizeof(int32_t));
+        int ok = bi && bn && bmv && bk && br0 && br1 && bp;
+        if (ok)
+            for (k = 0; k < n; k++) {
+                const struct mbt_slot *m = &e->mbt[pl[k].d % slots];
+                int j;
+                memcpy(bi + (size_t)k * nmb, m->intra,
+                       (size_t)nmb * sizeof(int));
+                memcpy(bn + (size_t)k * nmb, m->inter,
+                       (size_t)nmb * sizeof(int));
+                memcpy(bmv + (size_t)k * nmb * 4, m->mv,
+                       (size_t)nmb * 4 * sizeof(int));
+                memcpy(bk + (size_t)k * nmb, m->kind, (size_t)nmb);
+                br0[k] = br1[k] = -1;
+                for (j = 0; j < n; j++)
+                    if (pl[j].d == pl[k].r0)
+                        br0[k] = j;
+                for (j = 0; j < n; j++)
+                    if (pl[j].d == pl[k].r1)
+                        br1[k] = j;
+            }
+        if (ok)
+            e->d.ops.mbt_batch(e->d.ops.priv, n, e->mb_w, e->mb_h, bi, bn,
+                               bk, bmv, br0, br1, 32, bp);
+        if (ok)
+            for (k = 0; k < n; k++)
+                memcpy(e->mbt[pl[k].d % slots].prop_q + 0,
+                       bp + (size_t)k * nmb,
+                       (size_t)nmb * sizeof(int32_t));
+        free(bi); free(bn); free(bmv); free(bk); free(br0); free(br1); free(bp);
+        if (ok)
+            goto mbt_propagated;
+    }
     for (k = n - 1; k >= 0; k--) {
         const struct mbt_slot *m = &e->mbt[pl[k].d % slots];
 
         if (pl[k].r0 < 0)
             continue;
-        mbt_propagate(e->mb_w, e->mb_h, m->intra, m->inter, m->kind, m->mv,
-                      m->prop, e->mbt[pl[k].r0 % slots].prop,
-                      pl[k].r1 >= 0 ? e->mbt[pl[k].r1 % slots].prop : NULL, 32);
+        if (use_q)
+            mbt_propagate_q(e->mb_w, e->mb_h, m->intra, m->inter, m->kind,
+                            m->mv, m->prop_q,
+                            e->mbt[pl[k].r0 % slots].prop_q,
+                            pl[k].r1 >= 0 ? e->mbt[pl[k].r1 % slots].prop_q
+                                          : NULL, 32);
+        else
+            mbt_propagate(e->mb_w, e->mb_h, m->intra, m->inter, m->kind, m->mv,
+                          m->prop, e->mbt[pl[k].r0 % slots].prop,
+                          pl[k].r1 >= 0 ? e->mbt[pl[k].r1 % slots].prop : NULL, 32);
     }
+mbt_propagated:
     for (k = 0; k < nq; k++) {
         struct mbt_slot *m = &e->mbt[pl[k].d % slots];
 
         if (!pl[k].ref)
             continue;
-        for (i = 0; i < nmb; i++)
+        for (i = 0; i < nmb; i++) {
+            double p = use_q ? m->prop_q[i] / (double)MBT_Q : m->prop[i];
             m->qp[i] = (float)(-strength *
-                log2((m->intra[i] + m->prop[i]) / (double)m->intra[i]));
+                log2((m->intra[i] + p) / (double)m->intra[i]));
+        }
         m->qd = pl[k].d;
+        if (getenv("AEG_MBT_DEBUG") && k == 0)
+            fprintf(stderr, "mbt: n=%d use_q=%d d=%d intra0=%d prop=%lld qp0=%.4f\n",
+                    n, use_q, pl[k].d, m->intra[0],
+                    (long long)(use_q ? m->prop_q[0] : (int32_t)m->prop[0]),
+                    (double)m->qp[0]);
     }
 }
 
@@ -15131,7 +15966,13 @@ static void schedule_(struct aeg_encoder *e)
         nxt = b_adapt_decide(e, e->anchor, nxt);
     if (!idr)
         idr = idr_due(e, nxt);
-    if (idr) {
+    {
+        /* open GOP: the keyframe is an I slice, not an IDR, so the B pictures
+         * in front of it may still predict from the previous GOP. */
+        int open_i = idr && e->p.open_gop;
+        if (open_i)
+            idr = 0;
+        if (idr) {
         /* No B pictures can precede an IDR, so the group's B pictures go out as
          * P pictures first, in display order, and the IDR comes last. */
         for (d = e->anchor + 1; d < nxt; d++) {
@@ -15139,9 +15980,9 @@ static void schedule_(struct aeg_encoder *e)
             if (e->crf_on && e->crf_qc > 0.0)
                 e->crf_cplx[d % in_slots(e)] = la_cost(e, d - 1, d, d, NULL);
         }
-        add_job(e, nxt, AEG_SLICE_I, 1);
-    } else {
-        add_job(e, nxt, AEG_SLICE_P, 0);
+            add_job(e, nxt, AEG_SLICE_I, 1);
+        } else {
+            add_job(e, nxt, open_i ? AEG_SLICE_I : AEG_SLICE_P, 0);
         if (e->p.b_pyramid && nxt - e->anchor - 1 >= 2) {
             /* the middle B picture first, as a reference for the others:
              *   P4 B2(ref) B1 B3 */
@@ -15155,11 +15996,15 @@ static void schedule_(struct aeg_encoder *e)
                 add_job(e, d, AEG_SLICE_B, 0);
         }
     }
-    if (e->crf_on && e->crf_qc > 0.0 && !idr)
-        e->crf_cplx[nxt % in_slots(e)] = la_cost(e, e->anchor, nxt, nxt, NULL);
-    if (e->la_depth) {
-        int nq = mbt_group(e, pl, 0, e->anchor, nxt, idr);
-        mbt_run(e, pl, nq, e->anchor, nxt, idr ? nxt : e->last_idr_poc);
+        if (e->crf_on && e->crf_qc > 0.0 && !idr)
+            e->crf_cplx[nxt % in_slots(e)] = la_cost(e, e->anchor, nxt, nxt, NULL);
+        if (e->la_depth) {
+            int nq = mbt_group(e, pl, 0, e->anchor, nxt, idr, open_i);
+            mbt_run(e, pl, nq, e->anchor, nxt,
+                    (idr || open_i) ? nxt : e->last_idr_poc);
+        }
+        if (open_i)
+            e->last_idr_poc = nxt;
     }
     e->anchor = nxt;
 }
@@ -15275,6 +16120,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->trellis > 2)
         pp->trellis = 2;
     if (pp->gop_size < 0) pp->gop_size = 250;
+    if (pp->intra_refresh > 0) {
+        /* x264's --intra-refresh: the stream must not close a GOP with an
+         * IDR, and a scene cut would do exactly that. */
+        pp->gop_size = 0;
+        pp->scenecut = 0;
+    }
     /* B pictures: three between two anchors at most (AEG_MAX_BFRAMES), and none
      * at all without CABAC -- the B macroblock layer is only implemented for the
      * arithmetic coder (see code_slice). */
@@ -15540,6 +16391,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         if (want > AEG_MAX_SLICES) want = AEG_MAX_SLICES;
         if (want > e->mb_h) want = e->mb_h;
         e->slice_rows = (e->mb_h + want - 1) / want;
+        if (pp->slice_max_mbs > 0) {
+            int r = (pp->slice_max_mbs + e->mb_w - 1) / e->mb_w;
+            if (r < 1) r = 1;
+            if (e->slice_rows > r) e->slice_rows = r;
+        }
         /* MBAFF: a slice holds whole macroblock pairs */
         if (pp->field_coding >= 3)
             e->slice_rows += e->slice_rows & 1;
@@ -15562,16 +16418,46 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     e->seed_sad = (int32_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND *
                                        sizeof(int32_t));
     e->seed_cost = (int32_t *)aeg_alloc((size_t)e->mb_count * sizeof(int32_t));
-    e->par_pos = (int16_t *)aeg_alloc((size_t)e->mb_count * ME_ROUND_CAND * 4 *
+    e->par_pos = (int16_t *)aeg_alloc((size_t)e->mb_count * 4 * ME_ROUND_CAND * 4 *
                                       sizeof(int16_t));
     e->par_mv = (int16_t *)aeg_alloc((size_t)e->mb_count * 2 * sizeof(int16_t));
     e->par_cost = (int32_t *)aeg_alloc((size_t)e->mb_count * sizeof(int32_t));
+    /* the four partition shapes' whole-picture searches: the largest grid is
+     * the 8x8 one, four blocks per macroblock */
+    {
+        const size_t nsh = (size_t)e->mb_count * 4;
+        int s;
+        for (s = 1; s < 4; s++) {
+            e->par_sh_mv[s] = (int16_t *)aeg_alloc(nsh * 2 * sizeof(int16_t));
+            e->par_sh_cost[s] = (int32_t *)aeg_alloc(nsh * sizeof(int32_t));
+        }
+        e->par_sh_mv[0] = e->par_mv;
+        e->par_sh_cost[0] = e->par_cost;
+        e->par_imv = (int16_t *)aeg_alloc(nsh * 2 * sizeof(int16_t));
+        e->par_icost = (int32_t *)aeg_alloc(nsh * sizeof(int32_t));
+        e->par_job = (int16_t *)aeg_alloc(nsh * 4 * sizeof(int16_t));
+        e->par_cand = (int16_t *)aeg_alloc(nsh * ME_ROUND_CAND * 4 *
+                                           sizeof(int16_t));
+        e->par_sad = (int32_t *)aeg_alloc(nsh * ME_ROUND_CAND *
+                                          sizeof(int32_t));
+    }
+    {
+        const size_t nb = (size_t)e->mb_count;
+        int l;
+        for (l = 0; l < 2; l++) {
+            e->b_par_mv[l] = (int16_t *)aeg_alloc(nb * 2 * sizeof(int16_t));
+            e->b_par_cost[l] = (int32_t *)aeg_alloc(nb * sizeof(int32_t));
+        }
+        e->b_prev_mv = (int16_t *)aeg_alloc(nb * 2 * sizeof(int16_t));
+    }
     if (e->seed_mv)
         memset(e->seed_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     if (e->prev_seed)
         memset(e->prev_seed, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     if (e->par_mv)
         memset(e->par_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    if (e->b_prev_mv)
+        memset(e->b_prev_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     {
         int k;
         e->lr_scratch = (int *)aeg_alloc((size_t)e->mb_count * 4 * sizeof(int));
@@ -15582,7 +16468,13 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
                 e->lr_pic[k].mem = NULL;
     }
     if (!e->seed_mv || !e->seed_cand || !e->seed_sad || !e->seed_cost ||
+        !e->mb_encs ||
         !e->prev_seed || !e->par_pos || !e->par_mv || !e->par_cost ||
+        !e->par_sh_mv[1] || !e->par_sh_mv[2] || !e->par_sh_mv[3] ||
+        !e->par_sh_cost[1] || !e->par_sh_cost[2] || !e->par_sh_cost[3] ||
+        !e->par_imv || !e->par_icost || !e->par_cand || !e->par_sad ||
+        !e->par_job || !e->b_par_mv[0] || !e->b_par_mv[1] ||
+        !e->b_par_cost[0] || !e->b_par_cost[1] || !e->b_prev_mv ||
         !e->lr_scratch || !e->lr_mv[0] || !e->lr_mv[1] ||
         !e->lr_pic[0].mem || !e->lr_pic[1].mem || !e->lr_pic[2].mem) {
         aeg_set_last_error("out of memory");
@@ -15658,9 +16550,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
             m->mv = (int *)aeg_alloc(nm * 4 * sizeof(int));
             m->kind = (uint8_t *)aeg_alloc(nm);
             m->prop = (float *)aeg_alloc(nm * sizeof(float));
+            m->prop_q = (int64_t *)aeg_alloc(nm * sizeof(int64_t));
             m->qp = (float *)aeg_alloc(nm * sizeof(float));
             m->d = m->qd = -1;
             if (!m->intra || !m->inter || !m->mv || !m->kind || !m->prop ||
+                !m->prop_q ||
                 !m->qp) {
                 aeg_set_last_error("out of memory");
                 aeg_encoder_close(e);
@@ -15945,6 +16839,12 @@ struct ft_worker {
     int8_t *mb_dqp;
     int16_t *seed_mv, *prev_seed, *seed_cand, *par_pos, *par_mv;
     int32_t *seed_sad, *seed_cost, *par_cost;
+    int16_t *par_sh_mv[4];
+    int32_t *par_sh_cost[4];
+    int16_t *par_imv, *par_job, *par_cand;
+    int32_t *par_icost, *par_sad;
+    int16_t *b_par_mv[2], *b_prev_mv;
+    int32_t *b_par_cost[2];
     int *lr_scratch;
     int16_t *lr_mv[2];
     aeg_lowres lr_pic[3];
@@ -15986,6 +16886,20 @@ static void ft_worker_free(struct ft_worker *w)
     aeg_free(w->seed_sad);
     aeg_free(w->seed_cost);
     aeg_free(w->par_cost);
+    for (k = 1; k < 4; k++) {
+        aeg_free(w->par_sh_mv[k]);
+        aeg_free(w->par_sh_cost[k]);
+    }
+    aeg_free(w->par_imv);
+    aeg_free(w->par_icost);
+    aeg_free(w->par_job);
+    aeg_free(w->par_cand);
+    aeg_free(w->par_sad);
+    for (k = 0; k < 2; k++) {
+        aeg_free(w->b_par_mv[k]);
+        aeg_free(w->b_par_cost[k]);
+    }
+    aeg_free(w->b_prev_mv);
     aeg_free(w->lr_scratch);
     aeg_free(w->lr_mv[0]);
     aeg_free(w->lr_mv[1]);
@@ -16043,11 +16957,32 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
     w->seed_mv = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
     w->prev_seed = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
     w->seed_cand = (int16_t *)aeg_alloc(n * ME_ROUND_CAND * 4 * sizeof(int16_t));
-    w->par_pos = (int16_t *)aeg_alloc(n * ME_ROUND_CAND * 4 * sizeof(int16_t));
+    w->par_pos = (int16_t *)aeg_alloc(n * 4 * ME_ROUND_CAND * 4 * sizeof(int16_t));
     w->par_mv = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
     w->seed_sad = (int32_t *)aeg_alloc(n * ME_ROUND_CAND * sizeof(int32_t));
     w->seed_cost = (int32_t *)aeg_alloc(n * sizeof(int32_t));
     w->par_cost = (int32_t *)aeg_alloc(n * sizeof(int32_t));
+    {
+        const size_t nsh = n * 4;
+        int s, l;
+        for (s = 1; s < 4; s++) {
+            w->par_sh_mv[s] = (int16_t *)aeg_alloc(nsh * 2 * sizeof(int16_t));
+            w->par_sh_cost[s] = (int32_t *)aeg_alloc(nsh * sizeof(int32_t));
+        }
+        w->par_sh_mv[0] = w->par_mv;
+        w->par_sh_cost[0] = w->par_cost;
+        w->par_imv = (int16_t *)aeg_alloc(nsh * 2 * sizeof(int16_t));
+        w->par_icost = (int32_t *)aeg_alloc(nsh * sizeof(int32_t));
+        w->par_job = (int16_t *)aeg_alloc(nsh * 4 * sizeof(int16_t));
+        w->par_cand = (int16_t *)aeg_alloc(nsh * ME_ROUND_CAND * 4 *
+                                           sizeof(int16_t));
+        w->par_sad = (int32_t *)aeg_alloc(nsh * ME_ROUND_CAND * sizeof(int32_t));
+        for (l = 0; l < 2; l++) {
+            w->b_par_mv[l] = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+            w->b_par_cost[l] = (int32_t *)aeg_alloc(n * sizeof(int32_t));
+        }
+        w->b_prev_mv = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
+    }
     w->lr_scratch = (int *)aeg_alloc(n * 4 * sizeof(int));
     w->lr_mv[0] = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
     w->lr_mv[1] = (int16_t *)aeg_alloc(n * 2 * sizeof(int16_t));
@@ -16061,6 +16996,11 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
         !w->mbs || !w->mb_encs || !w->mb_dqp || !w->seed_mv ||
         !w->prev_seed || !w->seed_cand || !w->par_pos || !w->par_mv ||
         !w->seed_sad || !w->seed_cost || !w->par_cost || !w->lr_scratch ||
+        !w->par_sh_mv[1] || !w->par_sh_mv[2] || !w->par_sh_mv[3] ||
+        !w->par_sh_cost[1] || !w->par_sh_cost[2] || !w->par_sh_cost[3] ||
+        !w->par_imv || !w->par_icost || !w->par_job || !w->par_cand ||
+        !w->par_sad || !w->b_par_mv[0] || !w->b_par_mv[1] ||
+        !w->b_par_cost[0] || !w->b_par_cost[1] || !w->b_prev_mv ||
         !w->lr_mv[0] || !w->lr_mv[1] || !w->lr_pic[0].mem ||
         !w->lr_pic[1].mem || !w->lr_pic[2].mem || !w->mcr[0].buf || !w->mcr[1].buf)
         return AEG_ENOMEM;
@@ -16073,6 +17013,7 @@ static int ft_worker_alloc(struct aeg_encoder *e, struct ft_worker *w)
     }
     memset(w->par_mv, 0, n * 2 * sizeof(int16_t));
     memset(w->prev_seed, 0, n * 2 * sizeof(int16_t));
+    memset(w->b_prev_mv, 0, n * 2 * sizeof(int16_t));
     return AEG_OK;
 }
 
@@ -16440,6 +17381,7 @@ static int ft_launch(struct aeg_encoder *e)
     *c = *e;
     aeg_dispatch_unlock(&e->d);
     c->ft_on = 0;
+    c->ft_worker = 1;
     {
         int nt = slice_thread_count(e);
         c->lane = 1 + (int)(w - e->ftw) * (nt > 1 ? nt : 1);
@@ -16460,6 +17402,22 @@ static int ft_launch(struct aeg_encoder *e)
     c->seed_sad = w->seed_sad;
     c->seed_cost = w->seed_cost;
     c->par_cost = w->par_cost;
+    for (k = 1; k < 4; k++) {
+        c->par_sh_mv[k] = w->par_sh_mv[k];
+        c->par_sh_cost[k] = w->par_sh_cost[k];
+    }
+    c->par_sh_mv[0] = w->par_mv;
+    c->par_sh_cost[0] = w->par_cost;
+    c->par_imv = w->par_imv;
+    c->par_icost = w->par_icost;
+    c->par_job = w->par_job;
+    c->par_cand = w->par_cand;
+    c->par_sad = w->par_sad;
+    for (k = 0; k < 2; k++) {
+        c->b_par_mv[k] = w->b_par_mv[k];
+        c->b_par_cost[k] = w->b_par_cost[k];
+    }
+    c->b_prev_mv = w->b_prev_mv;
     c->lr_scratch = w->lr_scratch;
     c->lr_mv[0] = w->lr_mv[0];
     c->lr_mv[1] = w->lr_mv[1];
@@ -16528,8 +17486,13 @@ static int ft_launch(struct aeg_encoder *e)
     if (idr)
         e->frame_num = 0;
     memset(e->seed_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
+    memset(c->seed_mv, 0, (size_t)e->mb_count * 2 * sizeof(int16_t));
     e->par_valid = 0;
     e->par_full = 0;
+    e->par_valid_b = 0;
+    c->par_valid = 0;
+    c->par_full = 0;
+    c->par_valid_b = 0;
     e->frame_count++;
     e->enc_pos++;
     if (e->cur_is_ref) {
@@ -16666,27 +17629,34 @@ static int encode_core(struct aeg_encoder *e, const aeg_src *in, int64_t pts,
     }
     if (!e->p.bframes) {
         copy_yuv(e, e->srcp, in);
-        is_idr = idr_due(e, e->frame_count);
-        if (e->crf_low[0].mem) {
-            /* CRF's complexity and the VBV's size estimate: this picture
-             * against the last one (or alone, intra), from the lowres
-             * pictures the B-picture lookahead would have used */
-            aeg_lowres *cur = &e->crf_low[e->frame_count & 1];
-            aeg_lowres_build(cur, e->srcp[0], e->stride[0], e->w, e->h);
-            e->crf_last = e->frame_count && !is_idr
-                ? aeg_lowres_cost(cur, &e->crf_low[(e->frame_count - 1) & 1],
-                                  NULL, NULL, e->la_scratch)
-                : -1;
-            e->cur_satd = e->crf_last;
-            if ((e->vbv_active || e->abr_on) && e->crf_last < 0) {
-                int i;
-                aeg_lowres_intra(cur, e->la_scratch);
-                for (e->cur_satd = 0, i = 0; i < e->mb_count; i++)
-                    e->cur_satd += e->la_scratch[i];
+        {
+            int due = idr_due(e, e->frame_count);
+            int open_i = e->p.open_gop && due && e->frame_count > 0;
+            is_idr = due && !open_i;
+            if (open_i)
+                e->last_idr_poc = e->frame_count;
+            if (e->crf_low[0].mem) {
+                /* CRF's complexity and the VBV's size estimate: this picture
+                 * against the last one (or alone, intra), from the lowres
+                 * pictures the B-picture lookahead would have used */
+                aeg_lowres *cur = &e->crf_low[e->frame_count & 1];
+                aeg_lowres_build(cur, e->srcp[0], e->stride[0], e->w, e->h);
+                e->crf_last = e->frame_count && !is_idr && !open_i
+                    ? aeg_lowres_cost(cur, &e->crf_low[(e->frame_count - 1) & 1],
+                                      NULL, NULL, e->la_scratch)
+                    : -1;
+                e->cur_satd = e->crf_last;
+                if ((e->vbv_active || e->abr_on) && e->crf_last < 0) {
+                    int i;
+                    aeg_lowres_intra(cur, e->la_scratch);
+                    for (e->cur_satd = 0, i = 0; i < e->mb_count; i++)
+                        e->cur_satd += e->la_scratch[i];
+                }
             }
+            return encode_frame(e, (is_idr || open_i) ? AEG_SLICE_I
+                                                       : AEG_SLICE_P,
+                                is_idr, e->frame_count, pts, pkt);
         }
-        return encode_frame(e, is_idr ? AEG_SLICE_I : AEG_SLICE_P, is_idr,
-                            e->frame_count, pts, pkt);
     }
     /* With B pictures the pictures are coded out of display order: the anchor
      * that follows a group of B pictures has to be in the bitstream before
@@ -17352,6 +18322,19 @@ void aeg_encoder_close(aeg_encoder *enc)
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
     if (!e)
         return;
+    if (getenv("AEG_REC_DEV") && e->rec_dev_uploads)
+        fprintf(stderr, "aeg: rec-dev: %lld uploads, %.2f MB, 0 MB download, "
+                "%.2f MB/picture\n", (long long)e->rec_dev_uploads,
+                e->rec_dev_bytes / 1048576.0,
+                e->st.frames ? e->rec_dev_bytes / 1048576.0 / e->st.frames : 0.0);
+    if (getenv("AEG_LA_BATCH") && e->la_batch_calls)
+        fprintf(stderr, "aeg: lowres batch: %lld calls, %.2f MB, %.2f calls/picture\n",
+                (long long)e->la_batch_calls, e->la_batch_bytes / 1048576.0,
+                e->st.frames ? (double)e->la_batch_calls / e->st.frames : 0.0);
+    if (getenv("AEG_LA_DEV") && e->la_dev_uploads)
+        fprintf(stderr, "aeg: lowres ring: %lld uploads, %.2f MB, %d slots\n",
+                (long long)e->la_dev_uploads, e->la_dev_bytes / 1048576.0,
+                in_slots(e));
     if (getenv("AEG_LATIME"))
         fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms, "
                 "workers waited for rows %.0f ms, restarts %lld\n", e->sched_ns / 1e6,
@@ -17383,6 +18366,20 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_free(e->par_pos);
     aeg_free(e->par_mv);
     aeg_free(e->par_cost);
+    aeg_free(e->par_imv);
+    aeg_free(e->par_icost);
+    aeg_free(e->par_job);
+    aeg_free(e->par_cand);
+    aeg_free(e->par_sad);
+    for (int k = 1; k < 4; k++) {
+        aeg_free(e->par_sh_mv[k]);
+        aeg_free(e->par_sh_cost[k]);
+    }
+    for (int k = 0; k < 2; k++) {
+        aeg_free(e->b_par_mv[k]);
+        aeg_free(e->b_par_cost[k]);
+    }
+    aeg_free(e->b_prev_mv);
     aeg_free(e->mb_dqp);
     aeg_free(e->crf_cplx);
     aeg_free(e->plan_q);
@@ -17399,6 +18396,7 @@ void aeg_encoder_close(aeg_encoder *enc)
             aeg_free(e->mbt[i].mv);
             aeg_free(e->mbt[i].kind);
             aeg_free(e->mbt[i].prop);
+            aeg_free(e->mbt[i].prop_q);
             aeg_free(e->mbt[i].qp);
         }
     }

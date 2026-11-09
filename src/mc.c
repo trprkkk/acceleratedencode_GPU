@@ -24,6 +24,32 @@
  * undefined behaviour on an unaligned pixel address) */
 static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
 static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
+
+/* _mm_storeu_si32 is SSE2 but was only added to the headers in GCC 11 /
+ * clang 12 (and is absent from GCC 7, which the CI still has to build on).
+ * The definition is the same one those headers use, so the code below is
+ * identical on every compiler. */
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 11
+#ifndef AEG_HAVE_STOREU_SI32
+#define AEG_HAVE_STOREU_SI32
+static inline void aeg_storeu_si32_(void *p, __m128i a)
+{
+    int v = _mm_cvtsi128_si32(a);
+    memcpy(p, &v, 4);
+}
+#define _mm_storeu_si32(p, a) aeg_storeu_si32_((p), (a))
+#endif
+#elif defined(__clang__) && __clang_major__ < 12
+#ifndef AEG_HAVE_STOREU_SI32
+#define AEG_HAVE_STOREU_SI32
+static inline void aeg_storeu_si32_(void *p, __m128i a)
+{
+    int v = _mm_cvtsi128_si32(a);
+    memcpy(p, &v, 4);
+}
+#define _mm_storeu_si32(p, a) aeg_storeu_si32_((p), (a))
+#endif
+#endif
 #endif
 
 
@@ -1081,6 +1107,105 @@ int aeg_me_block_fs(const pixel *ref, int rstride, const pixel *cur,
     return me_block_inner(ref, rstride, cur, cstride, bw, bh, range, subme,
                           pred_x, pred_y, seed, extra, nextra, lambda, mc,
                           mvx, mvy, sad_out, hpt, fseed);
+}
+
+/* Local refinement around a vector another engine already produced.
+ *
+ * The whole-frame rounds (me_rounds_shape() in encoder.c) search every block
+ * of a picture at once from zero and from the previous picture's vector, so
+ * their result is a good starting point but not one that knows the block's MV
+ * predictor -- and the predictor is what the mvd of the coded vector costs.
+ * What is left to do per block is therefore small: measure the vector, its
+ * immediate neighbourhood and the predictor, then refine fractionally.  That
+ * is this function, and it is *all* the per-macroblock search a picture needs
+ * once the rounds have run -- on either backend, so the two produce the same
+ * stream (see docs/DESIGN_ja.md, principle P3). */
+int aeg_me_refine_around(const pixel *ref, int rstride, const pixel *cur,
+                         int cstride, int bw, int bh, int radius, int range,
+                         int subme, int pred_x, int pred_y,
+                         int seed_x, int seed_y, int lambda,
+                         const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                         int *sad_out)
+{
+    static const int8_t offs[8][2] = {
+        {-1, 0}, { 1, 0}, { 0,-1}, { 0, 1}, {-1,-1}, { 1,-1}, {-1, 1}, { 1, 1}
+    };
+    int pts[1 + 8 + 8 + 2][2], sads[1 + 8 + 8 + 2];
+    int n = 0, i, k, best = 1 << 30, bx, by, bd = 0;
+    me_rate rt;
+    const int cx = seed_x >> 2, cy = seed_y >> 2;   /* the seed, in whole pel */
+    const int r = radius > 0 ? radius : 1;
+
+    rt.lambda = lambda;
+    rt.px = pred_x;
+    rt.py = pred_y;
+    rt.dia = !!(subme & AEG_ME_DIA);
+    rt.qonly = 0;
+    subme &= ~AEG_ME_DIA;
+
+    /* the seed, its +-1 neighbours, the same at +-radius, the predictor and
+     * zero.  The list is de-duplicated, because at radius 1 the two
+     * neighbourhoods are the same eight points. */
+    {
+        int cand[1 + 8 + 8 + 2][2];
+        int nc = 0, pass;
+        cand[nc][0] = cx;        cand[nc][1] = cy;        nc++;
+        cand[nc][0] = pred_x >> 2; cand[nc][1] = pred_y >> 2; nc++;
+        cand[nc][0] = 0;         cand[nc][1] = 0;         nc++;
+        for (pass = 0; pass < 2; pass++) {
+            int d = pass ? r : 1;
+            for (i = 0; i < 8; i++) {
+                cand[nc][0] = cx + offs[i][0] * d;
+                cand[nc][1] = cy + offs[i][1] * d;
+                nc++;
+            }
+        }
+        for (i = 0; i < nc; i++) {
+            if (cand[i][0] < -range || cand[i][0] > range ||
+                cand[i][1] < -range || cand[i][1] > range)
+                continue;
+            for (k = 0; k < n; k++)
+                if (pts[k][0] == cand[i][0] && pts[k][1] == cand[i][1])
+                    break;
+            if (k < n)
+                continue;
+            pts[n][0] = cand[i][0];
+            pts[n][1] = cand[i][1];
+            n++;
+        }
+    }
+    me_sad_list(ref, rstride, cur, cstride, bw, bh, (const int (*)[2])pts, n, sads);
+    bx = cx; by = cy;
+    me_pick(&rt, (const int (*)[2])pts, sads, n, &best, &bx, &by);
+
+    if (subme < 0) {
+        *mvx = bx * 4;
+        *mvy = by * 4;
+        *sad_out = me_sad(ref, rstride, cur, cstride, bw, bh, bx, by);
+        return *sad_out;
+    }
+    if (subme == 0 && bx == cx && by == cy) {
+        /* Integer refinement kept the whole-frame vector: keep its fractional
+         * part too.  The rounds refined the fraction for the whole picture at
+         * once, so repeating a quarter-pel walk per block here would only redo
+         * work the device already did -- and the per-block stage is what
+         * costs, not the search. */
+        *mvx = bx * 4 + (seed_x & 3);
+        *mvy = by * 4 + (seed_y & 3);
+        *sad_out = me_sad(ref, rstride, cur, cstride, bw, bh, bx, by);
+        return *sad_out;
+    }
+    if (subme == 0)
+        subme = AEG_ME_DIA | 1;         /* a different position won: refine it */
+    {
+        int qx = bx * 4, qy = by * 4;
+        subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc, &rt,
+                      &qx, &qy, &bd);
+        *mvx = qx;
+        *mvy = qy;
+    }
+    *sad_out = bd;
+    return bd;
 }
 
 static int me_block_inner(const pixel *ref, int rstride, const pixel *cur,

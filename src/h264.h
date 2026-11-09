@@ -315,6 +315,12 @@ typedef struct aeg_sei {
     int pt_delays;              /* ... with the HRD's cpb/dpb delays      */
     uint32_t cpb_delay, dpb_delay; /* in clock ticks (two per frame)      */
     int pt_struct;              /* ... with pic_struct = pt_struct - 1 (0 = none) */
+    int recovery;               /* recovery_point (D.1.7)                */
+    unsigned recovery_cnt;      /* recovery_frame_cnt                    */
+    int hdr;                    /* mastering display + light level       */
+    const int *md_primaries;    /* R,G,B,WP x,y (0.00002 units)        */
+    uint32_t md_max_lum, md_min_lum; /* 0.0001 cd/m2                    */
+    int max_cll, max_fall;      /* content_light_level_info, cd/m2        */
     const char *info;           /* user_data_unregistered text, or NULL   */
 } aeg_sei;
 size_t aeg_write_sei(uint8_t *rbsp, size_t cap, const aeg_sei *s);
@@ -636,6 +642,20 @@ int  aeg_me_block_fs(const pixel *ref, int rstride, const pixel *cur,
                      const int (*extra)[2], int nextra, int lambda,
                      const aeg_mc_ctx *mc, int *mvx, int *mvy, int *sad_out,
                      int *hpt, const int fseed[2]);
+/* Local search around a vector another engine already found (the whole-frame
+ * rounds: see me_rounds_shape() in encoder.c).  `seed_x`/`seed_y` are in
+ * quarter-pel, `radius` is the integer-pel neighbourhood measured around them
+ * (the four axial and four diagonal neighbours at +-1, the same eight at
+ * +-radius, the MV predictor and zero).  The chosen position is then refined
+ * fractionally like any other search, so the candidates the rate-distortion
+ * decision sees stay comparable with the ones aeg_me_block_t() produces.
+ * Returns the SATD of the winner. */
+int  aeg_me_refine_around(const pixel *ref, int rstride, const pixel *cur,
+                          int cstride, int bw, int bh, int radius, int range,
+                          int subme, int pred_x, int pred_y,
+                          int seed_x, int seed_y, int lambda,
+                          const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                          int *sad_out);
 int  aeg_me_lambda(int qp);
 void aeg_mv_predict(const aeg_mb *mbs, int mb_stride, int mb_w,
                     int mb_x, int mb_y, int top_row,

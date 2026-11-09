@@ -145,6 +145,7 @@ void aeg_params_default(aeg_params *p)
     p->fps_num = 30;
     p->fps_den = 1;
     p->colorprim = p->transfer = p->colormatrix = -1;
+    p->max_cll = p->max_fall = -1;
     p->qp_max = 51;
     p->qp = 23;
     p->bit_depth = 8;

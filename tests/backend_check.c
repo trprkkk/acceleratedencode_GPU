@@ -208,6 +208,86 @@ static void check_sad(int w, int h)
     free(mv); free(o0); free(o1);
 }
 
+/* the whole-picture integer search: the device has to return exactly the
+ * vectors the CPU reference does, or the placement would change the stream */
+static void check_me(int w, int h)
+{
+    pic cur, ref;
+    int bs[3] = { 16, 16, 8 };
+    int b;
+
+    pic_alloc(&cur, w, h);
+    pic_alloc(&ref, w, h);
+    pic_fill(&cur, 1);
+    pic_fill(&ref, 1);
+    for (b = 0; b < 2; b++) {
+        int bw = bs[b], bh = b ? 8 : 16;
+        int mbw = (w + bw - 1) / bw, mbh = (h + bh - 1) / bh, i;
+        int n = mbw * mbh;
+        int16_t *job = (int16_t *)malloc((size_t)n * 8);
+        int16_t *m0 = (int16_t *)malloc((size_t)n * 4);
+        int16_t *m1 = (int16_t *)malloc((size_t)n * 4);
+        int32_t *s0 = (int32_t *)malloc((size_t)n * 4);
+        int32_t *s1 = (int32_t *)malloc((size_t)n * 4);
+        const int range = b ? 8 : 16;
+
+        for (i = 0; i < n; i++) {
+            int x = (i % mbw) * bw, y = (i / mbw) * bh;
+            job[4 * i + 0] = (int16_t)x;
+            job[4 * i + 1] = (int16_t)y;
+            job[4 * i + 2] = (int16_t)(rnd(2 * range + 1) - range);
+            job[4 * i + 3] = (int16_t)(rnd(2 * range + 1) - range);
+        }
+        if (dev.me_pic_upload) {
+            dev.me_pic_upload(dev.priv, AEG_ME_PIC_CUR, cur.org, cur.stride,
+                              w, h, h + 2 * AEG_PAD, 0x1111u + (uint64_t)b);
+            dev.me_pic_upload(dev.priv, AEG_ME_PIC_REF, ref.org, ref.stride,
+                              w, h, h + 2 * AEG_PAD, 0x2222u + (uint64_t)b);
+        }
+        cpu.me_batch(cpu.priv, cur.org, cur.stride, ref.org, ref.stride, bw, bh,
+                     range, job, n, h + 2 * AEG_PAD, m0, s0, 0, 0);
+        dev.me_batch(dev.priv, cur.org, cur.stride, ref.org, ref.stride, bw, bh,
+                     range, job, n, h + 2 * AEG_PAD, m1, s1, 0x1111u + (uint64_t)b,
+                     0x2222u + (uint64_t)b);
+        check(!memcmp(m0, m1, (size_t)n * 4),
+              b ? "me_batch (8x8 vectors)" : "me_batch (16x16 vectors)");
+        if (getenv("AEG_DEBUG_ME") && memcmp(m0, m1, (size_t)n * 4)) {
+            int q;
+            for (q = 0; q < n && q < 8; q++)
+                printf("      blk %d at (%d,%d) seed (%d,%d): cpu (%d,%d) dev (%d,%d)\n",
+                       q, job[4 * q], job[4 * q + 1], job[4 * q + 2],
+                       job[4 * q + 3], m0[2 * q], m0[2 * q + 1], m1[2 * q],
+                       m1[2 * q + 1]);
+        }
+        check(!memcmp(s0, s1, (size_t)n * 4),
+              b ? "me_batch (8x8 costs)" : "me_batch (16x16 costs)");
+        /* and the answer has to be a real minimum: the SAD the search reports
+         * must be the SAD at the vector it returns, and no worse than the SAD
+         * at zero.  (Both implementations once shared the same bug -- the
+         * reference was not offset to the block -- so comparing them with each
+         * other was not enough.) */
+        {
+            int bad = 0;
+            for (i = 0; i < n; i += 17) {
+                int x = (i % mbw) * bw, y = (i / mbw) * bh;
+                const uint8_t *cp = cur.org + (ptrdiff_t)y * cur.stride + x;
+                const uint8_t *rp = ref.org + (ptrdiff_t)y * ref.stride + x;
+                int sad = aeg_sad(bw, bh, cp, cur.stride,
+                                  rp + (ptrdiff_t)m0[2 * i + 1] * ref.stride + m0[2 * i],
+                                  ref.stride);
+                int sad0 = aeg_sad(bw, bh, cp, cur.stride, rp, ref.stride);
+                if (sad != s0[i] || sad > sad0)
+                    bad++;
+            }
+            check(!bad, b ? "me_batch (8x8 is a minimum)"
+                          : "me_batch (16x16 is a minimum)");
+        }
+        free(job); free(m0); free(m1); free(s0); free(s1);
+    }
+    pic_free(&cur);
+    pic_free(&ref);
+}
+
 /* the three fractional planes, compared over the whole allocation: the
  * padding is part of what motion compensation reads */
 static void check_interp(int w, int h, pic planes[4])
@@ -285,6 +365,36 @@ static int satd_agree_on(const aeg_be_ops *d, const pic *cur, pic planes[4],
 static int satd_agree(const pic *cur, pic planes[4], int bs, int upload)
 {
     return satd_agree_on(&dev, cur, planes, bs, upload);
+}
+
+/* Blocks whose origin is at or past the picture height: a encoder codes whole
+ * macroblock rows, so on a 1080-line picture the last row of 8x8 blocks starts
+ * at y = 1080, inside the padding.  The device has to read the same samples
+ * there as the host. */
+static int satd_agree_padding(const pic *cur, pic planes[4], int bs)
+{
+    const uint8_t *pl[4] = { planes[0].org, planes[1].org, planes[2].org,
+                             planes[3].org };
+    int nbw = cur->w / bs, rows = 3, n = nbw * rows * 9, i;
+    int16_t *pos = (int16_t *)malloc((size_t)n * 8);
+    int32_t *o0 = (int32_t *)malloc((size_t)n * 4);
+    int32_t *o1 = (int32_t *)malloc((size_t)n * 4);
+    int ok;
+
+    for (i = 0; i < n; i++) {
+        int b = i / 9, k = i % 9;
+        pos[4 * i + 0] = (int16_t)((b % nbw) * bs);
+        pos[4 * i + 1] = (int16_t)(cur->h + (b / nbw) * bs);
+        pos[4 * i + 2] = (int16_t)((k % 3) - 1);
+        pos[4 * i + 3] = (int16_t)((k / 3) - 1);
+    }
+    dev.ref_upload(dev.priv, pl, planes[0].stride, cur->w, cur->h);
+    cpu.ref_upload(cpu.priv, pl, planes[0].stride, cur->w, cur->h);
+    cpu.satd_batch(cpu.priv, cur->org, cur->stride, bs, bs, pos, n, o0);
+    dev.satd_batch(dev.priv, cur->org, cur->stride, bs, bs, pos, n, o1);
+    ok = !memcmp(o0, o1, (size_t)n * 4);
+    free(pos); free(o0); free(o1);
+    return ok;
 }
 
 /* ---------------------------------------------------------------- */
@@ -492,7 +602,8 @@ static void check_threads(int w, int h, int lanes)
 int main(int argc, char **argv)
 {
     int which = AEG_BACKEND_AUTO, k;
-    static const int sizes[][2] = { { 176, 144 }, { 640, 352 }, { 48, 32 } };
+    static const int sizes[][2] = { { 176, 144 }, { 640, 352 }, { 1920, 1080 },
+                                    { 48, 32 } };
 
     if (argc > 1 && !strcmp(argv[1], "opencl"))
         which = AEG_BACKEND_OPENCL;
@@ -507,16 +618,18 @@ int main(int argc, char **argv)
     }
     printf("   backend_check: %s\n", dev.desc);
     check_coef();
-    for (k = 0; k < 3; k++) {
+    for (k = 0; k < 4; k++) {
         int w = sizes[k][0], h = sizes[k][1], i;
         pic planes[4], cur;
         check_sad(w, h);
+        check_me(w, h);
         check_sse(w, h);
         check_interp(w, h, planes);
         pic_alloc(&cur, w, h);
         pic_fill(&cur, 1);
         check(satd_agree(&cur, planes, 16, 1), "satd_batch 16x16");
         check(satd_agree(&cur, planes, 8, 1), "satd_batch 8x8");
+        check(satd_agree_padding(&cur, planes, 8), "satd_batch 8x8 in the padding");
         pic_free(&cur);
         for (i = 0; i < 4; i++)
             pic_free(&planes[i]);

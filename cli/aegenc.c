@@ -56,6 +56,10 @@ static void usage(void)
 "                   linear srgb bt2020-10 bt2020-12 smpte2084 arib-std-b67\n"
 "  --colormatrix <m> matrix: gbr bt709 fcc bt470bg smpte170m smpte240m\n"
 "                   ycgco bt2020nc bt2020c\n"
+"  --master-display <s>  HDR10 mastering display SEI, x264 syntax:\n"
+"                   G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)\n"
+"  --max-cll <m,f>  content light level SEI: max content / frame-average\n"
+"                   light level in cd/m2\n"
 "  -g <int>         GOP size, 0 = only the first frame is IDR (default 250)\n"
 "  --scenecut <pct> insert an IDR when a scene change is detected (0 = off,\n"
 "                   default 120: inter prediction 20%% worse than intra)\n"
@@ -141,12 +145,21 @@ static void usage(void)
 "  --vbv-bufsize <kbits> VBV/HRD buffer size  (implies ABR)\n"
 "  --nal-hrd        signal the VBV model as the NAL HRD: hrd_parameters in\n"
 "                   the SPS, buffering period and picture timing SEI\n"
+"  --open-gop       keyframes are non-IDR I slices (open GOP); recovery\n"
+"                   point SEI marks them\n"
 "  --info-sei       write the encoder name and options into the stream (a\n"
 "                   user data SEI on the first picture, as x264 does)\n"
 "  --aq <n>         adaptive quantisation strength in tenths (0 = off,\n"
-"                   default 10 = x264 aq-strength 1.0)\n"
+"                   default off; --aq 10 = x264 aq-strength 1.0)\n"
+"  --aq-mode <n>    0 off, 1 variance, 2 auto-variance (default when\n"
+"                   --aq is given), 3 auto-variance with dark bias\n"
 "  --slices <n>     slices per picture (0/1 = one slice; n>1 cuts the\n"
 "                   picture into n row ranges, one NAL each)\n"
+"  --slice-max-mbs <n>  no slice holds more than n macroblocks\n"
+"  --slice-max-size <n> no slice payload exceeds n bytes\n"
+"  --intra-refresh <n>  no IDR after the first picture: code a moving\n"
+"                   intra band instead, every macroblock refreshed\n"
+"                   once per n frames (implies keyint infinite)\n"
 "  -t <int>         slice threads (0 = auto, 1 = serial; -t N without\n"
 "                   --slices uses one slice per thread)\n"
 "  --frame-threads <n> code n pictures at once, each following its\n"
@@ -160,6 +173,16 @@ static void usage(void)
 "                   the only B shapes so far)\n"
 "  -v <int>         verbosity (0 errors only, 1 normal, 2 every picture)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
+"  --device <n>     use device n of the selected backend (default 0);\n"
+"                   also selectable with AEG_DEVICE\n"
+"  --qpfile <file>  per-picture QPs: one `frame qp` per line (x264's\n"
+"                   format; comments after # and blank lines ignored;\n"
+"                   qp -1 leaves that picture to the rate controller)\n"
+"  --zones <s,e,q>  give display pictures s..e the QP q (repeatable;\n"
+"                   a --qpfile entry wins over a zone)\n"
+"  --roi <x,y,w,h,off>  add off to the QP of macroblocks touching the\n"
+"                   rectangle (pixel coordinates, repeatable;\n"
+"                   negative = finer)\n"
 "  --calibrate      measure the accelerator launch overhead and exit\n"
 "  --bench          encode three times (auto/cpu/accelerator) and report\n"
 "\n"
@@ -513,6 +536,60 @@ static int parse_stage(const char *s)
     return -1;
 }
 
+/* x264-style qpfile: lines of `frame qp` (an optional type letter is
+ * accepted and ignored).  Returns the table, -1 where no override was given. */
+static int *load_qpfile(const char *path, int *n_out)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    int *tab = NULL, n = 0, cap = 0;
+
+    *n_out = 0;
+    if (!f) {
+        fprintf(stderr, "error: cannot open qpfile %s\n", path);
+        return NULL;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        long frame, qp;
+        int k;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\r' || !*p)
+            continue;
+        if (sscanf(p, "%ld %ld", &frame, &qp) != 2 || frame < 0 ||
+            frame > 100000000L || qp < -1 || qp > 51) {
+            fprintf(stderr, "%s: bad line: %s", path, line);
+            free(tab);
+            fclose(f);
+            return NULL;
+        }
+        if (frame >= cap) {
+            int ncap = cap ? cap : 64;
+            while (ncap <= frame)
+                ncap *= 2;
+            {
+                int *nt = (int *)realloc(tab, (size_t)ncap * sizeof(int));
+                if (!nt) {
+                    fprintf(stderr, "out of memory reading %s\n", path);
+                    free(tab);
+                    fclose(f);
+                    return NULL;
+                }
+                tab = nt;
+                for (k = cap; k < ncap; k++)
+                    tab[k] = -1;
+                cap = ncap;
+            }
+        }
+        tab[frame] = (int)qp;
+        if (frame + 1 > n)
+            n = (int)frame + 1;
+    }
+    fclose(f);
+    *n_out = n;
+    return tab;
+}
+
 static void list_devices(void)
 {
     aeg_device_info info[16];
@@ -610,6 +687,8 @@ int main(int argc, char **argv)
     int width = 0, height = 0, qp = 23, gop = 250, max_frames = 0;
     int fps_num = 30, fps_den = 1, fps_set = 0, sar_w = 0, sar_h = 0;
     int fullrange = 0, demux = 0, seek = 0, interlaced = -1, field_coding = 0;
+    int md[8] = { 0 }, md_set = 0, max_cll = -1, max_fall = -1;
+    unsigned md_max_lum = 0, md_min_lum = 0;
     int in_csp = -1, in_depth = -1;
     aeg_image layout;
     size_t poff[3];
@@ -617,7 +696,7 @@ int main(int argc, char **argv)
     int crf_given = 0, bit_depth = 8;
     double fps;
     input_t inp;
-    int bitrate = 0, aq = -1;
+    int bitrate = 0, aq = -1, aq_mode = -1;
     int backend = AEG_BACKEND_AUTO, verbose = 1, bench = 0;
     int range = 0, subme = -1, partitions = -1, pass = 0, qcomp = 60;
     int refine_mv = -1, refine_cand = -1, qp_rd = -1, refs = -1, weightp = -1, bpyramid = -1;
@@ -629,6 +708,12 @@ int main(int argc, char **argv)
     char stats_path[4096];
     const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
     const char *orderpath = NULL;
+    const char *qpfilepath = NULL;
+    int *qptab = NULL, qpn = 0;
+    aeg_zone *zones = NULL;
+    int nzones = 0, zonecap = 0;
+    aeg_roi *rois = NULL;
+    int nrois = 0, roicap = 0;
     uint8_t *frame;
     size_t fsize;
     int64_t pts = 0;
@@ -714,7 +799,36 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
-        else if (!strcmp(a, "--info-sei")) p.info_sei = 1;
+        else if (!strcmp(a, "--master-display")) {
+            const char *v = next_arg(argc, argv, &i);
+            const char *r = strstr(v, "R("), *g = strstr(v, "G(");
+            const char *b = strstr(v, "B("), *w = strstr(v, "WP(");
+            const char *l = strstr(v, "L(");
+            unsigned lumax, lumin;
+            if (!r || !g || !b || !w || !l ||
+                sscanf(r, "R(%d,%d)", &md[0], &md[1]) != 2 ||
+                sscanf(g, "G(%d,%d)", &md[2], &md[3]) != 2 ||
+                sscanf(b, "B(%d,%d)", &md[4], &md[5]) != 2 ||
+                sscanf(w, "WP(%d,%d)", &md[6], &md[7]) != 2 ||
+                sscanf(l, "L(%u,%u)", &lumax, &lumin) != 2) {
+                fprintf(stderr, "error: --master-display %s: expected "
+                        "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)\n", v);
+                return 2;
+            }
+            md_max_lum = lumax;
+            md_min_lum = lumin;
+            md_set = 1;
+        }
+        else if (!strcmp(a, "--max-cll")) {
+            const char *v = next_arg(argc, argv, &i);
+            if (sscanf(v, "%d,%d", &max_cll, &max_fall) != 2 ||
+                max_cll < 0 || max_cll > 65535 || max_fall < 0 ||
+                max_fall > 65535) {
+                fprintf(stderr, "error: --max-cll %s: expected max,fall "
+                        "(0..65535)\n", v);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--colorprim") || !strcmp(a, "--transfer") ||
                  !strcmp(a, "--colormatrix")) {
             static const char *const pn[] = { "bt709", "bt470m", "bt470bg",
@@ -755,6 +869,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-b")) backend = parse_backend(next_arg(argc, argv, &i));
         else if (!strcmp(a, "-p")) p.preset = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--slices")) p.slices = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--slice-max-mbs"))
+            p.slice_max_mbs = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--slice-max-size"))
+            p.slice_max_size = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--intra-refresh"))
+            p.intra_refresh = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "-t") || !strcmp(a, "--threads"))
             p.threads = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--frame-threads"))
@@ -808,10 +928,73 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--partitions")) partitions = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--bitrate")) bitrate = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--aq")) aq = int_arg(a, next_arg(argc, argv, &i));
+        else if (!strcmp(a, "--aq-mode")) aq_mode = int_arg(a, next_arg(argc, argv, &i));
         else if (!strcmp(a, "--no-8x8dct")) p.transform_8x8 = 0;
         else if (!strcmp(a, "--no-cabac")) p.cabac = 0;
+        else if (!strcmp(a, "--open-gop")) p.open_gop = 1;
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
+        else if (!strcmp(a, "--qpfile")) qpfilepath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "--roi")) {
+            const char *v = next_arg(argc, argv, &i);
+            int x, y, w, h, off;
+            if (sscanf(v, "%d,%d,%d,%d,%d", &x, &y, &w, &h, &off) != 5 ||
+                w <= 0 || h <= 0 || off < -51 || off > 51) {
+                fprintf(stderr, "error: --roi %s: expected x,y,w,h,off "
+                        "(w,h > 0, off -51..51)\n", v);
+                return 2;
+            }
+            if (nrois == roicap) {
+                int nc = roicap ? roicap * 2 : 4;
+                aeg_roi *nr = (aeg_roi *)realloc(rois, (size_t)nc * sizeof(*nr));
+                if (!nr) {
+                    fprintf(stderr, "out of memory\n");
+                    return 1;
+                }
+                rois = nr;
+                roicap = nc;
+            }
+            rois[nrois].x = x;
+            rois[nrois].y = y;
+            rois[nrois].w = w;
+            rois[nrois].h = h;
+            rois[nrois].qp_offset = off;
+            nrois++;
+        }
+        else if (!strcmp(a, "--zones")) {
+            const char *v = next_arg(argc, argv, &i);
+            int s, e, q;
+            if (sscanf(v, "%d,%d,%d", &s, &e, &q) != 3 || s < 0 || e < s ||
+                q < 0 || q > 51) {
+                fprintf(stderr, "error: --zones %s: expected start,end,qp "
+                        "with 0 <= start <= end and qp 0..51\n", v);
+                return 2;
+            }
+            if (nzones == zonecap) {
+                int nc = zonecap ? zonecap * 2 : 4;
+                aeg_zone *nz = (aeg_zone *)realloc(zones, (size_t)nc * sizeof(*nz));
+                if (!nz) {
+                    fprintf(stderr, "out of memory\n");
+                    return 1;
+                }
+                zones = nz;
+                zonecap = nc;
+            }
+            zones[nzones].start = s;
+            zones[nzones].end = e;
+            zones[nzones].qp = q;
+            nzones++;
+        }
+        else if (!strcmp(a, "--device")) {
+            char buf[32];
+            int d = int_arg(a, next_arg(argc, argv, &i));
+            if (d < 0) {
+                fprintf(stderr, "error: --device %d: expected 0 or more\n", d);
+                return 2;
+            }
+            snprintf(buf, sizeof(buf), "%d", d);
+            setenv("AEG_DEVICE", buf, 1);
+        }
         else if (!strcmp(a, "--calibrate")) {
             int r = aeg_calibrate(backend);
             printf("calibration: %s\n", r == 0 ? "ok" : "accelerator unavailable");
@@ -853,6 +1036,9 @@ int main(int argc, char **argv)
         bad |= range_bad("-g", gop, 0, 1 << 30);
         bad |= range_bad("-n", max_frames, 0, 1 << 30);
         bad |= range_bad("--slices", p.slices, 0, 1024);
+        bad |= range_bad("--slice-max-mbs", p.slice_max_mbs, 0, 1 << 20);
+        bad |= range_bad("--slice-max-size", p.slice_max_size, 0, 1 << 30);
+        bad |= range_bad("--intra-refresh", p.intra_refresh, 0, 1 << 20);
         bad |= range_bad("-t", p.threads, 0, 256);
         bad |= range_bad("--frame-threads", p.frame_threads, 0, 8);
         bad |= range_bad("--scenecut", p.scenecut, 0, 10000);
@@ -877,6 +1063,7 @@ int main(int argc, char **argv)
             bad = 1;
         }
         if (aq >= 0) bad |= range_bad("--aq", aq, 0, 30);
+        if (aq_mode >= 0) bad |= range_bad("--aq-mode", aq_mode, 0, 3);
         if (range) bad |= range_bad("--range", range, 1, 512);
         if (subme >= 0) bad |= range_bad("--subme", subme, 0, 9);
         if (refine_mv >= 0) bad |= range_bad("--refine-mv", refine_mv, 0, 3);
@@ -1043,6 +1230,17 @@ int main(int argc, char **argv)
         }
     }
 
+    if (qpfilepath) {
+        qptab = load_qpfile(qpfilepath, &qpn);
+        if (!qptab)
+            return 1;
+        p.frame_qp = qptab;
+        p.n_frame_qp = qpn;
+    }
+    p.zones = zones;
+    p.n_zones = nzones;
+    p.rois = rois;
+    p.n_rois = nrois;
     p.width = width;
     p.height = height;
     p.qp = qp;
@@ -1051,13 +1249,29 @@ int main(int argc, char **argv)
     p.sar_w = sar_w;
     p.sar_h = sar_h;
     p.fullrange = fullrange;
+    if (md_set) {
+        int k;
+        p.master_display = 1;
+        for (k = 0; k < 8; k++)
+            p.md_primaries[k] = md[k];
+        p.md_max_lum = md_max_lum;
+        p.md_min_lum = md_min_lum;
+    }
+    p.max_cll = max_cll;
+    p.max_fall = max_fall;
     p.interlaced = interlaced >= 0 ? interlaced : inp.interlaced;
     p.field_coding = field_coding;
     if (field_coding && !p.interlaced)
         p.interlaced = 1;
     p.gop_size = gop;
     p.bitrate_kbps = bitrate;
-    if (aq >= 0) { p.aq_mode = aq > 0; p.aq_strength = aq; }
+    if (aq >= 0) {
+        p.aq_strength = aq;
+        /* --aq alone keeps the historical variance mode; the auto modes are
+         * opt-in. */
+        if (aq_mode < 0) p.aq_mode = aq > 0 ? 1 : 0;
+    }
+    if (aq_mode >= 0) p.aq_mode = aq_mode;
     p.rc_mode = bitrate > 0 ? AEG_RC_ABR : AEG_RC_CQP;
     p.qcomp = qcomp;
     p.bit_depth = bit_depth;
@@ -1148,10 +1362,15 @@ int main(int argc, char **argv)
             tot = aeg_now_ns() - t0;
             t[k] = tot;
             (void)bytes;
+            /* the content bitrate (bits per frame second of the source), not
+             * bytes over the time the encoder took: the old expression
+             * multiplied by the frame rate *and* divided by the elapsed time,
+             * so it reported a number that grew as the encoder got slower and
+             * could not be compared between runs. */
             if (verbose)
                 printf("%-6s %6" PRId64 " frames %8.2f ms/frame %8.0f kb/s\n",
                        aeg_backend_name(q.backend), n, tot / 1e6 / (n ? n : 1),
-                       n ? bytes * 8.0 * fps / (tot / 1e9) / 1000.0 : 0.0);
+                       n ? bytes * 8.0 / (n / (double)fps) / 1000.0 : 0.0);
             aeg_encoder_close(e);
         }
         if (t[1] > 0 && t[0] > 0)
