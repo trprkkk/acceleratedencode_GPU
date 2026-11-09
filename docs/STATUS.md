@@ -7031,3 +7031,79 @@ preset-4 settings (+23 % for -0.38) are poor value at preset 3.
 `tools/x264cmp.py` now computes PSNR frame by frame through memory maps, with
 the same result.  Whole-clip int64 copies took 2.5 GB per run, and two runs
 side by side were killed for lack of memory.
+
+## A cheaper QP-RD walk (experimental, `AEG_QPRD*`, default off)
+
+QP-RD costs preset 3 about 15 % of its time (cockL / vtestL CRF 24, serial).
+gprof (cockL, 120 pictures, p3 `--qp-rd 1`) puts about 10 % of the encode in
+the trials:
+- 44 % of that redecides Intra NxN modes at every trial QP (31 % of the
+  trials);
+- 21 % codes chroma again;
+- about 19 % is inter luma.
+
+Four switches (output unchanged without them):
+- **`AEG_QPRDKM=1`:** Intra NxN trials keep the winner's modes, which are
+  decided again once at the QP the walk picks.
+- **`AEG_QPRDNT=1`:** the walk runs without the trellis, and only the chosen
+  QP is coded again with it, against the decided QP.
+- **`AEG_QPRDMAX=n`:** at most n steps each way.
+- **`AEG_QPRDPS=1`:** first tries the QP that the tree-weighted lambda points
+  at, `orig + round(o (3 - s) / s)`, since `lambda * 2^(x/3)` is the decision
+  lambda of QP + x.  The walk starts from the better of the two.
+
+Preset 3, CRF, BD-rate against x264 veryslow (aegenc `--aq 0`), lookahead 60.
+The time column is the summed CPU time of the encodes with two runs side by
+side (approximate); serial times follow below.
+
+| p3 + | cockL | vtestL | megaL | long | change | time | long2 | change | time |
+|---|---|---|---|---|---|---|---|---|---|
+| (none) | +4.24 | +2.48 | +2.90 | +3.21 | | | +1.59 | | |
+| full QP-RD | +3.59 | -3.76 | +2.70 | +0.85 | -2.36 | +12.6 % | +1.39 | -0.20 | +16 % |
+| KM | +3.85 | -2.84 | +2.92 | +1.31 | -1.90 | +7.0 % | | | |
+| NT | +3.70 | -1.77 | +2.73 | +1.55 | -1.66 | +9.2 % | | | |
+| NT + KM | +3.83 | -1.38 | +2.82 | +1.76 | -1.45 | +3.3 % | | | |
+| MAX 1 | +3.29 | -0.85 | +2.31 | +1.59 | -1.62 | +5.7 % | | | |
+| NT + MAX 1 | +3.41 | +0.39 | +2.31 | +2.04 | -1.17 | +6.5 % | | | |
+| MAX 1 + KM | +3.38 | -0.31 | +2.25 | +1.77 | -1.44 | +1.1 % | | | |
+| PS | +3.95 | -4.11 | +2.82 | +0.89 | -2.32 | +11.5 % | | | |
+| **PS + MAX 1** | +3.89 | -3.84 | +2.83 | **+0.96** | **-2.25** | +4.4 % | +1.50 | -0.09 | +8 % |
+| PS + MAX 1 + KM | +3.97 | -2.87 | +2.90 | +1.34 | -1.87 | +3.5 % | +1.70 | +0.11 | +6 % |
+
+long2 per clip (cockL2 / vtestL2 / megaL2 / treeL):
+
+| p3 + | cockL2 | vtestL2 | megaL2 | treeL |
+|---|---|---|---|---|
+| (none) | +6.09 | -7.61 | -0.26 | +8.13 |
+| full QP-RD | +4.60 | -7.84 | -0.43 | +9.22 |
+| PS + MAX 1 | +4.42 | -7.58 | -0.21 | +9.38 |
+| PS + MAX 1 + KM | +4.85 | -7.21 | -0.09 | +9.25 |
+
+Serial, the minimum of three wall-clock runs (cockL / vtestL):
+
+| p3 + | seconds | time |
+|---|---|---|
+| (none) | 14.98 / 7.65 | |
+| full QP-RD | 17.45 / 8.66 | +16.5 / +13.2 % |
+| PS + MAX 1 | 16.44 / 8.31 | +9.7 / +8.6 % |
+| PS + MAX 1 + KM | 16.04 / 8.16 | +7.1 / +6.7 % |
+| MAX 1 + KM | 15.91 / 8.05 | +6.2 / +5.2 % |
+| MAX 1 | 16.43 / 7.93 | +9.7 / +3.7 % |
+
+**What this shows:**
+- **PS + MAX 1 against the full walk:** it keeps 95 % of the full walk's gain
+  on long for about 60 % of its time.
+- **The one-step walk on cockL and megaL:** it does better there than the
+  full walk (+3.29 / +2.31 against +3.59 / +2.70).  Only vtestL wants the
+  long moves, and those come from the tree-weighted lambda.  The predicted
+  start recovers them.
+- **The validation set:** QP-RD itself is worth much less on long2 (-0.20)
+  than on long (-2.36, of which vtestL alone is -6.2).  The weighting
+  constants (`o - 0.7 mean`) were tuned on the long set, so part of that gain
+  is probably fitted to it.  On long2 QP-RD gains about 1.5 on cockL2 and
+  loses 1.1-1.25 on treeL (the tree loss of the constant-QP table above).
+- **Preset 4:** replacing its full walk with PS + MAX 1 costs +0.23 (long)
+  and +0.19 (long2) for -4.4 / -4.8 % CPU, which fails the 0.1 % gate.
+  Preset 4 keeps the full walk.
+
+Nothing is switched on by default yet.
