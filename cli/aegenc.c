@@ -12,6 +12,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <inttypes.h>
 #include "aeg/aeg.h"
 
@@ -40,6 +42,7 @@ static void usage(void)
 "                   profile, CPU only; x264 --output-depth 10)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
+
 "  --lossless       lossless coding (experimental; not implemented yet)\n"
 
 "  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
@@ -659,6 +662,26 @@ static FILE *g_order;
 
 static int g_bps = 1;   /* bytes per reconstructed sample (2 at 10 bits) */
 
+static int ffmpeg_available(void)
+{
+    return system("ffmpeg -version >/dev/null 2>&1") == 0;
+}
+static int ffmpeg_remux(const char *in, const char *out, const char *fmt)
+{
+    pid_t pid = fork();
+    int st;
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        execlp("ffmpeg", "ffmpeg", "-v", "error", "-y", "-i", in,
+               "-c", "copy", "-f", fmt, out, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &st, 0) < 0)
+        return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
 static void write_packet(FILE *out, const char *dumppath, aeg_encoder *enc,
                          const aeg_packet *pkt, int *first,
                          int width, int height)
@@ -718,7 +741,9 @@ int main(int argc, char **argv)
     aeg_pass1_frame *pass1 = NULL;
     int pass1_n = 0, pass1_cap = 0, pass1_bframes = -1;
     char stats_path[4096];
-    const char *inpath = NULL, *outpath = NULL, *dumppath = NULL;
+    const char *inpath = NULL, *outpath = NULL, *dumppath = NULL, *muxfmt = NULL;
+    int mux_pipe = 0, mux_two = 0;
+    char mux_tmp[4096];
     const char *orderpath = NULL;
     const char *qpfilepath = NULL;
     int *qptab = NULL, qpn = 0;
@@ -965,6 +990,11 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-cabac")) p.cabac = 0;
         else if (!strcmp(a, "--open-gop")) p.open_gop = 1;
         else if (!strcmp(a, "--lossless")) lossless = 1;
+        else if (!strcmp(a, "--mux")) {
+            muxfmt = next_arg(argc, argv, &i);
+            if (!outpath && i + 1 < argc && argv[i + 1][0] != '-')
+                outpath = next_arg(argc, argv, &i);
+        }
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--qpfile")) qpfilepath = next_arg(argc, argv, &i);
@@ -1172,8 +1202,37 @@ int main(int argc, char **argv)
         return 2;
     }
     if (outpath) {
-        out = fopen(outpath, "wb");
-        if (!out) { perror(outpath); return 1; }
+        if (muxfmt) {
+            const char *ofmt = !strcmp(muxfmt, "mp4") ? "mp4" :
+                               !strcmp(muxfmt, "mkv") ? "matroska" :
+                               !strcmp(muxfmt, "ts") ? "mpegts" : NULL;
+            if (!ofmt) {
+                fprintf(stderr, "error: --mux mp4|mkv|ts\n");
+                return 2;
+            }
+            if (!ffmpeg_available()) {
+                fprintf(stderr, "warning: ffmpeg not found; writing raw .264 "
+                                "instead of %s\n", muxfmt);
+            } else {
+                char cmd[8192];
+                const char *target = outpath;
+                if (strcmp(ofmt, "mp4")) {
+                    snprintf(mux_tmp, sizeof(mux_tmp), "%s.tmp.mp4", outpath);
+                    target = mux_tmp;
+                    mux_two = 1;
+                }
+                snprintf(cmd, sizeof(cmd),
+                         "ffmpeg -v error -y -fflags +genpts -f h264 -r %d/%d -i - -c copy "
+                         "-f mp4 '%s'", fps_num, fps_den, target);
+                out = popen(cmd, "w");
+                if (!out) { perror("ffmpeg"); return 1; }
+                mux_pipe = 1;
+            }
+        }
+        if (out == stdout) {
+            out = fopen(outpath, "wb");
+            if (!out) { perror(outpath); return 1; }
+        }
     }
 
     /* Two-pass keys its measurement by display index (the packet's pts): with
@@ -1634,7 +1693,21 @@ int main(int argc, char **argv)
     aeg_encoder_close(enc);
     free(frame);
     if (in != stdin) fclose(in);
-    if (out != stdout) fclose(out);
+    if (mux_pipe) {
+        int mrc = pclose(out);
+        if (mrc != 0) {
+            fprintf(stderr, "ffmpeg mux failed (exit %d)\n", mrc);
+            ret = 1;
+        } else if (mux_two && ret == 0) {
+            const char *ofmt = !strcmp(muxfmt, "mkv") ? "matroska" :
+                               !strcmp(muxfmt, "ts") ? "mpegts" : "mp4";
+            if (ffmpeg_remux(mux_tmp, outpath, ofmt) != 0) {
+                fprintf(stderr, "ffmpeg remux to %s failed\n", muxfmt);
+                ret = 1;
+            }
+            remove(mux_tmp);
+        }
+    } else if (out != stdout) fclose(out);
     if (g_order)
         fclose(g_order);
     return ret;

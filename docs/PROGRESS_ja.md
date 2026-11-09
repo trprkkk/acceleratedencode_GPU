@@ -142,7 +142,7 @@
   - CQP 4点×長尺4クリップ BD-rate（off 比、正=悪化）: implicit は cockL **-0.95/-1.21%**、vtestL **-3.51/-5.44%**、megaL **-2.43/-4.13%**、treeL 0.00/0.00（PSNR/SSIM）。explicit は最小二乗＋SSE 安全弁（1% 未満改善、重み 31..33/offset ±2 の外は flag=0）に変更し、通常クリップではほぼ全 ref が flag=0。1080p 12f で off 197,174 → explicit 197,192 バイト（PWT の数ビットのみ）で、旧 +30% は解消し実質 0%。
   - CRF 4点×長尺4クリップ BD-rate（off 比）: implicit は cockL **-1.13/-2.06%**、vtestL **-3.23/-6.09%**、megaL **-2.19/-4.67%**、treeL 0.00/0.00、平均 **-1.64/-3.20%**。explicit は平均 **+0.27/+0.27%** で ≤+0.5% を満たす。**既定は implicit**。`--weightb 0` は旧既定 197,721 バイト（1080p 12f）と一致。
 - [ ] M-5j（lossless 未実装・無効化）: `--lossless` と `lossless` パラメータを追加したが、I_PCM / transform bypass の再構成経路が未実装。`--lossless` は `aeg_encoder_open` で明示エラーにして無効なストリームを防止。既定 lossy は不変。
-- [ ] M-5i: libavcodec wrapper、コンテナ連携
+- [x] M-5i（コンテナ出力）: `--mux mp4|mkv|ts <out>` を追加。raw Annex B を ffmpeg に渡して `-c copy` で多重化。mp4 は直接パイプ、mkv/ts は一時 mp4 経由で remux（ffmpeg 3.4 の MKV/TS が raw pipe の未設定タイムスタンプを拒否するため）。`--fps` は既存。`--mux` なしの raw 出力はバイト不変。MP4/MKV/TS の 8bit/10bit、open-GOP、implicit weighted B を ffmpeg で全数デコード確認。ES を取り出すと avcC 経由の SPS/PPS 再配置で raw とバイト一致しない（デコードは一致）。
 
 ### M-7 移植性（Windows / MSVC / ARM）
 - [ ] M-7a: `src/thread.h`（pthread/Win32）、`aeg_dl`（Windows ライブラリ名）
