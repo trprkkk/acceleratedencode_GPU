@@ -84,6 +84,19 @@ typedef struct aeg_be_ops {
     int (*satd_batch)(void *priv, const pixel *cur, int cstride, int bw,
                       int bh, const int16_t *pos, int count, int32_t *out);
 
+    /* The lowres motion search of a whole field, aeg_lowres_search_seeded()
+     * exactly (AEG_STAGE_LOOKAHEAD).  `cur` and `ref` point at the origins
+     * of lowres planes allocated with AEG_LA_PAD samples of border on every
+     * side (aeg_lowres_alloc), `stride` apart, w x h samples = (w/8) x (h/8)
+     * blocks.  `seed` (NULL = none) is the field of the same picture at
+     * distance n-1, scaled by num/den, `range` the vector bound.  out[]
+     * receives two ints per block (the vector, half samples) and then one
+     * per block (the cost), as the lookahead's field cache stores them.
+     * Optional. */
+    int (*lowres_search)(void *priv, const uint8_t *cur, const uint8_t *ref,
+                         int stride, int w, int h, const int *seed, int num,
+                         int den, int range, int *out);
+
     void (*sync)(void *priv);
     void (*destroy)(void *priv);
 
@@ -179,6 +192,12 @@ typedef struct aeg_dispatcher {
     int        coef_since[3];
     int        coef_dev[3];
     int        coef_decided[3];
+    /* The lookahead's lowres search (aeg_dispatch_la_pick / _done): time
+     * per 1024 blocks (moving average) on [0] the CPU and [1] the device,
+     * calls measured, calls since the slower side was last re-tried. */
+    int64_t    la_ns[2];
+    int        la_n[2];
+    int        la_since;
     /* Copies of the encoder made for other threads (frame threads, slice
      * threads) carry a copy of the dispatcher.  Their measurements
      * (aeg_dispatch_record, aeg_dispatch_coef_done) go to `root`, the
@@ -207,6 +226,14 @@ int  aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind);
 /* ... and how long that picture took, `mbs` macroblocks, placed as `dev`. */
 void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
                             int mbs);
+
+/* The lookahead's lowres search of one field: 1 = on the device.  Both
+ * forms give the same field, so this one is placed by timing: each side is
+ * probed a few times, then the faster stays and the other is re-tried now
+ * and then. */
+int  aeg_dispatch_la_pick(aeg_dispatcher *d);
+/* ... and how long that field took, `blocks` lowres blocks, placed as `dev`. */
+void aeg_dispatch_la_done(aeg_dispatcher *d, int dev, int64_t ns, int blocks);
 
 /* Device enumeration (aeg_query_devices in the public API). */
 int  aeg_backend_query(aeg_backend b, aeg_device_info *out, int max);

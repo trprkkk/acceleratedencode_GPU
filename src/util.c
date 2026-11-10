@@ -168,7 +168,7 @@ const char *aeg_stage_name(int stage)
 {
     static const char *names[AEG_STAGE_COUNT] = {
         "motion-est", "sad", "inter-pred", "transform",
-        "iquant-idct", "deblock", "intra-pred", "recon", "psnr"
+        "iquant-idct", "deblock", "intra-pred", "recon", "psnr", "lookahead"
     };
     if (stage < 0 || stage >= AEG_STAGE_COUNT)
         return "?";

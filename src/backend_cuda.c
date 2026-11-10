@@ -49,7 +49,12 @@ static const char aeg_cuda_preamble[] =
     "#define __kernel extern \"C\" __global__\n"
     "#define __global\n"
     "#define AEG_DEVFN static __device__\n"
-    "#define get_global_id(d) ((int)(blockIdx.x * blockDim.x + threadIdx.x))\n";
+    "#define get_global_id(d) ((int)(blockIdx.x * blockDim.x + threadIdx.x))\n"
+    "#define get_local_id(d) ((int)threadIdx.x)\n"
+    "#define get_local_size(d) ((int)blockDim.x)\n"
+    "#define get_group_id(d) ((int)blockIdx.x)\n"
+    "#define CLK_GLOBAL_MEM_FENCE 0\n"
+    "#define barrier(f) __syncthreads()\n";
 
 #define CUDA_SYMS(X)                                                          \
     X(CUresult, cuInit, (unsigned int))                                       \
@@ -102,6 +107,7 @@ typedef struct cuda_ctx {
     CUcontext ctx;
     CUmodule mod;
     CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq, k_tqdc, k_iqdc;
+    CUfunction k_lrs;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -550,6 +556,48 @@ static int cuda_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     return AEG_OK;
 }
 
+/* The lowres search of one field (aeg_be_ops.lowres_search): one block of
+ * 64 threads walks the field's diagonals (see the kernel), slots 8-11. */
+static int cuda_lowres_search(void *priv, const uint8_t *cur,
+                              const uint8_t *ref, int stride, int w, int h,
+                              const int *seed, int num, int den, int range,
+                              int *out)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8;
+    int has_seed = seed != NULL, hexit = AEG_LA_RANGE;
+    const size_t pbytes = (size_t)stride * (size_t)(h + 2 * pad);
+    const size_t nb = (size_t)mb_w * (size_t)mb_h;
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    CUdeviceptr dc, dr, ds, dout;
+    void *args[15];
+
+    if (mb_w <= 0 || mb_h <= 0)
+        return AEG_OK;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    dc = cuda_buf(o, 8, pbytes);
+    dr = cuda_buf(o, 9, pbytes);
+    dout = cuda_buf(o, 11, nb * 3 * sizeof(int));
+    ds = has_seed ? cuda_buf(o, 10, nb * 2 * sizeof(int)) : dout;
+    if (!dc || !dr || !dout || !ds)
+        return AEG_EBACKEND;
+    CU_CK(p_cuMemcpyHtoD_v2(dc, cur - org, pbytes));
+    CU_CK(p_cuMemcpyHtoD_v2(dr, ref - org, pbytes));
+    if (has_seed)
+        CU_CK(p_cuMemcpyHtoD_v2(ds, seed, nb * 2 * sizeof(int)));
+    args[0] = &dc;     args[1] = &dr;      args[2] = &stride;
+    args[3] = &pad;    args[4] = &w;       args[5] = &h;
+    args[6] = &mb_w;   args[7] = &mb_h;    args[8] = &ds;
+    args[9] = &has_seed; args[10] = &num;  args[11] = &den;
+    args[12] = &range; args[13] = &hexit;  args[14] = &dout;
+    if (p_cuLaunchKernel(o->k_lrs, 1, 1, 1, 64, 1, 1, 0, NULL, args,
+                         NULL) != CUDA_SUCCESS)
+        return AEG_EBACKEND;
+    CU_CK(p_cuMemcpyDtoH_v2(out, dout, nb * 3 * sizeof(int)));
+    return AEG_OK;
+}
+
 static void cuda_sync(void *priv)
 {
     cuda_ctx *o = (cuda_ctx *)priv;
@@ -639,7 +687,8 @@ static int nvrtc_load(void **lib)
 /* The kernels the backend looks up in the module. */
 static const char *const aeg_cuda_kernels[] = {
     "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
-    "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch", NULL
+    "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch",
+    "lowres_search", NULL
 };
 
 /* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
@@ -756,6 +805,7 @@ static int cuda_build_module(cuda_ctx *o)
     fn[0] = &o->k_sad; fn[1] = &o->k_tq; fn[2] = &o->k_iq;
     fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
     fn[6] = &o->k_tqiq; fn[7] = &o->k_tqdc; fn[8] = &o->k_iqdc;
+    fn[9] = &o->k_lrs;
     for (k = 0; aeg_cuda_kernels[k]; k++)
         if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
             CUDA_SUCCESS)
@@ -857,6 +907,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     o->k_tqiq = src->k_tqiq;
     o->k_tqdc = src->k_tqdc;
     o->k_iqdc = src->k_iqdc;
+    o->k_lrs = src->k_lrs;
     o->cus = src->cus;
     o->mem = src->mem;
     memcpy(o->name, src->name, sizeof(o->name));
@@ -873,6 +924,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     out->interp_plane = cuda_interp_plane;
     out->ref_upload = cuda_ref_upload;
     out->satd_batch = cuda_satd_batch;
+    out->lowres_search = cuda_lowres_search;
     out->sync = cuda_sync;
     out->destroy = cuda_destroy;
     out->clone = cuda_clone;
@@ -960,6 +1012,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops, int want)
     ops->interp_plane = cuda_interp_plane;
     ops->ref_upload = cuda_ref_upload;
     ops->satd_batch = cuda_satd_batch;
+    ops->lowres_search = cuda_lowres_search;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
     ops->clone = cuda_clone;

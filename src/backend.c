@@ -233,6 +233,28 @@ static int cpu_satd_batch(void *priv, const pixel *cur, int cstride, int bw,
     return AEG_OK;
 }
 
+/* the reference of lowres_search: the lookahead's own search */
+static int cpu_lowres_search(void *priv, const uint8_t *cur,
+                             const uint8_t *ref, int stride, int w, int h,
+                             const int *seed, int num, int den, int range,
+                             int *out)
+{
+    aeg_lowres c, r;
+
+    (void)priv;
+    c.mb_w = r.mb_w = w / 8;
+    c.mb_h = r.mb_h = h / 8;
+    c.w = r.w = w;
+    c.h = r.h = h;
+    c.stride = r.stride = stride;
+    c.mem = r.mem = NULL;
+    c.plane = (uint8_t *)cur;
+    r.plane = (uint8_t *)ref;
+    aeg_lowres_search_seeded(&c, &r, out, out + 2 * c.mb_w * c.mb_h, seed,
+                             num, den, range);
+    return AEG_OK;
+}
+
 void aeg_be_cpu_ops(aeg_be_ops *ops)
 {
     memset(ops, 0, sizeof(*ops));
@@ -247,6 +269,7 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->interp_plane = cpu_interp_plane;
     ops->ref_upload = cpu_ref_upload;
     ops->satd_batch = cpu_satd_batch;
+    ops->lowres_search = cpu_lowres_search;
     snprintf(ops->desc, sizeof(ops->desc), "cpu");
 }
 
@@ -423,6 +446,21 @@ static int g_interp_plane(void *priv, const pixel *ref, int rstride, int w,
         return AEG_OK;
     return l->g->cpu.interp_plane(l->g->cpu.priv, ref, rstride, w, h, which,
                                   dst, dstride);
+}
+
+static int g_lowres_search(void *priv, const uint8_t *cur,
+                           const uint8_t *ref, int stride, int w, int h,
+                           const int *seed, int num, int den, int range,
+                           int *out)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.lowres_search(l->dev.priv, cur, ref, stride, w,
+                                            h, seed, num, den, range, out),
+                    "lowres_search"))
+        return AEG_OK;
+    return l->g->cpu.lowres_search(l->g->cpu.priv, cur, ref, stride, w, h,
+                                   seed, num, den, range, out);
 }
 
 static int g_sse_batch(void *priv, const pixel *a, int sa, const pixel *b,
@@ -609,6 +647,7 @@ static int be_guard_wrap(aeg_be_ops *ops)
     }
     if (ops->interp_plane) ops->interp_plane = g_interp_plane;
     if (ops->sse_batch) ops->sse_batch = g_sse_batch;
+    if (ops->lowres_search) ops->lowres_search = g_lowres_search;
     if (ops->ref_upload && ops->satd_batch) {
         ops->ref_upload = g_ref_upload;
         ops->satd_batch = g_satd_batch;
@@ -805,8 +844,10 @@ static void dispatch_update(aeg_dispatcher *d)
             d->use_gpu[i] = 0;
             continue;
         }
-        /* the coefficient stages are placed by aeg_dispatch_coef_pick() */
-        if (i == AEG_STAGE_TRANSFORM || i == AEG_STAGE_IQUANT_IDCT)
+        /* the coefficient stages are placed by aeg_dispatch_coef_pick(),
+         * the lookahead by aeg_dispatch_la_pick() */
+        if (i == AEG_STAGE_TRANSFORM || i == AEG_STAGE_IQUANT_IDCT ||
+            i == AEG_STAGE_LOOKAHEAD)
             continue;
         /* Every other stage stays on the CPU unless -s puts it on a device.
          * Of them only inter prediction has a device form, and that form
@@ -848,6 +889,54 @@ void aeg_dispatch_update(aeg_dispatcher *d)
  * The first picture on each side is not counted: it pays one-off costs (the
  * OpenCL runtime compiles a kernel at its first launch, the buffers are
  * allocated) that would otherwise decide the comparison. */
+/* Placing the lookahead's lowres search.  Unlike the motion search, the
+ * device form is the same search (the kernel walks the field's diagonals
+ * in the CPU's dependency order, tests/backend_check.c), so the output
+ * cannot depend on the choice and plain timing may decide it.  Each call is
+ * one field; the first one on each side pays one-off costs (the kernel's
+ * first launch, the buffers) and is not counted. */
+#define AEG_LA_PROBE 4
+#define AEG_LA_RETRY 128
+
+int aeg_dispatch_la_pick(aeg_dispatcher *d)
+{
+    aeg_dispatcher *r;
+    int dev;
+
+    if (d->forced[AEG_STAGE_LOOKAHEAD] >= 0)
+        return d->have_gpu && d->ops.lowres_search &&
+               (d->forced[AEG_STAGE_LOOKAHEAD] == AEG_BACKEND_OPENCL ||
+                d->forced[AEG_STAGE_LOOKAHEAD] == AEG_BACKEND_CUDA);
+    if (!d->have_gpu || !d->ops.lowres_search)
+        return 0;
+    r = disp_lock(d);
+    if (r->la_n[0] <= AEG_LA_PROBE || r->la_n[1] <= AEG_LA_PROBE) {
+        dev = r->la_n[1] <= r->la_n[0];
+    } else {
+        dev = r->la_ns[1] < r->la_ns[0];
+        if (++r->la_since >= AEG_LA_RETRY) {
+            r->la_since = 0;
+            dev = !dev;
+        }
+    }
+    disp_unlock(r);
+    return dev;
+}
+
+void aeg_dispatch_la_done(aeg_dispatcher *d, int dev, int64_t ns, int blocks)
+{
+    aeg_dispatcher *r;
+    int64_t per;
+
+    if (blocks <= 0 || dev < 0 || dev > 1)
+        return;
+    per = ns * 1024 / blocks;
+    r = disp_lock(d);
+    if (r->la_n[dev]++ > 0)
+        r->la_ns[dev] = r->la_n[dev] == 2 ? per : (r->la_ns[dev] * 7 + per) / 8;
+    disp_unlock(r);
+}
+
 #define AEG_COEF_PROBE 3        /* counted pictures per placement and kind */
 #define AEG_COEF_RETRY 64
 

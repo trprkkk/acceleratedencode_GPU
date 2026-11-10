@@ -15275,6 +15275,49 @@ static const int *la_intra(struct aeg_encoder *e, int d)
     return e->la_icost[s];
 }
 
+/* One field's lowres search into f (vectors, then the costs at
+ * 2 * mb_count), on the device when the lookahead stage is placed there:
+ * the kernel is the same search, so the field is the same either way
+ * (tests/backend_check.c), and the placement is left to timing
+ * (aeg_dispatch_la_pick).  Without a device this is the plain call. */
+static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
+                      const aeg_lowres *r, int *f, const int *seed, int num,
+                      int den, int range)
+{
+    const int nb = c->mb_w * c->mb_h;
+    int64_t t0, dt;
+    int dev;
+
+    if (!e->d.have_gpu || !e->d.ops.lowres_search || nb != e->mb_count) {
+        aeg_lowres_search_seeded(c, r, f, f + 2 * e->mb_count, seed, num, den,
+                                 range);
+        return;
+    }
+    dev = aeg_dispatch_la_pick(&e->d);
+    t0 = aeg_now_ns();
+    if (dev) {
+        int rc;
+        AEG_PH(AEG_PH_LOWRES,
+               rc = e->d.ops.lowres_search(e->d.ops.priv, c->plane, r->plane,
+                                           c->stride, c->w, c->h, seed, num,
+                                           den, range, f));
+        if (rc != AEG_OK) {
+            dev = 0;
+            aeg_lowres_search_seeded(c, r, f, f + 2 * nb, seed, num, den,
+                                     range);
+        }
+    } else {
+        aeg_lowres_search_seeded(c, r, f, f + 2 * nb, seed, num, den, range);
+    }
+    dt = aeg_now_ns() - t0;
+    aeg_dispatch_la_done(&e->d, dev, dt, nb);
+    e->st.stage_ns[AEG_STAGE_LOOKAHEAD] += dt;
+    if (dev)
+        e->st.stage_gpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
+    else
+        e->st.stage_cpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
+}
+
 /* The search field of display picture d against display picture r (vectors
  * at f, costs at f + 2 * mb_count), computed once per pair while d is in the
  * ring: the group decision prices the same pair inside several (p0, p1, b)
@@ -15319,13 +15362,8 @@ static const int *la_field(struct aeg_encoder *e, int d, int r)
         if (!t[v].f)
             return NULL;
     }
-    if (seed)
-        aeg_lowres_search_seeded(&e->in_low[s], &e->in_low[r % slots], t[v].f,
-                                 t[v].f + 2 * e->mb_count, seed, dist,
-                                 dist - 1, srange);
-    else
-        aeg_lowres_search(&e->in_low[s], &e->in_low[r % slots], t[v].f,
-                          t[v].f + 2 * e->mb_count);
+    la_search(e, &e->in_low[s], &e->in_low[r % slots], t[v].f, seed,
+              seed ? dist : 1, seed ? dist - 1 : 1, srange);
     t[v].d = d;
     t[v].r = r;
     t[v].age = ++e->la_age;

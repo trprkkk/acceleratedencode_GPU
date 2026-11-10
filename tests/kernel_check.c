@@ -28,6 +28,13 @@ typedef unsigned long long ulong;
 #define AEG_DEVFN static
 static int aeg_mock_gid;
 #define get_global_id(d) (aeg_mock_gid)
+/* lowres_search is the one kernel with a work-group: run as a group of one
+ * item, it walks every diagonal itself, in order, and the barrier between
+ * them has nothing to wait for */
+#define get_local_id(d) 0
+#define get_local_size(d) 1
+#define CLK_GLOBAL_MEM_FENCE 0
+#define barrier(f) ((void)0)
 #include "kernels_gen.c"
 
 static uint32_t rng_state = 12345u;
@@ -163,6 +170,65 @@ static void call_sse(int i)
 {
     (void)i;
     sse_batch(g_a, g_sa, g_b, g_sb, g_tw, g_th, g_ssecount, g_sse);
+}
+
+/* ------------------------------------------------------------------ */
+/* lowres_search: the lookahead's field search                         */
+/* ------------------------------------------------------------------ */
+/* `ref` a shifted, noisy copy of `cur` (so the search has motion to find),
+ * padding included; a seed field of arbitrary vectors; kernel against
+ * aeg_lowres_search_seeded() */
+static int check_lowres(int mb_w, int mb_h, int seeded)
+{
+    aeg_lowres c, r;
+    const int nb = mb_w * mb_h, num = 3, den = 2, range = seeded ? 40 : 16;
+    int *seed = (int *)malloc(sizeof(int) * 2 * (size_t)nb);
+    int *got = (int *)malloc(sizeof(int) * 3 * (size_t)nb);
+    int *want = (int *)malloc(sizeof(int) * 3 * (size_t)nb);
+    int x, y, i, bad = 0, dx = rnd(13) - 6, dy = rnd(9) - 4;
+    size_t sz;
+
+    if (aeg_lowres_alloc(&c, mb_w, mb_h) || aeg_lowres_alloc(&r, mb_w, mb_h) ||
+        !seed || !got || !want) {
+        printf("   kernel_check: lowres_search: out of memory\n");
+        return 1;
+    }
+    sz = (size_t)c.stride * (size_t)(c.h + 2 * AEG_LA_PAD);
+    for (y = 0; y < c.h + 2 * AEG_LA_PAD; y++)
+        for (x = 0; x < c.stride; x++)
+            c.mem[(size_t)y * c.stride + x] =
+                (uint8_t)(128 + 60 * ((x / 5 + y / 3) & 1) + rnd(40) - 20 +
+                          (x * y) % 37);
+    for (y = 0; y < r.h + 2 * AEG_LA_PAD; y++)
+        for (x = 0; x < r.stride; x++) {
+            int sx = x + dx, sy = y + dy, v;
+            if (sx < 0) sx = 0;
+            if (sx >= c.stride) sx = c.stride - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= c.h + 2 * AEG_LA_PAD) sy = c.h + 2 * AEG_LA_PAD - 1;
+            v = c.mem[(size_t)sy * c.stride + sx] + rnd(9) - 4;
+            r.mem[(size_t)y * r.stride + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    for (i = 0; i < 2 * nb; i++)
+        seed[i] = rnd(81) - 40;
+    aeg_mock_gid = 0;
+    lowres_search(c.mem, r.mem, c.stride, AEG_LA_PAD, c.w, c.h, mb_w, mb_h,
+                  seed, seeded, num, den, range, AEG_LA_RANGE, got);
+    aeg_lowres_search_seeded(&c, &r, want, want + 2 * nb,
+                             seeded ? seed : NULL, num, den, range);
+    for (i = 0; i < 3 * nb; i++)
+        if (got[i] != want[i])
+            bad++;
+    if (bad)
+        printf("   kernel_check: lowres_search %dx%d%s: %d of %d differ\n",
+               mb_w, mb_h, seeded ? " seeded" : "", bad, 3 * nb);
+    (void)sz;
+    aeg_lowres_free(&c);
+    aeg_lowres_free(&r);
+    free(seed);
+    free(got);
+    free(want);
+    return bad != 0;
 }
 
 int main(void)
@@ -610,7 +676,16 @@ int main(void)
             free(plane[t]);
     }
 
+    {
+        static const int lsz[][2] = { { 1, 1 }, { 2, 1 }, { 1, 3 }, { 7, 5 },
+                                      { 22, 18 }, { 40, 22 } };
+        for (t = 0; t < 6; t++) {
+            fail |= check_lowres(lsz[t][0], lsz[t][1], 0);
+            fail |= check_lowres(lsz[t][0], lsz[t][1], 1);
+        }
+    }
+
     if (!fail)
-        printf("   kernel_check: 9 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 10 kernels agree with the CPU reference\n");
     return fail;
 }

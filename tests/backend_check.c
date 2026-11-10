@@ -489,6 +489,54 @@ static void check_threads(int w, int h, int lanes)
     pic_free(&wk[1].cur);
 }
 
+/* lowres_search on lowres planes allocated as the lookahead allocates them
+ * (aeg_lowres_alloc), the reference a shifted noisy copy, with and without
+ * a seed field */
+static void check_lowres(int mb_w, int mb_h, int seeded)
+{
+    aeg_lowres c, r;
+    const int nb = mb_w * mb_h, rows = mb_h * 8 + 2 * AEG_LA_PAD;
+    const int range = seeded ? 48 : AEG_LA_RANGE;
+    int *seed = (int *)malloc(sizeof(int) * 2 * (size_t)nb);
+    int *a = (int *)malloc(sizeof(int) * 3 * (size_t)nb);
+    int *b = (int *)malloc(sizeof(int) * 3 * (size_t)nb);
+    int x, y, i, dx = rnd(15) - 7, dy = rnd(11) - 5;
+
+    if (aeg_lowres_alloc(&c, mb_w, mb_h) || aeg_lowres_alloc(&r, mb_w, mb_h) ||
+        !seed || !a || !b) {
+        check(0, "lowres_search (allocation)");
+        return;
+    }
+    for (y = 0; y < rows; y++)
+        for (x = 0; x < c.stride; x++)
+            c.mem[(size_t)y * c.stride + x] =
+                (uint8_t)(100 + 50 * ((x / 6 + y / 4) & 1) + rnd(30) +
+                          (x * 3 + y * 5) % 41);
+    for (y = 0; y < rows; y++)
+        for (x = 0; x < r.stride; x++) {
+            int sx = x + dx, sy = y + dy, v;
+            sx = sx < 0 ? 0 : sx >= c.stride ? c.stride - 1 : sx;
+            sy = sy < 0 ? 0 : sy >= rows ? rows - 1 : sy;
+            v = c.mem[(size_t)sy * c.stride + sx] + rnd(7) - 3;
+            r.mem[(size_t)y * r.stride + x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    for (i = 0; i < 2 * nb; i++)
+        seed[i] = rnd(61) - 30;
+    memset(a, 0x55, sizeof(int) * 3 * (size_t)nb);
+    memset(b, 0xaa, sizeof(int) * 3 * (size_t)nb);
+    cpu.lowres_search(cpu.priv, c.plane, r.plane, c.stride, c.w, c.h,
+                      seeded ? seed : NULL, 5, 4, range, a);
+    dev.lowres_search(dev.priv, c.plane, r.plane, c.stride, c.w, c.h,
+                      seeded ? seed : NULL, 5, 4, range, b);
+    check(!memcmp(a, b, sizeof(int) * 3 * (size_t)nb),
+          seeded ? "lowres_search (seeded)" : "lowres_search");
+    aeg_lowres_free(&c);
+    aeg_lowres_free(&r);
+    free(seed);
+    free(a);
+    free(b);
+}
+
 int main(int argc, char **argv)
 {
     int which = AEG_BACKEND_AUTO, k;
@@ -520,6 +568,15 @@ int main(int argc, char **argv)
         pic_free(&cur);
         for (i = 0; i < 4; i++)
             pic_free(&planes[i]);
+    }
+    if (dev.lowres_search) {
+        /* QCIF, the long clips' cockL, 1080p, and the degenerate shapes */
+        static const int lsz[][2] = { { 11, 9 }, { 40, 22 }, { 120, 68 },
+                                      { 1, 1 }, { 1, 7 }, { 9, 1 } };
+        for (k = 0; k < 6; k++) {
+            check_lowres(lsz[k][0], lsz[k][1], 0);
+            check_lowres(lsz[k][0], lsz[k][1], 1);
+        }
     }
     check_threads(176, 144, 0);
     check_threads(176, 144, 1);

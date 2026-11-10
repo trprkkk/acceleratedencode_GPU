@@ -733,6 +733,7 @@ extern int aeg_log_level;
 /* Lookahead (lookahead.c): half-resolution source luma and the cost estimate
  * the adaptive B-picture decision is made on. */
 #define AEG_LA_PAD 32          /* lowres padding, in lowres samples */
+#define AEG_LA_RANGE 16        /* lowres search range and hexagon steps */
 typedef struct aeg_lowres {
     int mb_w, mb_h;            /* one 8x8 lowres block per macroblock */
     int w, h, stride;

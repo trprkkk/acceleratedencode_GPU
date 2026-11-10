@@ -7372,3 +7372,64 @@ algorithm. A field depends on another only through its seed (the same
 picture at distance n−1), so independent fields run concurrently. Every
 other lowres operation (downsampling, intra cost, the inter and bidir
 costs) is independent per block.
+
+## The lookahead's lowres search on the device (`-s la=`)
+
+The first step of the design: the lowres motion search of each lookahead
+field (the pass from one picture to another at distance n) now has a device
+form, kernel `lowres_search` (OpenCL and CUDA, shared source in
+`src/kernels.h`).
+
+- **The same search, not a new algorithm.** One work-group per field walks
+  the field's anti-diagonals (block x = t − 2y). The blocks of one diagonal
+  depend only on diagonals t−1 (left, top-right) and t−2 (top), so a barrier
+  between diagonals reproduces the CPU's raster order. Seeded and unseeded
+  searches, the seed scaling, the clamping to the padding and the vector
+  cost are the CPU's exactly. The output is the CPU's vectors and costs,
+  bit for bit, so where it runs can only change the speed.
+- **Placed by timing**, per field, like the coefficient stages. Each side is
+  probed four times (the first call of each is not counted, since it holds
+  compilation and allocation), then an EMA of the time per 1024 blocks
+  decides. The slower side is re-tried every 128 fields. `-s la=cpu|opencl|cuda`
+  forces it. New stage `AEG_STAGE_LOOKAHEAD` (CLI name `la`, stats line
+  `stage lookahead`).
+- **Checks.**
+  - `kernel_check` runs the kernel source as C (a one-item work-group
+    walks every diagonal itself) against `aeg_lowres_search_seeded()`.
+    It covers 6 sizes from 1×1 to 40×22 blocks, each with and without a
+    seed, with a shifted noisy reference so that the vectors are non-zero.
+  - `backend_check` compares the real device op with the CPU op on
+    planes allocated as the lookahead allocates them. It covers QCIF,
+    640×352, 1080p (120×68 blocks), 1×1, 1×7 and 9×1, seeded and
+    unseeded. A deliberately broken kernel (cost + 1) makes it fail 12
+    checks, which proves that the guard does not mask the device.
+  - `gpu_validate.sh`'s forced run now also forces `la`.
+- **On PoCL**, cockL 640×352, 40 frames, CRF 24, the encode with the
+  lookahead forced to the device is byte-identical to the CPU build at
+  p1/p2/p3/p4. The same holds with `--frame-threads 2`, `-t 2`, PAFF,
+  MBAFF, field coding and VBV. NVRTC compiles the kernel for every
+  architecture.
+
+| cockL, 40 frames, serial | lookahead stage, CPU | on PoCL (forced) | auto |
+|---|---|---|---|
+| p3 | 267 ms of 5.55 s | 1165-1241 ms | 294 ms, 9 % on the device (probes); total 5.53 s |
+| p4 | 266-268 ms of 7.16 s | 1134-1205 ms | |
+
+PoCL is a 2-core CPU running one work-group per field, so 4.5× slower is
+expected. The timing placement correctly keeps the stage on the CPU there.
+Whether a real GPU wins is unmeasured.
+
+**The search is only about 5 % of the time** (267 ms of 5.5 s at p3). The
+rest of the 15 % lowres phase is downsampling, intra cost, the bidir costs
+and the trellis's frame costs. To reach the 1.14-1.33× ceiling above, the
+following steps are needed:
+
+1. Keep the lowres planes resident on the device. They are currently
+   transferred on every call.
+2. Run independent fields in one launch (one work-group each). The backward
+   fields of a lookahead pass are independent.
+3. Move the per-block lowres operations (downsampling, intra and the
+   bidir costs) to the device.
+4. Then the frame-level asynchronous ME candidates (hierarchical search,
+   top-K, CPU refinement). That step needs its own CPU reference
+   implementation and a BD-rate check.

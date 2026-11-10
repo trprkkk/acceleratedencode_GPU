@@ -34,7 +34,7 @@
 #include <string.h>
 
 #define LA_PAD AEG_LA_PAD
-#define LA_RANGE 16          /* search range, in lowres samples          */
+#define LA_RANGE AEG_LA_RANGE /* search range, in lowres samples         */
 #define LA_LAMBDA 1          /* x264's lambda at its lookahead QP (12)   */
 #define LA_INTRA_PENALTY (5 * LA_LAMBDA + 4)
 

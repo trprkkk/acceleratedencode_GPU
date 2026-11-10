@@ -71,7 +71,7 @@ static void usage(void)
 "                   (PoCL) only with -b opencl\n"
 "  --device <n>     device n of that backend (the #n of --list-devices;\n"
 "                   default: the first GPU)\n"
-"  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr\n"
+"  -s <stage=be>    force one stage: est,sad,inter,tq,iq,deblock,intra,recon,psnr,la\n"
 "  -p <preset>      0=ultrafast 1=fast 2=medium 3=slow 4=veryslow\n"
 "  --no-8x8dct      use only 4x4 luma transforms (drops High profile)\n"
 "  --no-cabac       code the macroblock layer with CAVLC instead of CABAC\n"
@@ -518,7 +518,8 @@ static int parse_backend(const char *s)
 static int parse_stage(const char *s)
 {
     static const char *names[] = {
-        "est", "sad", "inter", "tq", "iq", "deblock", "intra", "recon", "psnr"
+        "est", "sad", "inter", "tq", "iq", "deblock", "intra", "recon", "psnr",
+        "la"
     };
     int i;
     for (i = 0; i < AEG_STAGE_COUNT; i++)

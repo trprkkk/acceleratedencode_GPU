@@ -92,7 +92,8 @@ enum aeg_stage {
     AEG_STAGE_INTRA_PRED  = 6, /* intra prediction of all modes             */
     AEG_STAGE_RECON       = 7, /* residual add / reconstruction             */
     AEG_STAGE_PSNR        = 8, /* distortion statistics                      */
-    AEG_STAGE_COUNT       = 9
+    AEG_STAGE_LOOKAHEAD   = 9, /* the lookahead's lowres motion search       */
+    AEG_STAGE_COUNT       = 10
 };
 
 AEG_API const char *aeg_stage_name(int stage);

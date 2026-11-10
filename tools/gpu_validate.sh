@@ -28,8 +28,9 @@
 # device, else an OpenCL GPU).  Set BE=opencl (or BE=cuda) to run them all on
 # that backend -- the way to reach PoCL, an OpenCL runtime on the CPU -- and to
 # add one more run that *forces* the two
-# coefficient stages and the interpolation planes through that backend with
-# `-s tq=... -s iq=... -s inter=...`.  The
+# coefficient stages, the interpolation planes and the lookahead's lowres
+# search through that backend with
+# `-s tq=... -s iq=... -s inter=... -s la=...`.  The
 # dispatcher is free not to pick those stages (it may measure the CPU as
 # faster), in which case `auto` is silently all-CPU; that forced run is the one
 # that tells whether the batched form pays for itself on the device.
@@ -126,7 +127,8 @@ run search AEG_SEED=1 AEG_PARFULL=1 -- $DEV "$@" || fail=1
 # the device must reproduce it byte for byte
 run searchcpu AEG_SEED=1 AEG_PARFULL=1 -- -b cpu "$@" || fail=1
 if [ -n "${BE:-}" ]; then
-    run stageforce -- $DEV -s "tq=$BE" -s "iq=$BE" -s "inter=$BE" "$@" || fail=1
+    run stageforce -- $DEV -s "tq=$BE" -s "iq=$BE" -s "inter=$BE" -s "la=$BE" \
+        "$@" || fail=1
 fi
 run all AEG_SEED=1 AEG_PARFULL=1 AEG_COEF_BATCH=1 AEG_RD_BATCH=1 -- $DEV "$@" \
     || fail=1

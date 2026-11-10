@@ -20,7 +20,8 @@ for the point-by-point answer to an external review):
   Whether any device placement is faster than the CPU is unmeasured.
 * **What `-b auto` puts on a device:** a GPU only (a CUDA device, else an
   OpenCL GPU; `-b opencl` is needed for PoCL), and on it only the two
-  coefficient stages of P/B pictures, by timing whole pictures both ways.
+  coefficient stages of P/B pictures, by timing whole pictures both ways,
+  and the lookahead's lowres search, by timing fields both ways.
   Everything else stays on the CPU unless `-s stage=backend` forces it.
   The device paths are per-macroblock batches with blocking transfers -- a
   correctness scaffold, not a GPU-resident design.
@@ -142,11 +143,12 @@ parallel, while the serial stages (entropy coding, bitstream assembly, rate
 control) are not.  This project therefore splits the encoder into two classes:
 
 The middle column says where a stage *can* run.  Under `-b auto` only the
-two coefficient rows are placed on a device (by measurement, below); the
-others run there only when `-s` forces them.
+two coefficient rows and the lookahead row are placed on a device (by
+measurement, below); the others run there only when `-s` forces them.
 
 | Stage | Where it runs | Why |
 |---|---|---|
+| Lookahead: the lowres motion search of each field (picture pair) | GPU (`lowres_search`, one work-group per field walking its anti-diagonals, `-s la=`), CPU otherwise | a block predicts only from its left, top and top-right neighbours, so the blocks of one anti-diagonal are independent and the walk is the CPU's raster order: the same field, byte for byte |
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
 | Whole-frame parallel search rounds (8 neighbours of every macroblock's best vector, four rounds) | GPU (`sad_batch`, one launch per round) | a whole picture's search as four batched calls instead of a serial hex walk per macroblock |
 | Fractional refinement as rounds (8 quarter/half-pel neighbours of every macroblock, up to three rounds at each step) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | each round is independent across macroblocks; replaces the per-macroblock subpel walk outright |
@@ -172,7 +174,10 @@ launches and the batch's host work included); the faster side stays, with 10%
 hysteresis, and the slower one is re-tried every 64 pictures.  The motion
 search is never placed by timing, because its device form is a different
 search and the stream would then depend on the machine's speed; `-s est=`
-forces it.  No other stage is placed automatically: inter prediction is the
+forces it.  The lookahead's lowres search is placed by timing too, per field
+(each side probed four times, the first call of each not counted, the slower
+re-tried every 128 fields): its kernel is the same search, so the choice
+cannot change the stream.  No other stage is placed automatically: inter prediction is the
 only one with a device form, and that form rebuilds every sub-sample plane of
 a reference per call where the CPU keeps them, so it cannot win; `-s inter=`
 forces it.  `--calibrate` (`aeg_calibrate()`) measures the fixed cost of a

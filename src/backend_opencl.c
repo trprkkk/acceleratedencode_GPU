@@ -47,6 +47,7 @@ typedef intptr_t cl_context_properties;
 #define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
 #define CL_DEVICE_MAX_COMPUTE_UNITS 0x1002
 #define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
+#define CL_KERNEL_WORK_GROUP_SIZE 0x11B0
 
 /* The OpenCL entry points are resolved at run time so that the encoder keeps
  * building (and running on the CPU) on machines without an OpenCL loader. */
@@ -69,6 +70,7 @@ static void ocl_load_error(const char *name)
     X(cl_int, clBuildProgram, (cl_program, cl_uint, const cl_device_id *, const char *, void *, void *)) \
     X(cl_int, clGetProgramBuildInfo, (cl_program, cl_device_id, cl_uint, size_t, void *, size_t *)) \
     X(cl_kernel, clCreateKernel, (cl_program, const char *, cl_int *)) \
+    X(cl_int, clGetKernelWorkGroupInfo, (cl_kernel, cl_device_id, cl_uint, size_t, void *, size_t *)) \
     X(cl_int, clSetKernelArg, (cl_kernel, cl_uint, size_t, const void *)) \
     X(cl_int, clEnqueueNDRangeKernel, (cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, const void *, void *)) \
     X(cl_int, clEnqueueWriteBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void *, cl_uint, const void *, void *)) \
@@ -96,6 +98,8 @@ typedef struct ocl_ctx {
     cl_command_queue queue;
     cl_program prog;
     cl_kernel k_sad, k_tq, k_iq, k_tqiq, k_sse, k_intp, k_satd, k_tqdc, k_iqdc;
+    cl_kernel k_lrs;
+    size_t lrs_wg;              /* lowres_search's work-group size */
     cl_mem buf[NBUF];
     size_t buf_sz[NBUF];
     int is_gpu;
@@ -631,6 +635,66 @@ static int ocl_satd_batch(void *priv, const uint8_t *cur, int cstride, int bw,
     return AEG_OK;
 }
 
+/* The lowres search of one field (aeg_be_ops.lowres_search): both padded
+ * planes and the seed go over, one work-group walks the field's
+ * diagonals, and the vectors and costs come back in one read (slots 8-11,
+ * which nothing else uses). */
+static int ocl_lowres_search(void *priv, const uint8_t *cur,
+                             const uint8_t *ref, int stride, int w, int h,
+                             const int *seed, int num, int den, int range,
+                             int *out)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    const int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8;
+    const int has_seed = seed != NULL, hexit = AEG_LA_RANGE;
+    const size_t pbytes = (size_t)stride * (size_t)(h + 2 * pad);
+    const size_t nb = (size_t)mb_w * (size_t)mb_h;
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    cl_mem mc, mr, ms, mo;
+    size_t local = o->lrs_wg, global = o->lrs_wg;
+    cl_int st = 0;
+
+    if (mb_w <= 0 || mb_h <= 0)
+        return AEG_OK;
+    mc = ocl_buf(o, 8, pbytes, CL_MEM_READ_ONLY);
+    mr = ocl_buf(o, 9, pbytes, CL_MEM_READ_ONLY);
+    mo = ocl_buf(o, 11, nb * 3 * sizeof(int), CL_MEM_READ_WRITE);
+    ms = has_seed ? ocl_buf(o, 10, nb * 2 * sizeof(int), CL_MEM_READ_ONLY)
+                  : mo;   /* not read: any valid buffer */
+    if (!mc || !mr || !mo || !ms)
+        return AEG_EBACKEND;
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mc, CL_TRUE, 0, pbytes, cur - org,
+                                  0, NULL, NULL));
+    OCL_CK(p_clEnqueueWriteBuffer(o->queue, mr, CL_TRUE, 0, pbytes, ref - org,
+                                  0, NULL, NULL));
+    if (has_seed)
+        OCL_CK(p_clEnqueueWriteBuffer(o->queue, ms, CL_TRUE, 0,
+                                      nb * 2 * sizeof(int), seed, 0, NULL,
+                                      NULL));
+    st |= p_clSetKernelArg(o->k_lrs, 0, sizeof(cl_mem), &mc);
+    st |= p_clSetKernelArg(o->k_lrs, 1, sizeof(cl_mem), &mr);
+    st |= p_clSetKernelArg(o->k_lrs, 2, sizeof(int), &stride);
+    st |= p_clSetKernelArg(o->k_lrs, 3, sizeof(int), &pad);
+    st |= p_clSetKernelArg(o->k_lrs, 4, sizeof(int), &w);
+    st |= p_clSetKernelArg(o->k_lrs, 5, sizeof(int), &h);
+    st |= p_clSetKernelArg(o->k_lrs, 6, sizeof(int), &mb_w);
+    st |= p_clSetKernelArg(o->k_lrs, 7, sizeof(int), &mb_h);
+    st |= p_clSetKernelArg(o->k_lrs, 8, sizeof(cl_mem), &ms);
+    st |= p_clSetKernelArg(o->k_lrs, 9, sizeof(int), &has_seed);
+    st |= p_clSetKernelArg(o->k_lrs, 10, sizeof(int), &num);
+    st |= p_clSetKernelArg(o->k_lrs, 11, sizeof(int), &den);
+    st |= p_clSetKernelArg(o->k_lrs, 12, sizeof(int), &range);
+    st |= p_clSetKernelArg(o->k_lrs, 13, sizeof(int), &hexit);
+    st |= p_clSetKernelArg(o->k_lrs, 14, sizeof(cl_mem), &mo);
+    if (st != CL_SUCCESS)
+        return AEG_EBACKEND;
+    OCL_CK(p_clEnqueueNDRangeKernel(o->queue, o->k_lrs, 1, NULL, &global,
+                                    &local, 0, NULL, NULL));
+    OCL_CK(p_clEnqueueReadBuffer(o->queue, mo, CL_TRUE, 0,
+                                 nb * 3 * sizeof(int), out, 0, NULL, NULL));
+    return AEG_OK;
+}
+
 static void ocl_sync(void *priv)
 {
     ocl_ctx *o = (ocl_ctx *)priv;
@@ -656,6 +720,7 @@ static void ocl_destroy(void *priv)
     if (o->k_satd) p_clReleaseKernel(o->k_satd);
     if (o->k_tqdc) p_clReleaseKernel(o->k_tqdc);
     if (o->k_iqdc) p_clReleaseKernel(o->k_iqdc);
+    if (o->k_lrs) p_clReleaseKernel(o->k_lrs);
     if (o->prog) p_clReleaseProgram(o->prog);
     if (o->queue) p_clReleaseCommandQueue(o->queue);
     if (o->ctx) p_clReleaseContext(o->ctx);
@@ -703,9 +768,22 @@ static int ocl_kernels(ocl_ctx *o)
     o->k_satd = p_clCreateKernel(o->prog, "satd_batch", &st);
     o->k_tqdc = p_clCreateKernel(o->prog, "tq_dc_batch", &st);
     o->k_iqdc = p_clCreateKernel(o->prog, "iq_dc_batch", &st);
+    o->k_lrs = p_clCreateKernel(o->prog, "lowres_search", &st);
+    /* one work-group walks a whole field; 64 items cover the longest
+     * diagonal of a 1080p lowres picture (68 block rows) in about one
+     * pass, and the kernel's own limit (its private arrays) may be lower */
+    o->lrs_wg = 64;
+    if (o->k_lrs) {
+        size_t wg = 0;
+        if (p_clGetKernelWorkGroupInfo(o->k_lrs, o->device,
+                                       CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg),
+                                       &wg, NULL) == CL_SUCCESS &&
+            wg > 0 && wg < o->lrs_wg)
+            o->lrs_wg = wg;
+    }
     return o->k_sad && o->k_tq && o->k_iq && o->k_tqiq && o->k_sse &&
-           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc ? AEG_OK
-                                                             : AEG_EBACKEND;
+           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc && o->k_lrs
+               ? AEG_OK : AEG_EBACKEND;
 }
 
 static int ocl_clone(void *priv, aeg_be_ops *out);
@@ -725,6 +803,7 @@ static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
     ops->interp_plane = ocl_interp_plane;
     ops->ref_upload = ocl_ref_upload;
     ops->satd_batch = ocl_satd_batch;
+    ops->lowres_search = ocl_lowres_search;
     ops->sync = ocl_sync;
     ops->destroy = ocl_destroy;
     ops->clone = ocl_clone;
