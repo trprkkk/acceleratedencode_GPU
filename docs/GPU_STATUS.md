@@ -212,3 +212,34 @@ reports only the CPU on the baseline and on this branch alike -- so the ASan
 builds cover the CPU paths, and the device paths are covered without ASan by
 `backend_check` (312 checks against the CPU reference, both backends, both
 queue orders) and `tools/gpu_validate.sh`.
+
+## 9. Quality over a long clip, and per plane
+
+`tools/crf_long.sh` measures the encoder's own reconstruction against the
+source, per quarter of 75 frames, on a 300-frame clip at CRF 24.  (The recon
+dump is in *coding* order, so it is reordered with `--dump-order` first:
+comparing it with the source as it comes out scores the reordering, not the
+encoder -- the first version of this harness reported 25 dB for exactly that
+reason.)
+
+| encoder                 | quarter 1 | 2 | 3 | 4 |
+|-------------------------|-----------|---|---|---|
+| aegenc preset 4         | 45.27 dB  | 45.46 | 45.15 | 45.53 |
+| aegenc preset 2         | 44.62 dB  | 44.46 | 44.27 | 44.52 |
+| x264 `--preset medium`  | 43.53 dB  | 43.45 | 43.49 | 43.56 |
+
+So the rate control holds: the spread across a 300-frame clip is under 0.4 dB
+for either encoder, and there is no trend to correct.  aegenc's CRF 24 sits
+1.8 dB above x264's at 23 % more bits (3314 against 2693 kbit/s), which is the
+same trade the constant-QP curve shows.
+
+`tools/plane_check.sh` compares the two per plane (decode with ffmpeg, psnr
+filter, nothing an encoder claims about itself):
+
+| QP 26 | Y | U | V | bytes |
+|-------|---|---|---|-------|
+| aegenc preset 4 | 50.20 | 49.17 | 49.67 | 1153812 |
+| x264 medium     | 48.87 | 48.20 | 49.07 | 1074448 |
+
+aegenc leads on every plane, U by 0.97 dB and V by 0.60 dB, so the gap is
+uniform -- it is a rate-distortion gap and not a chroma path that is broken.
