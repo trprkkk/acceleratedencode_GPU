@@ -168,6 +168,11 @@ static void usage(void)
 "                   override applies after the rate control has decided, so\n"
 "                   the controller still sees what the zone cost\n"
 "  --qpfile <path>  the same ranges from a file of \"<picture> <qp>\" lines\n"
+  "                   (x264's format: the QP of that one picture, repeated\n"
+  "                   until the next line)\n"
+  "  --lossless      code every macroblock as I_PCM: the samples are written\n"
+  "                   raw, so the reconstruction is the source exactly\n"
+  "                   (an all-I CAVLC stream, four times the bits)\n"
 "                   (x264's format: the QP of that one picture, repeated\n"
 "                   until the next line)\n"
 "  --list-devices   enumerate the compute devices and exit\n"
@@ -818,6 +823,7 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+        else if (!strcmp(a, "--lossless")) p.lossless = 1;
         else if (!strcmp(a, "--qpfile")) {
             const char *path = next_arg(argc, argv, &i);
             char line[128];

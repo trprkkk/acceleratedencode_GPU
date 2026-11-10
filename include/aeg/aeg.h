@@ -288,6 +288,13 @@ typedef struct aeg_params {
      * content, at a higher cost per macroblock.  On by default. */
     int cabac;
     int deblock;              /* 0 = off, 1 = on (default on)           */
+    /* Lossless: every macroblock is coded as I_PCM, so the samples go into
+     * the bitstream raw and come back exactly.  The stream is an all-I stream
+     * (I_PCM is a macroblock type of I slices only) coded with CAVLC, and it
+     * costs about eight bits a sample plus the syntax -- four times ordinary
+     * coding, which buys exactness.  H.264's cheaper lossless (transform
+     * bypass) is not implemented. */
+    int lossless;
     int deblock_alpha;        /* slice_alpha_c0_offset_div2, -6..6      */
     int deblock_beta;         /* slice_beta_offset_div2, -6..6          */
     int search_range;         /* integer pel search range, 0 = preset   */

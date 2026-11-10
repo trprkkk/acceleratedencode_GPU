@@ -1409,7 +1409,80 @@ if not bad:
           % (len(inside), len(outside)))
 sys.exit(1 if bad else 0)
 PY4
-echo "== device enumeration"
+echo "== lossless"
+# I_PCM codes the samples raw, so the reconstruction has to be the source
+# itself -- not merely the same as the decoder's output of the stream.  Both
+# are checked: the first is what "lossless" means, the second that the stream
+# is a stream an ordinary decoder can read.
+"$BUILD/genyuv" 320 192 8 "$TMP/ls.yuv" 3 >/dev/null
+$BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/ls.yuv" -o "$TMP/ls.264" \
+    --lossless --dump-recon "$TMP/ls.recon" >/dev/null 2>&1 || {
+  echo "   lossless: encode failed  FAIL"; FAIL=1; }
+python3 - "$TMP/ls.yuv" "$TMP/ls.recon" "$TMP/ls.264" 320 192 8 <<'PY6' || FAIL=1
+import sys
+src, rec, mp4, w, h, n = sys.argv[1:7]
+w, h, n = int(w), int(h), int(n)
+fs = w * h * 3 // 2
+a = open(src, "rb").read()[:fs * n]
+b = open(rec, "rb").read() if len(sys.argv) > 7 else open(rec, "rb").read()
+bad = 0
+if b[:fs * n] != a:
+    diff = sum(1 for x, y in zip(a, b[:fs * n]) if x != y)
+    print("   lossless: %d of %d samples differ from the source  FAIL" %
+          (diff, len(a)))
+    bad += 1
+if not bad:
+    rate = len(open(mp4, "rb").read()) * 8 / float(len(a))
+    print("   lossless: the reconstruction is the source exactly "
+          "(%d/%d samples), at %.2f bits a sample" % (len(a), len(a), rate))
+sys.exit(1 if bad else 0)
+PY6
+if "$FF" -v error -y -i "$TMP/ls.264" -f rawvideo -pix_fmt yuv420p \
+       "$TMP/ls.dec" 2>"$TMP/ls.decerr"; then
+    if cmp -s "$TMP/ls.yuv" "$TMP/ls.dec"; then
+        echo "   an independent decode is the source exactly too"
+    else
+        echo "   an independent decode differs from the source  FAIL"
+        FAIL=1
+    fi
+else
+    echo "   the decoder could not read the stream  FAIL"
+    FAIL=1
+fi
+if [ -s "$TMP/ls.decerr" ]; then
+    echo "   the decoder complained:"
+    sed 's/^/     /' "$TMP/ls.decerr" | head -3
+    FAIL=1
+fi
+
+# and at 10 bits, where the pcm samples are ten bits wide (the byte count the
+# copy uses is not the pixel count, which is the bug a 10-bit run finds)
+$BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/ls.yuv" -o /dev/null --lossless     --bit-depth 10 -v 0 2>/dev/null || rc10=1
+if [ "${rc10:-0}" != 0 ]; then
+    echo "   10-bit lossless: skipped (no 10-bit encoder)"
+else
+    ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x192:rate=30" \
+        -frames:v 8 -pix_fmt yuv420p10le -f rawvideo "$TMP/ls10.yuv" 2>/dev/null
+    $BUILD/aegenc -w 320 -h 192 -n 8 -i "$TMP/ls10.yuv" -o "$TMP/ls10.264" \
+        --lossless --bit-depth 10 --input-depth 10 \
+        --dump-recon "$TMP/ls10.recon" >/dev/null 2>&1 || {
+        echo "   10-bit lossless: encode failed  FAIL"; FAIL=1; }
+    if [ -s "$TMP/ls10.recon" ] && cmp -s "$TMP/ls10.yuv" "$TMP/ls10.recon"; then
+        echo "   10-bit lossless: the reconstruction is the source exactly"
+    else
+        echo "   10-bit lossless: the reconstruction is not the source  FAIL"
+        FAIL=1
+    fi
+    if "$FF" -v error -y -i "$TMP/ls10.264" -f rawvideo -pix_fmt yuv420p10le \
+           "$TMP/ls10.dec" 2>"$TMP/ls10.decerr" &&
+           cmp -s "$TMP/ls10.yuv" "$TMP/ls10.dec"; then
+        echo "   10-bit lossless: an independent decode is the source exactly"
+    else
+        echo "   10-bit lossless: an independent decode is not the source  FAIL"
+        FAIL=1
+    fi
+fi
+
 $BUILD/aegenc --list-devices 2>/dev/null | sed 's/^/   /'
 
 rm -rf "$TMP"

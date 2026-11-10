@@ -6348,6 +6348,8 @@ static int mb_type_bits(const struct aeg_encoder *e, const mbenc *c, int is_p)
     /* An I_NxN macroblock carries transform_size_8x8_flag right after mb_type
      * (7.3.5.2) whenever the picture parameter set enables the 8x8 transform,
      * whether or not the macroblock actually uses it. */
+    if (c->type == AEG_MB_IPCM)
+        return aeg_ue_bits(25u);   /* I_PCM: the last of the I-slice types */
     if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
         return aeg_ue_bits(is_p ? 5u : 0u) + (e->p.transform_8x8 ? 1 : 0);
     if (!is_p)
@@ -8014,6 +8016,71 @@ static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     e->cmemo_gen++;             /* code_chroma()'s results are per macroblock */
     e->lmemo_n = 0;             /* and so are rd_luma()'s */
+    /* Lossless: every macroblock is I_PCM.  There is nothing to decide -- the
+     * samples are the bitstream -- so the analysis, the candidate list and the
+     * transform paths are all skipped, and the reconstruction is written from
+     * the source directly (the decoder sets an I_PCM macroblock's samples from
+     * the pcm data, with no prediction and no residual). */
+    if (e->p.lossless) {
+        int pl, y, b, bits;
+        double lambda = AEG_LAMBDA(c->qp);
+        const int idx = mby * e->mb_w + mbx;
+        memset(c->level, 0, sizeof(c->level));
+        memset(c->nz, 0, sizeof(c->nz));
+        memset(c->nz8, 0, sizeof(c->nz8));
+        memset(c->mv, 0, sizeof(c->mv));
+        memset(c->pmv, 0, sizeof(c->pmv));
+        memset(c->ref, 0, sizeof(c->ref));
+        for (b = 0; b < 16; b++) {
+            c->intra4[b] = 2;   /* DC: no neighbour prediction in PCM */
+            c->intra8[b >> 2] = 2;
+        }
+        c->type = AEG_MB_IPCM;
+        c->cbp = 0;
+        c->t8 = 0;
+        c->i16_mode = 2;
+        c->chroma_mode = 0;
+        c->nparts = 1;
+        c->sub_type[0] = c->sub_type[1] = c->sub_type[2] = c->sub_type[3] = 0;
+        for (pl = 0; pl < 2; pl++) {
+            const int cs = pl ? 8 : 16, ch = pl ? 8 : 16;
+            (void)cs; (void)ch;
+        }
+        /* luma: 256 samples, then the two 8x8 chroma planes */
+        {
+            /* 16 * sizeof(pixel) bytes, not 16: the samples are 8 or 10 bits
+             * wide and both depths use the same code */
+            const size_t lw = 16 * sizeof(pixel), cw = 8 * sizeof(pixel);
+            pixel *d0 = e->recp[0] + (size_t)(mby * 16) * e->stride[0] + mbx * 16;
+            const pixel *s0 = e->srcp[0] + (size_t)(mby * 16) * e->stride[0] +
+                              mbx * 16;
+            for (y = 0; y < 16; y++)
+                memcpy(d0 + (size_t)y * e->stride[0], s0 + (size_t)y * e->stride[0],
+                       lw);
+            for (pl = 0; pl < 2; pl++) {
+                int yy;
+                pixel *dc = e->recp[1 + pl] +
+                            (size_t)(mby * 8) * e->stride[1] + mbx * 8;
+                const pixel *sc = e->srcp[1 + pl] +
+                                  (size_t)(mby * 8) * e->stride[1] + mbx * 8;
+                for (yy = 0; yy < 8; yy++)
+                    memcpy(dc + (size_t)yy * e->stride[1],
+                           sc + (size_t)yy * e->stride[1], cw);
+            }
+        }
+        /* the macroblock's price: I_PCM's mb_type, the byte alignment, and the
+         * samples.  ue(25) is twenty bits; the alignment is at most seven more. */
+        bits = 20 + 7 + 8 * (256 + 2 * 64);
+        c->hdr_bits = bits;
+        c->bits = bits;
+        c->sse = 0;
+        c->cost = (int64_t)((double)bits * lambda + 0.5);
+        e->mbs[idx].qp = c->qp;
+        if (e->p.cabac)
+            rd_cabac_bits(e, mbx, mby, c, cur_slice_kind(e), 1);
+        return;
+    }
+    e->lmemo_n = 0;             /* and so are rd_luma()'s */
     /* Both snapshots are written by the first candidate that is evaluated, and
      * at least one always is (a preset above 0 with no legal Intra_16x16 mode
      * returns above), but initialising them keeps the compiler from warning
@@ -8644,6 +8711,27 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
 {
     int blk;
     if (!is_p) {
+        if (c->type == AEG_MB_IPCM) {
+            int pl, y;
+            /* the pcm samples are BitDepthY / BitDepthC bits wide (7.3.5), so
+             * an 8-bit and a 10-bit encoder write a different width */
+            const int pw = BIT_DEPTH;
+            aeg_bw_ue(bw, 25);           /* I_PCM (table 7-11) */
+            aeg_bw_align_zero(bw);       /* pcm_alignment_zero_bit */
+            for (y = 0; y < 16; y++)
+                for (blk = 0; blk < 16; blk++)
+                    aeg_bw_put(bw, pw,
+                               e->srcp[0][(size_t)(mby * 16 + y) * e->stride[0] +
+                                         mbx * 16 + blk]);
+            for (pl = 0; pl < 2; pl++)
+                for (y = 0; y < 8; y++)
+                    for (blk = 0; blk < 8; blk++)
+                        aeg_bw_put(bw, pw,
+                                   e->srcp[1 + pl][(size_t)(mby * 8 + y) *
+                                                    e->stride[1] + mbx * 8 +
+                                                    blk]);
+            return;
+        }
         if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
             aeg_bw_ue(bw, 0);           /* I_NxN */
         else
@@ -15388,6 +15476,38 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->bframes > 0 && !pp->cabac) {
         aeg_log(AEG_LOG_WARNING, "aeg: B pictures need CABAC; coding without them");
         pp->bframes = 0;
+    }
+    /* Lossless (I_PCM): an all-I stream coded with CAVLC.  The macroblock type
+     * is an I-slice type, and its samples bypass the arithmetic coder, which
+     * this encoder's CABAC writer does not implement (the transform-bypass
+     * form of lossless is not implemented either, so lossless is the PCM
+     * kind).  Every other per-macroblock tool has nothing left to decide, so
+     * they are off: the samples are the bitstream. */
+    if (pp->lossless) {
+        /* every picture an IDR: I_PCM is a macroblock type of I slices, so a
+         * lossless stream is all-I.  A keyframe every picture also means the
+         * decoder never has to keep a reference, which is the other thing the
+         * lossless bitstream does not have. */
+        pp->gop_size = 1;
+        if (pp->cabac) {
+            aeg_log(AEG_LOG_WARNING,
+                    "aeg: lossless (I_PCM) needs CAVLC; coding with CAVLC");
+            pp->cabac = 0;
+        }
+        if (pp->bframes > 0 || pp->refs > 1) {
+            aeg_log(AEG_LOG_WARNING,
+                    "aeg: lossless is an all-I stream; coding without B "
+                    "pictures and without references");
+            pp->bframes = 0;
+            pp->refs = 1;
+        }
+        pp->trellis = 0;
+        pp->weightp = 0;
+        pp->mbtree = 0;
+        pp->aq_mode = 0;
+        pp->qp_rd = 0;
+        pp->deblock_alpha = -6;
+        pp->deblock_beta = -6;
     }
     /* A second P reference (list0[1], the anchor before the previous one).
      * Measured with tools/abbd.py over the four synthetic clips at preset 3:
