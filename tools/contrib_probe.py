@@ -59,8 +59,12 @@ def main():
     ap.add_argument('--presets', default='medium')
     ap.add_argument('--crf', type=int, default=27)
     ap.add_argument('--reps', type=int, default=3)
+    ap.add_argument('--variants', default='')
     a = ap.parse_args()
     variants = V_X265 if a.encoder == 'x265' else V_X264
+    if a.variants:
+        want = a.variants.split(',')
+        variants = [(n, e) for n, e in variants if n in want]
     rows = []
     for preset in a.presets.split(','):
         for name, extra in variants:

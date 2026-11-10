@@ -142,3 +142,4 @@ x265 2.6 の analysis save/load を使用。cockL 240f、640x352、CRF 27、pres
 - x265: RDO 過半。枝刈りが効くため **1.5〜2x** を狙う。
 - 多コア CPU＋非力 GPU では逆転し得る。起動時計測で GPU 経路を自動無効化。
 - 「同等以上」は全条件勝利ではなく、**速度×画質のパレート曲線**で判定する。
+See docs/DECISION_M8B_ja.md for the multi-point ceiling and GO/NO-GO package (1080p 120f: x265 medium 1.27x/slow 2.20x, x264 medium 1.27x/slow 1.63x).
