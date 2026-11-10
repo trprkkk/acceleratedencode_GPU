@@ -6333,6 +6333,13 @@ static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
                 seed[0] = e->lr_mv[0][(mby * e->mb_w + mbx) * 2 + 0];
                 seed[1] = e->lr_mv[0][(mby * e->mb_w + mbx) * 2 + 1];
             }
+            {
+                const int hi = (mby * e->mb_w + mbx) * 2;
+                if (e->p.mv_hints && hi + 1 < e->p.n_mv_hints) {
+                    seed[0] = e->p.mv_hints[hi];
+                    seed[1] = e->p.mv_hints[hi + 1];
+                }
+            }
             nnb = me_neighbour_cands(e, mbx, mby, 0, nb);
             e->me_hpt = 1 << 30;
             aeg_me_block_t(e->refpl[0][0] + mby * 16 * e->stride[0] + mbx * 16,

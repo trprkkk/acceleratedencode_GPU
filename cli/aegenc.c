@@ -43,8 +43,8 @@ static void usage(void)
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
 "  --mux <mp4|mkv|ts>  mux the Annex-B stream into a container (needs ffmpeg)\n"
+"  --mv-hints <file>  per-MB integer MV hints (prototype, 2*mb_w*mb_h ints)\n"
 
-"  --lossless       lossless coding (experimental; not implemented yet)\n"
 
 "  --crf <float>    constant quality instead of constant QP (x264's scale,\n"
 "                   -12..51 at 10 bits)\n"
@@ -747,6 +747,8 @@ int main(int argc, char **argv)
     char mux_tmp[4096];
     const char *orderpath = NULL;
     const char *qpfilepath = NULL;
+    const char *mvhintspath = NULL;
+    int16_t *mvhints = NULL;
     int *qptab = NULL, qpn = 0;
     aeg_zone *zones = NULL;
     int nzones = 0, zonecap = 0;
@@ -999,6 +1001,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-deblock")) p.deblock = 0;
         else if (!strcmp(a, "--list-devices")) { list_devices(); return 0; }
         else if (!strcmp(a, "--qpfile")) qpfilepath = next_arg(argc, argv, &i);
+        else if (!strcmp(a, "--mv-hints")) mvhintspath = next_arg(argc, argv, &i);
         else if (!strcmp(a, "--roi")) {
             const char *v = next_arg(argc, argv, &i);
             int x, y, w, h, off;
@@ -1341,6 +1344,28 @@ int main(int argc, char **argv)
     p.n_rois = nrois;
     p.width = width;
     p.height = height;
+    if (mvhintspath) {
+        int n = ((width + 15) / 16) * ((height + 15) / 16) * 2;
+        FILE *mf = fopen(mvhintspath, "r");
+        int k;
+        mvhints = (int16_t *)malloc((size_t)n * sizeof(*mvhints));
+        if (!mf || !mvhints) {
+            fprintf(stderr, "cannot open MV hints %s\n", mvhintspath);
+            return 1;
+        }
+        for (k = 0; k < n; k++) {
+            int v;
+            if (fscanf(mf, "%d", &v) != 1 || v < -32768 || v > 32767) {
+                fclose(mf);
+                fprintf(stderr, "MV hints need %d integer values\n", n);
+                return 2;
+            }
+            mvhints[k] = (int16_t)v;
+        }
+        fclose(mf);
+        p.mv_hints = mvhints;
+        p.n_mv_hints = n;
+    }
     p.qp = qp;
     p.fps_num = fps_num;
     p.fps_den = fps_den;

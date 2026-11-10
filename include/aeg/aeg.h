@@ -223,6 +223,11 @@ typedef struct aeg_params {
     int chroma_qp_offset;
     int qp;                   /* 0..51, used by CQP and as ABR start    */
     int lossless;             /* --lossless: 0/1 (not implemented yet) */
+    /* Optional per-macroblock integer MV hints (prototype for the GPU
+     * candidate-injection interface): 2 * mb_w * mb_h int16 values, raster
+     * order, in luma samples.  NULL/0 disables. */
+    const int16_t *mv_hints;
+    int n_mv_hints;
     int bitrate_kbps;         /* ABR target (0 = CQP)                   */
     int rc_mode;              /* aeg_rcmode                             */
     /* AEG_RC_CRF: the quality to hold, on x264's scale (lower is better;

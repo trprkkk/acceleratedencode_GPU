@@ -57,5 +57,6 @@
 ## 関連資料
 
 - コマンド集: `docs/COMMANDS_ja.md`
+- 方針・ロードマップ: `docs/DESIGN_POLICY_ja.md`
 - 進捗・設計: `docs/PROGRESS_ja.md`, `docs/DESIGN_ja.md`
 - 監査: `AUDIT_REPORT_ja.md`, `GPU_REVIEW_ja.md`
