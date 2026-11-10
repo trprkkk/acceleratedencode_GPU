@@ -637,7 +637,20 @@ void aeg_deblock_pair_row(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
     }
 }
 
+static void aeg_deblock_frame_ph(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                       int slice_alpha, int slice_beta, int deblock_idc);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_deblock_frame(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
+                       int slice_alpha, int slice_beta, int deblock_idc)
+{
+    const int prev = aeg_ph_push(AEG_PH_DEBLOCK);
+
+    aeg_deblock_frame_ph(pic, mbs, mb_stride, slice_alpha, slice_beta, deblock_idc);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_deblock_frame_ph(aeg_picture *pic, const aeg_mb *mbs, int mb_stride,
                        int slice_alpha, int slice_beta, int deblock_idc)
 {
     int x, y;

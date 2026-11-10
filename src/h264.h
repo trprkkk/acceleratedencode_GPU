@@ -780,4 +780,38 @@ void *aeg_alloc_aligned(size_t size, size_t align);
 void  aeg_free(void *p);
 int   aeg_cpu_count(void);
 
+/* Phase profiler (AEG_PHASES=1, a measurement aid, off by default).  Wall
+ * time is split into exclusive, nested phases: entering a phase charges the
+ * time since the last switch to the phase being left, so a lowres search
+ * inside the lookahead decision is counted once, as lowres.  Used to bound
+ * what moving the pixel analysis to a device could save (docs/STATUS.md,
+ * "How much could a GPU take off").  Never affects the output. */
+enum {
+    AEG_PH_OTHER = 0,   /* input, rate control, bitstream glue           */
+    AEG_PH_LOWRES,      /* lowres planes, searches, intra and mb costs   */
+    AEG_PH_LADEC,       /* B-adapt, macroblock tree, scene cuts (logic)  */
+    AEG_PH_MEINT,       /* full-resolution integer motion search         */
+    AEG_PH_MESUB,       /* fractional refinement of a motion search      */
+    AEG_PH_ANALYSE,     /* the rest of the macroblock pre-analysis       */
+    AEG_PH_CODE,        /* RD decisions, trellis, coding, reconstruction */
+    AEG_PH_DEBLOCK,     /* the in-loop filter                            */
+    AEG_PH_N
+};
+extern int aeg_ph_on;
+int  aeg_ph_switch(int ph);             /* returns the phase it left      */
+void aeg_ph_reset(void);
+void aeg_ph_report(void);
+static inline int aeg_ph_push(int ph)
+{
+    return aeg_ph_on ? aeg_ph_switch(ph) : -1;
+}
+static inline void aeg_ph_pop(int prev)
+{
+    if (prev >= 0)
+        aeg_ph_switch(prev);
+}
+/* run one statement inside a phase */
+#define AEG_PH(ph, stmt) \
+    do { int ph_prev_ = aeg_ph_push(ph); stmt; aeg_ph_pop(ph_prev_); } while (0)
+
 #endif /* AEG_H264_H */

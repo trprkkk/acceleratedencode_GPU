@@ -117,6 +117,53 @@ int64_t aeg_now_ns(void)
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+/* the phase profiler declared in h264.h */
+int aeg_ph_on;
+static _Atomic int64_t ph_ns[AEG_PH_N];
+static _Thread_local int ph_cur;
+static _Thread_local int64_t ph_t;
+
+int aeg_ph_switch(int ph)
+{
+    const int64_t now = aeg_now_ns();
+    const int old = ph_cur;
+
+    if (ph_t)
+        ph_ns[old] += now - ph_t;
+    ph_t = now;
+    ph_cur = ph;
+    return old;
+}
+
+void aeg_ph_reset(void)
+{
+    int i;
+
+    for (i = 0; i < AEG_PH_N; i++)
+        ph_ns[i] = 0;
+    ph_t = 0;
+    ph_cur = AEG_PH_OTHER;
+}
+
+void aeg_ph_report(void)
+{
+    static const char *names[AEG_PH_N] = {
+        "other", "lowres", "la-decision", "me-integer", "me-subpel",
+        "analyse-rest", "code", "deblock"
+    };
+    int64_t tot = 0;
+    int i;
+
+    aeg_ph_switch(AEG_PH_OTHER);
+    for (i = 0; i < AEG_PH_N; i++)
+        tot += ph_ns[i];
+    fprintf(stderr, "aeg phases (ms, %%):");
+    for (i = 0; i < AEG_PH_N; i++)
+        fprintf(stderr, " %s %.0f %.1f%s", names[i], ph_ns[i] / 1e6,
+                tot ? 100.0 * (double)ph_ns[i] / (double)tot : 0.0,
+                i + 1 < AEG_PH_N ? ";" : "\n");
+}
+
 const char *aeg_stage_name(int stage)
 {
     static const char *names[AEG_STAGE_COUNT] = {

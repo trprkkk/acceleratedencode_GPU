@@ -330,7 +330,20 @@ static int bidir_cost(const aeg_lowres *cur, const aeg_lowres *r0,
  * (cur, ref) only -- not on the other list of a B estimate, nor on whether
  * the macroblock tree or the group decision asked -- and the encoder keeps
  * it for every pair it has searched. */
+static void aeg_lowres_search_ph(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
+                       int *cost);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
+                       int *cost)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_search_ph(cur, ref, mv, cost);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_search_ph(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
                        int *cost)
 {
     aeg_lowres_search_seeded(cur, ref, mv, cost, NULL, 1, 1, LA_RANGE);
@@ -338,7 +351,22 @@ void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
 
 /* The same with an extra candidate per block, seed (2 ints per macroblock,
  * may be NULL) scaled by num / den, and the vectors bounded by +-range. */
+static void aeg_lowres_search_seeded_ph(const aeg_lowres *cur, const aeg_lowres *ref,
+                              int *mv, int *cost, const int *seed, int num,
+                              int den, int range);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,
+                              int *mv, int *cost, const int *seed, int num,
+                              int den, int range)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_search_seeded_ph(cur, ref, mv, cost, seed, num, den, range);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_search_seeded_ph(const aeg_lowres *cur, const aeg_lowres *ref,
                               int *mv, int *cost, const int *seed, int num,
                               int den, int range)
 {
@@ -378,7 +406,18 @@ void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,
 }
 
 /* The intra estimate of every block of `cur` (1 int per macroblock). */
+static void aeg_lowres_intra_ph(const aeg_lowres *cur, int *icost);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_intra(const aeg_lowres *cur, int *icost)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_intra_ph(cur, icost);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_intra_ph(const aeg_lowres *cur, int *icost)
 {
     int x, y;
 
@@ -388,7 +427,26 @@ void aeg_lowres_intra(const aeg_lowres *cur, int *icost)
 }
 
 /* aeg_lowres_cost() from the fields above (mv1/c1 unused without r1). */
+static int64_t aeg_lowres_cost_fields_ph(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1, int *intra_mbs);
+
+/* (timed as a phase, see aeg_ph_switch) */
 int64_t aeg_lowres_cost_fields(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1, int *intra_mbs)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    int64_t r = aeg_lowres_cost_fields_ph(cur, r0, r1, icost, mv0, c0, mv1, c1, intra_mbs);
+
+    aeg_ph_pop(prev);
+    return r;
+}
+
+static int64_t aeg_lowres_cost_fields_ph(const aeg_lowres *cur, const aeg_lowres *r0,
                                const aeg_lowres *r1, const int *icost,
                                const int *mv0, const int *c0,
                                const int *mv1, const int *c1, int *intra_mbs)
@@ -436,7 +494,22 @@ int64_t aeg_lowres_cost_fields(const aeg_lowres *cur, const aeg_lowres *r0,
     return total;
 }
 
+static int64_t aeg_lowres_cost_ph(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra_mbs, int *scratch);
+
+/* (timed as a phase, see aeg_ph_switch) */
 int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra_mbs, int *scratch)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    int64_t r = aeg_lowres_cost_ph(cur, r0, r1, intra_mbs, scratch);
+
+    aeg_ph_pop(prev);
+    return r;
+}
+
+static int64_t aeg_lowres_cost_ph(const aeg_lowres *cur, const aeg_lowres *r0,
                         const aeg_lowres *r1, int *intra_mbs, int *scratch)
 {
     int n = cur->mb_w * cur->mb_h;
@@ -462,7 +535,20 @@ int64_t aeg_lowres_cost(const aeg_lowres *cur, const aeg_lowres *r0,
  * estimate the vectors do not depend on.  Block row y reads `r0` down to
  * lowres row 8 * y + 23 (LA_RANGE below the block, plus the half-sample
  * tap). */
+static void aeg_lowres_mv_rows_ph(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
+                        int y0, int y1);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_mv_rows(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
+                        int y0, int y1)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_mv_rows_ph(cur, r0, mv, y0, y1);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_mv_rows_ph(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
                         int y0, int y1)
 {
     int mb_w = cur->mb_w, x, y;
@@ -500,7 +586,26 @@ void aeg_lowres_mv_rows(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
  * 2 both) and the two vectors of every block, border blocks included.  `mv`
  * holds 4 ints per macroblock (list 0 x/y, list 1 x/y, lowres half-sample
  * units). */
+static void aeg_lowres_mbcosts_fields_ph(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1,
+                               int *intra, int *inter, uint8_t *kind, int *mv);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_mbcosts_fields(const aeg_lowres *cur, const aeg_lowres *r0,
+                               const aeg_lowres *r1, const int *icost,
+                               const int *mv0, const int *c0,
+                               const int *mv1, const int *c1,
+                               int *intra, int *inter, uint8_t *kind, int *mv)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_mbcosts_fields_ph(cur, r0, r1, icost, mv0, c0, mv1, c1, intra, inter, kind, mv);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_mbcosts_fields_ph(const aeg_lowres *cur, const aeg_lowres *r0,
                                const aeg_lowres *r1, const int *icost,
                                const int *mv0, const int *c0,
                                const int *mv1, const int *c1,
@@ -538,7 +643,22 @@ void aeg_lowres_mbcosts_fields(const aeg_lowres *cur, const aeg_lowres *r0,
         }
 }
 
+static void aeg_lowres_mbcosts_ph(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra, int *inter,
+                        uint8_t *kind, int *mv, int *scratch);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
+                        const aeg_lowres *r1, int *intra, int *inter,
+                        uint8_t *kind, int *mv, int *scratch)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_mbcosts_ph(cur, r0, r1, intra, inter, kind, mv, scratch);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_mbcosts_ph(const aeg_lowres *cur, const aeg_lowres *r0,
                         const aeg_lowres *r1, int *intra, int *inter,
                         uint8_t *kind, int *mv, int *scratch)
 {

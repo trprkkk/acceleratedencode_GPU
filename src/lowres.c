@@ -12,7 +12,20 @@
 
 /* Box-filter the luma plane down by two in each direction; the part of the
  * macroblock grid outside the picture and the padding repeat the edge. */
+static void aeg_lowres_build_ph(aeg_lowres *l, const pixel *src, int sstride,
+                      int w, int h);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_build(aeg_lowres *l, const pixel *src, int sstride,
+                      int w, int h)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_build_ph(l, src, sstride, w, h);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_build_ph(aeg_lowres *l, const pixel *src, int sstride,
                       int w, int h)
 {
     aeg_lowres_build_rows(l, src, sstride, w, h, 0, l->h - 1);
@@ -20,7 +33,20 @@ void aeg_lowres_build(aeg_lowres *l, const pixel *src, int sstride,
 
 /* Rows y0..y1 of aeg_lowres_build(); the padding above follows row 0 and the
  * padding below the last row, in the call that builds them. */
+static void aeg_lowres_build_rows_ph(aeg_lowres *l, const pixel *src, int sstride,
+                           int w, int h, int y0, int y1);
+
+/* (timed as a phase, see aeg_ph_switch) */
 void aeg_lowres_build_rows(aeg_lowres *l, const pixel *src, int sstride,
+                           int w, int h, int y0, int y1)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+
+    aeg_lowres_build_rows_ph(l, src, sstride, w, h, y0, y1);
+    aeg_ph_pop(prev);
+}
+
+static void aeg_lowres_build_rows_ph(aeg_lowres *l, const pixel *src, int sstride,
                            int w, int h, int y0, int y1)
 {
     int x, y;

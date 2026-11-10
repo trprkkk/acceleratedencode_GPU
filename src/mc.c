@@ -1099,12 +1099,38 @@ int aeg_me_block_fs(const pixel *ref, int rstride, const pixel *cur,
                           mvx, mvy, sad_out, hpt, fseed);
 }
 
+static int me_block_core(const pixel *ref, int rstride, const pixel *cur,
+                         int cstride, int bw, int bh, int range, int subme,
+                         int pred_x, int pred_y, const int seed[2],
+                         const int (*extra)[2], int nextra, int lambda,
+                         const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                         int *sad_out, int *hpt, const int fseed[2])
+;
+
+/* (the phase profiler's split: the integer search here, the fractional
+ * refinement from the switch in me_block_core) */
 static int me_block_inner(const pixel *ref, int rstride, const pixel *cur,
                           int cstride, int bw, int bh, int range, int subme,
                           int pred_x, int pred_y, const int seed[2],
                           const int (*extra)[2], int nextra, int lambda,
                           const aeg_mc_ctx *mc, int *mvx, int *mvy,
                           int *sad_out, int *hpt, const int fseed[2])
+{
+    const int prev = aeg_ph_push(AEG_PH_MEINT);
+    const int r = me_block_core(ref, rstride, cur, cstride, bw, bh, range,
+                                subme, pred_x, pred_y, seed, extra, nextra,
+                                lambda, mc, mvx, mvy, sad_out, hpt, fseed);
+
+    aeg_ph_pop(prev);
+    return r;
+}
+
+static int me_block_core(const pixel *ref, int rstride, const pixel *cur,
+                         int cstride, int bw, int bh, int range, int subme,
+                         int pred_x, int pred_y, const int seed[2],
+                         const int (*extra)[2], int nextra, int lambda,
+                         const aeg_mc_ctx *mc, int *mvx, int *mvy,
+                         int *sad_out, int *hpt, const int fseed[2])
 {
     int best_cost = 1 << 30, best_sad = 1 << 30, bx = 0, by = 0;
     me_rate rt;
@@ -1214,6 +1240,8 @@ static int me_block_inner(const pixel *ref, int rstride, const pixel *cur,
             qy = fseed[1];
             rt.qonly = 1;
         }
+        if (aeg_ph_on)
+            aeg_ph_switch(AEG_PH_MESUB);
         subpel_refine(ref, rstride, cur, cstride, bw, bh, range, mc, &rt,
                       &qx, &qy, &best_sad);
         *mvx = qx; *mvy = qy;

@@ -6442,7 +6442,18 @@ static int part_gate_pct(const struct aeg_encoder *e)
     return v >= 0 ? v : e->p.preset == 1 ? 100 : 0;
 }
 
+static void analyse_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c);
+
+/* (timed as a phase, see aeg_ph_switch) */
 static void analyse_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    const int prev = aeg_ph_push(AEG_PH_ANALYSE);
+
+    analyse_mb_ph(e, mbx, mby, c);
+    aeg_ph_pop(prev);
+}
+
+static void analyse_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     int mode, n = 0, sad_of[4];
 
@@ -8454,7 +8465,18 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
     restore_chroma(e, mbx, mby, sc);
 }
 
+static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c);
+
+/* (timed as a phase, see aeg_ph_switch) */
 static void code_mb(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
+{
+    const int prev = aeg_ph_push(AEG_PH_CODE);
+
+    code_mb_ph(e, mbx, mby, c);
+    aeg_ph_pop(prev);
+}
+
+static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
 {
     e->cmemo_gen++;             /* code_chroma()'s results are per macroblock */
     e->lmemo_n = 0;             /* and so are rd_luma()'s */
@@ -11365,7 +11387,18 @@ static void rowpost_bands(struct aeg_encoder *e, int final)
         slot_publish(e, e->role_cur, pub);
 }
 
+static void rowpost_deblock_row_ph(struct aeg_encoder *e, const aeg_mb *mbs, int y);
+
+/* (timed as a phase, see aeg_ph_switch) */
 static void rowpost_deblock_row(struct aeg_encoder *e, const aeg_mb *mbs, int y)
+{
+    const int prev = aeg_ph_push(AEG_PH_DEBLOCK);
+
+    rowpost_deblock_row_ph(e, mbs, y);
+    aeg_ph_pop(prev);
+}
+
+static void rowpost_deblock_row_ph(struct aeg_encoder *e, const aeg_mb *mbs, int y)
 {
     int x;
     for (x = 0; x < e->mb_w; x++)
@@ -15623,7 +15656,18 @@ static void schedule(struct aeg_encoder *e)
     schedule_(e);
     e->sched_ns += aeg_now_ns() - t0;
 }
+static void schedule__ph(struct aeg_encoder *e);
+
+/* (timed as a phase, see aeg_ph_switch) */
 static void schedule_(struct aeg_encoder *e)
+{
+    const int prev = aeg_ph_push(AEG_PH_LADEC);
+
+    schedule__ph(e);
+    aeg_ph_pop(prev);
+}
+
+static void schedule__ph(struct aeg_encoder *e)
 {
     struct mbt_ent pl[AEG_RING];
 
@@ -15756,6 +15800,11 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         return NULL;
     }
     memcpy(&e->p, params, sizeof(e->p));
+    /* the phase profiler (a measurement aid; see h264.h) */
+    if (getenv("AEG_PHASES") && atoi(getenv("AEG_PHASES")) > 0) {
+        aeg_ph_on = 1;
+        aeg_ph_reset();
+    }
     pp = &e->p;
     if (pp->bit_depth != 0 && pp->bit_depth != BIT_DEPTH) {
         aeg_set_last_error("bit_depth not supported by this build");
@@ -17956,6 +18005,8 @@ void aeg_encoder_close(aeg_encoder *enc)
     struct aeg_encoder *e = (struct aeg_encoder *)enc;
     if (!e)
         return;
+    if (aeg_ph_on)
+        aeg_ph_report();
     if (getenv("AEG_LATIME"))
         fprintf(stderr, "schedule total %.0f ms, main waited %.0f ms, worker busy %.0f ms, "
                 "workers waited for rows %.0f ms, restarts %lld\n", e->sched_ns / 1e6,

@@ -7303,3 +7303,72 @@ so CRF is the mode that counts.
   +5.75 %: x264 puts its B pictures about 7 QP above P, with 89.9 % skip.
 - x264 weights the lowres bi-prediction by temporal distance (when weightb
   is on); aeg's `bidir_cost` averages the two predictions.
+
+## How much could a GPU take off: the phase profile
+
+This is the upper-bound measurement that the GPU design starts from. If
+the device did its part in zero time, how much faster would the encoder be?
+`AEG_PHASES=1` turns on a phase profiler (`aeg_ph_switch`, h264.h). It
+splits wall time into exclusive, nested phases and prints them when the
+encoder closes. It never changes the output (verified, and `make test` is
+unchanged).
+
+All runs are serial (`-t 1 --frame-threads 1`), CRF 24, `b6b8bab` defaults.
+Each column is the share of single-thread time (%):
+
+| clip, preset | lowres | la-decision | me-integer | me-subpel | analyse-rest | code | deblock | other |
+|---|---|---|---|---|---|---|---|---|
+| cockL p1 | 8.5 | 0.9 | 8.9 | 11.2 | 9.2 | 47.5 | 2.8 | 11.1 |
+| cockL p2 | 7.2 | 0.8 | 8.8 | 13.7 | 6.8 | 51.3 | 2.3 | 9.1 |
+| cockL p3 | 15.2 | 0.3 | 7.4 | 5.7 | 8.1 | 60.0 | 0.9 | 2.5 |
+| cockL p4 | 11.7 | 0.2 | 12.3 | 6.3 | 8.7 | 58.0 | 0.7 | 2.0 |
+| megaL p3 | 17.1 | 0.6 | 6.0 | 7.0 | 8.1 | 57.1 | 0.8 | 3.3 |
+| megaL p4 | 14.2 | 0.5 | 10.5 | 7.6 | 8.9 | 55.2 | 0.7 | 2.5 |
+| treeL p3 | 8.3 | 0.2 | 4.3 | 4.8 | 7.5 | 72.2 | 0.5 | 2.1 |
+| treeL p4 | 6.5 | 0.2 | 10.0 | 5.0 | 8.1 | 68.0 | 0.4 | 1.8 |
+| vtestL p3 | 14.7 | 0.5 | 3.5 | 6.0 | 7.5 | 63.9 | 0.7 | 3.2 |
+| vtestL p4 | 10.7 | 0.4 | 8.7 | 7.6 | 10.2 | 59.5 | 0.5 | 2.4 |
+
+What the phases cover:
+
+- **lowres:** downsampling, the lowres searches, and the intra, inter and
+  bidirectional costs.
+- **la-decision:** the B-adapt trellis, the macroblock tree and scene cuts.
+  These consume the lowres costs.
+- **me-integer:** the full-resolution integer motion search: candidates,
+  UMH, hex.
+- **me-subpel:** the fractional refinement of a motion search.
+- **analyse-rest:** the rest of the macroblock pre-analysis: intra SADs,
+  chroma mode, B bi-refinement, the bookkeeping.
+- **code:** RD mode decision, QP-RD, trellis, CABAC, reconstruction. ME
+  that runs inside RD is counted as ME.
+- **other** (p1/p2) is mostly input reading and the interpolation planes.
+
+**Ceilings** (Amdahl, CPU-bound, with the device phase taking zero time):
+
+- lowres + me-integer (the parts that are pure pixel work on source
+  pictures, the design's first two steps): **13-25 %** of the time, a
+  ceiling of **1.14-1.33x**.
+- Adding the open-loop part of the pre-analysis (intra direction, partition
+  narrowing): 21-34 %, a ceiling of 1.25-1.5x.
+- `code` alone is 47-72 %. Without cutting the number of RD trials, no
+  amount of offloading gets past **1.4-2x**.
+
+This agrees with the external design review's estimate for x264 medium
+(1.4-2x at most, a realistic 1.2-1.5x). Beyond that, the lever is pruning
+RD trials with device hints, which needs the ≤0.1 % BD gate, not more
+offload.
+
+The lowres phase is now the largest single device-friendly block at p3
+(15 % on cockL). The long-B changes above made it so, and it is what the
+next step moves.
+
+**Next step: the lowres search runs in a wavefront.** It predicts each
+block's vector from the left, top and top-right blocks of the same pass.
+Processing anti-diagonals two columns apart (one work-group per field)
+therefore reproduces the CPU's raster order exactly, so a device version
+can be bit-identical to the current output, not merely to a new reference
+algorithm. A field depends on another only through its seed (the same
+picture at distance n−1), so independent fields run concurrently. Every
+other lowres operation (downsampling, intra cost, the inter and bidir
+costs) is independent per block.
