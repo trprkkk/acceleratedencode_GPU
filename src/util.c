@@ -189,8 +189,10 @@ void aeg_params_default(aeg_params *p)
      * That optimum was an artefact of the synthetic clips: on five real clips
      * (docs/STATUS.md, *Real clips*) 12 costs 8-12 points of BD-rate against
      * x264 and the optimum is 4-6, with the I-picture offset and the adaptive
-     * group length on.  4 it is. */
-    p->bframes = 3;
+     * group length on.  4 it is.
+     * -1: the preset decides how many -- three up to preset 2, eight (with
+     * the adaptive decision picking the length) at presets 3 and 4. */
+    p->bframes = -1;
     /* -1: 4, or 2 with the macroblock tree, which already moves the anchors'
      * quantiser down by what the B pictures inherit from them */
     p->b_qp_offset = -1;

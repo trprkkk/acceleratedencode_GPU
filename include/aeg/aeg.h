@@ -226,7 +226,8 @@ typedef struct aeg_params {
      * before it (P only), 1..16 = up to that many B pictures are inserted
      * between an anchor and the next, and the stream is coded out of display
      * order.  The encoder holds `bframes` pictures of lookahead, so
-     * aeg_encoder_encode() returns AEG_EAGAIN until it has them. */
+     * aeg_encoder_encode() returns AEG_EAGAIN until it has them.  -1 (the
+     * default) = the preset's: 8 at presets 3 and 4, otherwise 3. */
     int bframes;
     /* Adaptive B pictures: 1 = `bframes` is the most a group can have, and the
      * lookahead decides group by group how many it gets (none on fast,

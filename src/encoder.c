@@ -106,9 +106,9 @@ typedef struct mbenc {
  * thread per slice, so this also bounds the thread count. */
 #define AEG_MAX_SLICES 64
 
-/* Upper bound on the B pictures between two anchors.  Three is what x264 calls
- * "bframes 3" and what the pyramid would need; more than that buys very little
- * and costs lookahead memory. */
+/* Upper bound on the B pictures between two anchors (x264's is 16 too).
+ * Presets 3 and 4 use 8, the faster ones 3; the ring, the search-field cache
+ * and the per-group arrays are sized from this. */
 #define AEG_MAX_BFRAMES 16
 /* list0 entries of a P picture at most (--ref); a B picture has one per
  * list.  The reference planes, their fractional planes and the per-reference
@@ -595,6 +595,9 @@ struct aeg_encoder {
      * window slides by a group, so most are reused) */
     struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
     int la_sf_n;            /* search fields used per slot (<= LA_SF)        */
+    int la_seed;            /* lowres search at distance n seeded from n - 1:
+                             * the range grows by this much per step, 0 = off */
+    int ba_wide;            /* the B-adapt trellis spans the whole ring       */
     int la_depth;           /* pictures the mbtree looks past the group      */
     int flushing;           /* the input has ended (aeg_encoder_flush)       */
     /* Macroblock tree, per ring slot: the lowres costs of the picture
@@ -15257,11 +15260,18 @@ static const int *la_field(struct aeg_encoder *e, int d, int r)
             t[i].age = ++e->la_age;
             return t[i].f;
         }
-    /* (experimental, AEG_LASEED=range step) at distance n > 1, the field at
-     * n - 1 scaled up as a candidate, and the range grown with n */
-    if (dist > 1 && ENV_INT("AEG_LASEED", 0) > 0) {
+    /* at distance n > 1 the field at n - 1, scaled up, is a candidate of every
+     * block and the range grows with n: a fixed +-16 lowres pels is the same
+     * bound at distance 1 and 8, so a long group's far pictures lost their
+     * motion and looked dearer than they are (x264 seeds the same way).  The
+     * recursion fills the shorter distances, which the group decision prices
+     * anyway, and leaves this field the newest of picture d, so it cannot be
+     * the victim chosen below. */
+    if (dist > 1 && e->la_seed > 0) {
         seed = la_field(e, d, r < d ? r + 1 : r - 1);
-        srange = 16 + ENV_INT("AEG_LASEED", 0) * (dist - 1);
+        if (!seed)
+            return NULL;
+        srange = 16 + e->la_seed * (dist - 1);
         if (srange > 64)
             srange = 64;
     }
@@ -15423,17 +15433,15 @@ static int64_t la_group_cost(struct aeg_encoder *e, int s, int t)
 }
 
 /* where the B-adapt trellis from anchor a ends: last (= a + bframes + 1),
- * or (AEG_BAW, experimental) further into the pictures already in the ring */
+ * or with ba_wide every picture already in the ring, as x264's path search
+ * runs over its whole lookahead: the first group is then chosen knowing
+ * what the ones after it will cost, not just whether it ends well */
 static int ba_end(struct aeg_encoder *e, int a, int last)
 {
-    const int w = ENV_INT("AEG_BAW", 0), avail = e->in_count - 1;
-    int l;
+    int l = e->in_count - 1;
 
-    if (w == 0 || e->p.b_adapt != 2)
+    if (!e->ba_wide || e->p.b_adapt != 2)
         return last;
-    l = w < 0 ? avail : a + w;
-    if (l > avail)
-        l = avail;
     if (l > a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1)
         l = a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1;
     return l > last ? l : last;
@@ -15840,9 +15848,17 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->trellis > 2)
         pp->trellis = 2;
     if (pp->gop_size < 0) pp->gop_size = 250;
-    /* B pictures: three between two anchors at most (AEG_MAX_BFRAMES), and none
-     * at all without CABAC -- the B macroblock layer is only implemented for the
-     * arithmetic coder (see code_slice). */
+    /* B pictures: -1 = the preset's, up to AEG_MAX_BFRAMES, and none at all
+     * without CABAC -- the B macroblock layer is only implemented for the
+     * arithmetic coder (see code_slice).  Presets 3 and 4 allow eight in a
+     * group, as x264's slower presets do: the adaptive decision still picks
+     * the length, and on still or slowly moving content a group of 6-8 is
+     * what x264 veryslow chooses (on the tree clip: 4.99 % behind x264 against
+     * 7.49 % with three; long and long2 sets -0.48 / -0.60 points at preset 4
+     * with the two lookahead changes below; see docs/STATUS.md, "Long B
+     * groups").  The faster presets keep three, which the speed of the
+     * smaller decision pays for. */
+    if (pp->bframes == -1) pp->bframes = pp->preset >= 3 ? 8 : 3;
     if (pp->bframes < 0) pp->bframes = 0;
     if (pp->bframes > AEG_MAX_BFRAMES) pp->bframes = AEG_MAX_BFRAMES;
     if (pp->bframes > 0 && !pp->cabac) {
@@ -15946,6 +15962,10 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         pp->mbtree = 0;
     e->la_depth = pp->mbtree ? pp->rc_lookahead : 0;
     e->la_sf_n = 2 * (pp->bframes + 1) + 2 > 8 ? 2 * (pp->bframes + 1) + 2 : 8;
+    /* presets 3 and 4: the seeded lowres search and the B-adapt trellis over
+     * the whole ring (see la_field and ba_end) */
+    e->la_seed = pp->preset >= 3 ? 8 : 0;
+    e->ba_wide = pp->preset >= 3;
     if (pp->b_qp_offset < 0)
         pp->b_qp_offset = pp->mbtree ? 2 : 4;
     /* (an offset past the QP scale only ever means "as coarse as it goes";

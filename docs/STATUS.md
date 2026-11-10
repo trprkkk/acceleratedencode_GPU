@@ -7225,3 +7225,81 @@ At preset 3, constant QP, against p3 without QP-RD (same clips as above):
   - The CI fuzz job restores the latest corpus from the Actions cache,
     fuzzes it, shrinks it and saves it again.  Each run's 120 s per target
     therefore start from what the earlier runs found.
+
+## Long B groups: eight at presets 3 and 4
+
+**Starting point.** treeL is the clip furthest behind x264 veryslow
+(+7.49 % at p4). Restricting x264 shows why: `-bf 3` costs x264 itself
++4.88 % on treeL, but `-refs 8` only +0.59 %. On still or slowly moving
+content, x264 picks groups of 5-8 B pictures; aeg could not go past 3.
+
+**GOP shape at CRF 24** (B-run length: count):
+
+| clip | x264 veryslow | aeg p4, `--bframes 8` (before the changes below) |
+|---|---|---|
+| megaL | {0:6, 1:8, 2:14, 3:20, 4:9, 5:6, 6:2} | {0:32, 1:3, 2:9, 3:24, 4:12, 5:3} |
+| cockL | {0:13, 1:10, 2:22, 3:26, 4:6, 5:1} | {0:37, 1:11, 2:9, 3:21, 4:11, 6:2} |
+| treeL | {2:1, 3:4, 4:2, 5:5, 7:9, 8:12} | {0:5, 8:26} |
+
+aeg chose far too many anchors back to back (zero-length runs).
+
+**What changed:**
+
+1. **`--bframes` up to 16** (`AEG_MAX_BFRAMES`), as in x264. Fifteen new
+   conformance cases cover groups of 8 and 16, fixed and adaptive, with
+   frame threads, 10-bit, slices, weightp, HRD, and the four interlaced
+   modes.
+2. **Lookahead cost cache.** Each (b, p0, p1) estimate is cached in a
+   direct-mapped table. With 8 B pictures the trellis re-priced the same
+   triples so often that p4 took 14.5 s instead of 8.3 s on 90 frames of
+   cockL. With the cache, `--bframes 8` costs the same time as 3. Output is
+   unchanged.
+3. **Seeded lowres search** (`la_field`, presets 3-4). The ±16 lowres-pel
+   search bound was the same at distance 1 and distance 8. Far pictures
+   lost their motion and looked dearer than they are. Now, at distance n,
+   the field at n−1, scaled by n/(n−1), is a candidate for every block, and
+   the range grows by 8 per step (capped at 64). x264 seeds the same way.
+4. **Trellis over the whole ring** (`ba_end`, presets 3-4). The B-adapt
+   trellis now prices every split of all the pictures in the lookahead, not
+   only the next bframes+1. The first group is then chosen knowing what the
+   later ones will cost, as x264's `slicetype_path` does.
+5. **Defaults.** `params.bframes` is now -1, meaning the preset decides: 8
+   at presets 3 and 4, otherwise 3. p0-p2 output is byte-identical to before.
+
+**CRF vs x264 veryslow** (PSNR BD-rate %):
+
+| config | cockL | vtestL | megaL | long | cockL2 | vtestL2 | megaL2 | treeL | long2 |
+|---|---|---|---|---|---|---|---|---|---|
+| p4 old (bf 3) | +2.44 | -5.57 | +1.11 | -0.67 | +3.25 | -8.16 | -1.82 | +7.49 | +0.19 |
+| p4 bf 8 | +1.11 | -5.51 | +2.10 | -0.77 | +3.44 | -8.90 | -1.16 | +4.99 | -0.41 |
+| p4 bf 8, whole-ring trellis | +1.06 | -5.80 | +1.97 | -0.93 | +3.00 | -8.90 | -1.55 | +5.70 | -0.44 |
+| p4 bf 8, seeded | +1.51 | -6.53 | +1.91 | -1.04 | +3.58 | -8.90 | -1.21 | +5.92 | -0.15 |
+| p4 bf 3, seeded + whole ring | +1.06 | -5.60 | +1.66 | -0.96 | +2.48 | -8.12 | -1.69 | +7.64 | +0.08 |
+| **p4 new** (bf 8, seeded + whole ring) | +1.67 | -6.81 | +1.71 | **-1.15** | +3.44 | -9.16 | -1.68 | +5.75 | **-0.41** |
+| p3 old | +3.15 | -3.64 | +2.40 | +0.64 | +4.24 | -8.38 | -0.93 | +8.32 | +0.81 |
+| p3 bf 3, seeded + whole ring | +1.89 | -3.81 | +3.13 | +0.40 | +3.61 | -8.07 | -0.82 | +8.76 | +0.87 |
+| **p3 new** | +2.76 | -5.07 | +2.96 | **+0.22** | +4.70 | -8.70 | -0.82 | +7.42 | **+0.65** |
+
+The "long" and "long2" columns are the set means. At p4 they move by
+-0.48 / -0.60 points; at p3 by -0.42 / -0.16.
+
+**Constant QP**, main + validation clips, p4 new vs p4 old: mean -0.04 %.
+Per clip it ranges from +2.79 % (mega) to -6.50 % (mega3). Without the
+macroblock tree, a long group's B pictures all get the same fixed offset,
+so CRF is the mode that counts.
+
+**Time** (cockL 240 f, CRF 24, `-t 1`, interleaved runs, 2-core host): about
++5-10 % at both presets (the minimum of four is +1 % at p3 and +9 % at p4).
+
+**Tried and not adopted:**
+
+- `--bframes 16`: treeL +6.37 %, worse than 8.
+- A trellis window of 18 pictures instead of the whole ring: mixed.
+- A range step of 4 instead of 8: one point on megaL, no better.
+
+**Still open:**
+
+- megaL/megaL2 lose 0.5-0.9 points with long groups. treeL is still
+  +5.75 %: x264 puts its B pictures about 7 QP above P, with 89.9 % skip.
+- x264 weights the lowres bi-prediction by temporal distance (when weightb
+  is on); aeg's `bidir_cost` averages the two predictions.
