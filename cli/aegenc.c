@@ -38,10 +38,11 @@ static void usage(void)
 "                   chroma resampled to 4:2:0, then dithered to the coded\n"
 "                   depth (as x264); 8-bit input to a 10-bit stream is\n"
 "                   scaled up exactly\n"
-"  --bit-depth <n>  coded bits per sample: 8 (default) or 10 (High 10\n"
-"                   profile, CPU only; x264 --output-depth 10)\n"
+"  --bit-depth <n>  coded bits per sample: 8 (default), 10 (High 10), or\n"
+"                   12 (experimental; default build rejects 12)\n"
 "  -o <file>        output Annex-B stream (default: stdout)\n"
 "  -q <int>         QP 0..51 (default 23)\n"
+"  --mux <mp4|mkv|ts>  mux the Annex-B stream into a container (needs ffmpeg)\n"
 
 "  --lossless       lossless coding (experimental; not implemented yet)\n"
 

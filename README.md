@@ -7,6 +7,9 @@ no fixed-function hardware encoder is used anywhere**: every pixel operation is
 ordinary SIMD/SIMT compute, so the picture quality is decided by our own
 rate-distortion decisions and transforms, not by a vendor ASIC.
 
+機能マトリクス（既定 ON / opt-in / 未実装 / 凍結）と検証済みコマンドは
+[STATUS](docs/STATUS_ja.md) と [COMMANDS](docs/COMMANDS_ja.md) にまとめています。
+
 > **Status: conformant High-profile encoder core (I, P and B pictures,
 > Intra_16x16, Intra_4x4 and Intra_8x8, the 8x8 luma transform, CABAC,
 > 16x16/16x8/8x16/P_8x8 inter partitioning down to 4x4 sub-partitions, the same
