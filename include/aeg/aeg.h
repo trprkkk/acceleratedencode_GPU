@@ -223,10 +223,10 @@ typedef struct aeg_params {
     int vbv_bufsize_kbits;    /* B: buffer size, 0 = off                */
     int gop_size;             /* keyframe interval, 0 = only first      */
     /* B pictures between two anchors: 0 = every picture predicts from the one
-     * before it (P only), 1..3 = that many B pictures are inserted between an
-     * anchor and the next, and the stream is coded out of display order.  The
-     * encoder holds `bframes` pictures of lookahead, so aeg_encoder_encode()
-     * returns AEG_EAGAIN until it has them. */
+     * before it (P only), 1..16 = up to that many B pictures are inserted
+     * between an anchor and the next, and the stream is coded out of display
+     * order.  The encoder holds `bframes` pictures of lookahead, so
+     * aeg_encoder_encode() returns AEG_EAGAIN until it has them. */
     int bframes;
     /* Adaptive B pictures: 1 = `bframes` is the most a group can have, and the
      * lookahead decides group by group how many it gets (none on fast,

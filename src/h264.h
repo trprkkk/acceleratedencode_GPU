@@ -762,6 +762,9 @@ void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
 void aeg_lowres_intra(const aeg_lowres *cur, int *icost);
 void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
                        int *cost);
+void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,
+                              int *mv, int *cost, const int *seed, int num,
+                              int den, int range);
 int64_t aeg_lowres_cost_fields(const aeg_lowres *cur, const aeg_lowres *r0,
                                const aeg_lowres *r1, const int *icost,
                                const int *mv0, const int *c0,

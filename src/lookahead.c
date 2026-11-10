@@ -145,7 +145,7 @@ static void get_pred(const aeg_lowres *ref, int bx, int by, int hx, int hy,
  * through mv[].  Candidates and predictor are in half-sample units too. */
 static int block_search(const aeg_lowres *cur, const aeg_lowres *ref,
                         int bx, int by, const int (*cand)[2], int ncand,
-                        int px, int py, int *mv)
+                        int px, int py, int *mv, int range)
 {
     static const int hex[6][2] = {
         {-2, 0}, {-1, 2}, {1, 2}, {2, 0}, {1, -2}, {-1, -2}
@@ -158,10 +158,10 @@ static int block_search(const aeg_lowres *cur, const aeg_lowres *ref,
     int lo_y = -by - LA_PAD + 1, hi_y = ref->h - by + LA_PAD - 9;
     int bmx = 0, bmy = 0, best = 0x7fffffff, i, it;
 
-    if (lo_x < -LA_RANGE) lo_x = -LA_RANGE;
-    if (hi_x > LA_RANGE) hi_x = LA_RANGE;
-    if (lo_y < -LA_RANGE) lo_y = -LA_RANGE;
-    if (hi_y > LA_RANGE) hi_y = LA_RANGE;
+    if (lo_x < -range) lo_x = -range;
+    if (hi_x > range) hi_x = range;
+    if (lo_y < -range) lo_y = -range;
+    if (hi_y > range) hi_y = range;
 #define LA_TRY(X, Y) do {                                                    \
         int tx_ = (X), ty_ = (Y), cst_;                                      \
         if (tx_ < lo_x || tx_ > hi_x || ty_ < lo_y || ty_ > hi_y) break;     \
@@ -333,12 +333,21 @@ static int bidir_cost(const aeg_lowres *cur, const aeg_lowres *r0,
 void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
                        int *cost)
 {
+    aeg_lowres_search_seeded(cur, ref, mv, cost, NULL, 1, 1, LA_RANGE);
+}
+
+/* The same with an extra candidate per block, seed (2 ints per macroblock,
+ * may be NULL) scaled by num / den, and the vectors bounded by +-range. */
+void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,
+                              int *mv, int *cost, const int *seed, int num,
+                              int den, int range)
+{
     int mb_w = cur->mb_w, mb_h = cur->mb_h, x, y;
 
     for (y = 0; y < mb_h; y++)
         for (x = 0; x < mb_w; x++) {
             int i = y * mb_w + x;
-            int cand[3][2], nc = 0, px, py;
+            int cand[4][2], nc = 0, px, py;
             int a[2] = {0, 0}, b[2] = {0, 0}, cc[2] = {0, 0};
 
             if (x > 0) {
@@ -354,11 +363,17 @@ void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
                     cand[nc][0] = cc[0]; cand[nc][1] = cc[1]; nc++;
                 }
             }
+            if (seed) {
+                int sx = seed[2 * i] * num, sy = seed[2 * i + 1] * num;
+                cand[nc][0] = (sx + (sx < 0 ? -den / 2 : den / 2)) / den;
+                cand[nc][1] = (sy + (sy < 0 ? -den / 2 : den / 2)) / den;
+                nc++;
+            }
             px = median3(a[0], b[0], cc[0]);
             py = median3(a[1], b[1], cc[1]);
             cost[i] = block_search(cur, ref, 8 * x, 8 * y,
                                    (const int (*)[2])cand, nc, px, py,
-                                   mv + 2 * i);
+                                   mv + 2 * i, range);
         }
 }
 
@@ -476,7 +491,7 @@ void aeg_lowres_mv_rows(const aeg_lowres *cur, const aeg_lowres *r0, int *mv,
             px = median3(a[0], b[0], cc[0]);
             py = median3(a[1], b[1], cc[1]);
             block_search(cur, r0, bx, by, (const int (*)[2])cand, nc, px, py,
-                         mv + 2 * i);
+                         mv + 2 * i, LA_RANGE);
         }
 }
 

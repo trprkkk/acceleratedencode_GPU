@@ -444,6 +444,20 @@ run_case weightp_ref4  320 192 10 5 -q 26 -p 4 --scenecut 0 --ref 4
 run_bcase bframes_ref4 320 192 13 3 1 -q 20 --scenecut 0 -p 4 --ref 4 --b-pyramid 0
 run_bcase bpyr_ref4    320 192 24 3 4 -q 26 -p 4 --ref 4 --scenecut 0
 run_bcase bpyr_ref6ft  320 192 24 3 4 -q 26 -p 4 --ref 6 --scenecut 0 --frame-threads 2
+# Long B runs (up to 16 B pictures between anchors, as in x264): fixed and
+# adaptive groups, the pyramid's single reference B in the middle, an IDR
+# cutting a group short, frame threads, 10 bits, slices, weighted P, the
+# macroblock tree and the HRD.
+run_bcase bframes8      320 192 30 8 4 -q 24 -p 4 --scenecut 0
+run_bcase bframes16_fix 320 192 40 16 4 -q 26 -p 3 --scenecut 0 --b-adapt 0 --b-pyramid 0
+run_bcase bframes16     320 192 40 16 3 -q 26 -p 4 --scenecut 0
+run_bcase bframes8_fix0 320 192 28 8 1 -q 26 -p 2 --scenecut 0 --b-adapt 0 --b-pyramid 0 -g 13
+run_bcase bframes8_a1   320 192 30 8 4 -q 28 -p 2 --scenecut 0 --b-adapt 1
+run_bcase bframes8_ft   320 192 34 8 4 -p 3 --crf 24 --scenecut 0 --frame-threads 3
+run_bcase bframes8_10b  320 192 24 8 4 -q 28 -p 3 --scenecut 0 --bit-depth 10
+run_bcase bframes8_sl   320 192 24 8 4 -q 26 -p 4 --scenecut 0 --slices 3 --ref 6
+run_bcase bframes8_wp   320 192 30 8 5 -q 26 -p 3 --scenecut 0
+run_bcase bframes8_hrd  320 192 40 8 6 -p 3 --crf 20 --vbv-maxrate 400 --vbv-bufsize 200 --nal-hrd
 # Slices: every slice is its own NAL and start code, so a macroblock in the top
 # row of a non-first slice must not predict from anything above it, and each
 # slice's data has to end exactly on its last macroblock (a slice that ends in
@@ -922,7 +936,7 @@ else
 fi
 bad=0
 for args in "-w" "-w 96 -h 64 -q x" "-w 95 -h 64" "-w 96 -h 64 -q 52" \
-            "-w 96 -h 64 --bframes 4" "-w 96 -h 64 --ref 9" "-w 96 -h 64 -p 5" \
+            "-w 96 -h 64 --bframes 17" "-w 96 -h 64 --ref 9" "-w 96 -h 64 -p 5" \
             "-w 96 -h 64 --fps 0" "-w 96 -h 64 --sar 4" "-w 96 -h 64 --direct x" \
             "-w 96 -h 64 --colorprim nope" "-w 64 -h 64 --demuxer y4m" \
             "-w 96 -h 64 --qpmax 0" "-w 96 -h 64 --qpmin 40 --qpmax 30" \
@@ -1028,6 +1042,12 @@ if command -v "$FF" >/dev/null 2>&1; then
     run_bcase paff_hrd 320 192 30 3 6 -p 3 --paff --crf 16 --vbv-maxrate 400 --vbv-bufsize 80 --nal-hrd -g 10
     AEG_FLDFORCE=0000111100001111 \
     run_bcase pm_hrd   176 144 24 3 4 -p 1 --paff-mbaff --bitrate 200 --vbv-maxrate 250 --vbv-bufsize 120 --nal-hrd --slices 2
+    # long B runs in field pictures and MBAFF frames
+    run_bcase fld_b8   176 144 24 8 4 -q 26 -p 3 --field
+    run_bcase mbaff_b8 176 144 24 8 7 -q 26 -p 3 --mbaff --frame-threads 2
+    AEG_FLDFORCE=0000111100001111 \
+    run_bcase paff_b8  176 144 26 8 4 -q 27 -p 4 --paff
+    run_bcase pm_b8    176 144 26 6 7 -p 3 --paff-mbaff --crf 24 --bff
     for c in fld_hrd paff_hrd pm_hrd; do
         if command -v "$FF" >/dev/null 2>&1; then
             python3 "$(dirname "$0")/../tools/hrd_check.py" "$FF" "$TMP/$c.264" \

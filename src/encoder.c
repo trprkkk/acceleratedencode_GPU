@@ -109,7 +109,7 @@ typedef struct mbenc {
 /* Upper bound on the B pictures between two anchors.  Three is what x264 calls
  * "bframes 3" and what the pyramid would need; more than that buys very little
  * and costs lookahead memory. */
-#define AEG_MAX_BFRAMES 3
+#define AEG_MAX_BFRAMES 16
 /* list0 entries of a P picture at most (--ref); a B picture has one per
  * list.  The reference planes, their fractional planes and the per-reference
  * state are indexed 0..AEG_MAX_REFS-1. */
@@ -127,8 +127,14 @@ typedef struct mbenc {
  * most; the input ring holds them on top of a group and its next anchor. */
 #define AEG_MAX_LOOKAHEAD 60
 #define AEG_RING (2 * AEG_MAX_BFRAMES + 6 + AEG_MAX_LOOKAHEAD)
-#define LA_CACHE 512
-#define LA_SF 8      /* lookahead search fields kept per ring slot */
+/* lookahead costs kept (direct-mapped by a hash of the display numbers):
+ * enough for every (p0, p1, b) the macroblock tree's 60-picture window asks
+ * for with 16 B pictures, which the window mostly asks for again after it
+ * slides by a group */
+#define LA_CACHE 16384
+/* lookahead search fields kept per ring slot: a B picture in a group of n
+ * is searched against up to n + 1 pictures on either side */
+#define LA_SF (2 * (AEG_MAX_BFRAMES + 1) + 2)
 typedef struct {
     int     type;
     int     nparts;
@@ -588,7 +594,7 @@ struct aeg_encoder {
     /* lookahead costs already computed, keyed by display indices (the
      * window slides by a group, so most are reused) */
     struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
-    int la_cache_n;
+    int la_sf_n;            /* search fields used per slot (<= LA_SF)        */
     int la_depth;           /* pictures the mbtree looks past the group      */
     int flushing;           /* the input has ended (aeg_encoder_flush)       */
     /* Macroblock tree, per ring slot: the lowres costs of the picture
@@ -15242,13 +15248,24 @@ static const int *la_field(struct aeg_encoder *e, int d, int r)
 {
     int slots = in_slots(e), s = d % slots, i, v = 0;
     struct la_sfield *t = e->la_sf[s];
+    const int dist = d > r ? d - r : r - d;
+    const int *seed = NULL;
+    int srange = 16;
 
-    for (i = 0; i < LA_SF; i++)
+    for (i = 0; i < e->la_sf_n; i++)
         if (t[i].f && t[i].d == d && t[i].r == r) {
             t[i].age = ++e->la_age;
             return t[i].f;
         }
-    for (i = 1; i < LA_SF; i++) {
+    /* (experimental, AEG_LASEED=range step) at distance n > 1, the field at
+     * n - 1 scaled up as a candidate, and the range grown with n */
+    if (dist > 1 && ENV_INT("AEG_LASEED", 0) > 0) {
+        seed = la_field(e, d, r < d ? r + 1 : r - 1);
+        srange = 16 + ENV_INT("AEG_LASEED", 0) * (dist - 1);
+        if (srange > 64)
+            srange = 64;
+    }
+    for (i = 1; i < e->la_sf_n; i++) {
         int sv = t[v].f && t[v].d == d, si = t[i].f && t[i].d == d;
         if (!t[i].f) { v = i; break; }
         if (sv > si || (sv == si && t[i].age < t[v].age))
@@ -15259,8 +15276,13 @@ static const int *la_field(struct aeg_encoder *e, int d, int r)
         if (!t[v].f)
             return NULL;
     }
-    aeg_lowres_search(&e->in_low[s], &e->in_low[r % slots], t[v].f,
-                      t[v].f + 2 * e->mb_count);
+    if (seed)
+        aeg_lowres_search_seeded(&e->in_low[s], &e->in_low[r % slots], t[v].f,
+                                 t[v].f + 2 * e->mb_count, seed, dist,
+                                 dist - 1, srange);
+    else
+        aeg_lowres_search(&e->in_low[s], &e->in_low[r % slots], t[v].f,
+                          t[v].f + 2 * e->mb_count);
     t[v].d = d;
     t[v].r = r;
     t[v].age = ++e->la_age;
@@ -15351,21 +15373,25 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
 static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
                           int *intra)
 {
-    int i, n = e->la_cache_n < LA_CACHE ? e->la_cache_n : LA_CACHE, in = 0;
+    /* (b + 1 is stored, so the zeroed table holds no entry; display numbers
+     * are never negative) */
+    const unsigned hsh = ((unsigned)b * 2654435761u) ^
+                         ((unsigned)(b - p0) * 40503u) ^
+                         ((unsigned)(p1 - b) * 97u);
+    const int i = (int)((hsh ^ (hsh >> 15)) & (LA_CACHE - 1));
+    int in = 0;
     int64_t c;
 
-    for (i = 0; i < n; i++)
-        if (e->la_cache[i].p0 == p0 && e->la_cache[i].p1 == p1 &&
-            e->la_cache[i].b == b) {
-            if (intra)
-                *intra = e->la_cache[i].intra;
-            return e->la_cache[i].c;
-        }
+    if (e->la_cache[i].b == b + 1 && e->la_cache[i].p0 == p0 &&
+        e->la_cache[i].p1 == p1) {
+        if (intra)
+            *intra = e->la_cache[i].intra;
+        return e->la_cache[i].c;
+    }
     c = la_cost(e, p0, p1, b, &in);
-    i = e->la_cache_n++ % LA_CACHE;
     e->la_cache[i].p0 = p0;
     e->la_cache[i].p1 = p1;
-    e->la_cache[i].b = b;
+    e->la_cache[i].b = b + 1;
     e->la_cache[i].c = c;
     e->la_cache[i].intra = in;
     if (intra)
@@ -15396,10 +15422,27 @@ static int64_t la_group_cost(struct aeg_encoder *e, int s, int t)
     return c;
 }
 
+/* where the B-adapt trellis from anchor a ends: last (= a + bframes + 1),
+ * or (AEG_BAW, experimental) further into the pictures already in the ring */
+static int ba_end(struct aeg_encoder *e, int a, int last)
+{
+    const int w = ENV_INT("AEG_BAW", 0), avail = e->in_count - 1;
+    int l;
+
+    if (w == 0 || e->p.b_adapt != 2)
+        return last;
+    l = w < 0 ? avail : a + w;
+    if (l > avail)
+        l = avail;
+    if (l > a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1)
+        l = a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1;
+    return l > last ? l : last;
+}
+
 static int b_adapt_trellis(struct aeg_encoder *e, int a, int last)
 {
-    int64_t best[AEG_MAX_BFRAMES + 3];
-    int from[AEG_MAX_BFRAMES + 3];
+    int64_t best[AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 3];
+    int from[AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 3];
     int n = last - a, i, k;
 
     if (n < 2)
@@ -15508,7 +15551,7 @@ static void mbt_run(struct aeg_encoder *e, struct mbt_ent *pl, int nq,
                     n = mbt_add(pl, n, i, i - 1, -1, 1);
             break;
         }
-        nx = e->p.b_adapt == 2 ? b_adapt_trellis(e, a, last)
+        nx = e->p.b_adapt == 2 ? b_adapt_trellis(e, a, ba_end(e, a, last))
            : e->p.b_adapt ? b_adapt_decide(e, a, last) : last;
         idr = e->p.gop_size > 0 && nx - lidr >= e->p.gop_size;
         n = mbt_group(e, pl, n, a, nx, idr);
@@ -15648,7 +15691,7 @@ static void schedule_(struct aeg_encoder *e)
         }
     }
     if (!idr && e->p.b_adapt == 2)
-        nxt = b_adapt_trellis(e, e->anchor, nxt);
+        nxt = b_adapt_trellis(e, e->anchor, ba_end(e, e->anchor, nxt));
     else if (!idr && e->p.b_adapt)
         nxt = b_adapt_decide(e, e->anchor, nxt);
     if (!idr)
@@ -15902,6 +15945,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     if (pp->rc_lookahead <= 0)
         pp->mbtree = 0;
     e->la_depth = pp->mbtree ? pp->rc_lookahead : 0;
+    e->la_sf_n = 2 * (pp->bframes + 1) + 2 > 8 ? 2 * (pp->bframes + 1) + 2 : 8;
     if (pp->b_qp_offset < 0)
         pp->b_qp_offset = pp->mbtree ? 2 : 4;
     /* (an offset past the QP scale only ever means "as coarse as it goes";

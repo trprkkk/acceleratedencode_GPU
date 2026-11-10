@@ -119,7 +119,7 @@ static void usage(void)
 "                   0 = off, 1 = on (default from preset 1)\n"
 "  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
 "                   preset 4, 4 at preset 3, otherwise 1)\n"
-"  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
+"  --bframes <n>    B pictures between two anchors, 0..16 (default 3).  The\n"
 "                   stream is then coded out of display order and the encoder\n"
 "                   holds n pictures of lookahead, so the first packets appear\n"
 "                   after n+1 frames; needs CABAC.  0 codes P pictures only.\n"
@@ -982,7 +982,7 @@ int main(int argc, char **argv)
         if (bpyramid >= 0) bad |= range_bad("--b-pyramid", bpyramid, 0, 1);
         if (mbtree >= 0) bad |= range_bad("--mbtree", mbtree, 0, 1);
         if (rclookahead >= 0) bad |= range_bad("--rc-lookahead", rclookahead, 0, 60);
-        if (bframes >= 0) bad |= range_bad("--bframes", bframes, 0, 3);
+        if (bframes >= 0) bad |= range_bad("--bframes", bframes, 0, 16);
         if (badapt >= 0) bad |= range_bad("--b-adapt", badapt, 0, 2);
         if (bqp > -1000) bad |= range_bad("--bqp", bqp, -51, 51);
         if (iqp > -1000) bad |= range_bad("--iqp", iqp, -51, 51);

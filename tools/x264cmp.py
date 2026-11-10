@@ -93,6 +93,12 @@ def configs():
     for spec in filter(None, os.environ.get('X264CMP_CFGS', '').split(';')):
         name, preset, args = spec.split(':', 2)
         c['aeg-' + name] = ('aeg', int(preset), args.split())
+    # and x264 ones: X264CMP_XCFGS="name|preset|ffmpeg args;..." ('|' since
+    # -x264-params uses ':'), --tune psnr included, e.g.
+    # "vsnotree|veryslow|-x264-params mbtree=0" gives x264-vsnotree
+    for spec in filter(None, os.environ.get('X264CMP_XCFGS', '').split(';')):
+        name, preset, args = spec.split('|', 2)
+        c['x264-' + name] = ('x264', preset, ['-tune', 'psnr'] + args.split())
     return c
 
 
@@ -225,9 +231,10 @@ def measure(cfg, clip, w, h, n, mode, v):
 
 
 def clip_list(names):
+    """Clip sets (main, val, long, long2) or single clips by name, by commas."""
     out = []
     for s in names.split(','):
-        out += CLIPS[s]
+        out += CLIPS[s] if s in CLIPS else [c for v in CLIPS.values() for c in v if c[0] == s][:1]
     return out
 
 
@@ -238,6 +245,8 @@ def key(name, cfg, clip, mode, v):
         k += '|' + AEG_ID
         if cfg[2]:
             k += '|' + ' '.join(cfg[2])
+    elif cfg[2][2:]:                    # X264CMP_XCFGS beyond --tune psnr
+        k += '|' + ' '.join(cfg[2][2:])
     return k
 
 
