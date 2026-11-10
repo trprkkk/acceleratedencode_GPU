@@ -8,3 +8,8 @@ build/
 __pycache__/
 .ci/
 build-*/
+
+# upstream fork sources (keep only notes)
+forks/x264/*
+!forks/x264/README_aeg_ja.md
+!forks/x264/README_build_ja.md
