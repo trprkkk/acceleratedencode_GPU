@@ -7118,3 +7118,92 @@ were removed.  Checks:
   `--paff-mbaff` and 10-bit.  Frame threads 1/2/3 are identical.
 - `make test` gains `qprd2_crf` and `qprd2_sl2` (decoder output equal to
   the reconstruction).
+
+## QP-RD on P pictures, and the fast walk at preset 3
+
+The constant-QP runs above showed QP-RD losing on one clip, tree2 (+1.4 % at
+p4 against `--qp-rd 0`; tree itself now gains, -1.0 %), and on treeL at CRF
+(long2, +1.2 points).  A debug dump of every walk (p4, 30 pictures, QP 22;
+dqp = the chosen QP minus the decided one, pshift = the weighting's target
+`o (3 - s) / s`) showed why:
+
+| clip | pictures | dqp | pshift |
+|---|---|---|---|
+| tree | P | -2.36 | -1.38 |
+| cock | I / P / B | +0.79 / -0.32 / -0.28 | -0.55 / -0.57 / -0.10 |
+| tree2 | P | -1.34 | -0.66 |
+| tree2 | B | -1.06 | -0.08 |
+
+QP-RD compares the QPs with the mode decision's lambda.  On P pictures that
+is 0.65 times the plain one (`P_MODE_LAMBDA`, worth about 1.9 QPs), so every
+coded macroblock is pulled towards a lower QP whatever the tree says.  tree2
+has much motion and little inheritance (11 % of its macroblocks skipped
+against 87 % in tree), and that overspends.
+
+The grid used temporary switches: a factor on P pictures' lambda, a share of
+B pictures' `mode_lambda_off` undone (positive) or added (negative), and a
+scale on the tree offset.  p4, BD-rate against `--qp-rd 0`, CQP main + val:
+
+| p4 QP-RD lambda | cock | vtest | mega | short | tree | cock2 | vtest2 | mega2 | tree2 | vtest3 | mega3 | mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| decision (before) | -0.81 | -2.99 | -0.80 | -0.45 | -1.01 | -0.88 | -0.86 | -0.22 | +1.42 | -0.86 | -0.21 | -0.70 |
+| P x1.25 | -1.13 | -2.98 | -0.81 | -1.55 | -1.04 | -1.63 | -1.39 | -0.24 | -0.31 | -1.24 | -1.01 | -1.21 |
+| **P x1.32** | -1.08 | -2.93 | -0.81 | -1.72 | -0.92 | -1.31 | -1.46 | -0.29 | **-0.66** | -1.38 | -1.16 | **-1.25** |
+| P x1.40 | -0.92 | -2.76 | -1.10 | -1.60 | -0.75 | -1.69 | -1.48 | -0.31 | -0.89 | -1.37 | -1.25 | -1.28 |
+| P x1.54 (plain) | -0.76 | -2.55 | -0.45 | -1.52 | -0.41 | -1.32 | -1.56 | -0.04 | -1.15 | -1.33 | -1.24 | -1.12 |
+| B: half the offset undone | -0.47 | -3.20 | -0.63 | -0.01 | -1.01 | -0.53 | -1.08 | -0.03 | +2.59 | -1.01 | -0.27 | -0.51 |
+| B: all undone | +0.65 | -3.14 | -0.08 | +1.46 | -1.01 | +0.08 | -0.92 | +0.43 | +5.63 | -0.97 | -0.11 | +0.18 |
+| P x1.25, B half undone | -0.80 | -3.20 | -0.83 | -1.27 | -1.04 | -1.40 | -1.52 | -0.13 | +0.65 | -1.35 | -1.01 | -1.08 |
+| P x1.25, B finer by half | -0.81 | -2.46 | -0.68 | -1.53 | -1.04 | -1.41 | -0.86 | -0.20 | -0.82 | -1.11 | -1.00 | -1.08 |
+| tree offset x0.5 | -1.48 | -2.40 | -1.00 | -1.63 | -1.39 | -1.59 | -0.05 | -0.65 | +0.11 | -0.40 | -0.76 | -1.02 |
+| tree offset x0 | -1.69 | -0.52 | -0.70 | -2.54 | -1.71 | -1.90 | +1.93 | -0.52 | -0.82 | +1.37 | -0.88 | -0.73 |
+
+CRF against x264 veryslow (long: cockL / vtestL / megaL; long2: cockL2 /
+vtestL2 / megaL2 / treeL):
+
+| | cockL | vtestL | megaL | long | cockL2 | vtestL2 | megaL2 | treeL | long2 |
+|---|---|---|---|---|---|---|---|---|---|
+| p4 `--qp-rd 0` | +3.45 | +0.31 | +1.77 | +1.84 | +4.81 | -7.32 | -0.91 | +7.18 | +0.94 |
+| p4 before | +2.82 | -5.93 | +1.62 | -0.50 | +3.59 | -7.49 | -1.12 | +8.37 | +0.83 |
+| p4 P x1.25 | +2.32 | -5.55 | +1.07 | -0.72 | +3.28 | -8.25 | -1.72 | +7.68 | +0.25 |
+| **p4 P x1.32** | +2.44 | -5.57 | +1.11 | **-0.67** | +3.25 | -8.16 | -1.82 | +7.49 | **+0.19** |
+| p4 P x1.40 | | | | | +3.38 | -8.41 | -1.86 | +7.34 | +0.11 |
+| p4 P x1.54 | +2.43 | -4.94 | +1.28 | -0.41 | | | | | |
+| p3 (QP-RD off) | +4.24 | +2.48 | +2.90 | +3.21 | +6.09 | -7.61 | -0.26 | +8.13 | +1.59 |
+| p3 `--qp-rd 1` before | +3.59 | -3.76 | +2.70 | +0.85 | +4.60 | -7.84 | -0.43 | +9.22 | +1.39 |
+| p3 `--qp-rd 2` before | +3.89 | -3.84 | +2.83 | +0.96 | +4.42 | -7.58 | -0.21 | +9.38 | +1.50 |
+| p3 `--qp-rd 1`, P x1.32 | +3.03 | -3.34 | +2.19 | +0.63 | +4.17 | -8.34 | -1.21 | +8.44 | +0.76 |
+| **p3 `--qp-rd 2`, P x1.32** | +3.15 | -3.64 | +2.40 | **+0.64** | +4.24 | -8.38 | -0.93 | +8.32 | **+0.81** |
+
+At preset 3, constant QP, against p3 without QP-RD (same clips as above):
+
+| p3 + | cock | vtest | mega | short | tree | cock2 | vtest2 | mega2 | tree2 | vtest3 | mega3 | mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--qp-rd 1` before | -1.10 | -2.91 | -0.59 | -0.28 | -1.00 | -1.03 | -1.07 | -0.84 | +1.41 | -1.09 | -0.01 | -0.77 |
+| `--qp-rd 2` before | -0.83 | -2.72 | -0.59 | +0.30 | -0.89 | -1.13 | -1.11 | -0.63 | +1.39 | -1.12 | -0.81 | -0.74 |
+| `--qp-rd 1`, P x1.32 | -1.30 | -3.02 | -0.80 | -1.51 | -0.87 | -1.63 | -1.56 | -0.90 | -0.53 | -1.51 | -1.07 | -1.34 |
+| **`--qp-rd 2`, P x1.32** | -1.03 | -2.87 | -0.92 | -0.66 | -0.77 | -1.62 | -1.62 | -0.70 | -0.19 | -1.37 | -1.33 | **-1.19** |
+
+**Adopted:**
+- **The P lambda:** QP-RD compares QPs on P pictures with 1.32 times the
+  decision lambda (`QPRD_P_LAMBDA`, about 0.86 of the plain one).  B
+  pictures keep theirs.  The 1.25-1.40 range is flat at constant QP, and
+  1.32 sits between the long (1.25) and long2 (1.40) optima.  QP-RD no longer
+  loses on any constant-QP clip, and treeL's loss at CRF went from +1.19 to
+  +0.31 at p4 and to +0.19 at p3 with `--qp-rd 2`.  vtestL gives back 0.36 at
+  p4; everything else gains.  This changes every QP-RD stream.
+- **Preset 3 now defaults to `--qp-rd 2`.**  With the fix it is -2.57 points
+  on long, -0.78 on long2 and -1.19 at constant QP, and it improves every
+  constant-QP clip.  The full walk adds only 0.01 / 0.05 more for about
+  twice the time.  Serial, minimum of three (cockL / vtestL, CRF 24, `-t 1`):
+  16.22 -> 17.75 s and 8.34 -> 9.05 s, that is +9.4 / +8.5 % time.  `--qp-rd 0`
+  gives the old speed.
+- **Checks:**
+  - The new build is byte-identical to the measured runs: three encodes at
+    p3/p4, CQP and CRF, and the p3 default against `--qp-rd 2`.
+  - p3 frame threads 1/2/3/5 are identical.
+  - `--mbaff`, `--paff`, `--paff-mbaff` and `--field` at p3 decode in FFmpeg
+    to the reconstruction.
+  - `make test` passes.
+- **Removed:** the experimental switches and the per-group B-picture count
+  they needed.

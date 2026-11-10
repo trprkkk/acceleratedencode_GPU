@@ -25,8 +25,8 @@ for the point-by-point answer to an external review):
   The device paths are per-macroblock batches with blocking transfers -- a
   correctness scaffold, not a GPU-resident design.
 * **Quality** is at x264 veryslow at constant QP (presets 3-4) and, with
-  CRF on long clips, preset 4 is now level with x264 veryslow (-0.5 %);
-  preset 3 is +3.2 %.  x264 is still 1.2-4x faster on the CPU.
+  CRF on long clips, preset 4 is now level with x264 veryslow (-0.7 %);
+  preset 3 is +0.6 %.  x264 is still 1.2-4x faster on the CPU.
 * Tested on Linux x86-64 (GCC 12, AVX2/SSE2/C paths); other OSes and
   architectures are not built or tested here.
 
@@ -92,7 +92,12 @@ x264 veryslow; since then QP-RD (`5929971`) and x264's CABAC trellis
 megaL +1.43; `--aq 0` against x264 `--tune psnr`), and p3 to +4.31 % (see
 *CABAC trellis* in `docs/STATUS.md`); a longer lookahead window (40 / 40 /
 60 / 60 at presets 1-4) then took p4 to **-0.50 %** and p3 to +3.21 % (see
-*Preset 3's CRF gap* there).  High 10 keeps the same standing (p3
+*Preset 3's CRF gap* there).  A fast QP-RD walk, now preset 3's default
+(`--qp-rd 2`, about +9 % time), and a coarser QP-RD lambda on P pictures
+then took p4 to **-0.67 %** and p3 to **+0.64 %** (on the second long set,
+long2: p4 +0.83 -> +0.19 %, p3 +1.59 -> +0.81 %; see *QP-RD on P pictures*
+there).  The constant-QP table above predates both; preset 3 is now about
+9 % slower than its fps column says.  High 10 keeps the same standing (p3
 -4.9 % against x264 medium 10-bit).
 
 Since the quoted status at the top was written the encoder gained B pyramid

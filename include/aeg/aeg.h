@@ -298,10 +298,11 @@ typedef struct aeg_params {
      * the macroblock tree, distortion is weighted by how much later pictures
      * inherit it).  0 = off, 1 = on (the full walk), 2 = fast (the QP the
      * macroblock tree's weighting points at, then one step either way); -1 =
-     * as the preset says (1 at preset 4, else 0).  Needs CABAC.  At preset 3,
-     * CRF on the long clips: 1 is -2.36 points of BD-rate for about 15 % of
-     * the encode time, 2 is -2.25 for about 9 % (docs/STATUS.md, "QP-RD"
-     * and "A cheaper QP-RD walk"). */
+     * as the preset says (1 at preset 4, 2 at preset 3, else 0).  Needs
+     * CABAC.  At preset 3, CRF on the long clips: 1 is -2.58 points of
+     * BD-rate for about 15 % of the encode time, 2 is -2.57 for about 9 %
+     * (docs/STATUS.md, "QP-RD", "A cheaper QP-RD walk" and "QP-RD on P
+     * pictures"). */
     int qp_rd;
     /* P-picture reference pictures: 1..8.  -1 = as the preset says (8 at
      * preset 4, 4 at preset 3, 1 below).  The

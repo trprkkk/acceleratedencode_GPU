@@ -8316,6 +8316,9 @@ static int64_t qprd_try(struct aeg_encoder *e, int mbx, int mby,
     return rd_price(e, mbx, mby, t, 0, lambda);
 }
 
+/* QP-RD's lambda on P pictures, relative to the mode decision's (qprd) */
+#define QPRD_P_LAMBDA 1.32
+
 static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
                  double lambda)
 {
@@ -8346,7 +8349,24 @@ static void qprd(struct aeg_encoder *e, int mbx, int mby, mbenc *best,
      * (the static background of vtestL is coarsened); all of it
      * -6.84/+0.31/+4.96; relative only -1.14/-1.58/-0.16; 0.3 of the mean
      * -4.43/-1.31/-0.53; 0.6 -7.01/-1.00/+0.93.  Not moving up where the
-     * tree lowered the QP instead: +0.79/-0.62/-0.53. */
+     * tree lowered the QP instead: +0.79/-0.62/-0.53.
+     *
+     * P pictures decide their modes with 0.65 times the lambda (see
+     * P_MODE_LAMBDA), which, used here, buys every coded macroblock about
+     * two QPs below what the weighting asks for.  On content where little is
+     * inherited (tree2: much motion, 11 % skipped) that overspends: P
+     * macroblocks went 1.34 QPs down against a weighting of 0.66 and the
+     * clip lost 1.4 %.  Comparing the QPs with 1.32 times that lambda (about
+     * 0.86 of the plain one) fixes it and helps nearly everywhere else.
+     * BD-rate of p4 against --qp-rd 0, CQP main+val mean / tree2: decision
+     * lambda -0.70 / +1.42; x1.25 -1.21 / -0.31; x1.32 -1.25 / -0.66; x1.40
+     * -1.28 / -0.89; plain (x1.54) -1.12 / -1.15.  B pictures' finer lambda
+     * (mode_lambda_off) is right as it is: undoing half of it -0.51 / +2.59,
+     * making it finer still -1.08 / -0.82 (with x1.25 on P).  Scaling the
+     * tree weighting down instead: half -1.02 / +0.11, none -0.73 / -0.82
+     * (vtest's static background gives its gain back). */
+    if (e->cur_is_p)
+        lambda *= QPRD_P_LAMBDA;
     if (e->mbt_on) {
         const double s = mbt_strength();
         const double o = mbt_off(e, mbx, mby) - 0.7 * e->mbt_avg;
@@ -15759,12 +15779,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * selection's, so it is off unless asked for. */
     if (pp->refine_cand < 0)
         pp->refine_cand = 0;
-    /* QP-RD: -2.2 points at CRF on the long clips at both slow presets, for
-     * +10 % time at preset 4 but +15-26 % at preset 3, which is the speed
-     * preset of the two -- there preset 4 with it is only a few percent
-     * slower and two points better. */
+    /* QP-RD: the full walk at preset 4; at preset 3 the fast one (CRF, long
+     * clips against x264 veryslow: +3.21 -> +0.64 on long, +1.59 -> +0.81 on
+     * long2, -1.19 at constant QP, for about +9 % time; the full walk would
+     * be +15 % for 0.01-0.05 more). */
     if (pp->qp_rd < 0)
-        pp->qp_rd = pp->preset >= 4;
+        pp->qp_rd = pp->preset >= 4 ? 1 : pp->preset == 3 ? 2 : 0;
     /* Level selection is a large amount of work (a price and an inverse
      * transform per candidate level), so presets 3 and 4 run it inside every
      * candidate (2: 0.15-2.4 points of BD-rate for 12-14 % of the encode time
