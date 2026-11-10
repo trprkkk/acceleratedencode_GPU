@@ -16606,6 +16606,10 @@ static int ft_join(struct aeg_encoder *e, struct ft_worker *w)
     e->st.bytes += c->st.bytes;
     e->st.frames += c->st.frames;
     e->st.enc_ns += c->st.enc_ns;
+    /* the macroblock coding and the entropy coder are not stages of their own,
+     * but the worker's share of them has to be merged like any stage's */
+    e->st.coding_ns += c->st.coding_ns;
+    e->st.entropy_ns += c->st.entropy_ns;
     for (k = 0; k < AEG_STAGE_COUNT; k++) {
         e->st.stage_ns[k] += c->st.stage_ns[k];
         e->st.stage_gpu_ns[k] += c->st.stage_gpu_ns[k];
