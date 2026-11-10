@@ -20,14 +20,14 @@ jobs:
     name: CPU build, make test, frame threads
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # a Python that pip may install into (the runner's system Python is
       # "externally managed", PEP 668); only the tools come from pip --
       # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci/ext
           key: ffmpeg-imageio-v7.0.2
@@ -90,14 +90,14 @@ jobs:
     name: OpenCL backend on PoCL
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # a Python that pip may install into (the runner's system Python is
       # "externally managed", PEP 668); only the tools come from pip --
       # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci/ext
           key: ffmpeg-imageio-v7.0.2
@@ -145,14 +145,14 @@ jobs:
     name: CUDA kernels through NVRTC
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # a Python that pip may install into (the runner's system Python is
       # "externally managed", PEP 668); only the tools come from pip --
       # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci/nvrtc
           key: nvrtc-cu12-v1
@@ -174,14 +174,14 @@ jobs:
     name: ASan + UBSan (CPU and the OpenCL host side), TSan
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # a Python that pip may install into (the runner's system Python is
       # "externally managed", PEP 668); only the tools come from pip --
       # ffmpeg, PoCL, NVRTC -- the encoder itself uses no Python
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .ci/ext
           key: ffmpeg-imageio-v7.0.2
@@ -272,7 +272,7 @@ jobs:
     name: Fuzzing (libFuzzer + ASan/UBSan; the gcc driver as a smoke test)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # coverage-guided: the runner's clang with libFuzzer, every target from
       # the checked-in seeds (tests/fuzz/corpus); a crash, a leak or any UBSan
       # report fails the job and the reproducer is kept as an artifact
@@ -289,14 +289,37 @@ jobs:
           fi
       # the build and the runs go to a log; on failure its tail is also put in
       # an annotation (readable through the checks API, unlike the raw log)
+      # the working corpus persists between runs: the latest one is restored
+      # (the seeds are copied over it), fuzzed, shrunk and saved again
+      - name: restore the fuzz corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: .ci/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
       - name: libFuzzer (clang), 120 s per target
         run: |
           set -o pipefail
-          if ! make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120 > fuzz-lf.log 2>&1; then
+          ls .ci/fuzz-corpus/* 2>/dev/null | grep -c . | sed 's/^/restored corpus files: /' || true
+          if ! make fuzz FUZZ_ENGINE=libfuzzer CC=clang FUZZ_TIME=120 \
+                  FUZZ_CORPUS=.ci/fuzz-corpus > fuzz-lf.log 2>&1; then
             sh tools/ci/fuzz_report.sh fuzz-lf.log libFuzzer
             exit 1
           fi
           grep -aE '^(==|Done|#[0-9]+ *DONE)' fuzz-lf.log || true
+      - name: shrink the fuzz corpus (libFuzzer -merge=1)
+        run: |
+          if ! make fuzz-merge FUZZ_ENGINE=libfuzzer CC=clang \
+                  FUZZ_CORPUS=.ci/fuzz-corpus > fuzz-merge.log 2>&1; then
+            sh tools/ci/fuzz_report.sh fuzz-merge.log "libFuzzer merge"
+            exit 1
+          fi
+          grep -a '^== ' fuzz-merge.log
+      - name: save the fuzz corpus
+        uses: actions/cache/save@v6
+        with:
+          path: .ci/fuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
       # the same harnesses through the standalone driver (tests/fuzz/driver.c),
       # the way they run where there is no clang: keeps that path building
       - name: standalone driver (gcc), 20 s per target
@@ -309,7 +332,7 @@ jobs:
           grep -aE '^(==|driver:)' fuzz-drv.log
       - name: keep reproducers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: |

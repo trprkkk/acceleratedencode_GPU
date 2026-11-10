@@ -276,10 +276,14 @@ test: $(BIN) $(BUILD)/genyuv $(BUILD)/cavlc_check $(BUILD)/syntax_check \
 # FUZZ_TIME seconds over its corpus with the standalone driver (any
 # compiler); `make fuzz FUZZ_ENGINE=libfuzzer CC=clang` links libFuzzer
 # instead, which adds coverage feedback.  A crash leaves its input in
-# build-fuzz/<target>-last-input (driver) or crash-* (libFuzzer).
+# build-fuzz/<target>-last-input (driver) or crash-* (libFuzzer).  The
+# working corpus is FUZZ_CORPUS/<target> (the seeds are copied in, libFuzzer
+# adds what it finds); `make fuzz-merge FUZZ_ENGINE=libfuzzer CC=clang`
+# shrinks it to the inputs that still add coverage (CI keeps it between runs).
 FUZZ_TARGETS := fuzz_api fuzz_image fuzz_cli
 FUZZ_TIME    ?= 60
 FUZZ_ENGINE  ?= driver
+FUZZ_CORPUS  ?= build-fuzz/corpus
 FUZZ_SAN     ?= -fsanitize=address,undefined -fno-sanitize-recover=undefined \
                 -fno-omit-frame-pointer
 # clang: no per-global COMDAT groups.  Their names hash the module's external
@@ -312,7 +316,7 @@ fuzz-build:
 
 fuzz: fuzz-build
 	for t in $(FUZZ_TARGETS); do \
-	    d=tests/fuzz/$$t.dict; c=build-fuzz/corpus/$$t; \
+	    d=tests/fuzz/$$t.dict; c=$(FUZZ_CORPUS)/$$t; \
 	    mkdir -p $$c && cp tests/fuzz/corpus/$${t#fuzz_}/* $$c/; \
 	    echo "== $$t ($(FUZZ_TIME) s)"; \
 	    ASAN_OPTIONS=detect_leaks=1 ./build-fuzz/$$t -max_total_time=$(FUZZ_TIME) \
@@ -320,11 +324,25 @@ fuzz: fuzz-build
 	        $$( [ -f $$d ] && echo -dict=$$d ) $$c || exit 1; \
 	done
 
+# libFuzzer only: keep the inputs of FUZZ_CORPUS/<target> that add coverage
+# (the merge runs each input once, so it also fails on a crash among them)
+fuzz-merge: fuzz-build
+	@[ "$(FUZZ_ENGINE)" = libfuzzer ] || \
+	    { echo "fuzz-merge needs FUZZ_ENGINE=libfuzzer"; exit 1; }
+	for t in $(FUZZ_TARGETS); do \
+	    c=$(FUZZ_CORPUS)/$$t; [ -d $$c ] || continue; \
+	    rm -rf $$c.merge && mkdir -p $$c.merge && \
+	    ASAN_OPTIONS=detect_leaks=1 ./build-fuzz/$$t -merge=1 -max_len=4096 \
+	        -artifact_prefix=build-fuzz/$$t- $$c.merge $$c || exit 1; \
+	    echo "== $$t: $$(ls $$c | wc -l) -> $$(ls $$c.merge | wc -l) inputs"; \
+	    rm -rf $$c && mv $$c.merge $$c; \
+	done
+
 clean:
 	rm -rf $(BUILD)
 
 .PHONY: all test clean shared install uninstall examples install-check \
-        fuzz fuzz-build
+        fuzz fuzz-build fuzz-merge
 # every object's header dependencies (-MMD), the CLI's and the tests' too:
 # a changed struct in aeg.h has to rebuild everything that includes it
 -include $(OBJ:.o=.d) $(PIC_OBJ:.o=.d) $(wildcard $(BUILD)/*.d) \

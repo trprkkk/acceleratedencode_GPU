@@ -21,9 +21,11 @@
 
 #if AEG_SIMD
 #include <emmintrin.h>
-
+#endif
+#if AEG_SSE2
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
- * undefined behaviour on an unaligned pixel address) */
+ * undefined behaviour on an unaligned pixel address); only the 8-bit SIMD
+ * paths use them */
 static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
 static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
 #endif

@@ -25,10 +25,13 @@
 #define COEF_MAX ((1 << (7 + BIT_DEPTH)) - 1)
 #define COEF_MIN (-(1 << (7 + BIT_DEPTH)))
 
+#if AEG_SSE2
 /* 32-bit loads and stores at any alignment (one movd; a cast to int * is
- * undefined behaviour on an unaligned pixel address) */
+ * undefined behaviour on an unaligned pixel address); only the 8-bit SIMD
+ * paths use them */
 static inline int ld32(const void *p) { int v; memcpy(&v, p, 4); return v; }
 static inline void st32(void *p, int v) { memcpy(p, &v, 4); }
+#endif
 
 /* The distortion metrics are the innermost loop of the motion search -- a
  * 320x192 picture at preset 2 runs ~480 block comparisons per macroblock, so a
@@ -2812,6 +2815,7 @@ static inline __m128i diff8(const pixel *a, const pixel *b)
     return _mm_sub_epi16(ld_px8(a), ld_px8(b));
 }
 
+#if AEG_SSE2   /* (8-bit only) */
 /* Sum of |4x4 Hadamard| of the two 4x4 blocks side by side in four rows of
  * eight differences: the vertical butterfly runs across the registers, the
  * horizontal one inside each group of four lanes (two shuffle-and-add stages
@@ -2839,6 +2843,7 @@ static inline __m128i satd8x4_abs(__m128i r0, __m128i r1, __m128i r2, __m128i r3
     acc = _mm_add_epi16(_mm_add_epi16(v[0], v[1]), _mm_add_epi16(v[2], v[3]));
     return _mm_madd_epi16(acc, ones);
 }
+#endif
 
 static inline int hsum_epi32(__m128i acc)
 {

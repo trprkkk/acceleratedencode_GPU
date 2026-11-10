@@ -25,7 +25,11 @@ make fuzz FUZZ_ENGINE=libfuzzer CC=clang   # coverage-guided (libFuzzer)
 `make fuzz-build` only builds `build-fuzz/fuzz_{api,image,cli}`. Its build
 directory is separate, so the normal build is untouched. `make fuzz` copies
 the seeds into `build-fuzz/corpus/<target>` (libFuzzer adds the inputs it
-finds there) and stops at the first finding.
+finds there) and stops at the first finding.  `FUZZ_CORPUS=dir` puts that
+working corpus elsewhere, so it survives `rm -rf build-fuzz` and later runs
+start from what earlier ones found.  `make fuzz-merge FUZZ_ENGINE=libfuzzer
+CC=clang` shrinks it to the inputs that still add coverage (libFuzzer's
+`-merge=1`).
 
 Each binary takes libFuzzer's command line, with either engine:
 
@@ -53,8 +57,11 @@ malformed files. To see only the sanitizer output:
 ## CI
 
 The `fuzz` job in `.github/workflows/ci.yml` runs every target for 120 s
-under clang's libFuzzer. Then it runs 20 s per target through the gcc
-driver, which keeps that build path working. If the job fails, the
+under clang's libFuzzer. Its working corpus (`.ci/fuzz-corpus`) is kept in
+the Actions cache: each run restores the latest one, merges the seeds in,
+fuzzes, shrinks it with `make fuzz-merge` and saves it, so the 120 s add up
+across runs instead of starting from the seeds every time. Then it runs 20 s
+per target through the gcc driver, which keeps that build path working. If the job fails, the
 reproducers are uploaded as the `fuzz-artifacts` artifact.
 
 ## Bugs found so far

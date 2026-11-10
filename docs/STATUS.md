@@ -7207,3 +7207,21 @@ At preset 3, constant QP, against p3 without QP-RD (same clips as above):
   - `make test` passes.
 - **Removed:** the experimental switches and the per-group B-picture count
   they needed.
+
+## Housekeeping: CI actions, clang warnings, a persistent fuzz corpus
+
+- **CI actions:** the Node.js 20 deprecation warning is gone.  The actions
+  now run on Node 24: `checkout@v7`, `setup-python@v7`, `cache@v6` and
+  `upload-artifact@v7`.  None of the inputs used here changed.
+- **clang warnings:** clang (22, `-Wall`) warned about five unused
+  functions, all in the 10-bit objects.  The 32-bit load/store helpers in
+  `transform.c` and `mc.c`, and `satd8x4_abs`, serve only the 8-bit SIMD
+  paths, so they are now under `AEG_SSE2` instead of `AEG_SIMD` (or no
+  guard).  The clang and gcc builds are warning-free and the output is
+  unchanged.
+- **Fuzz corpus:**
+  - `make fuzz` takes `FUZZ_CORPUS=dir` for its working corpus.
+  - `make fuzz-merge` (libFuzzer) shrinks the corpus with `-merge=1`.
+  - The CI fuzz job restores the latest corpus from the Actions cache,
+    fuzzes it, shrinks it and saves it again.  Each run's 120 s per target
+    therefore start from what the earlier runs found.
