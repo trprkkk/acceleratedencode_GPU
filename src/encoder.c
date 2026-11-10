@@ -11208,11 +11208,13 @@ static void rowpost_finalize_mb(struct aeg_encoder *e, int mbx, int mby,
                 qp = e->rp_qp;
             if (slice == AEG_SLICE_P &&
                 p_skippable(e, mbx, mby, t,
-                            (mby & 1) && e->rp_mbs[idx - e->mb_w].skip))
+                            e->mbaff && (mby & 1) &&
+                                e->rp_mbs[idx - e->mb_w].skip))
                 skipped = 1;
             if (slice == AEG_SLICE_B &&
                 b_skippable(e, mbx, mby, t,
-                            (mby & 1) && e->rp_mbs[idx - e->mb_w].skip))
+                            e->mbaff && (mby & 1) &&
+                                e->rp_mbs[idx - e->mb_w].skip))
                 skipped = 1;
             d->skip = (uint8_t)skipped;
             d->t8 = (uint8_t)mb_t8_coded(e, t, skipped);
@@ -12526,13 +12528,15 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     mbf_syntax(e, m->fld);
                 if (slice == AEG_SLICE_P &&
                     p_skippable(e, mbx, mby, tmp,
-                                (mby & 1) && e->mbs[idx - e->mb_w].skip))
+                                e->mbaff && (mby & 1) &&
+                                    e->mbs[idx - e->mb_w].skip))
                     skipped = 1;
                 /* A direct macroblock of a B slice with no residual is exactly
                  * what the skip flag means: same prediction, no residual. */
                 if (slice == AEG_SLICE_B &&
                     b_skippable(e, mbx, mby, tmp,
-                                (mby & 1) && e->mbs[idx - e->mb_w].skip))
+                                e->mbaff && (mby & 1) &&
+                                    e->mbs[idx - e->mb_w].skip))
                     skipped = 1;
                 m->skip = (uint8_t)skipped;
                 e->stat_mbs++;
@@ -12640,7 +12644,8 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                     mbf_syntax(e, e->mbs[idx].fld);
                 if (slice == AEG_SLICE_P &&
                     p_skippable(e, mbx, mby, tmp,
-                                (mby & 1) && e->mbs[idx - e->mb_w].skip))
+                                e->mbaff && (mby & 1) &&
+                                    e->mbs[idx - e->mb_w].skip))
                     skipped = 1;
                 e->stat_mbs++;
                 e->stat_skipped += skipped;
