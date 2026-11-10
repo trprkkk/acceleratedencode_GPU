@@ -1374,6 +1374,23 @@ int main(int argc, char **argv)
     p.qcomp = qcomp;
     p.bit_depth = bit_depth;
     p.lossless = lossless;
+    if (p.lossless && ((cqm && strcmp(cqm, "flat")) ||
+                       (weightb >= 0 && weightb != 0) || p.open_gop)) {
+        fprintf(stderr, "error: --lossless cannot be combined with CQM, "
+                        "weighted B or open-GOP\n");
+        return 2;
+    }
+    if (p.lossless) {
+        p.cabac = 0;
+        p.qp = 0;
+        p.bframes = 0;
+        p.gop_size = 1;
+        p.deblock = 0;
+        p.weightb = 0;
+        p.transform_8x8 = 0;
+        p.cqm_on = 0;
+        p.psy_rd = 0.0;
+    }
     if (crf_given) {
         p.rc_mode = AEG_RC_CRF;
         p.crf = crf;

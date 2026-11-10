@@ -8903,6 +8903,24 @@ static void write_mb(struct aeg_encoder *e, aeg_bitwriter *bw, int mbx, int mby,
                      mbenc *c, int is_p)
 {
     int blk;
+    if (c->type == AEG_MB_IPCM) {
+        const int s = e->stride[0], cs = e->stride[1];
+        const int px = mbx * 16, py = mby * 16;
+        const int cx = mbx * 8, cy = mby * 8;
+        int x, y;
+        aeg_bw_ue(bw, 25);                 /* I_PCM, Table 7-11 */
+        aeg_bw_align_zero(bw);             /* pcm_alignment_zero_bit */
+        for (y = 0; y < 16; y++)
+            for (x = 0; x < 16; x++)
+                aeg_bw_put(bw, 8, e->srcp[0][(py + y) * s + px + x]);
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++)
+                aeg_bw_put(bw, 8, e->srcp[1][(cy + y) * cs + cx + x]);
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++)
+                aeg_bw_put(bw, 8, e->srcp[2][(cy + y) * cs + cx + x]);
+        return;
+    }
     if (!is_p) {
         if (c->type == AEG_MB_I4x4 || c->type == AEG_MB_I8x8)
             aeg_bw_ue(bw, 0);           /* I_NxN */
@@ -12573,6 +12591,24 @@ static int code_slice(struct aeg_encoder *e, uint8_t *bs, size_t cap,
                 tmp->type != AEG_MB_I16x16)
                 tmp->qp = e->last_qp;
             e->mbs[idx].qp = (int8_t)tmp->qp;
+            if (e->p.lossless) {
+                int l;
+                tmp->type = AEG_MB_IPCM;
+                tmp->qp = 0;
+                e->mbs[idx].type = AEG_MB_IPCM;
+                e->mbs[idx].qp = 0;
+                tmp->cbp = 0;
+                for (l = 0; l < 3; l++) {
+                    const int px = l ? mbx * 8 : mbx * 16;
+                    const int py = l ? mby * 8 : mby * 16;
+                    const int rows = l ? 8 : 16;
+                    int yy;
+                    for (yy = 0; yy < rows; yy++)
+                        memcpy(e->recp[l] + (py + yy) * e->stride[l] + px,
+                               e->srcp[l] + (py + yy) * e->stride[l] + px,
+                               (size_t)(l ? 8 : 16));
+                }
+            }
 
             /* emit.  A P_L0_16x16 macroblock whose motion vector equals the
              * predictor and that carries no residual at all reconstructs
@@ -16394,8 +16430,8 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     memcpy(&e->p, params, sizeof(e->p));
     pp = &e->p;
-    if (pp->lossless) {
-        aeg_set_last_error("lossless coding is not implemented yet");
+    if (pp->lossless && (pp->cabac || pp->bit_depth != 8)) {
+        aeg_set_last_error("lossless I_PCM currently needs 8-bit CAVLC");
         aeg_free(e);
         return NULL;
     }

@@ -19,7 +19,7 @@
 | `AEG_REC_GPU`（device 再構成） | **未実装** | probe のみ。full source+recon 5.98 MiB/pic、luma-only 3.98 MiB/pic、levels+modes 6.23 MiB/pic。M-1 の 4 MB 超過 |
 | `AEG_DEBLOCK_PERSIST`（CPU 参照） | opt-in | ラスタ順 persistent スケジューラ。既定とバイト一致。device 版は M-1.2d-R 待ち |
 | `--mux mp4\|mkv\|ts` | opt-in | MP4/MKV/TS の 8bit/10bit を FFmpeg 全数デコード。raw 出力は不変 |
-| lossless（`--lossless`） | **未実装（明示エラー）** | QP=0 + transform bypass / I_PCM の再構成経路が未完成 |
+| lossless（`--lossless`） | **opt-in（8bit CAVLC）** | I_PCM 固定。4 クリップで入力 YUV とデコードの MD5 一致。10bit/CABAC は次段 |
 | 12bit（`--bit-depth 12`） | **experimental（既定無効）** | obj12/API/SPS profile 244 は実装。12bit 4:2:0 は FFprobe が `yuv420p12le` と認識するが、エンコードで heap corruption / CABAC MB エラーが残る |
 | 4:2:2 / 4:4:4 | **未実装** | 入力変換と符号化は 4:2:0 のみ |
 | HEVC / x265 コア | **未実装** | 本リポジトリは H.264 のみ |
@@ -44,7 +44,7 @@
 
 - **4:2:2 / 4:4:4**: 4:2:0 のみ実装。
 - **12bit**: 12bit ビルドは experimental。encode の heap corruption / CABAC エラーが未解決。
-- **lossless**: `--lossless` は明示エラー。I_PCM / transform bypass が未完成。
+- **lossless**: 8bit CAVLC の I_PCM のみ。10bit / CABAC は未対応。CQM / weighted B / open-GOP との併用はエラー。
 - **device 再構成（M-1.2d-R）**: source/recon/levels の転送が 4 MB/pic を超え、device 常駐が前提。
 - **クロスピクチャ先読み（M-1.1）**: frame_prologue の状態依存で保留。
 - **psy-trellis（M-5d2）**: psy-rd の凍結に依存して未着手。

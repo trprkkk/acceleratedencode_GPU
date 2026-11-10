@@ -195,13 +195,27 @@ ffmpeg -v error -i build/work/out10.264 -f null - && echo DEC_OK
 - `kernel_check: 9 kernels agree`
 - `nvrtc_check`: CUDA kernels compile
 
-## 11. 既知の未検証・不可
+## 11. lossless（8bit CAVLC I_PCM）
+
+```sh
+./build/aegenc -i build/work/small.yuv -w 320 -h 192 -n 4 \
+  --lossless -b cpu -o build/work/lossless.264 -v 0
+ffmpeg -v error -y -i build/work/lossless.264 \
+  -f rawvideo -pix_fmt yuv420p build/work/lossless.yuv
+cmp build/work/small.yuv build/work/lossless.yuv && echo LOSSLESS
+```
+
+期待値: `LOSSLESS`。1080p 12f は **37,797,731 バイト**。
+`--lossless` は CAVLC / I_PCM / QP0 / deblock off を強制する。
+CQM / weighted B / open-GOP との併用はエラー。`--mux mp4` は可。
+
+## 12. 既知の未検証・不可
 
 - 12bit（`--bit-depth 12`）: 既定バイナリでは明示エラー。`BIT_DEPTHS=12` の experimental ビルドでも decode 不能。
-- lossless（`--lossless`）: 明示エラー。
+- lossless の 10bit / CABAC: 未対応（8bit CAVLC のみ）。
 - 4:2:2 / 4:4:4 / HEVC: 未実装。
 
-## 12. 速度
+## 13. 速度
 
 ```sh
 for i in 1 2 3; do
