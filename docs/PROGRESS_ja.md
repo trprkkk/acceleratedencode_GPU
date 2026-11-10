@@ -145,6 +145,7 @@
 - [x] M-5i（コンテナ出力）: `--mux mp4|mkv|ts <out>` を追加。raw Annex B を ffmpeg に渡して `-c copy` で多重化。mp4 は直接パイプ、mkv/ts は一時 mp4 経由で remux（ffmpeg 3.4 の MKV/TS が raw pipe の未設定タイムスタンプを拒否するため）。`--fps` は既存。`--mux` なしの raw 出力はバイト不変。MP4/MKV/TS の 8bit/10bit、open-GOP、implicit weighted B を ffmpeg で全数デコード確認。ES を取り出すと avcC 経由の SPS/PPS 再配置で raw とバイト一致しない（デコードは一致）。
 - [ ] M-5k（12bit ビルド途中・experimental）: `BIT_DEPTH=12` の obj12、`_12` シンボル、`api.c` dispatch、`bitdepth.h` 12 許可、QP offset 24、SPS profile 244 を実装。`--bit-depth 12` で enc は開き、FFprobe は **High 4:4:4 Predictive / yuv420p12le** を認識（**4:2:0 12bit は profile 244 で構文上通る**）。ASAN では **`aeg_mc_ctx_free` の free で `mc->buf` が不正ポインタ**（最初の invalid write は検出されず、encoder/mc の 12bit オブジェクト間のレイアウト/初期化不整合が疑わしい）。デフォルトビルドは 8/10bit に戻し、12bit は `BIT_DEPTHS=12` の experimental ビルドのみ。`--bit-depth 12` はデフォルトバイナリで明示エラー。
 - [ ] M-5k-a audit: sizeof(aeg_encoder)=144424 (12bit allocation OK); mcr[0..3] zero, mcr[4..7] uninitialized garbage; encoder initializes only mcr[0]/[1]; aeg_mc_ctx magic guard was reverted because it changed 8/10bit output.
+- [ ] M-5k-b: mcr_n を導入し close は初期化済み mcr[0..1] のみ解放。q27 320x192 は ASAN で close クラッシュを解消したが、FFmpeg は MB 19,11 で CABAC エラー。q0 では別の free で heap corruption。12bit の係数/バッファ経路にまだ invalid write が残る。既定 8/10bit 出力は 197,721 のまま。
 
 ### M-7 移植性（Windows / MSVC / ARM）
 - [ ] M-7a: `src/thread.h`（pthread/Win32）、`aeg_dl`（Windows ライブラリ名）

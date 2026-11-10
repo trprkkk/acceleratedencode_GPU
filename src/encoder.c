@@ -463,6 +463,7 @@ struct aeg_encoder {
     pixel pred_l2[16 * 16];
     pixel pred_c2[2][8 * 8];
     aeg_mc_ctx mcr[AEG_MAX_REFS]; /* fractional planes of refpl[k][0] */
+    int mcr_n;
     int has_ref;
     int has_ref2;
     /* P slice with two active list0 entries: the newest and the oldest
@@ -16754,6 +16755,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
         e->mcr[k].stride = e->stride[0];
     e->top_row = 0;
     /* One slice per picture unless the caller asked for more.  Slices own whole
+    e->mcr_n = 2;
      * macroblock rows, and that is the granularity the picture is cut at. */
     {
         int want = pp->slices > 0 ? pp->slices : 0;
@@ -18721,7 +18723,7 @@ void aeg_encoder_close(aeg_encoder *enc)
     aeg_input_cvt_free(&e->cvt);
     free(e->cvt_pic);
     aeg_dispatch_destroy(&e->d);
-    for (int k = 0; k < AEG_MAX_REFS; k++)
+    for (int k = 0; k < (e->mcr_n > 0 ? e->mcr_n : 2); k++)
         aeg_mc_ctx_free(&e->mcr[k]);
     aeg_free(e->mb_encs);
     aeg_free(e->seed_mv);
