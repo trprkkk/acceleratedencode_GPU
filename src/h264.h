@@ -341,10 +341,16 @@ typedef struct aeg_pwt {
      * ever weighted, the others keep flag 0 */
     int lflag[16], lw[16], lo[16];
     int cflag[16], cw[16][2], co[16][2];
+    /* a B picture's list 1 entries (weighted_bipred_idc 1): the same shape,
+     * indexed by the list 1 entry */
+    int l1flag[16], l1w[16], l1lo[16];
+    int c1flag[16], c1w[16][2], c1co[16][2];
+    int bipred;                /* the table covers both lists (a B picture) */
 } aeg_pwt;
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
-                     int transform_8x8,
-                     int cabac, int weighted_pred, int bottom_poc);
+                     int transform_8x8, int cabac, int pps_id,
+                     int weighted_pred, int bottom_poc,
+                     int weighted_bipred);
 /* `cabac_init_idc` < 0 means CAVLC: the field is then absent from the header.
  * frame_num_bits | AEG_SH_FIELD: the SPS has frame_mbs_only_flag 0 (an
  * interlaced stream coded as frames), so the header carries field_pic_flag. */

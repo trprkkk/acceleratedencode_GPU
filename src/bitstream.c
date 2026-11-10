@@ -434,14 +434,15 @@ size_t aeg_write_sps(uint8_t *rbsp, size_t cap, const aeg_params *p,
 }
 
 size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
-                     int transform_8x8, int cabac,
-                     int weighted_pred, int bottom_poc)
+                     int transform_8x8, int cabac, int pps_id,
+                     int weighted_pred, int bottom_poc,
+                     int weighted_bipred)
 {
     aeg_bitwriter bw;
     aeg_bw_init(&bw, rbsp, cap, 0);
     /* PPS 1 is the weighted-prediction twin of PPS 0 (see the slice
      * header): only the pictures that use weights pay for the table. */
-    aeg_bw_ue(&bw, weighted_pred ? 1u : 0u); /* pic_parameter_set_id      */
+    aeg_bw_ue(&bw, (uint32_t)pps_id);         /* pic_parameter_set_id      */
     aeg_bw_ue(&bw, 0);          /* seq_parameter_set_id                    */
     aeg_bw_put(&bw, 1, cabac ? 1u : 0u); /* entropy_coding_mode_flag        */
     /* (frame pictures among field pictures give their bottom field its own
@@ -451,7 +452,9 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l0_default_active_minus1    */
     aeg_bw_ue(&bw, 0);          /* num_ref_idx_l1_default_active_minus1    */
     aeg_bw_put(&bw, 1, weighted_pred ? 1u : 0u); /* weighted_pred_flag */
-    aeg_bw_put(&bw, 2, 0);      /* weighted_bipred_idc                     */
+    /* weighted_bipred_idc (7.3.2.2): 0 = implicit, 1 = the table
+     * a B slice's header sends below */
+    aeg_bw_put(&bw, 2, (unsigned int)(weighted_bipred ? 1 : 0));
     aeg_bw_se(&bw, 0);          /* pic_init_qp_minus26                     */
     aeg_bw_se(&bw, 0);          /* pic_init_qs_minus26                     */
     aeg_bw_se(&bw, chroma_qp_offset); /* chroma_qp_index_offset            */
@@ -473,6 +476,43 @@ size_t aeg_write_pps(uint8_t *rbsp, size_t cap, int chroma_qp_offset,
 /* ------------------------------------------------------------------ */
 /* pred_weight_table() (7.3.3.2) of a P slice: present whenever the PPS sets
  * weighted_pred_flag, one entry per active list 0 reference, 4:2:0 chroma. */
+/* pred_weight_table() of a B slice (weighted_bipred_idc 1): the same entries
+ * for list 0 and then for list 1 (7.3.3.2). */
+static void write_pred_weight_table_b(aeg_bitwriter *bw, const aeg_pwt *t,
+                                      int nref0, int nref1)
+{
+    int i, c;
+
+    aeg_bw_ue(bw, (uint32_t)t->luma_denom);
+    aeg_bw_ue(bw, (uint32_t)t->chroma_denom);
+    for (i = 0; i < nref0; i++) {
+        aeg_bw_put(bw, 1, t->lflag[i] ? 1u : 0u);
+        if (t->lflag[i]) {
+            aeg_bw_se(bw, t->lw[i]);
+            aeg_bw_se(bw, t->lo[i]);
+        }
+        aeg_bw_put(bw, 1, t->cflag[i] ? 1u : 0u);
+        if (t->cflag[i])
+            for (c = 0; c < 2; c++) {
+                aeg_bw_se(bw, t->cw[i][c]);
+                aeg_bw_se(bw, t->co[i][c]);
+            }
+    }
+    for (i = 0; i < nref1; i++) {
+        aeg_bw_put(bw, 1, t->l1flag[i] ? 1u : 0u);
+        if (t->l1flag[i]) {
+            aeg_bw_se(bw, t->l1w[i]);
+            aeg_bw_se(bw, t->l1lo[i]);
+        }
+        aeg_bw_put(bw, 1, t->c1flag[i] ? 1u : 0u);
+        if (t->c1flag[i])
+            for (c = 0; c < 2; c++) {
+                aeg_bw_se(bw, t->c1w[i][c]);
+                aeg_bw_se(bw, t->c1co[i][c]);
+            }
+    }
+}
+
 static void write_pred_weight_table(aeg_bitwriter *bw, const aeg_pwt *t,
                                     int nref)
 {
@@ -560,7 +600,10 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
 
     aeg_bw_ue(bw, (uint32_t)first_mb); /* first_mb_in_slice                  */
     aeg_bw_ue(bw, (uint32_t)slice_type_in);
-    aeg_bw_ue(bw, pwt ? 1u : 0u);    /* pic_parameter_set_id (1 = weighted) */
+    /* the picture parameter set this slice's table needs: 1 = the P-weighted
+     * twin, 2 = the B-weighted one (each carries only one of the two weighted
+     * flags) */
+    aeg_bw_ue(bw, pwt ? (pwt->bipred ? 2u : 1u) : 0u);
     aeg_bw_put(bw, frame_num_bits & 0xff, (uint32_t)frame_num);
     if (frame_num_bits & AEG_SH_FPIC) {
         aeg_bw_put(bw, 1, 1);         /* field_pic_flag: a field            */
@@ -617,8 +660,15 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
         if (nos == 1)
             aeg_bw_put(bw, 1, 0);     /* ref_pic_list_modification_flag_l1  */
     }
+    /* pred_weight_table(): a P slice's when the PPS sets weighted_pred_flag,
+     * a B slice's when it sets weighted_bipred_idc, both *before* the
+     * reference marking (7.3.3).  It sits with the P one and not next to the
+     * reference list modification: after the marking the decoder reads the
+     * table out of the marking's bits and everything after it with it. */
     if (nos == 0 && pwt)
         write_pred_weight_table(bw, pwt, num_ref_idx_l0_active);
+    if (nos == 1 && pwt)
+        write_pred_weight_table_b(bw, pwt, 1, 1);
     if (is_ref) {
         if (idr) {
             aeg_bw_put(bw, 1, 0);     /* no_output_of_prior_pics_flag       */
@@ -635,6 +685,14 @@ void aeg_write_slice_header_poc(aeg_bitwriter *bw, int slice_type_in,
             aeg_bw_put(bw, 1, 0);     /* adaptive_ref_pic_marking_mode_flag */
         }
     }
+    /* pred_weight_table() of a B slice comes after the reference marking and
+     * before cabac_init_idc (7.3.3): putting it next to the reference list
+     * modification -- which is where the P slice's table sits, because a P
+     * slice has no marking of its own -- misaligns every symbol after it, and
+     * the decoder then reads a cabac_init_idc of 12 and a deblocking offset of
+     * 5 out of a run of weights. */
+    if (nos == 1 && pwt)
+        write_pred_weight_table_b(bw, pwt, 1, 1);
     if (cabac_init_idc >= 0 && nos != 2)
         aeg_bw_ue(bw, (uint32_t)cabac_init_idc);
     aeg_bw_se(bw, slice_qp_delta);    /* slice_qp_delta                     */

@@ -3083,6 +3083,8 @@ static void wp_apply(pixel *d, int stride, int w, int h, int wt, int off,
  * the weighted twin of the picture parameter set). */
 static int wp_used(const struct aeg_encoder *e)
 {
+    if (e->cur_is_b)
+        return e->wp.bipred;
     return e->cur_is_p && (e->wp.lflag[0] || e->wp.cflag[0]);
 }
 
@@ -3100,6 +3102,19 @@ static void mc_rect_luma_to(struct aeg_encoder *e, int list, pixel *dl,
         aeg_mc_luma(dl + y * 16 + x, 16, r, e->stride[0], w, h,
                     mvx & 3, mvy & 3);
         wp_apply(dl + y * 16 + x, 16, w, h, e->wp.lw[0], e->wp.lo[0],
+                 e->wp.luma_denom);
+        return;
+    }
+    /* A B picture's weighted prediction: each list's predictor is interpolated
+     * and then weighted with its own weight, and the two are averaged by the
+     * caller -- 8.4.2.3.2.  No pre-weighted copy of the reference is built (the
+     * P picture's exists so the motion search sees the weighted prediction);
+     * here the search keeps the unweighted one and only the exact prediction is
+     * weighted, as the decoder does. */
+    if (e->cur_is_b && e->wp.bipred && e->wp.lflag[list]) {
+        aeg_mc_luma(dl + y * 16 + x, 16, r, e->stride[0], w, h,
+                    mvx & 3, mvy & 3);
+        wp_apply(dl + y * 16 + x, 16, w, h, e->wp.lw[list], e->wp.lo[list],
                  e->wp.luma_denom);
         return;
     }
@@ -3125,7 +3140,8 @@ static void mc_rect_chroma_to(struct aeg_encoder *e, int list, pixel *dc[2],
                             mbx * 8 + cx + (mvx >> 3);
         aeg_mc_chroma(dc[pl] + cy * 8 + cx, 8, rc, e->stride[1],
                       cw, ch, mvx & 7, mvy & 7);
-        if (e->cur_is_p && e->wp.cflag[list])
+        if (e->cur_is_b && e->wp.bipred ? e->wp.cflag[list]
+                                        : (e->cur_is_p && e->wp.cflag[list]))
             wp_apply(dc[pl] + cy * 8 + cx, 8, cw, ch, e->wp.cw[list][pl],
                      e->wp.co[list][pl], e->wp.chroma_denom);
     }
@@ -12474,6 +12490,83 @@ static int64_t wp_cost_chroma(const struct aeg_encoder *e, int pl, int lw,
     return tot;
 }
 
+/** Weighted B prediction, part 4: the remaining encoder pieces.
+ *
+ * Each list's weight and offset are fitted from the picture pair -- the
+ * current source against the reference that list predicts from, on one sample
+ * in sixty-four -- by least squares.  The spec's form for one list is
+ * Clip1((x * w + 2^(d-1)) >> d) + o, so the fit is y = (a * x) / 2^d + b.
+ *
+ * A fade is where this buys something: the weight of the reference that is
+ * fading out falls towards zero while the other rises, and the two are then
+ * summed -- which the plain average (w0 = w1 = 2^(d-1)) cannot express.
+ */
+static void wp_analyse_b(struct aeg_encoder *e)
+{
+    int l;
+    const int denom = 6;
+    const int maxw = 127, minw = -128, maxo = 127, mino = -127;
+
+    if (!e->p.weighted_bipred || !e->cur_is_b || !e->has_ref || !e->has_ref2)
+        return;
+    /* Both lists get an entry whatever the fit says: a table with one of them
+     * missing is a syntax error, and the decoder then reads the rest of the
+     * header out of the middle of it.  A list that cannot be fitted keeps the
+     * neutral weight (2^(d-1), offset 0), which is the unweighted prediction
+     * it already used. */
+    for (l = 0; l < 2; l++) {
+        const pixel *ref = e->refpl[l][0];
+        const pixel *src = e->srcp[0];
+        const int st = e->stride[0];
+        const int wdt = e->w - (e->w & 7), hgt = e->h - (e->h & 7);
+        double sx = 0, sy = 0, sxx = 0, sxy = 0, a = 1.0, b = 0.0, d;
+        int w = 1 << (denom - 1), o = 0, x, y, n = 0;
+
+        for (y = 0; y < hgt; y += 8)
+            for (x = 0; x < wdt; x += 8) {
+                const pixel *sp = src + (size_t)y * st + x;
+                const pixel *rp = ref + (size_t)y * st + x;
+                int i;
+                for (i = 0; i < 8; i += 4) {
+                    double us = sp[i * st], ur = rp[i * st];
+                    sx += ur; sy += us; sxx += ur * ur; sxy += ur * us;
+                    n++;
+                }
+            }
+        if (n >= 64) {
+            d = (double)n * sxx - sx * sx;
+            if (d >= 1e-6) {
+                a = ((double)n * sxy - sx * sy) / d;
+                b = (sy - a * sx) / (double)n;
+            }
+        }
+        w = (int)(a * (1 << denom) + (a >= 0 ? 0.5 : -0.5));
+        if (w > maxw) w = maxw;
+        if (w < minw) w = minw;
+        o = (int)(b + (b >= 0 ? 0.5 : -0.5));
+        if (o > maxo) o = maxo;
+        if (o < mino) o = mino;
+        if (l == 0) {
+            e->wp.lflag[0] = 1;
+            e->wp.lw[0] = w;
+            e->wp.lo[0] = o;
+            e->wp.cflag[0] = 1;
+            e->wp.cw[0][0] = e->wp.cw[0][1] = w;
+            e->wp.co[0][0] = e->wp.co[0][1] = o;
+        } else {
+            e->wp.l1flag[0] = 1;
+            e->wp.l1w[0] = w;
+            e->wp.l1lo[0] = o;
+            e->wp.c1flag[0] = 1;
+            e->wp.c1w[0][0] = e->wp.c1w[0][1] = w;
+            e->wp.c1co[0][0] = e->wp.c1co[0][1] = o;
+        }
+    }
+    e->wp.luma_denom = denom;
+    e->wp.chroma_denom = denom;
+    e->wp.bipred = 1;
+}
+
 static int wp_threshold(void)
 {
     static _Atomic int v = -1;
@@ -12499,6 +12592,10 @@ static void wp_analyse(struct aeg_encoder *e)
     double sg;
 
     memset(&e->wp, 0, sizeof(e->wp));
+    if (e->cur_is_b) {
+        wp_analyse_b(e);
+        return;
+    }
     if (!e->p.weightp || !e->cur_is_p || !e->has_ref || lw < 8 || lh < 8 ||
         e->mbaff || (e->fld && (!e->fwp || !e->wp_mem)))
         return;
@@ -14729,20 +14826,32 @@ static void copy_yuv(const struct aeg_encoder *e, pixel *p[3],
                     e->vch, e->cw, e->ch);
 }
 
-/* SPS, PPS 0 and (with weighted prediction) PPS 1, as NAL units with start
- * codes: what every IDR picture begins with. */
+/* SPS, PPS 0 and the weighted twins, as NAL units with start codes: what every
+ * IDR picture begins with.
+ *
+ * A parameter set carries *one* of the two weighted flags: weighted_pred_flag
+ * (a P slice's table) and weighted_bipred_idc (a B slice's) are different
+ * symbols at different points of the two slice headers, and a set that sets
+ * both sends a decoder looking for a table where the slice sends none (it read
+ * cabac_init_idc 12 out of the middle of a weight table).  So PPS 1 is the
+ * P-weighted twin and PPS 2 the B-weighted one, and each picture refers to the
+ * set its own table needs. */
 static int write_param_sets(struct aeg_encoder *e)
 {
     uint8_t sps[256], pps[64];
     size_t n = 0, cap = sizeof(e->hdr);
+    const int wp_on = e->p.weightp && (e->p.field_coding == 0 ||
+                                       e->p.field_coding == 2 || e->fwp);
+    const int wb_on = e->p.weighted_bipred && e->p.bframes > 0;
     size_t sl = aeg_write_sps(sps, sizeof(sps), &e->p, e->mb_w, e->mb_h,
                               e->frame_num_bits, e->level_idc);
     size_t pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                              e->p.transform_8x8, e->p.cabac, 0,
-                              e->p.field_coding == 2 || e->p.field_coding == 4);
+                              e->p.transform_8x8, e->p.cabac, 0, 0,
+                              e->p.field_coding == 2 || e->p.field_coding == 4,
+                              0);
     /* worst case of a NAL: start code, header, and an emulation prevention
      * byte every two payload bytes */
-    if (!sl || !pl || 3 * (sl + 2 * pl) / 2 + 3 * 6 > cap)
+    if (!sl || !pl || 3 * (sl + 2 * (wp_on + wb_on) * pl) / 2 + 3 * 6 > cap)
         return AEG_ERROR;
     e->level_out = sps[2];   /* profile_idc, constraint flags, level_idc */
     if (e->p.interlaced && (e->level_out < 21 || e->level_out > 41))
@@ -14751,13 +14860,18 @@ static int write_param_sets(struct aeg_encoder *e)
                 e->level_out % 10);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 7, sps, sl, 1);
     n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
-    if (e->p.weightp && (e->p.field_coding == 0 || e->p.field_coding == 2 ||
-                         e->fwp)) {
-        /* PPS 1: the same with weighted_pred_flag, for the P pictures that
-         * send weights (the others keep referring to PPS 0) */
+    if (wp_on) {
+        /* PPS 1: weighted_pred_flag, for the P pictures that send weights */
         pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
-                           e->p.transform_8x8, e->p.cabac, 1,
-                           e->p.field_coding == 2 || e->p.field_coding == 4);
+                           e->p.transform_8x8, e->p.cabac, 1, 1,
+                           e->p.field_coding == 2 || e->p.field_coding == 4, 0);
+        n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
+    }
+    if (wb_on) {
+        /* PPS 2: weighted_bipred_idc, for the B pictures that send weights */
+        pl = aeg_write_pps(pps, sizeof(pps), e->p.chroma_qp_offset,
+                           e->p.transform_8x8, e->p.cabac, 2, 0,
+                           e->p.field_coding == 2 || e->p.field_coding == 4, 1);
         n += aeg_nal_write(e->hdr + n, cap - n, 3, 8, pps, pl, 0);
     }
     e->hdr_len = n;
@@ -15543,6 +15657,19 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
      * validation clips -- short, which fades, -1.8 -- at no measurable time) */
     if (pp->weightp < 0)
         pp->weightp = pp->preset >= 1;
+    /* Weighted B (--weightb) is refused until its B slice's pred_weight_table
+     * is decodable: the table is written, but an independent decoder still
+     * reads the rest of the slice header out of the middle of it (ffmpeg 3.4:
+     * "cabac_init_idc 6 overflow").  Everything below the flag is in place --
+     * the per-list fit, the two-list table, its own PPS 2, the per-list
+     * weighting in the motion compensation -- so the work that is left is the
+     * table's placement, not the feature.  docs/FEATURES.md says so. */
+    if (pp->weighted_bipred) {
+        aeg_log(AEG_LOG_WARNING,
+                "aeg: --weightb is refused: the B slice's pred_weight_table "
+                "misplaces the rest of the header; coding without it");
+        pp->weighted_bipred = 0;
+    }
     if (pp->refs < 1)
         pp->refs = 1;
     if (pp->refs > AEG_MAX_REFS)

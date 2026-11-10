@@ -335,6 +335,13 @@ typedef struct aeg_params {
      * pictures too: each field against its list 0 field).  -1 = as the
      * preset says (on from preset 1 up). */
     int weightp;
+    /* Explicit weighted prediction of B pictures (weighted_bipred_idc 1): the
+     * two lists' weights are fitted per picture and sent in the B slice's
+     * pred_weight_table, and each list's prediction is weighted before the two
+     * are averaged -- the decoder's arithmetic, 8.4.2.3.2.  On a fade one
+     * reference's weight falls to zero while the other's rises, which the
+     * plain average cannot express. */
+    int weighted_bipred;
     /* B pyramid: the middle B picture of a group of two or more is a
      * reference picture for the others (x264's b-pyramid "normal").  -1 = on
      * whenever it can be (B pictures, spatial direct, one P reference). */

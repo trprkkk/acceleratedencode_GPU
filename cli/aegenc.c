@@ -110,6 +110,10 @@ static void usage(void)
 "                   the others (default with B pictures), 0 = off\n"
 "  --weightp <n>    explicit weighted prediction of P pictures (fades),\n"
 "                   0 = off, 1 = on (default from preset 1)\n"
+"  --weightb <n>    explicit weighted prediction of B pictures (fades):\n"
+"                   each list's predictor is weighted with its own weight\n"
+"                   before the two are averaged (8.4.2.3.2), 0 = off\n"
+"                   (default), 1 = on\n"
 "  --ref <n>        reference pictures for P pictures, 1..8 (default 8 at\n"
 "                   preset 4, 4 at preset 3, otherwise 1)\n"
 "  --bframes <n>    B pictures between two anchors, 0..3 (default 3).  The\n"
@@ -824,6 +828,13 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(a, "--lossless")) p.lossless = 1;
+        else if (!strcmp(a, "--weightb")) {
+            /* refused until the B slice's table is placed: see
+             * aeg_params_resolve() in src/encoder.c */
+            fprintf(stderr, "error: --weightb is not usable yet: the B "
+                    "slice's pred_weight_table misaligns the header\n");
+            return 2;
+        }
         else if (!strcmp(a, "--qpfile")) {
             const char *path = next_arg(argc, argv, &i);
             char line[128];
