@@ -395,7 +395,7 @@ static int ocl_tq_iq_batch(void *priv, const int16_t *res, int nblk, int qp,
     int sh = qp / 6;
     int ls0 = aeg_dequant_ls[qp % 6][0], ls1 = aeg_dequant_ls[qp % 6][1],
         ls2 = aeg_dequant_ls[qp % 6][2];
-    cl_int st;
+    cl_int st = CL_SUCCESS;
     ocl_evlist ev;
 
     if (nblk <= 0)
@@ -532,7 +532,7 @@ static int ocl_sse_batch(void *priv, const uint8_t *a, int sa, const uint8_t *b,
     size_t abytes = (size_t)sa * h;
     uint64_t *tmp;
     size_t i, acc = 0;
-    cl_int st;
+    cl_int st = CL_SUCCESS;
     ocl_evlist ev;
 
     ma = ocl_buf(o, 0, abytes, CL_MEM_READ_ONLY);

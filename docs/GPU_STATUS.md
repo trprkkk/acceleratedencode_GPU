@@ -192,3 +192,23 @@ Speed at matched preset names (`tools/vs_presets.sh`):
 * 11.4 % BD-rate against x264 medium: the tools that would close it are the
   ones still missing (weighted B, custom quantisation matrices, open GOP), and
   they are listed in the API as absent rather than silently unimplemented.
+
+## 8. ASan and UBSan
+
+`tools/run_asan.sh` builds the tree with `-fsanitize=address,undefined` and
+runs the unit tests and a short encode through every backend.  **Zero reports**
+-- no leak, no out-of-bounds, no undefined behaviour -- from every run that
+finishes, on `api_check`, `cavlc_check`, `cabac_check`, `cabac_mb_check`,
+`kernel_check` and encodes with `-b cpu`, `-b cuda`, `-b opencl`, and with the
+coefficient stages forced to each device.
+
+One caveat, and it is this machine's, not the encoder's: a run that does not
+finish stops *inside the dynamic linker*, in `do_lookup_x` resolving
+`pthread_getspecific` for the ASan runtime (`tools/asan_hunt.sh` catches it
+with gdb), about one run in five, and the **untouched baseline hangs the same
+way** (`tools/asan_base_tri.sh`: one of six runs timed out at 900 s).  The
+same environment also stops the device loaders under ASan -- `--list-devices`
+reports only the CPU on the baseline and on this branch alike -- so the ASan
+builds cover the CPU paths, and the device paths are covered without ASan by
+`backend_check` (312 checks against the CPU reference, both backends, both
+queue orders) and `tools/gpu_validate.sh`.
