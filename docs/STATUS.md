@@ -7433,3 +7433,89 @@ following steps are needed:
 4. Then the frame-level asynchronous ME candidates (hierarchical search,
    top-K, CPU refinement). That step needs its own CPU reference
    implementation and a BD-rate check.
+
+### Batches: every field of a scheduling step in one launch
+
+One field per launch kept one work-group of the device busy and moved two
+lowres planes per field. At p3/p4 the fields a scheduling step will ask
+for are known before it starts:
+
+- The B-adapt trellis prices every group (s, t) of the window, and the
+  tree plans the same groups.
+- So the step needs every P pair (t, s) with t − s ≤ bframes + 1, the B
+  pairs of each group's pyramid structure (`la_need_window()`, the rule of
+  `la_group_cost()` / `mbt_group()`), and for a seeded field all the
+  shorter distances it is seeded from.
+
+`la_prefetch()` computes the missing ones in a single call of the new op
+`lowres_chains`:
+
+- **Chains.** One work-group per picture and direction walks its
+  distances in order. Each field is seeded from the previous one of its
+  chain, which is already in device memory.
+- **Residency.** The device keeps the ring's lowres pictures in one
+  buffer by ring slot. A slot is uploaded again only when it holds a new
+  picture (its tag is the display number, and `in_low` is written only
+  when a picture is pushed).
+- **Calls.** Fields of at most 128 MB go in one call. A failed call
+  leaves its fields to be searched on demand.
+
+A field depends only on (d, r) and its seeds, so computing it early or on
+the device cannot change it. `la_field()` finds it cached and still
+computes on demand anything the enumeration missed. On the CPU the step
+stays lazy. The placement times whole steps (2 probes per side, retry
+every 16 steps). Other configurations (b-adapt 1, or a narrow trellis)
+keep the per-field path.
+
+**Results.**
+
+- **Exact demand.** cockL at p3 and p4, 120 frames: 1610 fields in 29
+  batches, 0 searched on demand, and all 1610 looked up afterwards. The
+  enumeration matches the demand exactly, with nothing wasted. The first
+  batch is the initial window (137 chains, 910 fields); later steps add
+  about 16 chains / 84 fields each.
+- **Byte-identical to the CPU build (PoCL, `-s la=opencl`):**
+  - p1/p3/p4;
+  - `--frame-threads 2`, `-t 2`;
+  - PAFF, MBAFF, field coding;
+  - VBV;
+  - `--bframes 16` and `--bframes 2`;
+  - `--b-pyramid 0`, `-g 13`, `-g 5`;
+  - p2 with `--b-adapt 2` (per-field path);
+  - fade, a scene cut (cockL then vtestL), 720p hdL.
+  - The sanitized build gives the same stream.
+- **Tests.**
+  - `kernel_check` runs `lowres_chains` as C over chains of both
+    directions, given and chained seeds, on 6 sizes.
+  - `backend_check` runs three calls on one ring: a fresh upload, chains
+    on the resident pictures, and a slot holding a new picture. It covers
+    5 sizes up to 1080p.
+  - Mutations are caught: dropping the given seed fails `kernel_check`;
+    trusting a slot without its tag fails "slot reused".
+
+| serial, lookahead stage | CPU | PoCL, per field (before) | PoCL, batched (forced) |
+|---|---|---|---|
+| cockL p3, 40 frames | 185-194 ms | 1165-1241 ms | 388-437 ms |
+| cockL p4, 40 frames | 185-264 ms | 1134-1205 ms | 392-427 ms |
+| hdL 720p p3, 30 frames | 610-759 ms | — | 1045-1179 ms |
+| cockL p3, 240 frames | 1408 ms (20.7 s total) | — | 3028 ms (22.3 s); auto 1959 ms (22.0 s) |
+
+- **Faster on PoCL.** Batching makes the device path about 3× faster
+  there: two cores now run work-groups in parallel, and nothing is
+  transferred twice.
+- **Auto on PoCL.** The CPU is still about 2× faster there, and auto
+  picks it. Most of auto's device share on the 240-frame run is the first
+  step, which is not counted and is the largest batch.
+- **Clip length.** Clips shorter than the lookahead are decided in one
+  step at the end of the input, so auto never probes the CPU on them.
+- **Unmeasured.** Whether a real GPU wins is still unmeasured. After the
+  first batch a step has only about 16 chains, too few work-groups for a
+  large GPU.
+
+**Next steps:**
+
+1. Overlap a step's batch with the coding of the previous group
+   (asynchronous lookahead).
+2. Move the lowres downsampling, intra and bidir costs to the device.
+3. Enable the device lookahead at 10 bits. The lowres pictures are 8-bit
+   there too, but the 10-bit build opens no device backend.

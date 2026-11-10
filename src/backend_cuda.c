@@ -97,7 +97,7 @@ CUDA_SYMS(DECL)
 NVRTC_SYMS(DECL)
 #undef DECL
 
-#define NBUF 12
+#define NBUF 16
 #define AEG_BLOCK 256
 
 typedef struct cuda_ctx {
@@ -107,7 +107,7 @@ typedef struct cuda_ctx {
     CUcontext ctx;
     CUmodule mod;
     CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq, k_tqdc, k_iqdc;
-    CUfunction k_lrs;
+    CUfunction k_lrs, k_lrc;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -118,6 +118,14 @@ typedef struct cuda_ctx {
     int16_t *pos;               /* sad_batch: the rebased positions */
     size_t pos_cap;
     int is_clone;               /* shares ctx/mod/libraries with the first */
+    /* lowres_chains: the ring's lowres planes, resident (slot k at k *
+     * lr_slot bytes), each tagged with the picture it holds (-1 = none) */
+    CUdeviceptr lr_mem;
+    size_t lr_slot;
+    int lr_nslots;
+    int *lr_tag;
+    int *lr_host;               /* the packed chain and job tables */
+    size_t lr_host_cap;
 } cuda_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -598,6 +606,129 @@ static int cuda_lowres_search(void *priv, const uint8_t *cur,
     return AEG_OK;
 }
 
+/* buffers 12-15: chain table, job table, seeds, fields (see the OpenCL
+ * version, which this follows with synchronous copies) */
+static int cuda_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
+                              int nslots, const aeg_la_chain *chains,
+                              int nchains, const aeg_la_job *jobs, int stride,
+                              int w, int h)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8, hexit = AEG_LA_RANGE;
+    const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    const int fsz = 3 * mb_w * mb_h;
+    const size_t sb = sizeof(int) * (size_t)(2 * fsz / 3);
+    int njobs = 0, nseed = 0, c, i, ss;
+    size_t need;
+    CUdeviceptr dc, dj, ds, dout;
+    void *args[13];
+
+    if (mb_w <= 0 || mb_h <= 0 || nchains <= 0)
+        return AEG_OK;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    for (c = 0; c < nchains; c++) {
+        if (chains[c].first + chains[c].count > njobs)
+            njobs = chains[c].first + chains[c].count;
+        nseed += chains[c].seed != NULL;
+    }
+    if (slot * (size_t)nslots > 0x7fffffffu ||
+        (size_t)fsz * (size_t)njobs > 0x1fffffffu)
+        return AEG_EBACKEND;
+    if (!o->lr_mem || o->lr_slot != slot || o->lr_nslots < nslots) {
+        int *tag = (int *)realloc(o->lr_tag, sizeof(int) * (size_t)nslots);
+        if (!tag)
+            return AEG_ENOMEM;
+        o->lr_tag = tag;
+        if (o->lr_mem)
+            p_cuMemFree_v2(o->lr_mem);
+        o->lr_mem = 0;
+        o->lr_nslots = 0;
+        o->lr_slot = slot;
+        if (p_cuMemAlloc_v2(&o->lr_mem, slot * (size_t)nslots) != CUDA_SUCCESS) {
+            o->lr_mem = 0;
+            return AEG_EBACKEND;
+        }
+        o->lr_nslots = nslots;
+        for (i = 0; i < nslots; i++)
+            o->lr_tag[i] = -1;
+    }
+    need = 4 * (size_t)nchains + 5 * (size_t)njobs;
+    if (need > o->lr_host_cap) {
+        int *t = (int *)realloc(o->lr_host, sizeof(int) * need);
+        if (!t)
+            return AEG_ENOMEM;
+        o->lr_host = t;
+        o->lr_host_cap = need;
+    }
+    dc = cuda_buf(o, 12, sizeof(int) * 4 * (size_t)nchains);
+    dj = cuda_buf(o, 13, sizeof(int) * 5 * (size_t)njobs);
+    dout = cuda_buf(o, 15, sizeof(int) * (size_t)fsz * (size_t)njobs);
+    ds = nseed ? cuda_buf(o, 14, sb * (size_t)nseed) : dout;
+    if (!dc || !dj || !ds || !dout)
+        return AEG_EBACKEND;
+    for (i = 0; i < npics; i++) {
+        int k = pics[i].slot;
+        if (k < 0 || k >= nslots)
+            goto fail;
+        if (o->lr_tag[k] == pics[i].tag)
+            continue;
+        o->lr_tag[k] = -1;
+        if (p_cuMemcpyHtoD_v2(o->lr_mem + slot * (size_t)k,
+                              pics[i].plane - org, slot) != CUDA_SUCCESS)
+            goto fail;
+        o->lr_tag[k] = pics[i].tag;
+    }
+    nseed = 0;
+    for (c = 0; c < nchains; c++) {
+        int *ci = o->lr_host + 4 * c;
+        ci[0] = pics[chains[c].cur].slot;
+        ci[1] = chains[c].first;
+        ci[2] = chains[c].count;
+        ci[3] = -1;
+        if (chains[c].seed) {
+            ci[3] = nseed * (2 * fsz / 3);
+            if (p_cuMemcpyHtoD_v2(ds + sb * (size_t)nseed, chains[c].seed,
+                                  sb) != CUDA_SUCCESS)
+                goto fail;
+            nseed++;
+        }
+    }
+    for (i = 0; i < njobs; i++) {
+        int *ji = o->lr_host + 4 * nchains + 5 * i;
+        ji[0] = pics[jobs[i].ref].slot;
+        ji[1] = jobs[i].seeded;
+        ji[2] = jobs[i].num;
+        ji[3] = jobs[i].den;
+        ji[4] = jobs[i].range;
+    }
+    if (p_cuMemcpyHtoD_v2(dc, o->lr_host, sizeof(int) * 4 * (size_t)nchains) !=
+            CUDA_SUCCESS ||
+        p_cuMemcpyHtoD_v2(dj, o->lr_host + 4 * nchains,
+                          sizeof(int) * 5 * (size_t)njobs) != CUDA_SUCCESS)
+        goto fail;
+    ss = (int)slot;
+    args[0] = &o->lr_mem; args[1] = &ss;     args[2] = &stride;
+    args[3] = &pad;       args[4] = &w;      args[5] = &h;
+    args[6] = &mb_w;      args[7] = &mb_h;   args[8] = &dc;
+    args[9] = &dj;        args[10] = &ds;    args[11] = &hexit;
+    args[12] = &dout;
+    if (p_cuLaunchKernel(o->k_lrc, (unsigned)nchains, 1, 1, 64, 1, 1, 0, NULL,
+                         args, NULL) != CUDA_SUCCESS)
+        goto fail;
+    for (i = 0; i < njobs; i++)
+        if (p_cuMemcpyDtoH_v2(jobs[i].out,
+                              dout + sizeof(int) * (size_t)fsz * (size_t)i,
+                              sizeof(int) * (size_t)fsz) != CUDA_SUCCESS)
+            goto fail;
+    return AEG_OK;
+fail:
+    for (i = 0; i < o->lr_nslots; i++)
+        o->lr_tag[i] = -1;
+    return AEG_EBACKEND;
+}
+
 static void cuda_sync(void *priv)
 {
     cuda_ctx *o = (cuda_ctx *)priv;
@@ -617,6 +748,10 @@ static void cuda_destroy(void *priv)
         if (o->buf[i])
             p_cuMemFree_v2(o->buf[i]);
     free(o->pos);
+    if (o->lr_mem)
+        p_cuMemFree_v2(o->lr_mem);
+    free(o->lr_tag);
+    free(o->lr_host);
     if (o->is_clone) {
         free(o);
         return;
@@ -688,7 +823,7 @@ static int nvrtc_load(void **lib)
 static const char *const aeg_cuda_kernels[] = {
     "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
     "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch",
-    "lowres_search", NULL
+    "lowres_search", "lowres_chains", NULL
 };
 
 /* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
@@ -776,7 +911,7 @@ static int cuda_build_module(cuda_ctx *o)
     char *ptx = NULL, log[2048];
     int major = 5, minor = 0, cc, k, rc;
     CUresult cr;
-    CUfunction *fn[10];
+    CUfunction *fn[11];
 
     p_cuDeviceGetAttribute(&major,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -805,7 +940,7 @@ static int cuda_build_module(cuda_ctx *o)
     fn[0] = &o->k_sad; fn[1] = &o->k_tq; fn[2] = &o->k_iq;
     fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
     fn[6] = &o->k_tqiq; fn[7] = &o->k_tqdc; fn[8] = &o->k_iqdc;
-    fn[9] = &o->k_lrs;
+    fn[9] = &o->k_lrs; fn[10] = &o->k_lrc;
     for (k = 0; aeg_cuda_kernels[k]; k++)
         if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
             CUDA_SUCCESS)
@@ -908,6 +1043,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     o->k_tqdc = src->k_tqdc;
     o->k_iqdc = src->k_iqdc;
     o->k_lrs = src->k_lrs;
+    o->k_lrc = src->k_lrc;
     o->cus = src->cus;
     o->mem = src->mem;
     memcpy(o->name, src->name, sizeof(o->name));
@@ -925,6 +1061,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     out->ref_upload = cuda_ref_upload;
     out->satd_batch = cuda_satd_batch;
     out->lowres_search = cuda_lowres_search;
+    out->lowres_chains = cuda_lowres_chains;
     out->sync = cuda_sync;
     out->destroy = cuda_destroy;
     out->clone = cuda_clone;
@@ -1013,6 +1150,7 @@ int aeg_be_cuda_create(aeg_be_ops *ops, int want)
     ops->ref_upload = cuda_ref_upload;
     ops->satd_batch = cuda_satd_batch;
     ops->lowres_search = cuda_lowres_search;
+    ops->lowres_chains = cuda_lowres_chains;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
     ops->clone = cuda_clone;

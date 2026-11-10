@@ -255,6 +255,31 @@ static int cpu_lowres_search(void *priv, const uint8_t *cur,
     return AEG_OK;
 }
 
+/* the reference of lowres_chains: the chains one after another, every field
+ * the lookahead's own search */
+static int cpu_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
+                             int nslots, const aeg_la_chain *chains,
+                             int nchains, const aeg_la_job *jobs, int stride,
+                             int w, int h)
+{
+    int c, j;
+
+    (void)npics;
+    (void)nslots;
+    for (c = 0; c < nchains; c++) {
+        const aeg_la_chain *ch = &chains[c];
+        const int *prev = ch->seed;
+        for (j = ch->first; j < ch->first + ch->count; j++) {
+            cpu_lowres_search(priv, pics[ch->cur].plane, pics[jobs[j].ref].plane,
+                              stride, w, h, jobs[j].seeded ? prev : NULL,
+                              jobs[j].num, jobs[j].den, jobs[j].range,
+                              jobs[j].out);
+            prev = jobs[j].out;
+        }
+    }
+    return AEG_OK;
+}
+
 void aeg_be_cpu_ops(aeg_be_ops *ops)
 {
     memset(ops, 0, sizeof(*ops));
@@ -270,6 +295,7 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->ref_upload = cpu_ref_upload;
     ops->satd_batch = cpu_satd_batch;
     ops->lowres_search = cpu_lowres_search;
+    ops->lowres_chains = cpu_lowres_chains;
     snprintf(ops->desc, sizeof(ops->desc), "cpu");
 }
 
@@ -463,6 +489,21 @@ static int g_lowres_search(void *priv, const uint8_t *cur,
                                    seed, num, den, range, out);
 }
 
+static int g_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
+                           int nslots, const aeg_la_chain *chains, int nchains,
+                           const aeg_la_job *jobs, int stride, int w, int h)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.lowres_chains(l->dev.priv, pics, npics, nslots,
+                                            chains, nchains, jobs, stride, w,
+                                            h),
+                    "lowres_chains"))
+        return AEG_OK;
+    return l->g->cpu.lowres_chains(l->g->cpu.priv, pics, npics, nslots, chains,
+                                   nchains, jobs, stride, w, h);
+}
+
 static int g_sse_batch(void *priv, const pixel *a, int sa, const pixel *b,
                        int sb, int w, int h, uint64_t *out)
 {
@@ -648,6 +689,7 @@ static int be_guard_wrap(aeg_be_ops *ops)
     if (ops->interp_plane) ops->interp_plane = g_interp_plane;
     if (ops->sse_batch) ops->sse_batch = g_sse_batch;
     if (ops->lowres_search) ops->lowres_search = g_lowres_search;
+    if (ops->lowres_chains) ops->lowres_chains = g_lowres_chains;
     if (ops->ref_upload && ops->satd_batch) {
         ops->ref_upload = g_ref_upload;
         ops->satd_batch = g_satd_batch;
@@ -897,10 +939,16 @@ void aeg_dispatch_update(aeg_dispatcher *d)
  * first launch, the buffers) and is not counted. */
 #define AEG_LA_PROBE 4
 #define AEG_LA_RETRY 128
+/* per scheduling step when the fields come in batches (la_prefetch in
+ * encoder.c): a step is one group's worth of fields, so fewer of them */
+#define AEG_LA_PROBE_BATCH 2
+#define AEG_LA_RETRY_BATCH 16
 
-int aeg_dispatch_la_pick(aeg_dispatcher *d)
+int aeg_dispatch_la_pick(aeg_dispatcher *d, int batch)
 {
     aeg_dispatcher *r;
+    const int probe = batch ? AEG_LA_PROBE_BATCH : AEG_LA_PROBE;
+    const int retry = batch ? AEG_LA_RETRY_BATCH : AEG_LA_RETRY;
     int dev;
 
     if (d->forced[AEG_STAGE_LOOKAHEAD] >= 0)
@@ -910,11 +958,11 @@ int aeg_dispatch_la_pick(aeg_dispatcher *d)
     if (!d->have_gpu || !d->ops.lowres_search)
         return 0;
     r = disp_lock(d);
-    if (r->la_n[0] <= AEG_LA_PROBE || r->la_n[1] <= AEG_LA_PROBE) {
+    if (r->la_n[0] <= probe || r->la_n[1] <= probe) {
         dev = r->la_n[1] <= r->la_n[0];
     } else {
         dev = r->la_ns[1] < r->la_ns[0];
-        if (++r->la_since >= AEG_LA_RETRY) {
+        if (++r->la_since >= retry) {
             r->la_since = 0;
             dev = !dev;
         }

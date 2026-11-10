@@ -37,6 +37,7 @@ typedef intptr_t cl_context_properties;
 #define CL_MEM_WRITE_ONLY (1 << 1)
 #define CL_MEM_READ_WRITE (1 << 0)
 #define CL_TRUE 1
+#define CL_FALSE 0
 #define CL_PROGRAM_BUILD_LOG 0x1183
 #define CL_DEVICE_TYPE 0x1000
 #define CL_DEVICE_TYPE_GPU (1 << 2)
@@ -89,7 +90,7 @@ static void ocl_load_error(const char *name)
 OCL_SYMS(DECL)
 #undef DECL
 
-#define NBUF 12
+#define NBUF 16
 
 typedef struct ocl_ctx {
     cl_platform_id platform;
@@ -113,6 +114,15 @@ typedef struct ocl_ctx {
     int16_t *pos;               /* sad_batch: the rebased positions */
     size_t pos_cap;
     int no_clone;               /* the runtime cannot take several queues */
+    /* lowres_chains: the ring's lowres planes, resident (slot k at k *
+     * lr_slot bytes), each tagged with the picture it holds (-1 = none) */
+    cl_kernel k_lrc;
+    cl_mem lr_mem;
+    size_t lr_slot;
+    int lr_nslots;
+    int *lr_tag;
+    int *lr_host;               /* the packed chain and job tables */
+    size_t lr_host_cap;
 } ocl_ctx;
 
 /* PoCL 4.x-6.x abort when two command queues launch the same kernel at the
@@ -695,6 +705,153 @@ static int ocl_lowres_search(void *priv, const uint8_t *cur,
     return AEG_OK;
 }
 
+/* buffers 12-15: chain table, job table, seeds, fields */
+static int ocl_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
+                             int nslots, const aeg_la_chain *chains,
+                             int nchains, const aeg_la_job *jobs, int stride,
+                             int w, int h)
+{
+    ocl_ctx *o = (ocl_ctx *)priv;
+    const int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8, hexit = AEG_LA_RANGE;
+    const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    const int fsz = 3 * mb_w * mb_h;
+    int njobs = 0, nseed = 0, c, i, slot_i, rc = AEG_EBACKEND;
+    size_t need, local = o->lrs_wg, global;
+    cl_mem mc, mj, ms, mo;
+    cl_int st = 0;
+
+    if (mb_w <= 0 || mb_h <= 0 || nchains <= 0)
+        return AEG_OK;
+    for (c = 0; c < nchains; c++) {
+        if (chains[c].first + chains[c].count > njobs)
+            njobs = chains[c].first + chains[c].count;
+        nseed += chains[c].seed != NULL;
+    }
+    /* the kernel's offsets are ints */
+    if (slot * (size_t)nslots > 0x7fffffffu ||
+        (size_t)fsz * (size_t)njobs > 0x1fffffffu)
+        return AEG_EBACKEND;
+    if (!o->lr_mem || o->lr_slot != slot || o->lr_nslots < nslots) {
+        int *tag = (int *)realloc(o->lr_tag, sizeof(int) * (size_t)nslots);
+        if (!tag)
+            return AEG_ENOMEM;
+        o->lr_tag = tag;
+        if (o->lr_mem)
+            p_clReleaseMemObject(o->lr_mem);
+        o->lr_mem = p_clCreateBuffer(o->ctx, CL_MEM_READ_ONLY,
+                                     slot * (size_t)nslots, NULL, &st);
+        o->lr_slot = slot;
+        o->lr_nslots = o->lr_mem && st == CL_SUCCESS ? nslots : 0;
+        for (i = 0; i < nslots; i++)
+            o->lr_tag[i] = -1;
+        if (!o->lr_nslots)
+            return AEG_EBACKEND;
+    }
+    need = 4 * (size_t)nchains + 5 * (size_t)njobs;
+    if (need > o->lr_host_cap) {
+        int *t = (int *)realloc(o->lr_host, sizeof(int) * need);
+        if (!t)
+            return AEG_ENOMEM;
+        o->lr_host = t;
+        o->lr_host_cap = need;
+    }
+    mc = ocl_buf(o, 12, sizeof(int) * 4 * (size_t)nchains, CL_MEM_READ_ONLY);
+    mj = ocl_buf(o, 13, sizeof(int) * 5 * (size_t)njobs, CL_MEM_READ_ONLY);
+    mo = ocl_buf(o, 15, sizeof(int) * (size_t)fsz * (size_t)njobs,
+                 CL_MEM_READ_WRITE);
+    ms = nseed ? ocl_buf(o, 14, sizeof(int) * (size_t)(2 * fsz / 3) * nseed,
+                         CL_MEM_READ_ONLY)
+               : mo;            /* not read: any valid buffer */
+    if (!mc || !mj || !ms || !mo)
+        return AEG_EBACKEND;
+
+    /* the pictures whose slot holds something else */
+    for (i = 0; i < npics; i++) {
+        slot_i = pics[i].slot;
+        if (slot_i < 0 || slot_i >= nslots)
+            goto fail;
+        if (o->lr_tag[slot_i] == pics[i].tag)
+            continue;
+        o->lr_tag[slot_i] = -1;
+        if (p_clEnqueueWriteBuffer(o->queue, o->lr_mem, CL_FALSE,
+                                   slot * (size_t)slot_i, slot,
+                                   pics[i].plane - org, 0, NULL,
+                                   NULL) != CL_SUCCESS)
+            goto fail;
+        o->lr_tag[slot_i] = pics[i].tag;
+    }
+    nseed = 0;
+    for (c = 0; c < nchains; c++) {
+        int *ci = o->lr_host + 4 * c;
+        ci[0] = pics[chains[c].cur].slot;
+        ci[1] = chains[c].first;
+        ci[2] = chains[c].count;
+        ci[3] = -1;
+        if (chains[c].seed) {
+            const size_t sb = sizeof(int) * (size_t)(2 * fsz / 3);
+            ci[3] = nseed * (2 * fsz / 3);
+            if (p_clEnqueueWriteBuffer(o->queue, ms, CL_FALSE, sb * nseed, sb,
+                                       chains[c].seed, 0, NULL,
+                                       NULL) != CL_SUCCESS)
+                goto fail;
+            nseed++;
+        }
+    }
+    for (i = 0; i < njobs; i++) {
+        int *ji = o->lr_host + 4 * nchains + 5 * i;
+        ji[0] = pics[jobs[i].ref].slot;
+        ji[1] = jobs[i].seeded;
+        ji[2] = jobs[i].num;
+        ji[3] = jobs[i].den;
+        ji[4] = jobs[i].range;
+    }
+    if (p_clEnqueueWriteBuffer(o->queue, mc, CL_FALSE, 0,
+                               sizeof(int) * 4 * (size_t)nchains, o->lr_host,
+                               0, NULL, NULL) != CL_SUCCESS ||
+        p_clEnqueueWriteBuffer(o->queue, mj, CL_FALSE, 0,
+                               sizeof(int) * 5 * (size_t)njobs,
+                               o->lr_host + 4 * nchains, 0, NULL,
+                               NULL) != CL_SUCCESS)
+        goto fail;
+    {
+        int ss = (int)slot;
+        st |= p_clSetKernelArg(o->k_lrc, 0, sizeof(cl_mem), &o->lr_mem);
+        st |= p_clSetKernelArg(o->k_lrc, 1, sizeof(int), &ss);
+        st |= p_clSetKernelArg(o->k_lrc, 2, sizeof(int), &stride);
+        st |= p_clSetKernelArg(o->k_lrc, 3, sizeof(int), &pad);
+        st |= p_clSetKernelArg(o->k_lrc, 4, sizeof(int), &w);
+        st |= p_clSetKernelArg(o->k_lrc, 5, sizeof(int), &h);
+        st |= p_clSetKernelArg(o->k_lrc, 6, sizeof(int), &mb_w);
+        st |= p_clSetKernelArg(o->k_lrc, 7, sizeof(int), &mb_h);
+        st |= p_clSetKernelArg(o->k_lrc, 8, sizeof(cl_mem), &mc);
+        st |= p_clSetKernelArg(o->k_lrc, 9, sizeof(cl_mem), &mj);
+        st |= p_clSetKernelArg(o->k_lrc, 10, sizeof(cl_mem), &ms);
+        st |= p_clSetKernelArg(o->k_lrc, 11, sizeof(int), &hexit);
+        st |= p_clSetKernelArg(o->k_lrc, 12, sizeof(cl_mem), &mo);
+    }
+    global = local * (size_t)nchains;
+    if (st != CL_SUCCESS ||
+        p_clEnqueueNDRangeKernel(o->queue, o->k_lrc, 1, NULL, &global, &local,
+                                 0, NULL, NULL) != CL_SUCCESS)
+        goto fail;
+    for (i = 0; i < njobs; i++)
+        if (p_clEnqueueReadBuffer(o->queue, mo, CL_FALSE,
+                                  sizeof(int) * (size_t)fsz * (size_t)i,
+                                  sizeof(int) * (size_t)fsz, jobs[i].out, 0,
+                                  NULL, NULL) != CL_SUCCESS)
+            goto fail;
+    if (p_clFinish(o->queue) == CL_SUCCESS)
+        return AEG_OK;
+fail:
+    /* whatever was enqueued is drained before the host buffers go away,
+     * and no slot is trusted after a failure */
+    p_clFinish(o->queue);
+    for (i = 0; i < o->lr_nslots; i++)
+        o->lr_tag[i] = -1;
+    return rc;
+}
+
 static void ocl_sync(void *priv)
 {
     ocl_ctx *o = (ocl_ctx *)priv;
@@ -711,6 +868,11 @@ static void ocl_destroy(void *priv)
         if (o->buf[i])
             p_clReleaseMemObject(o->buf[i]);
     free(o->pos);
+    if (o->lr_mem)
+        p_clReleaseMemObject(o->lr_mem);
+    free(o->lr_tag);
+    free(o->lr_host);
+    if (o->k_lrc) p_clReleaseKernel(o->k_lrc);
     if (o->k_sad) p_clReleaseKernel(o->k_sad);
     if (o->k_tq) p_clReleaseKernel(o->k_tq);
     if (o->k_iq) p_clReleaseKernel(o->k_iq);
@@ -769,6 +931,7 @@ static int ocl_kernels(ocl_ctx *o)
     o->k_tqdc = p_clCreateKernel(o->prog, "tq_dc_batch", &st);
     o->k_iqdc = p_clCreateKernel(o->prog, "iq_dc_batch", &st);
     o->k_lrs = p_clCreateKernel(o->prog, "lowres_search", &st);
+    o->k_lrc = p_clCreateKernel(o->prog, "lowres_chains", &st);
     /* one work-group walks a whole field; 64 items cover the longest
      * diagonal of a 1080p lowres picture (68 block rows) in about one
      * pass, and the kernel's own limit (its private arrays) may be lower */
@@ -781,8 +944,17 @@ static int ocl_kernels(ocl_ctx *o)
             wg > 0 && wg < o->lrs_wg)
             o->lrs_wg = wg;
     }
+    if (o->k_lrc) {
+        size_t wg = 0;
+        if (p_clGetKernelWorkGroupInfo(o->k_lrc, o->device,
+                                       CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg),
+                                       &wg, NULL) == CL_SUCCESS &&
+            wg > 0 && wg < o->lrs_wg)
+            o->lrs_wg = wg;
+    }
     return o->k_sad && o->k_tq && o->k_iq && o->k_tqiq && o->k_sse &&
-           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc && o->k_lrs
+           o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc && o->k_lrs &&
+           o->k_lrc
                ? AEG_OK : AEG_EBACKEND;
 }
 
@@ -804,6 +976,7 @@ static void ocl_fill_ops(ocl_ctx *o, aeg_be_ops *ops)
     ops->ref_upload = ocl_ref_upload;
     ops->satd_batch = ocl_satd_batch;
     ops->lowres_search = ocl_lowres_search;
+    ops->lowres_chains = ocl_lowres_chains;
     ops->sync = ocl_sync;
     ops->destroy = ocl_destroy;
     ops->clone = ocl_clone;

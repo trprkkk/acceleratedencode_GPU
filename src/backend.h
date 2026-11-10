@@ -12,6 +12,25 @@
 
 #include "h264.h"
 
+/* lowres_chains(): the pictures, the chains and the fields of a batch */
+typedef struct aeg_la_pic {
+    const uint8_t *plane;   /* origin of a padded lowres plane            */
+    int slot, tag;          /* residency key: ring slot, display number   */
+} aeg_la_pic;
+
+typedef struct aeg_la_chain {
+    int cur;                /* index into pics                            */
+    int first, count;       /* jobs[first .. first + count), in order     */
+    const int *seed;        /* the first job's seed if it is seeded       */
+} aeg_la_chain;
+
+typedef struct aeg_la_job {
+    int ref;                /* index into pics                            */
+    int seeded;             /* seed = the previous field of the chain     */
+    int num, den, range;    /* as lowres_search()                         */
+    int *out;               /* 3 ints per block, as lowres_search()       */
+} aeg_la_job;
+
 typedef struct aeg_be_ops {
     void *priv;
     int   backend;          /* AEG_BACKEND_* actually in use             */
@@ -96,6 +115,23 @@ typedef struct aeg_be_ops {
     int (*lowres_search)(void *priv, const uint8_t *cur, const uint8_t *ref,
                          int stride, int w, int h, const int *seed, int num,
                          int den, int range, int *out);
+
+    /* Many fields in one call: each chain is one picture's fields against a
+     * run of references, in order, and a job marked `seeded` takes the
+     * previous job's output of its chain as its seed (the first job of a
+     * chain takes chain.seed).  Chains are independent of each other, so a
+     * device runs them concurrently (one work-group each) while the fields
+     * of a chain follow one another.  Every field is lowres_search() with
+     * the same arguments; the output is the same ints, at jobs[i].out.
+     * pics[] are the lowres pictures the chains refer to: plane origin as
+     * for lowres_search(), and a ring `slot` (0..nslots-1) with a `tag`
+     * (the picture's display number) under which a device may keep the
+     * plane resident between calls -- a slot is uploaded again only when its
+     * tag changes, so the caller must not reuse a (slot, tag) pair for
+     * different samples.  Optional. */
+    int (*lowres_chains)(void *priv, const aeg_la_pic *pics, int npics,
+                         int nslots, const aeg_la_chain *chains, int nchains,
+                         const aeg_la_job *jobs, int stride, int w, int h);
 
     void (*sync)(void *priv);
     void (*destroy)(void *priv);
@@ -227,11 +263,12 @@ int  aeg_dispatch_coef_pick(aeg_dispatcher *d, int kind);
 void aeg_dispatch_coef_done(aeg_dispatcher *d, int kind, int dev, int64_t ns,
                             int mbs);
 
-/* The lookahead's lowres search of one field: 1 = on the device.  Both
- * forms give the same field, so this one is placed by timing: each side is
- * probed a few times, then the faster stays and the other is re-tried now
- * and then. */
-int  aeg_dispatch_la_pick(aeg_dispatcher *d);
+/* The lookahead's lowres search of one field (batch = 0), or of one
+ * scheduling step's batch of fields (batch = 1): 1 = on the device.  Both
+ * forms give the same fields, so this one is placed by timing, in time per
+ * block searched: each side is probed a few times, then the faster stays
+ * and the other is re-tried now and then. */
+int  aeg_dispatch_la_pick(aeg_dispatcher *d, int batch);
 /* ... and how long that field took, `blocks` lowres blocks, placed as `dev`. */
 void aeg_dispatch_la_done(aeg_dispatcher *d, int dev, int64_t ns, int blocks);
 

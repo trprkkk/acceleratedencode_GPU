@@ -537,6 +537,104 @@ static void check_lowres(int mb_w, int mb_h, int seeded)
     free(b);
 }
 
+/* lowres_chains: three calls on one ring -- the first uploads every slot,
+ * the second runs other chains on the resident pictures, the third after
+ * one slot received a new picture (new tag), which must be uploaded again
+ * rather than served stale */
+static void lr_fill(aeg_lowres *l, int k)
+{
+    int x, y;
+    for (y = 0; y < l->mb_h * 8 + 2 * AEG_LA_PAD; y++)
+        for (x = 0; x < l->stride; x++) {
+            int u = x + 3 * k, v = y - 2 * k;
+            l->mem[(size_t)y * l->stride + x] =
+                (uint8_t)(110 + 50 * ((u / 5 + v / 4) & 1) +
+                          (u * 7 + v * 3) % 29 + rnd(9));
+        }
+}
+
+static void check_chains(int mb_w, int mb_h)
+{
+    enum { NS = 6, NJ = 9 };
+    aeg_lowres lr[NS];
+    aeg_la_pic pics[NS];
+    aeg_la_chain chs[5];
+    aeg_la_job ja[NJ], jb[NJ];
+    const int nb = mb_w * mb_h;
+    int *a = (int *)malloc(sizeof(int) * 3 * (size_t)nb * NJ);
+    int *b = (int *)malloc(sizeof(int) * 3 * (size_t)nb * NJ);
+    int *seed = (int *)malloc(sizeof(int) * 2 * (size_t)nb);
+    int k, i, call;
+
+    if (!a || !b || !seed) {
+        check(0, "lowres_chains (allocation)");
+        return;
+    }
+    for (k = 0; k < NS; k++) {
+        if (aeg_lowres_alloc(&lr[k], mb_w, mb_h)) {
+            check(0, "lowres_chains (allocation)");
+            return;
+        }
+        lr_fill(&lr[k], k);
+        pics[k].plane = lr[k].plane;
+        pics[k].slot = (k * 5 + 1) % NS;
+        pics[k].tag = k;
+    }
+    for (i = 0; i < 2 * nb; i++)
+        seed[i] = rnd(41) - 20;
+    for (call = 0; call < 3; call++) {
+        /* chains: (cur, first, count, seeded from `seed`) */
+        static const int cc[3][5][4] = {
+            { { 5, 0, 4, 0 }, { 0, 4, 3, 0 }, { 2, 7, 2, 1 }, { 0, 0, 0, 0 } },
+            { { 3, 0, 2, 0 }, { 1, 2, 3, 1 }, { 4, 5, 1, 0 }, { 2, 6, 3, 0 } },
+            { { 2, 0, 3, 0 }, { 4, 3, 2, 0 }, { 0, 5, 2, 1 }, { 5, 7, 2, 0 } } };
+        int nc = call == 0 ? 3 : 4, cur, cnt;
+        if (call == 2) {
+            /* slot of picture 2 gets new samples under a new tag */
+            lr_fill(&lr[2], 17);
+            pics[2].tag = 100;
+        }
+        for (i = 0; i < nc; i++) {
+            chs[i].cur = cc[call][i][0];
+            chs[i].first = cc[call][i][1];
+            chs[i].count = cc[call][i][2];
+            chs[i].seed = cc[call][i][3] ? seed : NULL;
+        }
+        for (i = 0; i < nc; i++) {
+            cur = chs[i].cur;
+            for (cnt = 0; cnt < chs[i].count; cnt++) {
+                aeg_la_job *j = &ja[chs[i].first + cnt];
+                int dist = cnt + 1;
+                j->ref = (cur + (i & 1 ? dist : NS - dist)) % NS;
+                j->seeded = cnt > 0 || chs[i].seed;
+                j->num = j->seeded ? dist + 1 : 1;
+                j->den = j->seeded ? dist : 1;
+                j->range = 16 + 8 * cnt;
+                j->out = a + (size_t)(chs[i].first + cnt) * 3 * nb;
+                jb[chs[i].first + cnt] = *j;
+                jb[chs[i].first + cnt].out =
+                    b + (size_t)(chs[i].first + cnt) * 3 * nb;
+            }
+        }
+        cnt = chs[nc - 1].first + chs[nc - 1].count;
+        memset(a, 0x55, sizeof(int) * 3 * (size_t)nb * NJ);
+        memset(b, 0xaa, sizeof(int) * 3 * (size_t)nb * NJ);
+        cpu.lowres_chains(cpu.priv, pics, NS, NS, chs, nc, ja, lr[0].stride,
+                          lr[0].w, lr[0].h);
+        dev.lowres_chains(dev.priv, pics, NS, NS, chs, nc, jb, lr[0].stride,
+                          lr[0].w, lr[0].h);
+        check(!memcmp(a, b, sizeof(int) * 3 * (size_t)nb * (size_t)cnt),
+              call == 0 ? "lowres_chains (upload)"
+              : call == 1 ? "lowres_chains (resident)"
+                          : "lowres_chains (slot reused)");
+    }
+    for (k = 0; k < NS; k++)
+        aeg_lowres_free(&lr[k]);
+    free(a);
+    free(b);
+    free(seed);
+}
+
 int main(int argc, char **argv)
 {
     int which = AEG_BACKEND_AUTO, k;
@@ -577,6 +675,12 @@ int main(int argc, char **argv)
             check_lowres(lsz[k][0], lsz[k][1], 0);
             check_lowres(lsz[k][0], lsz[k][1], 1);
         }
+    }
+    if (dev.lowres_chains) {
+        static const int csz[][2] = { { 11, 9 }, { 40, 22 }, { 120, 68 },
+                                      { 1, 1 }, { 3, 1 } };
+        for (k = 0; k < 5; k++)
+            check_chains(csz[k][0], csz[k][1]);
     }
     check_threads(176, 144, 0);
     check_threads(176, 144, 1);

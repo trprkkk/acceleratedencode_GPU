@@ -148,7 +148,7 @@ measurement, below); the others run there only when `-s` forces them.
 
 | Stage | Where it runs | Why |
 |---|---|---|
-| Lookahead: the lowres motion search of each field (picture pair) | GPU (`lowres_search`, one work-group per field walking its anti-diagonals, `-s la=`), CPU otherwise | a block predicts only from its left, top and top-right neighbours, so the blocks of one anti-diagonal are independent and the walk is the CPU's raster order: the same field, byte for byte |
+| Lookahead: the lowres motion search of each field (picture pair) | GPU (`lowres_chains`: at presets 3-4 every field a scheduling step will price, in one launch, one work-group per picture and direction, the lowres pictures resident by ring slot; `lowres_search`, one field per launch, elsewhere; `-s la=`), CPU otherwise | a block predicts only from its left, top and top-right neighbours, so the blocks of one anti-diagonal are independent and the walk is the CPU's raster order: the same field, byte for byte |
 | Motion estimation (SAD/SATD over a search window) | GPU (batched kernel) | thousands of independent block comparisons |
 | Whole-frame parallel search rounds (8 neighbours of every macroblock's best vector, four rounds) | GPU (`sad_batch`, one launch per round) | a whole picture's search as four batched calls instead of a serial hex walk per macroblock |
 | Fractional refinement as rounds (8 quarter/half-pel neighbours of every macroblock, up to three rounds at each step) | GPU (`satd_batch`, one launch per round, reference registered once by `ref_upload`) | each round is independent across macroblocks; replaces the per-macroblock subpel walk outright |
@@ -174,10 +174,12 @@ launches and the batch's host work included); the faster side stays, with 10%
 hysteresis, and the slower one is re-tried every 64 pictures.  The motion
 search is never placed by timing, because its device form is a different
 search and the stream would then depend on the machine's speed; `-s est=`
-forces it.  The lookahead's lowres search is placed by timing too, per field
-(each side probed four times, the first call of each not counted, the slower
-re-tried every 128 fields): its kernel is the same search, so the choice
-cannot change the stream.  No other stage is placed automatically: inter prediction is the
+forces it.  The lookahead's lowres search is placed by timing too, in time
+per block searched: per scheduling step where the fields come in batches
+(presets 3-4; each side probed twice, the slower re-tried every 16 steps),
+per field elsewhere (four probes, every 128 fields), the first call of each
+side not counted.  Its kernels are the same search, so the choice cannot
+change the stream.  No other stage is placed automatically: inter prediction is the
 only one with a device form, and that form rebuilds every sub-sample plane of
 a reference per call where the CPU keeps them, so it cannot win; `-s inter=`
 forces it.  `--calibrate` (`aeg_calibrate()`) measures the fixed cost of a

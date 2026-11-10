@@ -33,6 +33,7 @@ static int aeg_mock_gid;
  * them has nothing to wait for */
 #define get_local_id(d) 0
 #define get_local_size(d) 1
+#define get_group_id(d) (aeg_mock_gid)
 #define CLK_GLOBAL_MEM_FENCE 0
 #define barrier(f) ((void)0)
 #include "kernels_gen.c"
@@ -226,6 +227,120 @@ static int check_lowres(int mb_w, int mb_h, int seeded)
     aeg_lowres_free(&c);
     aeg_lowres_free(&r);
     free(seed);
+    free(got);
+    free(want);
+    return bad != 0;
+}
+
+/* lowres_chains: a ring of pictures in one buffer (slot k at k * slot
+ * bytes, as the device keeps them), chains in both directions, seeded from
+ * the previous field of the chain or from a given field; every group run in
+ * turn against aeg_be_ops.lowres_chains of the CPU */
+static int check_chains(int mb_w, int mb_h)
+{
+    enum { NS = 5 };
+    aeg_lowres lr[NS];
+    aeg_be_ops cpu;
+    aeg_la_pic pics[NS];
+    aeg_la_chain chs[4];
+    aeg_la_job jobs[8];
+    const int nb = mb_w * mb_h;
+    int chain_i[16], job_i[40], *seed0, *got, *want, x, y, k, i, bad = 0;
+    size_t slot;
+    uint8_t *ring;
+
+    aeg_be_cpu_ops(&cpu);
+    for (k = 0; k < NS; k++)
+        if (aeg_lowres_alloc(&lr[k], mb_w, mb_h))
+            return 1;
+    slot = (size_t)lr[0].stride * (size_t)(lr[0].h + 2 * AEG_LA_PAD);
+    ring = (uint8_t *)malloc(slot * NS);
+    seed0 = (int *)malloc(sizeof(int) * 2 * (size_t)nb);
+    got = (int *)malloc(sizeof(int) * 3 * (size_t)nb * 8);
+    want = (int *)malloc(sizeof(int) * 3 * (size_t)nb * 8);
+    if (!ring || !seed0 || !got || !want)
+        return 1;
+    /* a pattern panning a few samples per picture, plus noise */
+    for (k = 0; k < NS; k++) {
+        for (y = 0; y < lr[k].h + 2 * AEG_LA_PAD; y++)
+            for (x = 0; x < lr[k].stride; x++) {
+                int u = x + 3 * k, v = y - 2 * k;
+                lr[k].mem[(size_t)y * lr[k].stride + x] =
+                    (uint8_t)(110 + 50 * ((u / 5 + v / 4) & 1) +
+                              (u * 7 + v * 3) % 29 + rnd(9));
+            }
+        memcpy(ring + slot * k, lr[k].mem, slot);
+        pics[k].plane = lr[k].plane;
+        pics[k].slot = (k + 2) % NS;      /* slots need not follow the order */
+        pics[k].tag = k;
+    }
+    for (i = 0; i < 2 * nb; i++)
+        seed0[i] = rnd(41) - 20;
+    /* chain 0: picture 4 backwards to 3, 2, 1 (seeded after the first);
+     * chain 1: picture 0 forwards to 1, 2, given the seed for its first;
+     * chain 2: picture 2 to 4, unseeded; chain 3: picture 1 to 0, 3 (the
+     * second unseeded) */
+    {
+        static const int cj[8][4] = { { 3, 0, 1, 1 }, { 2, 1, 2, 1 },
+                                      { 1, 1, 3, 2 }, { 1, 1, 3, 2 },
+                                      { 2, 1, 2, 1 }, { 4, 0, 1, 1 },
+                                      { 0, 0, 1, 1 }, { 3, 0, 1, 1 } };
+        static const int cc[4][3] = { { 4, 0, 3 }, { 0, 3, 2 }, { 2, 5, 1 },
+                                      { 1, 6, 2 } };
+        for (i = 0; i < 8; i++) {
+            jobs[i].ref = cj[i][0];
+            jobs[i].seeded = cj[i][1] || i == 3;
+            jobs[i].num = cj[i][2];
+            jobs[i].den = cj[i][3];
+            jobs[i].range = 16 + 8 * (cj[i][2] - 1);
+            jobs[i].out = want + (size_t)i * 3 * nb;
+        }
+        for (i = 0; i < 4; i++) {
+            chs[i].cur = cc[i][0];
+            chs[i].first = cc[i][1];
+            chs[i].count = cc[i][2];
+            chs[i].seed = i == 1 ? seed0 : NULL;
+        }
+    }
+    cpu.lowres_chains(cpu.priv, pics, NS, NS, chs, 4, jobs, lr[0].stride,
+                      lr[0].w, lr[0].h);
+    {
+        /* the kernel's tables, as the backends pack them */
+        uint8_t *planes = (uint8_t *)malloc(slot * NS);
+        for (k = 0; k < NS; k++)
+            memcpy(planes + slot * (size_t)pics[k].slot, lr[k].mem, slot);
+        for (i = 0; i < 4; i++) {
+            chain_i[4 * i] = pics[chs[i].cur].slot;
+            chain_i[4 * i + 1] = chs[i].first;
+            chain_i[4 * i + 2] = chs[i].count;
+            chain_i[4 * i + 3] = chs[i].seed ? 0 : -1;
+        }
+        for (i = 0; i < 8; i++) {
+            job_i[5 * i] = pics[jobs[i].ref].slot;
+            job_i[5 * i + 1] = jobs[i].seeded;
+            job_i[5 * i + 2] = jobs[i].num;
+            job_i[5 * i + 3] = jobs[i].den;
+            job_i[5 * i + 4] = jobs[i].range;
+        }
+        memset(got, 0x5a, sizeof(int) * 3 * (size_t)nb * 8);
+        for (i = 0; i < 4; i++) {
+            aeg_mock_gid = i;
+            lowres_chains(planes, (int)slot, lr[0].stride, AEG_LA_PAD, lr[0].w,
+                          lr[0].h, mb_w, mb_h, chain_i, job_i, seed0,
+                          AEG_LA_RANGE, got);
+        }
+        free(planes);
+    }
+    for (i = 0; i < 3 * nb * 8; i++)
+        if (got[i] != want[i])
+            bad++;
+    if (bad)
+        printf("   kernel_check: lowres_chains %dx%d: %d of %d differ\n", mb_w,
+               mb_h, bad, 3 * nb * 8);
+    for (k = 0; k < NS; k++)
+        aeg_lowres_free(&lr[k]);
+    free(ring);
+    free(seed0);
     free(got);
     free(want);
     return bad != 0;
@@ -682,10 +797,11 @@ int main(void)
         for (t = 0; t < 6; t++) {
             fail |= check_lowres(lsz[t][0], lsz[t][1], 0);
             fail |= check_lowres(lsz[t][0], lsz[t][1], 1);
+            fail |= check_chains(lsz[t][0], lsz[t][1]);
         }
     }
 
     if (!fail)
-        printf("   kernel_check: 10 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 11 kernels agree with the CPU reference\n");
     return fail;
 }

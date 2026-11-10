@@ -587,10 +587,15 @@ struct aeg_encoder {
     /* the lookahead's per-picture fields (la_field): the intra estimate of
      * the picture in each ring slot, and its searches against up to LA_SF
      * references, tagged with display numbers */
-    struct la_sfield { int d, r, age; int *f; } la_sf[AEG_RING][LA_SF];
+    struct la_sfield { int d, r, age, busy; int *f; } la_sf[AEG_RING][LA_SF];
     int la_icost_d[AEG_RING];
     int *la_icost[AEG_RING];
     int la_age;
+    /* the placement of this scheduling step's lowres searches when the
+     * fields are prefetched in batches (la_prefetch): -1 = no step open,
+     * else 0 CPU / 1 device, with the time and blocks it has spent */
+    int la_step_dev;
+    int64_t la_step_ns, la_step_blk;
     /* lookahead costs already computed, keyed by display indices (the
      * window slides by a group, so most are reused) */
     struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
@@ -15293,7 +15298,7 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
                                  range);
         return;
     }
-    dev = aeg_dispatch_la_pick(&e->d);
+    dev = e->la_step_dev >= 0 ? e->la_step_dev : aeg_dispatch_la_pick(&e->d, 0);
     t0 = aeg_now_ns();
     if (dev) {
         int rc;
@@ -15310,7 +15315,12 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
         aeg_lowres_search_seeded(c, r, f, f + 2 * nb, seed, num, den, range);
     }
     dt = aeg_now_ns() - t0;
-    aeg_dispatch_la_done(&e->d, dev, dt, nb);
+    if (e->la_step_dev >= 0) {
+        e->la_step_ns += dt;
+        e->la_step_blk += nb;
+    } else {
+        aeg_dispatch_la_done(&e->d, dev, dt, nb);
+    }
     e->st.stage_ns[AEG_STAGE_LOOKAHEAD] += dt;
     if (dev)
         e->st.stage_gpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
@@ -15323,6 +15333,35 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
  * ring: the group decision prices the same pair inside several (p0, p1, b)
  * estimates and the macroblock tree again, 36 % repeats on cock.  An entry
  * of a picture that left the ring is reused first, then the oldest. */
+/* a cache entry for a new field of picture d: a free one, else one of a
+ * picture that left the ring, else d's oldest -- never one marked busy (a
+ * batch in the making holds its seeds and outputs) */
+static int la_take(struct aeg_encoder *e, int d)
+{
+    struct la_sfield *t = e->la_sf[d % in_slots(e)];
+    int i, v = -1;
+
+    for (i = 0; i < e->la_sf_n; i++) {
+        int sv, si;
+        if (t[i].busy)
+            continue;
+        if (!t[i].f) { v = i; break; }
+        if (v < 0) { v = i; continue; }
+        sv = t[v].d == d;
+        si = t[i].d == d;
+        if (sv > si || (sv == si && t[i].age < t[v].age))
+            v = i;
+    }
+    if (v < 0)
+        return -1;
+    if (!t[v].f) {
+        t[v].f = (int *)aeg_alloc(sizeof(int) * 3 * (size_t)e->mb_count);
+        if (!t[v].f)
+            return -1;
+    }
+    return v;
+}
+
 static const int *la_field(struct aeg_encoder *e, int d, int r)
 {
     int slots = in_slots(e), s = d % slots, i, v = 0;
@@ -15351,23 +15390,233 @@ static const int *la_field(struct aeg_encoder *e, int d, int r)
         if (srange > 64)
             srange = 64;
     }
-    for (i = 1; i < e->la_sf_n; i++) {
-        int sv = t[v].f && t[v].d == d, si = t[i].f && t[i].d == d;
-        if (!t[i].f) { v = i; break; }
-        if (sv > si || (sv == si && t[i].age < t[v].age))
-            v = i;
-    }
-    if (!t[v].f) {
-        t[v].f = (int *)aeg_alloc(sizeof(int) * 3 * (size_t)e->mb_count);
-        if (!t[v].f)
-            return NULL;
-    }
+    v = la_take(e, d);
+    if (v < 0)
+        return NULL;
     la_search(e, &e->in_low[s], &e->in_low[r % slots], t[v].f, seed,
               seed ? dist : 1, seed ? dist - 1 : 1, srange);
     t[v].d = d;
     t[v].r = r;
     t[v].age = ++e->la_age;
     return t[v].f;
+}
+
+/* the cached field of d against r, or NULL (no search) */
+static struct la_sfield *la_lookup(struct aeg_encoder *e, int d, int r)
+{
+    struct la_sfield *t = e->la_sf[d % in_slots(e)];
+    int i;
+
+    for (i = 0; i < e->la_sf_n; i++)
+        if (t[i].f && t[i].d == d && t[i].r == r)
+            return &t[i];
+    return NULL;
+}
+
+/* Fields in batches.  With the lookahead's search on the device, a field
+ * at a time is a launch and two plane transfers per field, and one
+ * work-group of a whole GPU busy.  At p3/p4 the B-adapt trellis prices
+ * every group (s, t) of the window, and the tree the same groups, so the
+ * fields a scheduling step will ask for are known before it starts: every
+ * P pair (t, s), t - s <= bframes + 1, and the B pairs of each group's
+ * structure (la_group_cost / mbt_group), with all the shorter distances a
+ * seeded field is seeded from.  The missing ones go to the device in one
+ * call: a chain per picture and direction (each field seeded from the
+ * previous one of its chain, on the device), the lowres pictures resident
+ * there by ring slot.  A field depends only on (d, r) and the fields it is
+ * seeded from, so computing it early, late or on the device cannot change
+ * it; la_field() then finds it cached, and computes on demand whatever the
+ * enumeration did not foresee.  On the CPU the step stays lazy: nothing is
+ * computed that nobody asks for. */
+#define LA_NEED_W (2 * AEG_MAX_BFRAMES + 3)
+#define LA_BATCH_INTS (1 << 25)        /* fields per call: 128 MB of ints */
+
+static void la_need(unsigned char (*need)[LA_NEED_W], int a, int G, int d,
+                    int r)
+{
+    need[d - a][r - d + G] = 1;
+}
+
+/* the pairs the trellis and the tree can ask for in the window a..end */
+static void la_need_window(const struct aeg_encoder *e,
+                           unsigned char (*need)[LA_NEED_W], int a, int end)
+{
+    const int G = e->p.bframes + 1;
+    int s, t, b;
+
+    for (s = a; s < end; s++)
+        for (t = s + 1; t <= end && t - s <= G; t++) {
+            la_need(need, a, G, t, s);
+            if (e->p.b_pyramid && t - s > 2) {
+                int mid = s + (t - s) / 2;
+                la_need(need, a, G, mid, s);
+                la_need(need, a, G, mid, t);
+                for (b = s + 1; b < t; b++)
+                    if (b != mid) {
+                        la_need(need, a, G, b, b < mid ? s : mid);
+                        la_need(need, a, G, b, b < mid ? mid : t);
+                    }
+            } else {
+                for (b = s + 1; b < t; b++) {
+                    la_need(need, a, G, b, s);
+                    la_need(need, a, G, b, t);
+                }
+            }
+        }
+}
+
+static void la_step_end(struct aeg_encoder *e)
+{
+    if (e->la_step_dev >= 0 && e->la_step_blk > 0)
+        aeg_dispatch_la_done(&e->d, e->la_step_dev, e->la_step_ns,
+                             e->la_step_blk > 0x7fffffff
+                                 ? 0x7fffffff : (int)e->la_step_blk);
+    e->la_step_dev = -1;
+    e->la_step_ns = 0;
+    e->la_step_blk = 0;
+}
+
+static void la_prefetch(struct aeg_encoder *e, int a)
+{
+    const int slots = in_slots(e), nb = e->mb_count, G = e->p.bframes + 1;
+    const int maxj = AEG_RING * 2 * G;
+    int end = e->in_count - 1, d, dir, k, i, np = 0, nc = 0, nj = 0, c0, j0;
+    int computed = 0;
+    unsigned char (*need)[LA_NEED_W];
+    int pic_of[AEG_RING];
+    aeg_la_pic pics[AEG_RING];
+    aeg_la_chain *ch;
+    aeg_la_job *jb;
+    struct la_sfield **ent;
+    int64_t t0, dt;
+
+    if (!e->d.have_gpu || !e->d.ops.lowres_chains || e->p.b_adapt != 2 ||
+        !e->ba_wide || !e->la_sf_n || e->la_step_dev >= 0 || a < 0 ||
+        !e->in_low[0].mem || e->in_low[0].mb_w * e->in_low[0].mb_h != nb)
+        return;
+    if (end > a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1)
+        end = a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1;
+    if (end <= a || end - a >= AEG_RING || a < e->in_count - slots)
+        return;
+    e->la_step_dev = aeg_dispatch_la_pick(&e->d, 1);
+    if (!e->la_step_dev)
+        return;                       /* on the CPU: on demand, timed */
+    need = (unsigned char (*)[LA_NEED_W])aeg_alloc(sizeof(*need) * AEG_RING);
+    ch = (aeg_la_chain *)aeg_alloc(sizeof(*ch) * (size_t)maxj);
+    jb = (aeg_la_job *)aeg_alloc(sizeof(*jb) * (size_t)maxj);
+    ent = (struct la_sfield **)aeg_alloc(sizeof(*ent) * (size_t)maxj);
+    if (!need || !ch || !jb || !ent)
+        goto out;
+    memset(need, 0, sizeof(*need) * AEG_RING);
+    la_need_window(e, need, a, end);
+    for (i = 0; i < AEG_RING; i++)
+        pic_of[i] = -1;
+    for (d = a; d <= end; d++)
+        for (dir = -1; dir <= 1; dir += 2) {
+            int kmax = 0, open = 0;
+            for (k = 1; k <= G; k++)
+                if (d + dir * k >= a && d + dir * k <= end &&
+                    need[d - a][dir * k + G])
+                    kmax = k;
+            for (k = 1; k <= kmax; k++) {
+                const int r = d + dir * k;
+                const int seeded = e->la_seed > 0 && k > 1;
+                struct la_sfield *f = la_lookup(e, d, r);
+                int v, range = 16;
+                if (f) {
+                    f->busy = 1;      /* a seed, perhaps: keep it */
+                    open = 0;
+                    continue;
+                }
+                if (e->la_seed <= 0 && !need[d - a][dir * k + G])
+                    continue;         /* unseeded: only what is asked */
+                if (nj >= maxj)
+                    goto out;
+                v = la_take(e, d);
+                if (v < 0)
+                    goto out;
+                f = &e->la_sf[d % slots][v];
+                f->d = d;
+                f->r = r;
+                f->age = ++e->la_age;
+                f->busy = 1;
+                if (seeded)
+                    range = 16 + e->la_seed * (k - 1) > 64
+                                ? 64 : 16 + e->la_seed * (k - 1);
+                if (!open || e->la_seed <= 0) {
+                    const struct la_sfield *sd =
+                        seeded ? la_lookup(e, d, r - dir) : NULL;
+                    if (pic_of[d % slots] < 0) {
+                        pic_of[d % slots] = np;
+                        pics[np].plane = e->in_low[d % slots].plane;
+                        pics[np].slot = d % slots;
+                        pics[np++].tag = d;
+                    }
+                    ch[nc].cur = pic_of[d % slots];
+                    ch[nc].first = nj;
+                    ch[nc].count = 0;
+                    ch[nc++].seed = sd ? sd->f : NULL;
+                    open = 1;
+                }
+                if (pic_of[r % slots] < 0) {
+                    pic_of[r % slots] = np;
+                    pics[np].plane = e->in_low[r % slots].plane;
+                    pics[np].slot = r % slots;
+                    pics[np++].tag = r;
+                }
+                jb[nj].ref = pic_of[r % slots];
+                jb[nj].seeded = seeded;
+                jb[nj].num = seeded ? k : 1;
+                jb[nj].den = seeded ? k - 1 : 1;
+                jb[nj].range = range;
+                jb[nj].out = f->f;
+                ent[nj++] = f;
+                ch[nc - 1].count++;
+            }
+        }
+    /* in calls of at most LA_BATCH_INTS ints of fields, whole chains each */
+    computed = 1;
+    t0 = aeg_now_ns();
+    for (c0 = 0; c0 < nc;) {
+        int c1 = c0, rc;
+        j0 = ch[c0].first;
+        while (c1 < nc && (c1 == c0 ||
+                           (int64_t)(ch[c1].first + ch[c1].count - j0) * 3 *
+                                   nb <= LA_BATCH_INTS))
+            c1++;
+        for (i = c0; i < c1; i++)
+            ch[i].first -= j0;
+        AEG_PH(AEG_PH_LOWRES,
+               rc = e->d.ops.lowres_chains(e->d.ops.priv, pics, np, slots,
+                                           ch + c0, c1 - c0, jb + j0,
+                                           e->in_low[0].stride,
+                                           e->in_low[0].w, e->in_low[0].h));
+        if (rc != AEG_OK) {
+            /* nothing trusted: the fields of this call are searched again
+             * on demand */
+            for (i = c0; i < nc; i++)
+                for (k = 0; k < ch[i].count; k++)
+                    ent[ch[i].first + (i < c1 ? j0 : 0) + k]->d = -1;
+            break;
+        }
+        c0 = c1;
+    }
+    dt = aeg_now_ns() - t0;
+    e->la_step_ns += dt;
+    e->la_step_blk += (int64_t)nj * nb;
+    e->st.stage_ns[AEG_STAGE_LOOKAHEAD] += dt;
+    e->st.stage_gpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
+out:
+    if (!computed && ent)
+        for (i = 0; i < nj; i++)     /* taken, never searched */
+            ent[i]->d = -1;
+    for (d = 0; d < slots; d++)
+        for (i = 0; i < e->la_sf_n; i++)
+            e->la_sf[d][i].busy = 0;
+    aeg_free(need);
+    aeg_free(ch);
+    aeg_free(jb);
+    aeg_free(ent);
 }
 
 static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
@@ -15702,6 +15951,7 @@ static void schedule_(struct aeg_encoder *e)
     const int prev = aeg_ph_push(AEG_PH_LADEC);
 
     schedule__ph(e);
+    la_step_end(e);
     aeg_ph_pop(prev);
 }
 
@@ -15724,6 +15974,7 @@ static void schedule__ph(struct aeg_encoder *e)
         add_job(e, 0, AEG_SLICE_I, 1);
         e->anchor = 0;
         if (e->la_depth) {
+            la_prefetch(e, 0);
             mbt_add(pl, 0, 0, -1, -1, 1);
             mbt_run(e, pl, 1, -1, 0, 0);
         }
@@ -15755,6 +16006,7 @@ static void schedule__ph(struct aeg_encoder *e)
     }
     if (e->la_depth && !e->flushing && e->in_count <= nxt + e->la_depth)
         return;                       /* the tree's window is not full yet */
+    la_prefetch(e, e->anchor);
     /* The scene cut test has to run before anything is queued: an IDR drops
      * every reference before it, so the B pictures of its group could no longer
      * be coded once it is in the queue.  It also decides *where* the group ends:
@@ -16052,6 +16304,7 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     /* presets 3 and 4: the seeded lowres search and the B-adapt trellis over
      * the whole ring (see la_field and ba_end) */
     e->la_seed = pp->preset >= 3 ? 8 : 0;
+    e->la_step_dev = -1;
     e->ba_wide = pp->preset >= 3;
     if (pp->b_qp_offset < 0)
         pp->b_qp_offset = pp->mbtree ? 2 : 4;
