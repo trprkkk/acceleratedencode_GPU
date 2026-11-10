@@ -179,7 +179,13 @@ per block searched: per scheduling step where the fields come in batches
 (presets 3-4; each side probed twice, the slower re-tried every 16 steps),
 per field elsewhere (four probes, every 128 fields), the first call of each
 side not counted.  Its kernels are the same search, so the choice cannot
-change the stream.  No other stage is placed automatically: inter prediction is the
+change the stream.  At presets 3-4 most of those fields are searched
+before any step asks for them: as each picture arrives, a helper thread
+searches the pairs it ends (on the device's own lane, or on the CPU when
+the encoder may use threads) while the encoder codes, and the encoder
+waits for it only when it needs a result or reuses a lowres picture the
+helper is reading.  `AEG_LATIME=1`
+prints the lookahead's time and that wait.  No other stage is placed automatically: inter prediction is the
 only one with a device form, and that form rebuilds every sub-sample plane of
 a reference per call where the CPU keeps them, so it cannot win; `-s inter=`
 forces it.  `--calibrate` (`aeg_calibrate()`) measures the fixed cost of a

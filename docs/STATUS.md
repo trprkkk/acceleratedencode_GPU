@@ -7515,7 +7515,75 @@ keep the per-field path.
 **Next steps:**
 
 1. Overlap a step's batch with the coding of the previous group
-   (asynchronous lookahead).
+   (asynchronous lookahead). Done in the next section.
 2. Move the lowres downsampling, intra and bidir costs to the device.
 3. Enable the device lookahead at 10 bits. The lowres pictures are 8-bit
    there too, but the 10-bit build opens no device backend.
+
+### Asynchronous lookahead: fields searched while the encoder codes
+
+A decision waits until `la_depth` pictures past its group are in. So a
+picture d is inside every window that will ever price a pair (x, d) with x
+within bframes + 1 of it. The pairs whose later picture is d can be
+searched as soon as d arrives, long before any step asks for them.
+
+`la_bg_push()` runs after each picture is pushed. It builds that picture's
+chains (the same enumeration as the step batch, `la_build()`) and hands
+them to a helper thread while the encoder goes on coding.
+
+- **Device.** The helper calls `lowres_chains` on its own device lane
+  (lane 15), so the call overlaps the coding threads' kernels.
+- **CPU.** The helper runs the chains with the CPU ops. It is used when
+  the machine has more than one core and the encoder may use threads
+  (`-t` not 1, or frame threads ≥ 2: the auto frame-threads rule). On one
+  core or with `-t 1 --frame-threads 1`, the CPU lookahead stays lazy.
+- **Waits.** The batch's cache entries are busy until it finishes. The
+  encoder waits for it only when it reads a field (`la_field()`),
+  overwrites a lowres picture (`push_input()`), or pushes the next batch.
+  A CPU batch is split by chains, and a thread that has to wait takes the
+  chains still left, so a wait is never idle.
+- **Step batch.** The scheduling step's own `la_prefetch()` gets only what
+  the pushes could not foresee, usually nothing.
+- **Timing.** The helper's time counts toward the placement as before
+  (`aeg_dispatch_la_done`). `AEG_LATIME=1` also prints how long the
+  encoder waited for the helper.
+
+A field depends only on (d, r) and its seeds, so the thread or the device
+that computes it, and when, cannot change it.
+
+**Results.**
+
+- **Byte-identical to `a9dcab2`.**
+  - CPU: p1/p3/p4 × {default, `-t 1 --frame-threads 1`,
+    `--frame-threads 3`, `-t 2`, `-t 3`, PAFF, MBAFF}.
+  - OpenCL (PoCL, `-s la=opencl`), no warnings: p1/p3/p4,
+    `--frame-threads 3`, `-t 2`, PAFF, MBAFF, VBV, `--bframes 16` and
+    `--bframes 2`, `--b-pyramid 0`, `-g 13`, and auto placement.
+  - The scene cut (cockL then vtestL): forced OpenCL, auto, and the CPU
+    helper each insert the same single IDR.
+- **Sanitizers.** TSan is clean on p1/p3/p4 with `--frame-threads 3`,
+  `-t 2` and the defaults. ASan/UBSan, with leak checks, is clean on the
+  CPU and OpenCL paths.
+
+| cockL p3 `--crf 24`, 240 frames, 2 cores | before | async | encoder waited |
+|---|---|---|---|
+| `--frame-threads 1` | 24.56-24.81 s | 23.74-23.92 s | 0.32-0.37 s |
+| default (auto frame threads) | 15.87-16.82 s | 15.75-15.87 s | 0.35-0.41 s |
+
+- **Speed.** On 2 cores, about 3-4% faster with one frame thread; with
+  auto frame threads the runs are noisy (1-6%). The stream is the same in
+  every run (md5 7fe07d). Before chains were shared, the encoder waited
+  1.0-1.5 s on the same runs.
+- **Ceiling.** The lookahead stage was about 7% of these runs. On 2 cores
+  the helper competes with the coding threads, so more cores should give
+  more of it back.
+
+**A bug found on the way.** Locally (gcc 12), TSan reported a race with
+`-t 2`, even on CI's 176×144 clip (9 rows: 5 + 4, so the second slice
+starts on an odd row). The skip decision read the skip flag of the
+macroblock above on every odd row, and on a slice's first row that
+macroblock belongs to the other slice's thread. The value is used only
+with MBAFF, where slices start on even rows. `a9dcab2` fails the same way
+here, but CI's TSan job (gcc 13) passed. Its compiler probably moves the
+load into the MBAFF branch. The read is now guarded by `e->mbaff`, so the
+output cannot change.
