@@ -345,9 +345,12 @@ and slice threads, interlace signalling.  The QPs keep the 8-bit scale
 (`-q 22` is the same quantiser step relative to the signal at both depths,
 unlike x264, whose 10-bit `--qp` counts from QP'Y); CRF and the rate
 controls may go below zero, to -12, which is where 10 bits pay off.
-`--dump-recon` writes 16-bit little-endian samples (`yuv420p10le`).  10-bit
-runs on the CPU only -- the device kernels are 8-bit, so `-b opencl` falls
-back with a warning.  The SSE2/AVX2 kernels have 16-bit-sample forms (SAD,
+`--dump-recon` writes 16-bit little-endian samples (`yuv420p10le`).  At 10
+bits only the lookahead goes to a device (`-b opencl` / `-b cuda`, or a GPU
+with `-b auto`): its lowres pictures are 8-bit at every depth, so the
+search, intra and cost kernels are the 8-bit encoder's, and one more
+kernel downsamples the 10-bit luma.  Every other stage stays on the CPU,
+since those device kernels are 8-bit.  The SSE2/AVX2 kernels have 16-bit-sample forms (SAD,
 SATD/SA8D, SSD, the 4x4 and 8x8 transforms and quantisers, the half-pel,
 quarter-pel and chroma filters), each bit-exact with the C path, so 10 bits
 cost about what 8 bits do: 0.90-1.11x the 8-bit time at default threads,

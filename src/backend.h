@@ -154,19 +154,22 @@ typedef struct aeg_be_ops {
     /* The rest of the lookahead on the same resident ring (pics, nslots,
      * stride, w, h as for lowres_chains; all three optional):
      *
-     * lowres_build: aeg_lowres_build() of the luma `src` (sw x sh,
-     * sstride; the device backends take 8-bit samples) into ring slot
-     * pic->slot, which then holds pic->tag; the
-     * padded plane comes back at pic->plane (an allocation of
-     * aeg_lowres_alloc), the same bytes the host would have built.
+     * lowres_build: aeg_lowres_build() of the luma `src` (sw x sh, sstride
+     * samples of `depth` bits: one byte each at 8, two above) into ring
+     * slot pic->slot, which then holds pic->tag; the padded plane comes
+     * back at pic->plane (an allocation of aeg_lowres_alloc), the same
+     * bytes the host would have built.  The lowres plane is 8-bit at every
+     * depth, so this is the one lookahead operation that sees the depth;
+     * the CPU reference takes only its own (EINVAL otherwise), a device
+     * any of 8..14.
      *
      * lowres_intra: aeg_lowres_intra() of every picture, 1 int per block at
      * out[i]; `i8` is aeg_lowres_i8() (the directional Intra_8x8 modes).
      *
      * lowres_costs: every estimate of costs[] (see aeg_la_cost). */
-    int (*lowres_build)(void *priv, const pixel *src, int sstride, int sw,
-                        int sh, const aeg_la_pic *pic, int nslots, int stride,
-                        int w, int h);
+    int (*lowres_build)(void *priv, const void *src, int sstride, int depth,
+                        int sw, int sh, const aeg_la_pic *pic, int nslots,
+                        int stride, int w, int h);
     int (*lowres_intra)(void *priv, const aeg_la_pic *pics, int npics,
                         int nslots, int *const *out, int i8, int stride,
                         int w, int h);
@@ -253,6 +256,13 @@ int aeg_be_create_dev(int which, int dev, aeg_be_ops *ops);
 typedef struct aeg_dispatcher {
     aeg_be_ops ops;                  /* accelerator (or CPU)            */
     int        have_gpu;
+    /* The lookahead's operations (lowres_*): `ops` itself at 8 bits; at a
+     * higher depth, where every other kernel is 8-bit and so `ops` is the
+     * CPU's, a device instance of the lookahead operations alone (its
+     * pictures are 8-bit at every depth; lowres_build takes the depth),
+     * owned here (la_own).  la_dev: they are a device's. */
+    aeg_be_ops la_ops;
+    int        la_dev, la_own;
     int        use_gpu[AEG_STAGE_COUNT];   /* current decision           */
     int        forced[AEG_STAGE_COUNT];    /* -1 auto, else forced       */
     int64_t    cpu_ns[AEG_STAGE_COUNT][2]; /* [stage][last/ema]          */

@@ -132,6 +132,12 @@ if [ -n "${BE:-}" ]; then
 fi
 run all AEG_SEED=1 AEG_PARFULL=1 AEG_COEF_BATCH=1 AEG_RD_BATCH=1 -- $DEV "$@" \
     || fail=1
+# a 10-bit encode: every stage on the CPU but the lookahead, which goes to the
+# device (8-bit lowres pictures, downsampled there from the 10-bit luma)
+if [ -n "${BE:-}" ]; then
+    run cpu10 -- -b cpu --bit-depth 10 "$@" || fail=1
+    run la10 -- $DEV -s "la=$BE" --bit-depth 10 "$@" || fail=1
+fi
 
 echo "== bitstream: the coefficient stages may not change a single byte"
 same="auto coefbatch rdbatch"
@@ -150,6 +156,15 @@ for name in $same; do
         fail=1
     fi
 done
+if [ -n "${BE:-}" ]; then
+    if [ -f "$TMP/la10.264" ] && [ -f "$TMP/cpu10.264" ] &&
+       cmp -s "$TMP/cpu10.264" "$TMP/la10.264"; then
+        echo "   la10: identical to the 10-bit CPU stream"
+    else
+        echo "   la10: DIFFERS from the 10-bit CPU stream (or is missing)"
+        fail=1
+    fi
+fi
 # search/all are a different motion search from the serial one, so they are
 # compared with that search run on the CPU backend instead
 for name in search all; do

@@ -311,16 +311,18 @@ void aeg_la_cost_sum(const int *blk, int mb_w, int mb_h, int64_t *total,
 }
 
 /* the references of the rest of the lookahead: its own functions */
-static int cpu_lowres_build(void *priv, const pixel *src, int sstride,
-                            int sw, int sh, const aeg_la_pic *pic, int nslots,
-                            int stride, int w, int h)
+static int cpu_lowres_build(void *priv, const void *src, int sstride,
+                            int depth, int sw, int sh, const aeg_la_pic *pic,
+                            int nslots, int stride, int w, int h)
 {
     aeg_lowres l;
 
     (void)priv;
     (void)nslots;
+    if (depth != BIT_DEPTH)
+        return AEG_EINVAL;
     cpu_lr_view(&l, pic->plane, stride, w, h);
-    aeg_lowres_build(&l, src, sstride, sw, sh);
+    aeg_lowres_build(&l, (const pixel *)src, sstride, sw, sh);
     return AEG_OK;
 }
 
@@ -594,18 +596,18 @@ static int g_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
                                    nchains, jobs, stride, w, h);
 }
 
-static int g_lowres_build(void *priv, const pixel *src, int sstride,
-                          int sw, int sh, const aeg_la_pic *pic, int nslots,
-                          int stride, int w, int h)
+static int g_lowres_build(void *priv, const void *src, int sstride,
+                          int depth, int sw, int sh, const aeg_la_pic *pic,
+                          int nslots, int stride, int w, int h)
 {
     be_lane *l = (be_lane *)priv;
     if (guard_enter(l) &&
-        guard_leave(l, l->dev.lowres_build(l->dev.priv, src, sstride, sw, sh,
-                                           pic, nslots, stride, w, h),
+        guard_leave(l, l->dev.lowres_build(l->dev.priv, src, sstride, depth,
+                                           sw, sh, pic, nslots, stride, w, h),
                     "lowres_build"))
         return AEG_OK;
-    return l->g->cpu.lowres_build(l->g->cpu.priv, src, sstride, sw, sh, pic,
-                                  nslots, stride, w, h);
+    return l->g->cpu.lowres_build(l->g->cpu.priv, src, sstride, depth, sw, sh,
+                                  pic, nslots, stride, w, h);
 }
 
 static int g_lowres_intra(void *priv, const aeg_la_pic *pics, int npics,
@@ -905,10 +907,79 @@ static int be_create_raw(int which, int dev, aeg_be_ops *ops)
 /* ------------------------------------------------------------------ */
 /* Dispatcher                                                          */
 /* ------------------------------------------------------------------ */
+#if BIT_DEPTH != 8
+/* The lookahead device of a high-depth encoder: the backend's own choice
+ * of device (as be_create_raw at 8 bits: -b auto takes a GPU only), with
+ * everything but the lookahead operations dropped before the guard wraps
+ * it -- those kernels are 8-bit -- so the guard's CPU fallback is this
+ * depth's reference.  0 = none. */
+static int la_dev_create(int which, int dev, aeg_be_ops *ops)
+{
+    aeg_be_ops raw;
+    int ok = 0;
+
+    aeg_be_cpu_ops(&raw);
+    if (which == AEG_BACKEND_OPENCL)
+        ok = aeg_be_opencl_create(&raw, dev, 0) == AEG_OK;
+    else if (which == AEG_BACKEND_CUDA)
+        ok = aeg_be_cuda_create(&raw, dev) == AEG_OK;
+    else if (which == AEG_BACKEND_AUTO) {
+        ok = aeg_be_cuda_create(&raw, dev) == AEG_OK;
+        if (!ok) {
+            aeg_be_cpu_ops(&raw);
+            ok = aeg_be_opencl_create(&raw, dev, 1) == AEG_OK;
+        }
+    }
+    if (!ok || !raw.lowres_search || !raw.lowres_build) {
+        if (ok && raw.destroy)
+            raw.destroy(raw.priv);
+        aeg_be_cpu_ops(ops);
+        return 0;
+    }
+    memset(ops, 0, sizeof(*ops));
+    ops->priv = raw.priv;
+    ops->backend = raw.backend;
+    memcpy(ops->desc, raw.desc, sizeof(ops->desc));
+    ops->lowres_search = raw.lowres_search;
+    ops->lowres_chains = raw.lowres_chains;
+    ops->lowres_build = raw.lowres_build;
+    ops->lowres_intra = raw.lowres_intra;
+    ops->lowres_costs = raw.lowres_costs;
+    ops->sync = raw.sync;
+    ops->destroy = raw.destroy;
+    ops->clone = raw.clone;
+    if (be_guard_wrap(ops) != AEG_OK) {
+        raw.destroy(raw.priv);
+        aeg_be_cpu_ops(ops);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
 void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
 {
     int i;
     memset(d, 0, sizeof(*d));
+#if BIT_DEPTH != 8
+    /* every kernel but the lookahead's is 8-bit: the stages stay on the
+     * CPU, the lookahead may go to a device */
+    aeg_be_cpu_ops(&d->ops);
+    if (backend != AEG_BACKEND_CPU &&
+        la_dev_create(backend, p ? p->device : -1, &d->la_ops)) {
+        d->la_dev = 1;
+        d->la_own = 1;
+        aeg_log(AEG_LOG_INFO, "aeg: %d-bit: the lookahead may run on %s %s; "
+                "every other stage on the CPU (its kernels are 8-bit)",
+                BIT_DEPTH, aeg_backend_name(d->la_ops.backend), d->la_ops.desc);
+    } else {
+        d->la_ops = d->ops;
+        if (backend == AEG_BACKEND_OPENCL || backend == AEG_BACKEND_CUDA ||
+            (p && p->device >= 0))
+            aeg_log(AEG_LOG_WARNING, "aeg: no %s device is available, using "
+                    "the CPU", aeg_backend_name(backend));
+    }
+#else
     aeg_be_create_dev(backend, p ? p->device : -1, &d->ops);
     if (d->ops.backend == AEG_BACKEND_CPU &&
         (backend == AEG_BACKEND_OPENCL || backend == AEG_BACKEND_CUDA ||
@@ -920,8 +991,13 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
             aeg_log(AEG_LOG_WARNING, "aeg: no %s device is available, using "
                     "the CPU", aeg_backend_name(backend));
     }
+#endif
     d->have_gpu = d->ops.backend != AEG_BACKEND_CPU &&
                   d->ops.tq_batch != NULL;
+#if BIT_DEPTH == 8
+    d->la_ops = d->ops;
+    d->la_dev = d->have_gpu && d->ops.lowres_search != NULL;
+#endif
     for (i = 0; i < AEG_STAGE_COUNT; i++) {
         d->forced[i] = p ? p->stage_backend[i] : -1;
         d->use_gpu[i] = 0;
@@ -939,6 +1015,11 @@ void aeg_dispatch_init(aeg_dispatcher *d, int backend, const aeg_params *p)
 
 void aeg_dispatch_destroy(aeg_dispatcher *d)
 {
+    if (d->la_own && d->la_ops.destroy)
+        d->la_ops.destroy(d->la_ops.priv);
+    d->la_own = 0;
+    d->la_dev = 0;
+    d->la_ops.destroy = NULL;
     if (d->ops.destroy)
         d->ops.destroy(d->ops.priv);
     d->ops.destroy = NULL;
@@ -1087,10 +1168,10 @@ int aeg_dispatch_la_pick(aeg_dispatcher *d, int batch)
     int dev;
 
     if (d->forced[AEG_STAGE_LOOKAHEAD] >= 0)
-        return d->have_gpu && d->ops.lowres_search &&
+        return d->la_dev &&
                (d->forced[AEG_STAGE_LOOKAHEAD] == AEG_BACKEND_OPENCL ||
                 d->forced[AEG_STAGE_LOOKAHEAD] == AEG_BACKEND_CUDA);
-    if (!d->have_gpu || !d->ops.lowres_search)
+    if (!d->la_dev)
         return 0;
     r = disp_lock(d);
     if (r->la_n[0] <= probe || r->la_n[1] <= probe) {

@@ -45,6 +45,7 @@ typedef int nvrtcResult;
 
 static const char aeg_cuda_preamble[] =
     "typedef unsigned char uchar;\n"
+    "typedef unsigned short ushort;\n"
     "typedef unsigned long long ulong;\n"
     "#define __kernel extern \"C\" __global__\n"
     "#define __global\n"
@@ -107,7 +108,7 @@ typedef struct cuda_ctx {
     CUcontext ctx;
     CUmodule mod;
     CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq, k_tqdc, k_iqdc;
-    CUfunction k_lrs, k_lrc, k_lrb, k_lri, k_lrk;
+    CUfunction k_lrs, k_lrc, k_lrb, k_lri, k_lrk, k_lrb16;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -764,19 +765,21 @@ fail:
 
 /* The rest of the lookahead on the ring (see the OpenCL versions);
  * buffer 16: the source luma */
-static int cuda_lowres_build(void *priv, const uint8_t *src, int sstride,
-                             int sw, int sh, const aeg_la_pic *pic, int nslots,
-                             int stride, int w, int h)
+static int cuda_lowres_build(void *priv, const void *src, int sstride,
+                             int depth, int sw, int sh, const aeg_la_pic *pic,
+                             int nslots, int stride, int w, int h)
 {
     cuda_ctx *o = (cuda_ctx *)priv;
-    int pad = AEG_LA_PAD, rc, dst;
+    int pad = AEG_LA_PAD, rc, dst, a = 0;
+    const int hi = depth > 8;
     const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
     const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
-    const size_t sbytes = (size_t)sstride * (size_t)(sh - 1) + (size_t)sw;
+    const size_t sbytes = ((size_t)sstride * (size_t)(sh - 1) + (size_t)sw)
+                          << hi;
     CUdeviceptr ds;
-    void *args[10];
+    void *args[11];
 
-    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0)
+    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0 || depth < 8 || depth > 14)
         return AEG_EINVAL;
     if (cuda_bind(o) != AEG_OK)
         return AEG_EBACKEND;
@@ -788,12 +791,20 @@ static int cuda_lowres_build(void *priv, const uint8_t *src, int sstride,
         return AEG_EBACKEND;
     dst = (int)(slot * (size_t)pic->slot);
     o->lr_tag[pic->slot] = -1;
-    args[0] = &ds;      args[1] = &sstride; args[2] = &sw;
-    args[3] = &sh;      args[4] = &o->lr_mem; args[5] = &dst;
-    args[6] = &stride;  args[7] = &pad;     args[8] = &w;
-    args[9] = &h;
+    args[a++] = &ds;
+    args[a++] = &sstride;
+    args[a++] = &sw;
+    args[a++] = &sh;
+    if (hi)
+        args[a++] = &depth;
+    args[a++] = &o->lr_mem;
+    args[a++] = &dst;
+    args[a++] = &stride;
+    args[a++] = &pad;
+    args[a++] = &w;
+    args[a++] = &h;
     if (p_cuMemcpyHtoD_v2(ds, src, sbytes) != CUDA_SUCCESS ||
-        cuda_launch(o->k_lrb, (int)slot, args) != AEG_OK ||
+        cuda_launch(hi ? o->k_lrb16 : o->k_lrb, (int)slot, args) != AEG_OK ||
         p_cuMemcpyDtoH_v2((uint8_t *)pic->plane - org,
                           o->lr_mem + slot * (size_t)pic->slot,
                           slot) != CUDA_SUCCESS)
@@ -1053,7 +1064,7 @@ static const char *const aeg_cuda_kernels[] = {
     "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
     "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch",
     "lowres_search", "lowres_chains", "lowres_build", "lowres_intra",
-    "lowres_costs", NULL
+    "lowres_costs", "lowres_build16", NULL
 };
 
 /* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
@@ -1141,7 +1152,7 @@ static int cuda_build_module(cuda_ctx *o)
     char *ptx = NULL, log[2048];
     int major = 5, minor = 0, cc, k, rc;
     CUresult cr;
-    CUfunction *fn[14];
+    CUfunction *fn[15];
 
     p_cuDeviceGetAttribute(&major,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -1171,7 +1182,7 @@ static int cuda_build_module(cuda_ctx *o)
     fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
     fn[6] = &o->k_tqiq; fn[7] = &o->k_tqdc; fn[8] = &o->k_iqdc;
     fn[9] = &o->k_lrs; fn[10] = &o->k_lrc; fn[11] = &o->k_lrb;
-    fn[12] = &o->k_lri; fn[13] = &o->k_lrk;
+    fn[12] = &o->k_lri; fn[13] = &o->k_lrk; fn[14] = &o->k_lrb16;
     for (k = 0; aeg_cuda_kernels[k]; k++)
         if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
             CUDA_SUCCESS)
@@ -1278,6 +1289,7 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     o->k_lrb = src->k_lrb;
     o->k_lri = src->k_lri;
     o->k_lrk = src->k_lrk;
+    o->k_lrb16 = src->k_lrb16;
     o->cus = src->cus;
     o->mem = src->mem;
     memcpy(o->name, src->name, sizeof(o->name));

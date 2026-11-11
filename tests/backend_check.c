@@ -695,12 +695,12 @@ static void check_rest(int mb_w, int mb_h)
             pc[k].tag = pd[k].tag = round ? 7 : k;
             memset(lc[k].mem, 0x11, sz);
             memset(ld[k].mem, 0xee, sz);
-            cpu.lowres_build(cpu.priv, src, sstride, sw, sh, &pc[k], NS,
+            cpu.lowres_build(cpu.priv, src, sstride, 8, sw, sh, &pc[k], NS,
                              lc[k].stride, lc[k].w, lc[k].h);
             if (round)
                 memcpy(ld[k].mem, lc[k].mem, sz);   /* the host's picture */
             else
-                dev.lowres_build(dev.priv, src, sstride, sw, sh, &pd[k], NS,
+                dev.lowres_build(dev.priv, src, sstride, 8, sw, sh, &pd[k], NS,
                                  ld[k].stride, ld[k].w, ld[k].h);
             ok &= !memcmp(lc[k].mem, ld[k].mem, sz);
         }
@@ -803,6 +803,81 @@ static void check_rest(int mb_w, int mb_h)
     free(fb);
 }
 
+/* lowres_build at 10 bits: the device builds three slots from 16-bit
+ * sources (runs of full-range white among them) and must hand back the
+ * 10-bit encoder's own bytes (the library holds both depths); the intra
+ * estimates then run on those resident slots, uploading nothing.  This is
+ * the path of a 10-bit encode's lookahead on a device. */
+void aeg_be_cpu_ops_10(aeg_be_ops *ops);
+
+static void check_build16(int mb_w, int mb_h)
+{
+    enum { NS = 3 };
+    aeg_be_ops cpu10;
+    aeg_lowres lc[NS], ld[NS];
+    aeg_la_pic pc[NS], pd[NS];
+    const int nb = mb_w * mb_h;
+    const int sw = 16 * mb_w - (mb_w > 1 ? 1 : 0), sh = 16 * mb_h - (mb_h > 1 ? 5 : 0);
+    const int sstride = sw + 10;
+    uint16_t *src = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)sstride * (size_t)sh);
+    int *ica[NS], *icb[NS], k, x, y, ok = 1, ok2 = 1;
+    size_t sz;
+
+    aeg_be_cpu_ops_10(&cpu10);
+    if (!src)
+        return;
+    for (k = 0; k < NS; k++) {
+        if (aeg_lowres_alloc(&lc[k], mb_w, mb_h) ||
+            aeg_lowres_alloc(&ld[k], mb_w, mb_h))
+            return;
+        ica[k] = (int *)malloc(sizeof(int) * (size_t)nb);
+        icb[k] = (int *)malloc(sizeof(int) * (size_t)nb);
+        if (!ica[k] || !icb[k])
+            return;
+    }
+    sz = (size_t)lc[0].stride * (size_t)(lc[0].h + 2 * AEG_LA_PAD);
+    for (k = 0; k < NS; k++) {
+        for (y = 0; y < sh; y++)
+            for (x = 0; x < sstride; x++) {
+                const int u = x + 6 * k, v = y + 2 * k;
+                src[(size_t)y * sstride + x] = (uint16_t)(
+                    ((u / 7 + v / 3) & 1) ? 1023 - rnd(2)
+                                          : 100 + (u * 11 + v * 17) % 800 + rnd(40));
+            }
+        pc[k].plane = lc[k].plane;
+        pd[k].plane = ld[k].plane;
+        pc[k].slot = pd[k].slot = (k + 1) % NS;
+        pc[k].tag = pd[k].tag = 100 + k;
+        memset(lc[k].mem, 0x11, sz);
+        memset(ld[k].mem, 0xee, sz);
+        cpu10.lowres_build(cpu10.priv, src, sstride, 10, sw, sh, &pc[k], NS,
+                           lc[k].stride, lc[k].w, lc[k].h);
+        if (dev.lowres_build(dev.priv, src, sstride, 10, sw, sh, &pd[k], NS,
+                             ld[k].stride, ld[k].w, ld[k].h) != AEG_OK)
+            ok = 0;
+        ok &= !memcmp(lc[k].mem, ld[k].mem, sz);
+    }
+    check(ok, "lowres_build (10-bit)");
+    cpu10.lowres_intra(cpu10.priv, pc, NS, NS, ica, aeg_lowres_i8(),
+                       lc[0].stride, lc[0].w, lc[0].h);
+    /* the device's resident slots: its planes, then scribbled on the host
+     * so that a re-upload would show */
+    for (k = 0; k < NS; k++)
+        memset(ld[k].mem, 0, sz);
+    dev.lowres_intra(dev.priv, pd, NS, NS, icb, aeg_lowres_i8(),
+                     ld[0].stride, ld[0].w, ld[0].h);
+    for (k = 0; k < NS; k++)
+        ok2 &= !memcmp(ica[k], icb[k], sizeof(int) * (size_t)nb);
+    check(ok2, "lowres_intra after a 10-bit lowres_build (resident)");
+    for (k = 0; k < NS; k++) {
+        aeg_lowres_free(&lc[k]);
+        aeg_lowres_free(&ld[k]);
+        free(ica[k]);
+        free(icb[k]);
+    }
+    free(src);
+}
+
 int main(int argc, char **argv)
 {
     int which = AEG_BACKEND_AUTO, k;
@@ -853,8 +928,10 @@ int main(int argc, char **argv)
     if (dev.lowres_build && dev.lowres_intra && dev.lowres_costs) {
         static const int rsz[][2] = { { 11, 9 }, { 40, 22 }, { 120, 68 },
                                       { 1, 1 }, { 3, 1 }, { 1, 4 } };
-        for (k = 0; k < 6; k++)
+        for (k = 0; k < 6; k++) {
             check_rest(rsz[k][0], rsz[k][1]);
+            check_build16(rsz[k][0], rsz[k][1]);
+        }
     }
     check_threads(176, 144, 0);
     check_threads(176, 144, 1);

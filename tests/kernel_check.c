@@ -22,6 +22,7 @@
 #include "backend.h"
 
 typedef unsigned char uchar;
+typedef unsigned short ushort;
 typedef unsigned long long ulong;
 #define __kernel
 #define __global
@@ -424,7 +425,7 @@ static int check_rest(int mb_w, int mb_h)
                     (uint8_t)(90 + 70 * (((u + 2 * v) / 7) & 1) +
                               ((u * v) % 23) + rnd(13));
             }
-        cpu.lowres_build(cpu.priv, src, sstride, sw, sh,
+        cpu.lowres_build(cpu.priv, src, sstride, 8, sw, sh,
                          &(aeg_la_pic){ lr[k].plane, slots[k], k }, NS,
                          lr[k].stride, lr[k].w, lr[k].h);
         for (i = 0; i < lr[k].stride * (lr[k].h + 2 * AEG_LA_PAD); i++) {
@@ -527,6 +528,79 @@ static int check_rest(int mb_w, int mb_h)
     free(icg);
     free(blk);
     free(data);
+    return bad != 0;
+}
+
+/* lowres_build16 against the 10-bit encoder's own reference (the library
+ * holds both depths; the 10-bit symbols carry _10): sources with runs of
+ * full-range white, which round up to 256 before the clamp, and odd sizes
+ * that clamp the 2x2 box at the right and bottom edges */
+void aeg_be_cpu_ops_10(aeg_be_ops *ops);
+
+static int check_build16(int mb_w, int mb_h)
+{
+    aeg_be_ops cpu10;
+    aeg_lowres l;
+    const int sw = 16 * mb_w - (mb_w > 1 ? 5 : 0);
+    const int sh = 16 * mb_h - (mb_h > 1 ? 3 : 0), sstride = sw + 7;
+    uint16_t *src;
+    uint8_t *plane;
+    size_t slot;
+    int x, y, i, k, bad = 0, white = 0;
+
+    aeg_be_cpu_ops_10(&cpu10);
+    if (aeg_lowres_alloc(&l, mb_w, mb_h))
+        return 1;
+    slot = (size_t)l.stride * (size_t)(l.h + 2 * AEG_LA_PAD);
+    src = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)sstride * (size_t)sh);
+    plane = (uint8_t *)malloc(2 * slot);
+    if (!src || !plane)
+        return 1;
+    for (k = 0; k < 3; k++) {
+        for (y = 0; y < sh; y++)
+            for (x = 0; x < sstride; x++) {
+                const int u = x + 7 * k, v = y + 3 * k;
+                int s = ((u / 6 + v / 5) & 1) ? 1023 - rnd(3)
+                                              : 64 + (u * 13 + v * 29) % 900;
+                if (k == 2)
+                    s = rnd(1024);
+                src[(size_t)y * sstride + x] = (uint16_t)s;
+            }
+        memset(l.mem, 0x5a, slot);
+        memset(plane, 0xa5, 2 * slot);
+        if (cpu10.lowres_build(cpu10.priv, src, sstride, 10, sw, sh,
+                               &(aeg_la_pic){ l.plane, 0, k }, 1, l.stride,
+                               l.w, l.h) != AEG_OK) {
+            printf("   kernel_check: no 10-bit lowres_build reference\n");
+            return 1;
+        }
+        for (i = 0; i < (int)slot; i++) {
+            aeg_mock_gid = i;
+            lowres_build16(src, sstride, sw, sh, 10, plane, (int)slot,
+                           l.stride, AEG_LA_PAD, l.w, l.h);
+        }
+        for (i = 0; i < (int)slot; i++)
+            white += l.mem[i] == 255;
+        if (memcmp(plane + slot, l.mem, slot)) {
+            printf("   kernel_check: lowres_build16 %dx%d (%d) differs\n",
+                   mb_w, mb_h, k);
+            bad++;
+        }
+        for (i = 0; i < (int)slot; i++)
+            if (plane[i] != 0xa5) {   /* nothing outside its slot */
+                printf("   kernel_check: lowres_build16 wrote outside its "
+                       "slot\n");
+                bad++;
+                break;
+            }
+    }
+    if (!white) {
+        printf("   kernel_check: lowres_build16 test has no white\n");
+        bad++;
+    }
+    aeg_lowres_free(&l);
+    free(src);
+    free(plane);
     return bad != 0;
 }
 
@@ -983,11 +1057,12 @@ int main(void)
             fail |= check_lowres(lsz[t][0], lsz[t][1], 1);
             fail |= check_chains(lsz[t][0], lsz[t][1]);
             fail |= check_rest(lsz[t][0], lsz[t][1]);
+            fail |= check_build16(lsz[t][0], lsz[t][1]);
         }
     }
 
     fail |= check_i8_modes();
     if (!fail)
-        printf("   kernel_check: 14 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 15 kernels agree with the CPU reference\n");
     return fail;
 }

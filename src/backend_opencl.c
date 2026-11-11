@@ -125,7 +125,7 @@ typedef struct ocl_ctx {
     size_t lr_host_cap;
     /* the rest of the lookahead on the same ring (lowres_build / _intra /
      * _costs): their kernels and the host side of the costs' blocks */
-    cl_kernel k_lrb, k_lri, k_lrk;
+    cl_kernel k_lrb, k_lrb16, k_lri, k_lrk;
     int *lk_blk;
     size_t lk_blk_cap;
 } ocl_ctx;
@@ -894,22 +894,24 @@ static int ocl_lr_fail(ocl_ctx *o, int rc)
     return rc;
 }
 
-/* buffer 16: the source luma */
-static int ocl_lowres_build(void *priv, const uint8_t *src, int sstride,
-                            int sw, int sh, const aeg_la_pic *pic, int nslots,
-                            int stride, int w, int h)
+/* buffer 16: the source luma (8-bit, or two bytes a sample above) */
+static int ocl_lowres_build(void *priv, const void *src, int sstride,
+                            int depth, int sw, int sh, const aeg_la_pic *pic,
+                            int nslots, int stride, int w, int h)
 {
     ocl_ctx *o = (ocl_ctx *)priv;
-    const int pad = AEG_LA_PAD;
+    const int pad = AEG_LA_PAD, hi = depth > 8;
     const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
     const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
-    const size_t sbytes = (size_t)sstride * (size_t)(sh - 1) + (size_t)sw;
+    const size_t sbytes = ((size_t)sstride * (size_t)(sh - 1) + (size_t)sw)
+                          << hi;
+    cl_kernel k = hi ? o->k_lrb16 : o->k_lrb;
     size_t global = slot;
     cl_mem ms;
     cl_int st = 0;
-    int rc, dst;
+    int rc, dst, a = 0;
 
-    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0)
+    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0 || depth < 8 || depth > 14)
         return AEG_EINVAL;
     if ((rc = ocl_lr_ring(o, slot, nslots)) != AEG_OK)
         return rc;
@@ -923,18 +925,20 @@ static int ocl_lowres_build(void *priv, const uint8_t *src, int sstride,
     if (p_clEnqueueWriteBuffer(o->queue, ms, CL_FALSE, 0, sbytes, src, 0, NULL,
                                NULL) != CL_SUCCESS)
         return ocl_lr_fail(o, AEG_EBACKEND);
-    st |= p_clSetKernelArg(o->k_lrb, 0, sizeof(cl_mem), &ms);
-    st |= p_clSetKernelArg(o->k_lrb, 1, sizeof(int), &sstride);
-    st |= p_clSetKernelArg(o->k_lrb, 2, sizeof(int), &sw);
-    st |= p_clSetKernelArg(o->k_lrb, 3, sizeof(int), &sh);
-    st |= p_clSetKernelArg(o->k_lrb, 4, sizeof(cl_mem), &o->lr_mem);
-    st |= p_clSetKernelArg(o->k_lrb, 5, sizeof(int), &dst);
-    st |= p_clSetKernelArg(o->k_lrb, 6, sizeof(int), &stride);
-    st |= p_clSetKernelArg(o->k_lrb, 7, sizeof(int), &pad);
-    st |= p_clSetKernelArg(o->k_lrb, 8, sizeof(int), &w);
-    st |= p_clSetKernelArg(o->k_lrb, 9, sizeof(int), &h);
+    st |= p_clSetKernelArg(k, a++, sizeof(cl_mem), &ms);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &sstride);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &sw);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &sh);
+    if (hi)
+        st |= p_clSetKernelArg(k, a++, sizeof(int), &depth);
+    st |= p_clSetKernelArg(k, a++, sizeof(cl_mem), &o->lr_mem);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &dst);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &stride);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &pad);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &w);
+    st |= p_clSetKernelArg(k, a++, sizeof(int), &h);
     if (st != CL_SUCCESS ||
-        p_clEnqueueNDRangeKernel(o->queue, o->k_lrb, 1, NULL, &global, NULL, 0,
+        p_clEnqueueNDRangeKernel(o->queue, k, 1, NULL, &global, NULL, 0,
                                  NULL, NULL) != CL_SUCCESS ||
         p_clEnqueueReadBuffer(o->queue, o->lr_mem, CL_TRUE,
                               slot * (size_t)pic->slot, slot,
@@ -1143,6 +1147,7 @@ static void ocl_destroy(void *priv)
     free(o->lr_host);
     free(o->lk_blk);
     if (o->k_lrb) p_clReleaseKernel(o->k_lrb);
+    if (o->k_lrb16) p_clReleaseKernel(o->k_lrb16);
     if (o->k_lri) p_clReleaseKernel(o->k_lri);
     if (o->k_lrk) p_clReleaseKernel(o->k_lrk);
     if (o->k_lrc) p_clReleaseKernel(o->k_lrc);
@@ -1206,6 +1211,7 @@ static int ocl_kernels(ocl_ctx *o)
     o->k_lrs = p_clCreateKernel(o->prog, "lowres_search", &st);
     o->k_lrc = p_clCreateKernel(o->prog, "lowres_chains", &st);
     o->k_lrb = p_clCreateKernel(o->prog, "lowres_build", &st);
+    o->k_lrb16 = p_clCreateKernel(o->prog, "lowres_build16", &st);
     o->k_lri = p_clCreateKernel(o->prog, "lowres_intra", &st);
     o->k_lrk = p_clCreateKernel(o->prog, "lowres_costs", &st);
     /* one work-group walks a whole field; 64 items cover the longest
@@ -1230,7 +1236,7 @@ static int ocl_kernels(ocl_ctx *o)
     }
     return o->k_sad && o->k_tq && o->k_iq && o->k_tqiq && o->k_sse &&
            o->k_intp && o->k_satd && o->k_tqdc && o->k_iqdc && o->k_lrs &&
-           o->k_lrc && o->k_lrb && o->k_lri && o->k_lrk
+           o->k_lrc && o->k_lrb && o->k_lrb16 && o->k_lri && o->k_lrk
                ? AEG_OK : AEG_EBACKEND;
 }
 

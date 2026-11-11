@@ -7716,3 +7716,49 @@ byte-identical to before.
 On cockL stretched to full-range 10-bit (8.8% of luma ≥ 1022), p3
 `--crf 24`, 30 frames: 97 669 → 97 800 bytes, 42.37 → 42.41 dB. The
 decisions changed, but quality is about the same.
+
+## The lookahead on a device in 10-bit encodes
+
+Until now a 10-bit encoder had no device at all: every device kernel is
+8-bit, so `-b opencl` fell back to the CPU with a warning. The lookahead
+is the exception. Its lowres pictures are 8-bit at every depth (the
+downshift rounds the 2×2 sum to 8 bits), so the search, chains, intra and
+cost kernels are already right for 10-bit. Only the downsampling reads
+the source.
+
+- **`lowres_build` takes the depth.** The op now takes `const void *src`
+  plus `depth`. A new kernel, `lowres_build16`, reads 16-bit samples and
+  rounds and clamps exactly as `aeg_lowres_build()` does at that depth (see
+  the fix above). The CPU reference accepts only its own depth.
+- **The dispatcher has a lookahead handle** (`la_ops`, `la_dev`): at
+  8 bits it is `ops` itself. At 10 bits `ops` stays the CPU's exactly as
+  before, and `la_dev_create()` opens the device the backend would pick
+  (`-b auto`: a GPU only). Everything but the five lookahead operations is
+  dropped before the guard wraps it, so the guard falls back to the 10-bit
+  CPU reference. The dispatcher owns that instance and destroys it. The
+  lookahead code (`la_search`, the helper's lane, the placement vote) uses
+  only `la_ops`/`la_dev`. Every other stage of a 10-bit encode stays on the
+  CPU, and the log says so.
+
+**Checks**
+- **`tests/kernel_check.c`** (15 kernels): `lowres_build16` matches the
+  library's own 10-bit reference (`aeg_be_cpu_ops_10`, called through the
+  `_10` symbol) on sources with runs of full-range white, at six sizes. It
+  writes nothing outside its slot. Mutating the clamp or the rounding is
+  caught.
+- **`tests/backend_check.c`** (393 checks): the device builds three slots
+  from 10-bit sources and must return the 10-bit reference's bytes. The
+  intra estimates then run on those resident slots after the host copies
+  are zeroed, so a re-upload would show. Using the 8-bit kernel, or
+  uploading half the 16-bit source, is caught.
+- **Encoder on PoCL.** Byte-identical to the CPU build at 10 bits with
+  `-s la=opencl` and with automatic placement. This covers upconverted
+  cockL at p1/p3/p4, `--frame-threads 2`, `--bframes 16`, a 720p clip,
+  and native full-range 10-bit with white areas at p3 and at p4 `-q`.
+  8-bit is still identical to `3f9d652`. Mutating `lowres_build16` or the
+  costs kernel changes the 10-bit stream, so the device results are used.
+- **`tools/gpu_validate.sh`** gains a `cpu10`/`la10` pair, so CI's PoCL
+  job checks the 10-bit device lookahead too.
+- **Sanitizers:** ASan/UBSan clean, with no leak from our code (only
+  PoCL's LLVM). TSan clean, forced and automatic, with 2 frame threads.
+  NVRTC compiles `lowres_build16` (`ushort` added to the CUDA preamble).

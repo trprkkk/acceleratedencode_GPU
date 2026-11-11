@@ -15309,7 +15309,7 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
     int64_t t0, dt;
     int dev;
 
-    if (!e->d.have_gpu || !e->d.ops.lowres_search || nb != e->mb_count) {
+    if (!e->d.la_dev || nb != e->mb_count) {
         aeg_lowres_search_seeded(c, r, f, f + 2 * e->mb_count, seed, num, den,
                                  range);
         return;
@@ -15319,9 +15319,9 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
     if (dev) {
         int rc;
         AEG_PH(AEG_PH_LOWRES,
-               rc = e->d.ops.lowres_search(e->d.ops.priv, c->plane, r->plane,
-                                           c->stride, c->w, c->h, seed, num,
-                                           den, range, f));
+               rc = e->d.la_ops.lowres_search(e->d.la_ops.priv, c->plane,
+                                              r->plane, c->stride, c->w, c->h,
+                                              seed, num, den, range, f));
         if (rc != AEG_OK) {
             dev = 0;
             aeg_lowres_search_seeded(c, r, f, f + 2 * nb, seed, num, den,
@@ -15551,8 +15551,8 @@ static struct la_bg *la_bg_get(struct aeg_encoder *e)
     pthread_cond_init(&bg->go, NULL);
     pthread_cond_init(&bg->done, NULL);
     aeg_be_cpu_ops(&bg->cpu);
-    if (e->d.have_gpu && e->d.ops.lowres_chains) {
-        aeg_be_lane(&e->d.ops, LA_LANE, &bg->lane);
+    if (e->d.la_dev && e->d.la_ops.lowres_chains) {
+        aeg_be_lane(&e->d.la_ops, LA_LANE, &bg->lane);
         bg->have_lane = bg->lane.lowres_chains != NULL;
     }
     e->la_bg = bg;
@@ -15891,7 +15891,8 @@ static int la_dev_build(struct aeg_encoder *e, int slot, int d)
     t0 = aeg_now_ns();
     AEG_PH(AEG_PH_LOWRES,
            rc = bg->lane.lowres_build(bg->lane.priv, e->in_plane[slot][0],
-                                      e->stride[0], e->w, e->h, &pic,
+                                      e->stride[0], BIT_DEPTH, e->w, e->h,
+                                      &pic,
                                       in_slots(e), e->in_low[slot].stride,
                                       e->in_low[slot].w, e->in_low[slot].h));
     la_dev_time(e, aeg_now_ns() - t0);

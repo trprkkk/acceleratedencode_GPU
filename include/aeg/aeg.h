@@ -196,8 +196,10 @@ typedef struct aeg_params {
      * qp_max and the per-picture QPs keep the 8-bit scale (QPY: a QP of 22
      * means the same quantiser step relative to the signal at both depths);
      * at 10 bits the rate control may go below 0, down to -12, unless qp_min
-     * says otherwise.  10-bit runs on the CPU only (the GPU kernels are
-     * 8-bit).  Input: aeg_encoder_encode_image() with 10-bit I420/YV12 goes
+     * says otherwise.  At 10 bits only the lookahead may use a device (its
+     * lowres pictures are 8-bit at every depth; it is downsampled there
+     * from the 10-bit luma), every other stage runs on the CPU (those GPU
+     * kernels are 8-bit).  Input: aeg_encoder_encode_image() with 10-bit I420/YV12 goes
      * in unchanged, anything else is converted (8-bit input is scaled up
      * exactly, deeper input dithered to 10 bits); aeg_encoder_encode() and
      * _encode_planes() take 8-bit samples.  aeg_encoder_recon() returns
