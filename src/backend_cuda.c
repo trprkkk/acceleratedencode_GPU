@@ -97,7 +97,7 @@ CUDA_SYMS(DECL)
 NVRTC_SYMS(DECL)
 #undef DECL
 
-#define NBUF 16
+#define NBUF 20
 #define AEG_BLOCK 256
 
 typedef struct cuda_ctx {
@@ -107,7 +107,7 @@ typedef struct cuda_ctx {
     CUcontext ctx;
     CUmodule mod;
     CUfunction k_sad, k_tq, k_iq, k_sse, k_intp, k_satd, k_tqiq, k_tqdc, k_iqdc;
-    CUfunction k_lrs, k_lrc;
+    CUfunction k_lrs, k_lrc, k_lrb, k_lri, k_lrk;
     CUdeviceptr buf[NBUF];
     size_t buf_sz[NBUF];
     int cus;
@@ -126,6 +126,8 @@ typedef struct cuda_ctx {
     int *lr_tag;
     int *lr_host;               /* the packed chain and job tables */
     size_t lr_host_cap;
+    int *lk_blk;                /* lowres_costs: the per-block results */
+    size_t lk_blk_cap;
 } cuda_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -606,6 +608,64 @@ static int cuda_lowres_search(void *priv, const uint8_t *cur,
     return AEG_OK;
 }
 
+/* The ring of resident lowres planes (see the OpenCL version). */
+static int cuda_lr_ring(cuda_ctx *o, size_t slot, int nslots)
+{
+    int i;
+
+    if (nslots <= 0 || slot * (size_t)nslots > 0x7fffffffu)
+        return AEG_EBACKEND;
+    if (o->lr_mem && o->lr_slot == slot && o->lr_nslots >= nslots)
+        return AEG_OK;
+    {
+        int *tag = (int *)realloc(o->lr_tag, sizeof(int) * (size_t)nslots);
+        if (!tag)
+            return AEG_ENOMEM;
+        o->lr_tag = tag;
+    }
+    if (o->lr_mem)
+        p_cuMemFree_v2(o->lr_mem);
+    o->lr_mem = 0;
+    o->lr_nslots = 0;
+    o->lr_slot = slot;
+    if (p_cuMemAlloc_v2(&o->lr_mem, slot * (size_t)nslots) != CUDA_SUCCESS) {
+        o->lr_mem = 0;
+        return AEG_EBACKEND;
+    }
+    o->lr_nslots = nslots;
+    for (i = 0; i < nslots; i++)
+        o->lr_tag[i] = -1;
+    return AEG_OK;
+}
+
+static int cuda_lr_pics(cuda_ctx *o, const aeg_la_pic *pics, int npics,
+                        int nslots, size_t slot, ptrdiff_t org)
+{
+    int i, k;
+
+    for (i = 0; i < npics; i++) {
+        k = pics[i].slot;
+        if (k < 0 || k >= nslots)
+            return AEG_EINVAL;
+        if (o->lr_tag[k] == pics[i].tag)
+            continue;
+        o->lr_tag[k] = -1;
+        if (p_cuMemcpyHtoD_v2(o->lr_mem + slot * (size_t)k,
+                              pics[i].plane - org, slot) != CUDA_SUCCESS)
+            return AEG_EBACKEND;
+        o->lr_tag[k] = pics[i].tag;
+    }
+    return AEG_OK;
+}
+
+static int cuda_lr_fail(cuda_ctx *o, int rc)
+{
+    int i;
+    for (i = 0; i < o->lr_nslots; i++)
+        o->lr_tag[i] = -1;
+    return rc;
+}
+
 /* buffers 12-15: chain table, job table, seeds, fields (see the OpenCL
  * version, which this follows with synchronous copies) */
 static int cuda_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
@@ -633,27 +693,10 @@ static int cuda_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
             njobs = chains[c].first + chains[c].count;
         nseed += chains[c].seed != NULL;
     }
-    if (slot * (size_t)nslots > 0x7fffffffu ||
-        (size_t)fsz * (size_t)njobs > 0x1fffffffu)
+    if ((size_t)fsz * (size_t)njobs > 0x1fffffffu)
         return AEG_EBACKEND;
-    if (!o->lr_mem || o->lr_slot != slot || o->lr_nslots < nslots) {
-        int *tag = (int *)realloc(o->lr_tag, sizeof(int) * (size_t)nslots);
-        if (!tag)
-            return AEG_ENOMEM;
-        o->lr_tag = tag;
-        if (o->lr_mem)
-            p_cuMemFree_v2(o->lr_mem);
-        o->lr_mem = 0;
-        o->lr_nslots = 0;
-        o->lr_slot = slot;
-        if (p_cuMemAlloc_v2(&o->lr_mem, slot * (size_t)nslots) != CUDA_SUCCESS) {
-            o->lr_mem = 0;
-            return AEG_EBACKEND;
-        }
-        o->lr_nslots = nslots;
-        for (i = 0; i < nslots; i++)
-            o->lr_tag[i] = -1;
-    }
+    if ((i = cuda_lr_ring(o, slot, nslots)) != AEG_OK)
+        return i;
     need = 4 * (size_t)nchains + 5 * (size_t)njobs;
     if (need > o->lr_host_cap) {
         int *t = (int *)realloc(o->lr_host, sizeof(int) * need);
@@ -668,18 +711,8 @@ static int cuda_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
     ds = nseed ? cuda_buf(o, 14, sb * (size_t)nseed) : dout;
     if (!dc || !dj || !ds || !dout)
         return AEG_EBACKEND;
-    for (i = 0; i < npics; i++) {
-        int k = pics[i].slot;
-        if (k < 0 || k >= nslots)
-            goto fail;
-        if (o->lr_tag[k] == pics[i].tag)
-            continue;
-        o->lr_tag[k] = -1;
-        if (p_cuMemcpyHtoD_v2(o->lr_mem + slot * (size_t)k,
-                              pics[i].plane - org, slot) != CUDA_SUCCESS)
-            goto fail;
-        o->lr_tag[k] = pics[i].tag;
-    }
+    if (cuda_lr_pics(o, pics, npics, nslots, slot, org) != AEG_OK)
+        goto fail;
     nseed = 0;
     for (c = 0; c < nchains; c++) {
         int *ci = o->lr_host + 4 * c;
@@ -729,6 +762,201 @@ fail:
     return AEG_EBACKEND;
 }
 
+/* The rest of the lookahead on the ring (see the OpenCL versions);
+ * buffer 16: the source luma */
+static int cuda_lowres_build(void *priv, const uint8_t *src, int sstride,
+                             int sw, int sh, const aeg_la_pic *pic, int nslots,
+                             int stride, int w, int h)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    int pad = AEG_LA_PAD, rc, dst;
+    const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    const size_t sbytes = (size_t)sstride * (size_t)(sh - 1) + (size_t)sw;
+    CUdeviceptr ds;
+    void *args[10];
+
+    if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0)
+        return AEG_EINVAL;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    if ((rc = cuda_lr_ring(o, slot, nslots)) != AEG_OK)
+        return rc;
+    if (pic->slot < 0 || pic->slot >= nslots)
+        return AEG_EINVAL;
+    if (!(ds = cuda_buf(o, 16, sbytes)))
+        return AEG_EBACKEND;
+    dst = (int)(slot * (size_t)pic->slot);
+    o->lr_tag[pic->slot] = -1;
+    args[0] = &ds;      args[1] = &sstride; args[2] = &sw;
+    args[3] = &sh;      args[4] = &o->lr_mem; args[5] = &dst;
+    args[6] = &stride;  args[7] = &pad;     args[8] = &w;
+    args[9] = &h;
+    if (p_cuMemcpyHtoD_v2(ds, src, sbytes) != CUDA_SUCCESS ||
+        cuda_launch(o->k_lrb, (int)slot, args) != AEG_OK ||
+        p_cuMemcpyDtoH_v2((uint8_t *)pic->plane - org,
+                          o->lr_mem + slot * (size_t)pic->slot,
+                          slot) != CUDA_SUCCESS)
+        return cuda_lr_fail(o, AEG_EBACKEND);
+    o->lr_tag[pic->slot] = pic->tag;
+    return AEG_OK;
+}
+
+/* buffers 17, 18: the slot table, the estimates */
+static int cuda_lowres_intra(void *priv, const aeg_la_pic *pics, int npics,
+                             int nslots, int *const *out, int i8, int stride,
+                             int w, int h)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8, rc, i, ss;
+    const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    const size_t nb = (size_t)mb_w * (size_t)mb_h;
+    const size_t global = nb * (size_t)(npics > 0 ? npics : 0);
+    CUdeviceptr dt, dout;
+    void *args[10];
+
+    if (npics <= 0 || nb == 0)
+        return AEG_OK;
+    if (global > 0x7fffffffu)
+        return AEG_EBACKEND;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    if ((rc = cuda_lr_ring(o, slot, nslots)) != AEG_OK)
+        return rc;
+    if ((size_t)npics > o->lr_host_cap) {
+        int *t = (int *)realloc(o->lr_host, sizeof(int) * (size_t)npics);
+        if (!t)
+            return AEG_ENOMEM;
+        o->lr_host = t;
+        o->lr_host_cap = (size_t)npics;
+    }
+    dt = cuda_buf(o, 17, sizeof(int) * (size_t)npics);
+    dout = cuda_buf(o, 18, sizeof(int) * global);
+    if (!dt || !dout)
+        return AEG_EBACKEND;
+    if ((rc = cuda_lr_pics(o, pics, npics, nslots, slot, org)) != AEG_OK)
+        return cuda_lr_fail(o, rc);
+    for (i = 0; i < npics; i++)
+        o->lr_host[i] = pics[i].slot;
+    ss = (int)slot;
+    args[0] = &o->lr_mem; args[1] = &ss;    args[2] = &stride;
+    args[3] = &pad;       args[4] = &mb_w;  args[5] = &mb_h;
+    args[6] = &dt;        args[7] = &npics; args[8] = &i8;
+    args[9] = &dout;
+    if (p_cuMemcpyHtoD_v2(dt, o->lr_host, sizeof(int) * (size_t)npics) !=
+            CUDA_SUCCESS ||
+        cuda_launch(o->k_lri, (int)global, args) != AEG_OK)
+        return cuda_lr_fail(o, AEG_EBACKEND);
+    for (i = 0; i < npics; i++)
+        if (p_cuMemcpyDtoH_v2(out[i], dout + sizeof(int) * nb * (size_t)i,
+                              sizeof(int) * nb) != CUDA_SUCCESS)
+            return cuda_lr_fail(o, AEG_EBACKEND);
+    return AEG_OK;
+}
+
+/* buffers 17-19: the job table, the per-block results, the fields and
+ * intra estimates (each distinct array once) */
+static int cuda_lowres_costs(void *priv, const aeg_la_pic *pics, int npics,
+                             int nslots, const aeg_la_cost *costs, int ncosts,
+                             int stride, int w, int h)
+{
+    cuda_ctx *o = (cuda_ctx *)priv;
+    int pad = AEG_LA_PAD, mb_w = w / 8, mb_h = h / 8, rc, i, k, ss;
+    int narr = 0, *off;
+    const int **arr;
+    const size_t slot = (size_t)stride * (size_t)(h + 2 * pad);
+    const ptrdiff_t org = (ptrdiff_t)pad * stride + pad;
+    const size_t nb = (size_t)mb_w * (size_t)mb_h;
+    const size_t global = nb * (size_t)(ncosts > 0 ? ncosts : 0);
+    size_t need, ndata = 0;
+    CUdeviceptr dj, dout, dd;
+    void *args[10];
+
+    if (ncosts <= 0 || nb == 0)
+        return AEG_OK;
+    if (global > 0x1fffffffu)
+        return AEG_EBACKEND;
+    if (cuda_bind(o) != AEG_OK)
+        return AEG_EBACKEND;
+    if ((rc = cuda_lr_ring(o, slot, nslots)) != AEG_OK)
+        return rc;
+    need = 6 * (size_t)ncosts +
+           3 * (size_t)ncosts * (1 + sizeof(void *) / sizeof(int) + 1);
+    if (need > o->lr_host_cap) {
+        int *t = (int *)realloc(o->lr_host, sizeof(int) * need);
+        if (!t)
+            return AEG_ENOMEM;
+        o->lr_host = t;
+        o->lr_host_cap = need;
+    }
+    if (global > o->lk_blk_cap) {
+        int *t = (int *)realloc(o->lk_blk, sizeof(int) * global);
+        if (!t)
+            return AEG_ENOMEM;
+        o->lk_blk = t;
+        o->lk_blk_cap = global;
+    }
+    off = o->lr_host + 6 * (size_t)ncosts;
+    arr = (const int **)(void *)(off + 3 * (size_t)ncosts +
+                                 (3 * (size_t)ncosts & 1));
+    for (i = 0; i < ncosts; i++) {
+        const int *a[3];
+        const size_t len[3] = { 3 * nb, 3 * nb, nb };
+        int *ji = o->lr_host + 6 * i, j;
+        if (costs[i].cur < 0 || costs[i].cur >= npics || costs[i].r0 < 0 ||
+            costs[i].r0 >= npics || costs[i].r1 >= npics)
+            return AEG_EINVAL;
+        a[0] = costs[i].f0;
+        a[1] = costs[i].r1 >= 0 ? costs[i].f1 : costs[i].f0;
+        a[2] = costs[i].icost;
+        ji[0] = pics[costs[i].cur].slot;
+        ji[1] = pics[costs[i].r0].slot;
+        ji[2] = costs[i].r1 >= 0 ? pics[costs[i].r1].slot : -1;
+        for (j = 0; j < 3; j++) {
+            for (k = 0; k < narr && arr[k] != a[j]; k++)
+                ;
+            if (k == narr) {
+                arr[narr] = a[j];
+                off[narr++] = (int)ndata;
+                ndata += len[j];
+                if (ndata > 0x1fffffffu)
+                    return AEG_EBACKEND;
+            }
+            ji[3 + j] = off[k];
+        }
+    }
+    dj = cuda_buf(o, 17, sizeof(int) * 6 * (size_t)ncosts);
+    dout = cuda_buf(o, 18, sizeof(int) * global);
+    dd = cuda_buf(o, 19, sizeof(int) * ndata);
+    if (!dj || !dout || !dd)
+        return AEG_EBACKEND;
+    if ((rc = cuda_lr_pics(o, pics, npics, nslots, slot, org)) != AEG_OK)
+        return cuda_lr_fail(o, rc);
+    for (k = 0; k < narr; k++) {
+        const size_t len = (k + 1 < narr ? (size_t)off[k + 1] : ndata) -
+                           (size_t)off[k];
+        if (p_cuMemcpyHtoD_v2(dd + sizeof(int) * (size_t)off[k], arr[k],
+                              sizeof(int) * len) != CUDA_SUCCESS)
+            return cuda_lr_fail(o, AEG_EBACKEND);
+    }
+    ss = (int)slot;
+    args[0] = &o->lr_mem; args[1] = &ss;     args[2] = &stride;
+    args[3] = &pad;       args[4] = &mb_w;   args[5] = &mb_h;
+    args[6] = &dj;        args[7] = &ncosts; args[8] = &dd;
+    args[9] = &dout;
+    if (p_cuMemcpyHtoD_v2(dj, o->lr_host, sizeof(int) * 6 * (size_t)ncosts) !=
+            CUDA_SUCCESS ||
+        cuda_launch(o->k_lrk, (int)global, args) != AEG_OK ||
+        p_cuMemcpyDtoH_v2(o->lk_blk, dout, sizeof(int) * global) !=
+            CUDA_SUCCESS)
+        return cuda_lr_fail(o, AEG_EBACKEND);
+    for (i = 0; i < ncosts; i++)
+        aeg_la_cost_sum(o->lk_blk + nb * (size_t)i, mb_w, mb_h,
+                        costs[i].total, costs[i].intra);
+    return AEG_OK;
+}
+
 static void cuda_sync(void *priv)
 {
     cuda_ctx *o = (cuda_ctx *)priv;
@@ -752,6 +980,7 @@ static void cuda_destroy(void *priv)
         p_cuMemFree_v2(o->lr_mem);
     free(o->lr_tag);
     free(o->lr_host);
+    free(o->lk_blk);
     if (o->is_clone) {
         free(o);
         return;
@@ -823,7 +1052,8 @@ static int nvrtc_load(void **lib)
 static const char *const aeg_cuda_kernels[] = {
     "sad_batch", "tq_batch", "iq_idct_batch", "sse_batch", "interp_plane",
     "satd_batch", "tq_iq_batch", "tq_dc_batch", "iq_dc_batch",
-    "lowres_search", "lowres_chains", NULL
+    "lowres_search", "lowres_chains", "lowres_build", "lowres_intra",
+    "lowres_costs", NULL
 };
 
 /* NVRTC 11.2+ can list the architectures it compiles for; optional, so an
@@ -911,7 +1141,7 @@ static int cuda_build_module(cuda_ctx *o)
     char *ptx = NULL, log[2048];
     int major = 5, minor = 0, cc, k, rc;
     CUresult cr;
-    CUfunction *fn[11];
+    CUfunction *fn[14];
 
     p_cuDeviceGetAttribute(&major,
                            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
@@ -940,7 +1170,8 @@ static int cuda_build_module(cuda_ctx *o)
     fn[0] = &o->k_sad; fn[1] = &o->k_tq; fn[2] = &o->k_iq;
     fn[3] = &o->k_sse; fn[4] = &o->k_intp; fn[5] = &o->k_satd;
     fn[6] = &o->k_tqiq; fn[7] = &o->k_tqdc; fn[8] = &o->k_iqdc;
-    fn[9] = &o->k_lrs; fn[10] = &o->k_lrc;
+    fn[9] = &o->k_lrs; fn[10] = &o->k_lrc; fn[11] = &o->k_lrb;
+    fn[12] = &o->k_lri; fn[13] = &o->k_lrk;
     for (k = 0; aeg_cuda_kernels[k]; k++)
         if (p_cuModuleGetFunction(fn[k], o->mod, aeg_cuda_kernels[k]) !=
             CUDA_SUCCESS)
@@ -1044,6 +1275,9 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     o->k_iqdc = src->k_iqdc;
     o->k_lrs = src->k_lrs;
     o->k_lrc = src->k_lrc;
+    o->k_lrb = src->k_lrb;
+    o->k_lri = src->k_lri;
+    o->k_lrk = src->k_lrk;
     o->cus = src->cus;
     o->mem = src->mem;
     memcpy(o->name, src->name, sizeof(o->name));
@@ -1062,6 +1296,9 @@ static int cuda_clone(void *priv, aeg_be_ops *out)
     out->satd_batch = cuda_satd_batch;
     out->lowres_search = cuda_lowres_search;
     out->lowres_chains = cuda_lowres_chains;
+    out->lowres_build = cuda_lowres_build;
+    out->lowres_intra = cuda_lowres_intra;
+    out->lowres_costs = cuda_lowres_costs;
     out->sync = cuda_sync;
     out->destroy = cuda_destroy;
     out->clone = cuda_clone;
@@ -1151,6 +1388,9 @@ int aeg_be_cuda_create(aeg_be_ops *ops, int want)
     ops->satd_batch = cuda_satd_batch;
     ops->lowres_search = cuda_lowres_search;
     ops->lowres_chains = cuda_lowres_chains;
+    ops->lowres_build = cuda_lowres_build;
+    ops->lowres_intra = cuda_lowres_intra;
+    ops->lowres_costs = cuda_lowres_costs;
     ops->sync = cuda_sync;
     ops->destroy = cuda_destroy;
     ops->clone = cuda_clone;

@@ -346,6 +346,190 @@ static int check_chains(int mb_w, int mb_h)
     return bad != 0;
 }
 
+/* The directional Intra_8x8 modes of lowres_intra, one by one: the kernel
+ * keeps only the cheapest, so a wrong sample of a mode that rarely wins
+ * would hide there.  Random edges, every mode 3..8, against
+ * aeg_intra8x8_edge() / aeg_intra8x8_pred(). */
+static int check_i8_modes(void)
+{
+    int t, m, x, y, bad = 0;
+
+    for (t = 0; t < 2000; t++) {
+        int top[16], left[8], tl = rnd(256), E[25], G[25], H[24], k;
+        uint8_t t8[16], l8[8], want[64];
+        aeg_iedge ed;
+        for (k = 0; k < 16; k++)
+            t8[k] = (uint8_t)(top[k] = t & 1 ? rnd(256) : 100 + rnd(30));
+        for (k = 0; k < 8; k++)
+            l8[k] = (uint8_t)(left[k] = t & 2 ? rnd(256) : 60 + rnd(150));
+        la_i8_edge(top, left, tl, E, G, H);
+        aeg_intra8x8_edge(&ed, t8, l8, tl, 1, 1, 1);
+        for (m = 3; m < 9; m++) {
+            aeg_intra8x8_pred(want, 8, &ed, m);
+            for (y = 0; y < 8; y++)
+                for (x = 0; x < 8; x++)
+                    if (la_i8_sample(E, G, H, m, x, y) != want[8 * y + x]) {
+                        if (!bad)
+                            printf("   kernel_check: lowres_intra mode %d"
+                                   " sample (%d, %d) differs\n", m, x, y);
+                        bad++;
+                    }
+        }
+    }
+    return bad != 0;
+}
+
+/* lowres_build, lowres_intra, lowres_costs: the rest of the lookahead on
+ * a ring of planes, against aeg_be_ops of the CPU (the lookahead's own
+ * functions).  The source is smaller than the lowres grid covers, so the
+ * build's edge repeat is exercised; the pictures have directional texture
+ * for the Intra_8x8 modes; the estimates take real fields and arbitrary
+ * vectors (half samples, zero and not), with and without list 1. */
+static int check_rest(int mb_w, int mb_h)
+{
+    enum { NS = 4, NJ = 7 };
+    aeg_lowres lr[NS];
+    aeg_be_ops cpu;
+    aeg_la_pic pics[NS];
+    aeg_la_cost cj[NJ];
+    const int nb = mb_w * mb_h;
+    const int sw = 16 * mb_w - (mb_w > 1 ? 5 : 0), sh = 16 * mb_h - (mb_h > 1 ? 9 : 0);
+    const int sstride = sw + 11;
+    int slots[NS], *ic[NS], *icg, *fld[NS], *blk, *data, jobs_i[6 * NJ];
+    int64_t tot[NJ];
+    int intra[NJ], x, y, k, i, bad = 0;
+    size_t slot;
+    uint8_t *src, *planes;
+
+    aeg_be_cpu_ops(&cpu);
+    for (k = 0; k < NS; k++)
+        if (aeg_lowres_alloc(&lr[k], mb_w, mb_h))
+            return 1;
+    slot = (size_t)lr[0].stride * (size_t)(lr[0].h + 2 * AEG_LA_PAD);
+    src = (uint8_t *)malloc((size_t)sstride * (size_t)sh);
+    planes = (uint8_t *)malloc(slot * NS);
+    icg = (int *)malloc(sizeof(int) * (size_t)nb * NS);
+    blk = (int *)malloc(sizeof(int) * (size_t)nb * NJ);
+    data = (int *)malloc(sizeof(int) * (size_t)nb * (3 * NS + NS));
+    if (!src || !planes || !icg || !blk || !data)
+        return 1;
+    memset(planes, 0x33, slot * NS);
+    for (k = 0; k < NS; k++) {
+        slots[k] = (k + 1) % NS;
+        /* the source: diagonal stripes panning by picture, plus noise */
+        for (y = 0; y < sh; y++)
+            for (x = 0; x < sstride; x++) {
+                int u = x + 5 * k, v = y + 3 * k;
+                src[(size_t)y * sstride + x] =
+                    (uint8_t)(90 + 70 * (((u + 2 * v) / 7) & 1) +
+                              ((u * v) % 23) + rnd(13));
+            }
+        cpu.lowres_build(cpu.priv, src, sstride, sw, sh,
+                         &(aeg_la_pic){ lr[k].plane, slots[k], k }, NS,
+                         lr[k].stride, lr[k].w, lr[k].h);
+        for (i = 0; i < lr[k].stride * (lr[k].h + 2 * AEG_LA_PAD); i++) {
+            aeg_mock_gid = i;
+            lowres_build(src, sstride, sw, sh, planes, (int)slot * slots[k],
+                         lr[k].stride, AEG_LA_PAD, lr[k].w, lr[k].h);
+        }
+        if (memcmp(planes + slot * (size_t)slots[k], lr[k].mem, slot)) {
+            printf("   kernel_check: lowres_build %dx%d differs\n", mb_w, mb_h);
+            bad++;
+        }
+        pics[k].plane = lr[k].plane;
+        pics[k].slot = slots[k];
+        pics[k].tag = k;
+        ic[k] = data + (size_t)nb * (3 * NS + k);
+        fld[k] = data + (size_t)nb * 3 * k;
+    }
+
+    /* intra: the CPU's, then the kernel's for all pictures in one range */
+    cpu.lowres_intra(cpu.priv, pics, NS, NS, ic, aeg_lowres_i8(),
+                     lr[0].stride, lr[0].w, lr[0].h);
+    for (i = 0; i < NS * nb; i++) {
+        aeg_mock_gid = i;
+        lowres_intra(planes, (int)slot, lr[0].stride, AEG_LA_PAD, mb_w, mb_h,
+                     slots, NS, aeg_lowres_i8(), icg);
+    }
+    for (k = 0; k < NS; k++)
+        if (memcmp(icg + (size_t)nb * k, ic[k], sizeof(int) * (size_t)nb)) {
+            printf("   kernel_check: lowres_intra %dx%d differs (picture %d)\n",
+                   mb_w, mb_h, k);
+            bad++;
+        }
+
+    /* fields: picture k against k + 1 searched (k < 2), the others made
+     * up -- vectors within the padding, half of them zero (independently
+     * in the two, so that one list's can be zero and the other's not),
+     * costs above the intra ones, so that the zero-vector average wins
+     * now and then */
+    for (k = 0; k < NS; k++) {
+        if (k < 2) {
+            cpu.lowres_search(cpu.priv, lr[k].plane, lr[k + 1].plane,
+                              lr[k].stride, lr[k].w, lr[k].h, NULL, 1, 1, 16,
+                              fld[k]);
+        } else {
+            for (i = 0; i < nb; i++) {
+                const int z = rnd(2);
+                fld[k][2 * i] = z ? 0 : rnd(81) - 40;
+                fld[k][2 * i + 1] = z ? 0 : rnd(81) - 40;
+                fld[k][2 * nb + i] = ic[0][i] + rnd(301) + 100;
+            }
+        }
+    }
+    {
+        static const int jj[NJ][5] = {
+            /* cur, r0, r1, f0, f1 */
+            { 1, 0, 2, 0, 1 }, { 2, 1, 3, 1, 2 }, { 0, 1, -1, 0, 0 },
+            { 3, 2, -1, 2, 0 }, { 1, 3, 0, 3, 3 }, { 2, 0, 3, 2, 3 },
+            /* its own references: the zero-vector average costs 0 */
+            { 1, 1, 1, 2, 3 }
+        };
+        for (i = 0; i < NJ; i++) {
+            cj[i].cur = jj[i][0];
+            cj[i].r0 = jj[i][1];
+            cj[i].r1 = jj[i][2];
+            cj[i].f0 = fld[jj[i][3]];
+            cj[i].f1 = fld[jj[i][4]];
+            cj[i].icost = ic[jj[i][0]];
+            cj[i].total = &tot[i];
+            cj[i].intra = &intra[i];
+            jobs_i[6 * i] = slots[jj[i][0]];
+            jobs_i[6 * i + 1] = slots[jj[i][1]];
+            jobs_i[6 * i + 2] = jj[i][2] >= 0 ? slots[jj[i][2]] : -1;
+            jobs_i[6 * i + 3] = (int)(fld[jj[i][3]] - data);
+            jobs_i[6 * i + 4] = (int)(fld[jj[i][4]] - data);
+            jobs_i[6 * i + 5] = (int)(ic[jj[i][0]] - data);
+        }
+    }
+    cpu.lowres_costs(cpu.priv, pics, NS, NS, cj, NJ, lr[0].stride, lr[0].w,
+                     lr[0].h);
+    for (i = 0; i < NJ * nb; i++) {
+        aeg_mock_gid = i;
+        lowres_costs(planes, (int)slot, lr[0].stride, AEG_LA_PAD, mb_w, mb_h,
+                     jobs_i, NJ, data, blk);
+    }
+    for (i = 0; i < NJ; i++) {
+        int64_t t;
+        int n;
+        aeg_la_cost_sum(blk + (size_t)nb * i, mb_w, mb_h, &t, &n);
+        if (t != tot[i] || n != intra[i]) {
+            printf("   kernel_check: lowres_costs %dx%d estimate %d: %lld/%d,"
+                   " want %lld/%d\n", mb_w, mb_h, i, (long long)t, n,
+                   (long long)tot[i], intra[i]);
+            bad++;
+        }
+    }
+    for (k = 0; k < NS; k++)
+        aeg_lowres_free(&lr[k]);
+    free(src);
+    free(planes);
+    free(icg);
+    free(blk);
+    free(data);
+    return bad != 0;
+}
+
 int main(void)
 {
     aeg_be_ops cpu;
@@ -798,10 +982,12 @@ int main(void)
             fail |= check_lowres(lsz[t][0], lsz[t][1], 0);
             fail |= check_lowres(lsz[t][0], lsz[t][1], 1);
             fail |= check_chains(lsz[t][0], lsz[t][1]);
+            fail |= check_rest(lsz[t][0], lsz[t][1]);
         }
     }
 
+    fail |= check_i8_modes();
     if (!fail)
-        printf("   kernel_check: 11 kernels agree with the CPU reference\n");
+        printf("   kernel_check: 14 kernels agree with the CPU reference\n");
     return fail;
 }

@@ -761,6 +761,9 @@ void aeg_lowres_mbcosts(const aeg_lowres *cur, const aeg_lowres *r0,
  * 2 ints of vector and 1 of cost per macroblock), which depends on the
  * (picture, reference) pair only.  Identical results. */
 void aeg_lowres_intra(const aeg_lowres *cur, int *icost);
+/* whether the intra estimate tries the directional Intra_8x8 modes too
+ * (AEG_LRI8, default on): a device computing it is told (lowres_intra) */
+int aeg_lowres_i8(void);
 void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
                        int *cost);
 void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,

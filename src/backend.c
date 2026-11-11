@@ -280,6 +280,93 @@ static int cpu_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
     return AEG_OK;
 }
 
+static void cpu_lr_view(aeg_lowres *l, const uint8_t *plane, int stride,
+                        int w, int h)
+{
+    l->mb_w = w / 8;
+    l->mb_h = h / 8;
+    l->w = w;
+    l->h = h;
+    l->stride = stride;
+    l->mem = NULL;
+    l->plane = (uint8_t *)plane;
+}
+
+void aeg_la_cost_sum(const int *blk, int mb_w, int mb_h, int64_t *total,
+                     int *intra)
+{
+    const int border = mb_w > 2 && mb_h > 2;
+    int64_t t = 0;
+    int n = 0, x, y;
+
+    for (y = border; y < mb_h - border; y++)
+        for (x = border; x < mb_w - border; x++) {
+            const int v = blk[y * mb_w + x];
+            t += v >> 1;
+            n += v & 1;
+        }
+    *total = t;
+    if (intra)
+        *intra = n;
+}
+
+/* the references of the rest of the lookahead: its own functions */
+static int cpu_lowres_build(void *priv, const pixel *src, int sstride,
+                            int sw, int sh, const aeg_la_pic *pic, int nslots,
+                            int stride, int w, int h)
+{
+    aeg_lowres l;
+
+    (void)priv;
+    (void)nslots;
+    cpu_lr_view(&l, pic->plane, stride, w, h);
+    aeg_lowres_build(&l, src, sstride, sw, sh);
+    return AEG_OK;
+}
+
+static int cpu_lowres_intra(void *priv, const aeg_la_pic *pics, int npics,
+                            int nslots, int *const *out, int i8, int stride,
+                            int w, int h)
+{
+    aeg_lowres l;
+    int i;
+
+    (void)priv;
+    (void)nslots;
+    if (i8 != aeg_lowres_i8())
+        return AEG_EINVAL;      /* the CPU's estimate has one setting */
+    for (i = 0; i < npics; i++) {
+        cpu_lr_view(&l, pics[i].plane, stride, w, h);
+        aeg_lowres_intra(&l, out[i]);
+    }
+    return AEG_OK;
+}
+
+static int cpu_lowres_costs(void *priv, const aeg_la_pic *pics, int npics,
+                            int nslots, const aeg_la_cost *costs, int ncosts,
+                            int stride, int w, int h)
+{
+    const int n = (w / 8) * (h / 8);
+    aeg_lowres c, r0, r1;
+    int i;
+
+    (void)priv;
+    (void)npics;
+    (void)nslots;
+    for (i = 0; i < ncosts; i++) {
+        const aeg_la_cost *k = &costs[i];
+        cpu_lr_view(&c, pics[k->cur].plane, stride, w, h);
+        cpu_lr_view(&r0, pics[k->r0].plane, stride, w, h);
+        if (k->r1 >= 0)
+            cpu_lr_view(&r1, pics[k->r1].plane, stride, w, h);
+        *k->total = aeg_lowres_cost_fields(
+            &c, &r0, k->r1 >= 0 ? &r1 : NULL, k->icost, k->f0, k->f0 + 2 * n,
+            k->r1 >= 0 ? k->f1 : NULL, k->r1 >= 0 ? k->f1 + 2 * n : NULL,
+            k->intra);
+    }
+    return AEG_OK;
+}
+
 void aeg_be_cpu_ops(aeg_be_ops *ops)
 {
     memset(ops, 0, sizeof(*ops));
@@ -296,6 +383,9 @@ void aeg_be_cpu_ops(aeg_be_ops *ops)
     ops->satd_batch = cpu_satd_batch;
     ops->lowres_search = cpu_lowres_search;
     ops->lowres_chains = cpu_lowres_chains;
+    ops->lowres_build = cpu_lowres_build;
+    ops->lowres_intra = cpu_lowres_intra;
+    ops->lowres_costs = cpu_lowres_costs;
     snprintf(ops->desc, sizeof(ops->desc), "cpu");
 }
 
@@ -504,6 +594,48 @@ static int g_lowres_chains(void *priv, const aeg_la_pic *pics, int npics,
                                    nchains, jobs, stride, w, h);
 }
 
+static int g_lowres_build(void *priv, const pixel *src, int sstride,
+                          int sw, int sh, const aeg_la_pic *pic, int nslots,
+                          int stride, int w, int h)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.lowres_build(l->dev.priv, src, sstride, sw, sh,
+                                           pic, nslots, stride, w, h),
+                    "lowres_build"))
+        return AEG_OK;
+    return l->g->cpu.lowres_build(l->g->cpu.priv, src, sstride, sw, sh, pic,
+                                  nslots, stride, w, h);
+}
+
+static int g_lowres_intra(void *priv, const aeg_la_pic *pics, int npics,
+                          int nslots, int *const *out, int i8, int stride,
+                          int w, int h)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.lowres_intra(l->dev.priv, pics, npics, nslots,
+                                           out, i8, stride, w, h),
+                    "lowres_intra"))
+        return AEG_OK;
+    return l->g->cpu.lowres_intra(l->g->cpu.priv, pics, npics, nslots, out,
+                                  i8, stride, w, h);
+}
+
+static int g_lowres_costs(void *priv, const aeg_la_pic *pics, int npics,
+                          int nslots, const aeg_la_cost *costs, int ncosts,
+                          int stride, int w, int h)
+{
+    be_lane *l = (be_lane *)priv;
+    if (guard_enter(l) &&
+        guard_leave(l, l->dev.lowres_costs(l->dev.priv, pics, npics, nslots,
+                                           costs, ncosts, stride, w, h),
+                    "lowres_costs"))
+        return AEG_OK;
+    return l->g->cpu.lowres_costs(l->g->cpu.priv, pics, npics, nslots, costs,
+                                  ncosts, stride, w, h);
+}
+
 static int g_sse_batch(void *priv, const pixel *a, int sa, const pixel *b,
                        int sb, int w, int h, uint64_t *out)
 {
@@ -690,6 +822,9 @@ static int be_guard_wrap(aeg_be_ops *ops)
     if (ops->sse_batch) ops->sse_batch = g_sse_batch;
     if (ops->lowres_search) ops->lowres_search = g_lowres_search;
     if (ops->lowres_chains) ops->lowres_chains = g_lowres_chains;
+    if (ops->lowres_build) ops->lowres_build = g_lowres_build;
+    if (ops->lowres_intra) ops->lowres_intra = g_lowres_intra;
+    if (ops->lowres_costs) ops->lowres_costs = g_lowres_costs;
     if (ops->ref_upload && ops->satd_batch) {
         ops->ref_upload = g_ref_upload;
         ops->satd_batch = g_satd_batch;

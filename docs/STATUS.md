@@ -7637,3 +7637,68 @@ and intra estimates about 25 ms each. So moving those three to the device
 can no longer save much time. Their point is a lookahead that stays on
 the device, next to a source the device motion search will need anyway.
 
+## The rest of the lookahead on the device (8-bit, presets 3-4)
+
+With the searches on the device lane, the other three parts of the
+lookahead now follow them there. Each has a kernel in `src/kernels.h`,
+a CPU reference op in `src/backend.c`, and an OpenCL and a CUDA op. The
+CPU guard falls back to the reference on any device error.
+
+- **`lowres_build`**: one work-item per sample of the padded plane (2×2
+  box, clamped source, the CPU's rounding). The device writes the plane
+  into its ring slot, tagged with the picture, and reads it back for the
+  CPU's own uses (the tree, the scene-cut test). The searches then find
+  the picture resident and upload nothing. `push_input()` calls it when
+  the latest batch of searches went to the device (`la_on_dev`).
+- **`lowres_intra`**: one work-item per block and picture, covering DC, H,
+  V, planar and the 8×8 directional modes 3-8 with x264-style edge
+  filtering (whichever `aeg_lowres_i8()` selects). One call covers every
+  picture of the scheduling step's window whose estimate is not
+  current.
+- **`lowres_costs`**: one work-item per block and estimate. It takes the
+  better of the field's vectors (or their average for B) and the intra
+  estimate, as `aeg_lowres_cost_fields()` does. The host sums the blocks
+  with `aeg_la_cost_sum()` (border excluded, intra count).
+  `la_dev_rest()` lists every estimate (p0, p1, b) the B-adapt trellis can
+  ask for, walking each group of the window the way `la_group_cost()`
+  does. It skips those already cached or whose fields are not cached,
+  runs the rest in calls of at most 32 MB of per-block results, and puts
+  them into the cost cache with `la_cost()`'s B discount.
+
+Each estimate is a function of the lowres pictures and their fields
+alone, and these are the CPU's. Anything skipped or failed is still
+computed on demand, so the decisions cannot change. The macroblock tree's
+per-block costs and the scene-cut estimates stay on the CPU. The cache's
+lookup and insertion were split out of `la_cost_ci()`
+(`la_cache_peek`/`la_cache_put`) without changing its order.
+
+These parts do not vote on the placement. The searches' timing still
+decides it per batch, and the rest follows; on a CPU-only build nothing
+changes.
+
+**Checks**
+- **`tests/kernel_check.c`** (14 kernels): build, intra and costs agree
+  with the CPU ops on a 4-slot ring at six sizes, down to 1×1. The modes
+  3-8 agree with `aeg_intra8x8_edge`/`_pred` on 2000 random edges. 10 of
+  10 hand mutations of the kernels are caught. A job using its own picture
+  as both references was added, so the zero-vector B average has to win
+  somewhere.
+- **`tests/backend_check.c`** (381 checks on PoCL): the device builds every
+  slot and must return the host's bytes. Intra, a chain and the costs
+  then run on the resident slots. One slot then receives a new picture
+  built on the host, which the next calls must upload rather than serve
+  stale. Mutations that trust a slot regardless of its tag, or build into
+  slot 0, are caught.
+- **The encoder:** byte-identical to `52080d5` on PoCL with `-s la=opencl`
+  (and with automatic placement). This covers cockL p3/p4,
+  `--frame-threads 2`, `--bframes 16`, `--b-pyramid 0`, `-q`, megaL,
+  720p, and 10-bit (which stays on the CPU). Mutating each of the three
+  kernels in turn changes the stream (for the costs, an asymmetric P/B
+  change moves the group decisions), so all three are really used.
+- **Sanitizers:** ASan/UBSan clean, and TSan clean with 1 and 2 frame
+  threads and with mixed placement. NVRTC compiles the kernels for every
+  architecture.
+
+PoCL is a CPU device, so it gives no meaningful time. On a GPU the
+saving is at most the ~180 ms these parts took on the CPU per 120 cockL
+frames. The point is that the lowres pictures no longer need uploading.

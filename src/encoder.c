@@ -596,6 +596,10 @@ struct aeg_encoder {
      * else 0 CPU / 1 device, with the time and blocks it has spent */
     int la_step_dev;
     int64_t la_step_ns, la_step_blk;
+    /* the placement of the latest batch of searches (1 = device lane):
+     * the lowres downsampling, the intra estimates and the cost estimates
+     * of the window follow it (la_dev_build, la_dev_rest) */
+    int la_on_dev;
     struct la_bg *la_bg;    /* batches on a helper thread (la_bg_push)  */
     int la_bg_cpu;          /* ... on the CPU too: threads are allowed  */
     int64_t la_wait_ns;     /* the main thread blocked on the helper    */
@@ -15156,6 +15160,7 @@ static void bind_source(struct aeg_encoder *e, int display)
 }
 
 static void la_bg_wait(struct aeg_encoder *e);
+static int la_dev_build(struct aeg_encoder *e, int slot, int d);
 
 static void push_input(struct aeg_encoder *e, const aeg_src *in,
                        int64_t pts)
@@ -15163,7 +15168,7 @@ static void push_input(struct aeg_encoder *e, const aeg_src *in,
     int slot = e->in_count % in_slots(e);
     la_bg_wait(e);                  /* it may be reading that lowres slot */
     copy_yuv(e, e->in_plane[slot], in);
-    if (e->in_low[slot].mem)
+    if (e->in_low[slot].mem && !la_dev_build(e, slot, e->in_count))
         aeg_lowres_build(&e->in_low[slot], e->in_plane[slot][0], e->stride[0],
                          e->w, e->h);
     e->in_pts[slot] = pts;
@@ -15480,6 +15485,13 @@ struct la_bg {
     int next;                    /* CPU batch: the next chain to take   */
     aeg_be_ops lane, cpu;        /* the device lane, the CPU reference  */
     int have_lane;
+    /* la_dev_rest: the estimates asked for (by offsets from the window's
+     * first picture), and the lowres_costs() batch with its results */
+    unsigned char cneed[LA_NEED_H][LA_NEED_W][LA_NEED_W];
+    aeg_la_cost *kc;
+    int (*kkey)[3];
+    int64_t *ktot;
+    int *kin, kcap;
 };
 
 static void la_need(unsigned char (*need)[LA_NEED_W], int a, int G, int d,
@@ -15563,6 +15575,10 @@ static void la_bg_close(struct aeg_encoder *e)
     pthread_mutex_destroy(&bg->mu);
     pthread_cond_destroy(&bg->go);
     pthread_cond_destroy(&bg->done);
+    aeg_free(bg->kc);
+    aeg_free(bg->kkey);
+    aeg_free(bg->ktot);
+    aeg_free(bg->kin);
     aeg_free(bg);
     e->la_bg = NULL;
 }
@@ -15806,6 +15822,7 @@ static void la_bg_push(struct aeg_encoder *e)
     }
     la_bg_geom(e, bg);
     bg->dev = dev;
+    e->la_on_dev = dev;
     bg->ops = dev ? &bg->lane : &bg->cpu;
     bg->ns = 0;
     bg->next = 0;
@@ -15841,13 +15858,239 @@ static void la_step_end(struct aeg_encoder *e)
     e->la_step_blk = 0;
 }
 
+static int la_cache_peek(const struct aeg_encoder *e, int p0, int p1, int b);
+static void la_cache_put(struct aeg_encoder *e, int p0, int p1, int b,
+                         int64_t c, int in);
+
+/* the time of a lookahead call on the device lane, to the statistics */
+static void la_dev_time(struct aeg_encoder *e, int64_t dt)
+{
+    e->st.stage_ns[AEG_STAGE_LOOKAHEAD] += dt;
+    e->st.stage_gpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
+}
+
+/* The lowres picture of display picture d into ring slot `slot`, on the
+ * device lane when the searches are placed there: the kernel computes the
+ * same samples (tests/backend_check.c) and hands them back for the CPU's
+ * own uses, and the picture stays resident for the searches, which then
+ * upload nothing.  0 = not done (the caller builds on the CPU).  The lane
+ * is idle (push_input waited for it). */
+static int la_dev_build(struct aeg_encoder *e, int slot, int d)
+{
+    struct la_bg *bg = e->la_bg;
+    aeg_la_pic pic;
+    int64_t t0;
+    int rc;
+
+    if (!e->la_on_dev || !bg || !bg->have_lane || !bg->lane.lowres_build ||
+        !la_batching(e))
+        return 0;
+    pic.plane = e->in_low[slot].plane;
+    pic.slot = slot;
+    pic.tag = d;
+    t0 = aeg_now_ns();
+    AEG_PH(AEG_PH_LOWRES,
+           rc = bg->lane.lowres_build(bg->lane.priv, e->in_plane[slot][0],
+                                      e->stride[0], e->w, e->h, &pic,
+                                      in_slots(e), e->in_low[slot].stride,
+                                      e->in_low[slot].w, e->in_low[slot].h));
+    la_dev_time(e, aeg_now_ns() - t0);
+    return rc == AEG_OK;
+}
+
+static int la_kgrow(struct la_bg *bg, int n)
+{
+    int cap = bg->kcap ? bg->kcap : 256;
+    aeg_la_cost *kc;
+    int (*kkey)[3], *kin;
+    int64_t *ktot;
+
+    if (n <= bg->kcap)
+        return 1;
+    while (cap < n)
+        cap *= 2;
+    kc = (aeg_la_cost *)aeg_alloc(sizeof(*kc) * (size_t)cap);
+    kkey = (int (*)[3])aeg_alloc(sizeof(*kkey) * (size_t)cap);
+    ktot = (int64_t *)aeg_alloc(sizeof(*ktot) * (size_t)cap);
+    kin = (int *)aeg_alloc(sizeof(*kin) * (size_t)cap);
+    if (!kc || !kkey || !ktot || !kin) {
+        aeg_free(kc);
+        aeg_free(kkey);
+        aeg_free(ktot);
+        aeg_free(kin);
+        return 0;
+    }
+    if (bg->kcap) {
+        memcpy(kc, bg->kc, sizeof(*kc) * (size_t)bg->kcap);
+        memcpy(kkey, bg->kkey, sizeof(*kkey) * (size_t)bg->kcap);
+    }
+    aeg_free(bg->kc);
+    aeg_free(bg->kkey);
+    aeg_free(bg->ktot);
+    aeg_free(bg->kin);
+    bg->kc = kc;
+    bg->kkey = kkey;
+    bg->ktot = ktot;
+    bg->kin = kin;
+    bg->kcap = cap;
+    return 1;
+}
+
+/* the estimate (p0, p1, b) of a group in the window from a, once */
+static void la_cneed(struct la_bg *bg, int a, int G, int p0, int p1, int b)
+{
+    bg->cneed[b - a][p0 - b + G][p1 - b + G] = 1;
+}
+
+#define LA_COST_INTS (1 << 23)         /* per-block results per call: 32 MB */
+
+/* The rest of the scheduling step's lookahead on the device lane, after its
+ * searches: the intra estimates of the window's pictures, then every cost
+ * estimate the B-adapt trellis can ask for (each group's, as
+ * la_group_cost() walks it) that is not cached yet, into the cache.  An
+ * estimate is a function of the lowres pictures and their fields alone,
+ * which are the CPU's (the fields cached, the pictures resident), and the
+ * kernels compute what aeg_lowres_intra() and aeg_lowres_cost_fields() do
+ * (tests/kernel_check.c, tests/backend_check.c), so the decisions cannot
+ * change; whatever this skips (a field not cached, a failed call) is
+ * computed on demand as before.  The macroblock tree's per-block costs
+ * stay on the CPU. */
+static void la_dev_rest(struct aeg_encoder *e, struct la_bg *bg, int a,
+                        int end)
+{
+    const int slots = in_slots(e), G = e->p.bframes + 1, n = e->mb_count;
+    int pic_of[AEG_RING], *out[AEG_RING], d, s, t, b, i, nk = 0, k0;
+    int64_t t0 = aeg_now_ns();
+
+    if (!bg->lane.lowres_intra || !bg->lane.lowres_costs || end <= a ||
+        end - a >= LA_NEED_H || end - a >= slots || a < e->in_count - slots)
+        return;
+    la_bg_geom(e, bg);
+    /* the intra estimates of the window, one call */
+    bg->np = 0;
+    for (d = a; d <= end; d++) {
+        const int sl = d % slots;
+        if (!e->la_icost[sl]) {
+            e->la_icost[sl] = (int *)aeg_alloc(sizeof(int) * (size_t)n);
+            e->la_icost_d[sl] = -1;
+            if (!e->la_icost[sl])
+                return;
+        }
+        if (e->la_icost_d[sl] == d)
+            continue;
+        bg->pics[bg->np].plane = e->in_low[sl].plane;
+        bg->pics[bg->np].slot = sl;
+        bg->pics[bg->np].tag = d;
+        out[bg->np++] = e->la_icost[sl];
+    }
+    if (bg->np) {
+        int rc;
+        AEG_PH(AEG_PH_LOWRES,
+               rc = bg->lane.lowres_intra(bg->lane.priv, bg->pics, bg->np,
+                                          slots, out, aeg_lowres_i8(),
+                                          bg->stride, bg->w, bg->h));
+        if (rc != AEG_OK) {
+            la_dev_time(e, aeg_now_ns() - t0);
+            return;
+        }
+        for (i = 0; i < bg->np; i++)
+            e->la_icost_d[bg->pics[i].slot] = bg->pics[i].tag;
+    }
+
+    /* the estimates of every group (s, t) of the window */
+    memset(bg->cneed, 0, sizeof(bg->cneed[0]) * (size_t)(end - a + 1));
+    for (s = a; s < end; s++)
+        for (t = s + 1; t <= end && t - s <= G; t++) {
+            la_cneed(bg, a, G, s, t, t);
+            if (e->p.b_pyramid && t - s > 2) {
+                const int mid = s + (t - s) / 2;
+                la_cneed(bg, a, G, s, t, mid);
+                for (b = s + 1; b < t; b++)
+                    if (b != mid)
+                        la_cneed(bg, a, G, b < mid ? s : mid,
+                                 b < mid ? mid : t, b);
+            } else {
+                for (b = s + 1; b < t; b++)
+                    la_cneed(bg, a, G, s, t, b);
+            }
+        }
+    /* the ones not cached whose fields are, by picture */
+    for (i = 0; i < AEG_RING; i++)
+        pic_of[i] = -1;
+    bg->np = 0;
+    for (b = a; b <= end; b++) {
+        int o0, o1;
+        for (o0 = 0; o0 < 2 * G + 1; o0++)
+            for (o1 = G; o1 < 2 * G + 1; o1++) {
+                const int p0 = b + o0 - G, p1 = b + o1 - G;
+                const struct la_sfield *f0, *f1 = NULL;
+                const int r[3] = { b, p0, p1 };
+                int q;
+                if (!bg->cneed[b - a][o0][o1] ||
+                    la_cache_peek(e, p0, p1, b) >= 0)
+                    continue;
+                f0 = la_lookup(e, b, p0);
+                if (p1 != b)
+                    f1 = la_lookup(e, b, p1);
+                if (!f0 || (p1 != b && !f1) || !la_kgrow(bg, nk + 1))
+                    continue;
+                for (q = 0; q < 3; q++)
+                    if (pic_of[r[q] % slots] < 0) {
+                        pic_of[r[q] % slots] = bg->np;
+                        bg->pics[bg->np].plane = e->in_low[r[q] % slots].plane;
+                        bg->pics[bg->np].slot = r[q] % slots;
+                        bg->pics[bg->np++].tag = r[q];
+                    }
+                bg->kc[nk].cur = pic_of[b % slots];
+                bg->kc[nk].r0 = pic_of[p0 % slots];
+                bg->kc[nk].r1 = p1 != b ? pic_of[p1 % slots] : -1;
+                bg->kc[nk].f0 = f0->f;
+                bg->kc[nk].f1 = f1 ? f1->f : NULL;
+                bg->kc[nk].icost = e->la_icost[b % slots];
+                bg->kkey[nk][0] = p0;
+                bg->kkey[nk][1] = p1;
+                bg->kkey[nk][2] = b;
+                nk++;
+            }
+    }
+    /* (the results' places only now: la_kgrow moves them) */
+    for (i = 0; i < nk; i++) {
+        bg->kc[i].total = &bg->ktot[i];
+        bg->kc[i].intra = &bg->kin[i];
+    }
+    /* in calls of at most LA_COST_INTS per-block results */
+    for (k0 = 0; k0 < nk;) {
+        int k1 = nk, rc;
+        if ((int64_t)(k1 - k0) * n > LA_COST_INTS)
+            k1 = k0 + (LA_COST_INTS / n > 0 ? LA_COST_INTS / n : 1);
+        AEG_PH(AEG_PH_LOWRES,
+               rc = bg->lane.lowres_costs(bg->lane.priv, bg->pics, bg->np,
+                                          slots, bg->kc + k0, k1 - k0,
+                                          bg->stride, bg->w, bg->h));
+        if (rc != AEG_OK)
+            break;
+        for (i = k0; i < k1; i++) {
+            int64_t c = bg->ktot[i];
+            /* la_cost()'s discount of a B picture */
+            if (bg->kkey[i][1] != bg->kkey[i][2])
+                c = c * 100 / la_bias();
+            la_cache_put(e, bg->kkey[i][0], bg->kkey[i][1], bg->kkey[i][2], c,
+                         bg->kin[i]);
+        }
+        k0 = k1;
+    }
+    la_dev_time(e, aeg_now_ns() - t0);
+}
+
 /* The scheduling step's own batch, before it prices anything: whatever the
  * pushes did not search (with a device, or the helper idle), on the device
- * lane in this thread; on the CPU the step stays on demand. */
+ * lane in this thread; on the CPU the step stays on demand.  With the
+ * searches on the device the rest of the step's lookahead follows them
+ * (la_dev_rest). */
 static void la_prefetch(struct aeg_encoder *e, int a)
 {
     struct la_bg *bg;
-    int end = e->in_count - 1, i;
+    int end = e->in_count - 1, i, nj;
     int64_t t0, dt;
 
     if (!la_batching(e) || e->la_step_dev >= 0 || a < 0 ||
@@ -15858,24 +16101,29 @@ static void la_prefetch(struct aeg_encoder *e, int a)
         return;
     if (end > a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1)
         end = a + AEG_MAX_LOOKAHEAD + AEG_MAX_BFRAMES + 1;
-    if (la_build(e, bg, a, end, end) <= 0)
+    nj = la_build(e, bg, a, end, end);
+    if (nj < 0)
         return;
-    e->la_step_dev = aeg_dispatch_la_pick(&e->d, 1);
-    if (!e->la_step_dev) {
-        for (i = 0; i < bg->nj; i++)  /* on the CPU: on demand, timed */
-            bg->ent[i]->d = -1;
+    if (nj > 0) {
+        e->la_step_dev = aeg_dispatch_la_pick(&e->d, 1);
+        e->la_on_dev = e->la_step_dev;
+        if (!e->la_step_dev) {
+            for (i = 0; i < bg->nj; i++)  /* on the CPU: on demand, timed */
+                bg->ent[i]->d = -1;
+            la_unbusy(e);
+            return;
+        }
+        la_bg_geom(e, bg);
+        t0 = aeg_now_ns();
+        AEG_PH(AEG_PH_LOWRES, la_run(bg, &bg->lane));
+        dt = aeg_now_ns() - t0;
         la_unbusy(e);
-        return;
+        e->la_step_ns += dt;
+        e->la_step_blk += (int64_t)bg->nj * bg->nb;
+        la_dev_time(e, dt);
     }
-    la_bg_geom(e, bg);
-    t0 = aeg_now_ns();
-    AEG_PH(AEG_PH_LOWRES, la_run(bg, &bg->lane));
-    dt = aeg_now_ns() - t0;
-    la_unbusy(e);
-    e->la_step_ns += dt;
-    e->la_step_blk += (int64_t)bg->nj * bg->nb;
-    e->st.stage_ns[AEG_STAGE_LOOKAHEAD] += dt;
-    e->st.stage_gpu_ns[AEG_STAGE_LOOKAHEAD] += dt;
+    if (e->la_on_dev)
+        la_dev_rest(e, bg, a, end);
 }
 
 static int64_t la_cost(struct aeg_encoder *e, int p0, int p1, int b,
@@ -15959,50 +16207,74 @@ static int b_adapt_decide(struct aeg_encoder *e, int a, int last)
  * included (x264's slicetype_path_cost) -- and the first group of the
  * cheapest split is the one coded.  Unlike the fast rule it sees what each
  * B picture would cost, not only how far the anchor can reach. */
-static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
-                          int *intra)
+/* (b + 1 is stored, so the zeroed table holds no entry; display numbers
+ * are never negative) */
+/* The distances are small and b grows by one, so the key is mixed
+ * through every bit (murmur3's finaliser) before it picks a set: the
+ * earlier multiply-and-fold put pairs of keys the tree asks for over and
+ * over in the same slot, and 85% of the misses were such evictions.
+ * Each set keeps its two entries in recency order. */
+static int la_cache_set(int p0, int p1, int b)
 {
-    /* (b + 1 is stored, so the zeroed table holds no entry; display numbers
-     * are never negative) */
-    /* The distances are small and b grows by one, so the key is mixed
-     * through every bit (murmur3's finaliser) before it picks a set: the
-     * earlier multiply-and-fold put pairs of keys the tree asks for over and
-     * over in the same slot, and 85% of the misses were such evictions.
-     * Each set keeps its two entries in recency order. */
     unsigned hsh = (unsigned)b ^ ((unsigned)(b - p0) << 20) ^
                    ((unsigned)(p1 - b) << 26);
-    int i, in = 0;
-    int64_t c;
 
     hsh ^= hsh >> 16;
     hsh *= 0x85ebca6bu;
     hsh ^= hsh >> 13;
     hsh *= 0xc2b2ae35u;
     hsh ^= hsh >> 16;
-    i = 2 * (int)(hsh & (LA_CACHE / 2 - 1));
-    if (e->la_cache[i].b == b + 1 && e->la_cache[i].p0 == p0 &&
-        e->la_cache[i].p1 == p1) {
-        if (intra)
-            *intra = e->la_cache[i].intra;
-        return e->la_cache[i].c;
-    }
-    if (e->la_cache[i + 1].b == b + 1 && e->la_cache[i + 1].p0 == p0 &&
-        e->la_cache[i + 1].p1 == p1) {
-        /* to the front of its set */
-        const struct la_centry t = e->la_cache[i + 1];
-        e->la_cache[i + 1] = e->la_cache[i];
-        e->la_cache[i] = t;
-        if (intra)
-            *intra = t.intra;
-        return t.c;
-    }
-    c = la_cost(e, p0, p1, b, &in);
+    return 2 * (int)(hsh & (LA_CACHE / 2 - 1));
+}
+
+/* the entry of (p0, p1, b) in its set, -1 if none (the order unchanged) */
+static int la_cache_peek(const struct aeg_encoder *e, int p0, int p1, int b)
+{
+    const int i = la_cache_set(p0, p1, b);
+    int k;
+
+    for (k = i; k < i + 2; k++)
+        if (e->la_cache[k].b == b + 1 && e->la_cache[k].p0 == p0 &&
+            e->la_cache[k].p1 == p1)
+            return k;
+    return -1;
+}
+
+/* a new entry at the front of its set, the older one second */
+static void la_cache_put(struct aeg_encoder *e, int p0, int p1, int b,
+                         int64_t c, int in)
+{
+    const int i = la_cache_set(p0, p1, b);
+
     e->la_cache[i + 1] = e->la_cache[i];
     e->la_cache[i].p0 = p0;
     e->la_cache[i].p1 = p1;
     e->la_cache[i].b = b + 1;
     e->la_cache[i].c = c;
     e->la_cache[i].intra = in;
+}
+
+static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
+                          int *intra)
+{
+    const int k = la_cache_peek(e, p0, p1, b);
+    int in = 0;
+    int64_t c;
+
+    if (k >= 0) {
+        const int i = k & ~1;
+        if (k != i) {
+            /* to the front of its set */
+            const struct la_centry t = e->la_cache[k];
+            e->la_cache[k] = e->la_cache[i];
+            e->la_cache[i] = t;
+        }
+        if (intra)
+            *intra = e->la_cache[i].intra;
+        return e->la_cache[i].c;
+    }
+    c = la_cost(e, p0, p1, b, &in);
+    la_cache_put(e, p0, p1, b, c, in);
     if (intra)
         *intra = in;
     return c;

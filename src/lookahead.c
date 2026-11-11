@@ -230,7 +230,7 @@ static int block_search(const aeg_lowres *cur, const aeg_lowres *ref,
     return best;
 }
 
-static int la_i8(void)
+int aeg_lowres_i8(void)
 {
     static int v = -1;
     if (v < 0) {
@@ -286,7 +286,7 @@ static int intra_cost(const aeg_lowres *cur, int bx, int by)
                     (a + b * (x - 3) + cc * (y - 3) + 16) >> 5, 0, 255);
         s = aeg_satd(8, 8, c, cur->stride, pred, 8);
         if (s < best) best = s;
-        if (la_i8()) {
+        if (aeg_lowres_i8()) {
             /* x264 (subme > 1): the six directional Intra_8x8 modes on
              * filtered edges as well.  top[8..15] is the top-right, which
              * at the right edge reads the padding.  Without them the

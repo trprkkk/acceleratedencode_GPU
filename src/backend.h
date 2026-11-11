@@ -31,6 +31,24 @@ typedef struct aeg_la_job {
     int *out;               /* 3 ints per block, as lowres_search()       */
 } aeg_la_job;
 
+/* lowres_costs(): one cost estimate, aeg_lowres_cost_fields() of picture
+ * `cur` from `r0` (and `r1`: a B estimate; r1 < 0 = list 0 only) with the
+ * fields f0 / f1 (3 ints per block, as lowres_search() writes them) and
+ * cur's intra estimates */
+typedef struct aeg_la_cost {
+    int cur, r0, r1;        /* indices into pics                          */
+    const int *f0, *f1;     /* f1 unused without r1                       */
+    const int *icost;       /* 1 int per block                            */
+    int64_t *total;         /* out: the estimate                          */
+    int *intra;             /* out: its intra blocks (border excluded)    */
+} aeg_la_cost;
+
+/* The device form of lowres_costs computes 2 * cost + (intra won) per block
+ * (the lowres_costs kernel); this sums one estimate's blocks the way
+ * aeg_lowres_cost_fields() does, the border excluded. */
+void aeg_la_cost_sum(const int *blk, int mb_w, int mb_h, int64_t *total,
+                     int *intra);
+
 typedef struct aeg_be_ops {
     void *priv;
     int   backend;          /* AEG_BACKEND_* actually in use             */
@@ -132,6 +150,29 @@ typedef struct aeg_be_ops {
     int (*lowres_chains)(void *priv, const aeg_la_pic *pics, int npics,
                          int nslots, const aeg_la_chain *chains, int nchains,
                          const aeg_la_job *jobs, int stride, int w, int h);
+
+    /* The rest of the lookahead on the same resident ring (pics, nslots,
+     * stride, w, h as for lowres_chains; all three optional):
+     *
+     * lowres_build: aeg_lowres_build() of the luma `src` (sw x sh,
+     * sstride; the device backends take 8-bit samples) into ring slot
+     * pic->slot, which then holds pic->tag; the
+     * padded plane comes back at pic->plane (an allocation of
+     * aeg_lowres_alloc), the same bytes the host would have built.
+     *
+     * lowres_intra: aeg_lowres_intra() of every picture, 1 int per block at
+     * out[i]; `i8` is aeg_lowres_i8() (the directional Intra_8x8 modes).
+     *
+     * lowres_costs: every estimate of costs[] (see aeg_la_cost). */
+    int (*lowres_build)(void *priv, const pixel *src, int sstride, int sw,
+                        int sh, const aeg_la_pic *pic, int nslots, int stride,
+                        int w, int h);
+    int (*lowres_intra)(void *priv, const aeg_la_pic *pics, int npics,
+                        int nslots, int *const *out, int i8, int stride,
+                        int w, int h);
+    int (*lowres_costs)(void *priv, const aeg_la_pic *pics, int npics,
+                        int nslots, const aeg_la_cost *costs, int ncosts,
+                        int stride, int w, int h);
 
     void (*sync)(void *priv);
     void (*destroy)(void *priv);

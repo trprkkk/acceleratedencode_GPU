@@ -635,6 +635,174 @@ static void check_chains(int mb_w, int mb_h)
     free(seed);
 }
 
+/* lowres_build, lowres_intra, lowres_costs on one ring: the device builds
+ * every slot (and must hand back the host's bytes); the intra estimates,
+ * a chain and the cost estimates then run on those resident slots, with
+ * nothing uploaded; finally one slot holds a new picture built on the host
+ * (new tag), which the next calls must upload rather than serve stale. */
+static void check_rest(int mb_w, int mb_h)
+{
+    enum { NS = 5, NJ = 6 };
+    aeg_lowres lc[NS], ld[NS];
+    aeg_la_pic pc[NS], pd[NS];
+    aeg_la_cost ka[NJ], kb[NJ];
+    aeg_la_chain ch;
+    aeg_la_job ja[2], jb[2];
+    const int nb = mb_w * mb_h;
+    const int sw = 16 * mb_w - (mb_w > 1 ? 3 : 0), sh = 16 * mb_h - (mb_h > 1 ? 7 : 0);
+    const int sstride = sw + 24;
+    int *ica[NS], *icb[NS], *fld[NS], *fa, *fb, intra_a[NJ], intra_b[NJ];
+    int64_t ta[NJ], tb[NJ];
+    uint8_t *src = (uint8_t *)malloc((size_t)sstride * (size_t)sh);
+    size_t sz;
+    int k, i, x, y, ok, round;
+
+    for (k = 0; k < NS; k++)
+        if (aeg_lowres_alloc(&lc[k], mb_w, mb_h) ||
+            aeg_lowres_alloc(&ld[k], mb_w, mb_h)) {
+            check(0, "lowres_build (allocation)");
+            return;
+        }
+    sz = (size_t)lc[0].stride * (size_t)(lc[0].h + 2 * AEG_LA_PAD);
+    fa = (int *)malloc(sizeof(int) * 3 * (size_t)nb * 2);
+    fb = (int *)malloc(sizeof(int) * 3 * (size_t)nb * 2);
+    for (k = 0; k < NS; k++) {
+        ica[k] = (int *)malloc(sizeof(int) * (size_t)nb);
+        icb[k] = (int *)malloc(sizeof(int) * (size_t)nb);
+        fld[k] = (int *)malloc(sizeof(int) * 3 * (size_t)nb);
+        if (!ica[k] || !icb[k] || !fld[k])
+            return;
+    }
+    if (!src || !fa || !fb)
+        return;
+    for (round = 0; round < 2; round++) {
+        /* round 0: every picture built by both; round 1: slot of picture 2
+         * gets a new picture (tag 7) built on the host only */
+        ok = 1;
+        for (k = 0; k < NS; k++) {
+            if (round && k != 2)
+                continue;
+            for (y = 0; y < sh; y++)
+                for (x = 0; x < sstride; x++) {
+                    int u = x + 4 * k + 9 * round, v = y + 2 * k;
+                    src[(size_t)y * sstride + x] =
+                        (uint8_t)(80 + 80 * (((u + 3 * v) / 9) & 1) +
+                                  (u * v) % 31 + rnd(11));
+                }
+            pc[k].plane = lc[k].plane;
+            pd[k].plane = ld[k].plane;
+            pc[k].slot = pd[k].slot = (k + 3) % NS;
+            pc[k].tag = pd[k].tag = round ? 7 : k;
+            memset(lc[k].mem, 0x11, sz);
+            memset(ld[k].mem, 0xee, sz);
+            cpu.lowres_build(cpu.priv, src, sstride, sw, sh, &pc[k], NS,
+                             lc[k].stride, lc[k].w, lc[k].h);
+            if (round)
+                memcpy(ld[k].mem, lc[k].mem, sz);   /* the host's picture */
+            else
+                dev.lowres_build(dev.priv, src, sstride, sw, sh, &pd[k], NS,
+                                 ld[k].stride, ld[k].w, ld[k].h);
+            ok &= !memcmp(lc[k].mem, ld[k].mem, sz);
+        }
+        if (!round)
+            check(ok, "lowres_build");
+
+        /* the intra estimates of every picture, resident */
+        for (k = 0; k < NS; k++) {
+            memset(ica[k], 0x55, sizeof(int) * (size_t)nb);
+            memset(icb[k], 0xaa, sizeof(int) * (size_t)nb);
+        }
+        cpu.lowres_intra(cpu.priv, pc, NS, NS, ica, aeg_lowres_i8(),
+                         lc[0].stride, lc[0].w, lc[0].h);
+        dev.lowres_intra(dev.priv, pd, NS, NS, icb, aeg_lowres_i8(),
+                         ld[0].stride, ld[0].w, ld[0].h);
+        ok = 1;
+        for (k = 0; k < NS; k++)
+            ok &= !memcmp(ica[k], icb[k], sizeof(int) * (size_t)nb);
+        check(ok, round ? "lowres_intra (slot reused)" : "lowres_intra");
+
+        /* a chain on the built slots: picture 2 against 1, then 0 */
+        ch.cur = 2;
+        ch.first = 0;
+        ch.count = 2;
+        ch.seed = NULL;
+        for (i = 0; i < 2; i++) {
+            ja[i].ref = 1 - i;
+            ja[i].seeded = i > 0;
+            ja[i].num = i ? 2 : 1;
+            ja[i].den = 1;
+            ja[i].range = 16 + 8 * i;
+            ja[i].out = fa + (size_t)i * 3 * nb;
+            jb[i] = ja[i];
+            jb[i].out = fb + (size_t)i * 3 * nb;
+        }
+        cpu.lowres_chains(cpu.priv, pc, NS, NS, &ch, 1, ja, lc[0].stride,
+                          lc[0].w, lc[0].h);
+        dev.lowres_chains(dev.priv, pd, NS, NS, &ch, 1, jb, ld[0].stride,
+                          ld[0].w, ld[0].h);
+        check(!memcmp(fa, fb, sizeof(int) * 6 * (size_t)nb),
+              round ? "lowres_chains after lowres_build (slot reused)"
+                    : "lowres_chains after lowres_build");
+
+        /* the estimates: fields searched on the CPU, two made up with
+         * independent zero vectors; B and P, and one with its own picture
+         * as both references */
+        for (k = 0; k < NS; k++) {
+            if (k < 3) {
+                cpu.lowres_search(cpu.priv, lc[k].plane, lc[k + 1].plane,
+                                  lc[k].stride, lc[k].w, lc[k].h, NULL, 1, 1,
+                                  16, fld[k]);
+            } else {
+                for (i = 0; i < nb; i++) {
+                    const int z = rnd(2);
+                    fld[k][2 * i] = z ? 0 : rnd(81) - 40;
+                    fld[k][2 * i + 1] = z ? 0 : rnd(81) - 40;
+                    fld[k][2 * nb + i] = ica[0][i] + rnd(301) + 100;
+                }
+            }
+        }
+        {
+            static const int jj[NJ][5] = {
+                { 1, 0, 2, 0, 1 }, { 2, 1, 3, 1, 2 }, { 0, 1, -1, 0, 0 },
+                { 4, 3, -1, 3, 0 }, { 2, 0, 4, 3, 4 }, { 1, 1, 1, 3, 4 }
+            };
+            for (i = 0; i < NJ; i++) {
+                ka[i].cur = jj[i][0];
+                ka[i].r0 = jj[i][1];
+                ka[i].r1 = jj[i][2];
+                ka[i].f0 = fld[jj[i][3]];
+                ka[i].f1 = fld[jj[i][4]];
+                ka[i].icost = ica[jj[i][0]];
+                ka[i].total = &ta[i];
+                ka[i].intra = &intra_a[i];
+                kb[i] = ka[i];
+                kb[i].total = &tb[i];
+                kb[i].intra = &intra_b[i];
+                ta[i] = tb[i] = -1;
+                intra_a[i] = intra_b[i] = -1;
+            }
+        }
+        cpu.lowres_costs(cpu.priv, pc, NS, NS, ka, NJ, lc[0].stride, lc[0].w,
+                         lc[0].h);
+        dev.lowres_costs(dev.priv, pd, NS, NS, kb, NJ, ld[0].stride, ld[0].w,
+                         ld[0].h);
+        ok = 1;
+        for (i = 0; i < NJ; i++)
+            ok &= ta[i] == tb[i] && intra_a[i] == intra_b[i];
+        check(ok, round ? "lowres_costs (slot reused)" : "lowres_costs");
+    }
+    for (k = 0; k < NS; k++) {
+        aeg_lowres_free(&lc[k]);
+        aeg_lowres_free(&ld[k]);
+        free(ica[k]);
+        free(icb[k]);
+        free(fld[k]);
+    }
+    free(src);
+    free(fa);
+    free(fb);
+}
+
 int main(int argc, char **argv)
 {
     int which = AEG_BACKEND_AUTO, k;
@@ -681,6 +849,12 @@ int main(int argc, char **argv)
                                       { 1, 1 }, { 3, 1 } };
         for (k = 0; k < 5; k++)
             check_chains(csz[k][0], csz[k][1]);
+    }
+    if (dev.lowres_build && dev.lowres_intra && dev.lowres_costs) {
+        static const int rsz[][2] = { { 11, 9 }, { 40, 22 }, { 120, 68 },
+                                      { 1, 1 }, { 3, 1 }, { 1, 4 } };
+        for (k = 0; k < 6; k++)
+            check_rest(rsz[k][0], rsz[k][1]);
     }
     check_threads(176, 144, 0);
     check_threads(176, 144, 1);
