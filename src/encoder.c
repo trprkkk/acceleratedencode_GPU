@@ -127,7 +127,7 @@ typedef struct mbenc {
  * most; the input ring holds them on top of a group and its next anchor. */
 #define AEG_MAX_LOOKAHEAD 60
 #define AEG_RING (2 * AEG_MAX_BFRAMES + 6 + AEG_MAX_LOOKAHEAD)
-/* lookahead costs kept (direct-mapped by a hash of the display numbers):
+/* lookahead costs kept (2-way sets by a hash of the display numbers):
  * enough for every (p0, p1, b) the macroblock tree's 60-picture window asks
  * for with 16 B pictures, which the window mostly asks for again after it
  * slides by a group */
@@ -601,7 +601,7 @@ struct aeg_encoder {
     int64_t la_wait_ns;     /* the main thread blocked on the helper    */
     /* lookahead costs already computed, keyed by display indices (the
      * window slides by a group, so most are reused) */
-    struct { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
+    struct la_centry { int p0, p1, b, intra; int64_t c; } la_cache[LA_CACHE];
     int la_sf_n;            /* search fields used per slot (<= LA_SF)        */
     int la_seed;            /* lowres search at distance n seeded from n - 1:
                              * the range grows by this much per step, 0 = off */
@@ -15964,20 +15964,40 @@ static int64_t la_cost_ci(struct aeg_encoder *e, int p0, int p1, int b,
 {
     /* (b + 1 is stored, so the zeroed table holds no entry; display numbers
      * are never negative) */
-    const unsigned hsh = ((unsigned)b * 2654435761u) ^
-                         ((unsigned)(b - p0) * 40503u) ^
-                         ((unsigned)(p1 - b) * 97u);
-    const int i = (int)((hsh ^ (hsh >> 15)) & (LA_CACHE - 1));
-    int in = 0;
+    /* The distances are small and b grows by one, so the key is mixed
+     * through every bit (murmur3's finaliser) before it picks a set: the
+     * earlier multiply-and-fold put pairs of keys the tree asks for over and
+     * over in the same slot, and 85% of the misses were such evictions.
+     * Each set keeps its two entries in recency order. */
+    unsigned hsh = (unsigned)b ^ ((unsigned)(b - p0) << 20) ^
+                   ((unsigned)(p1 - b) << 26);
+    int i, in = 0;
     int64_t c;
 
+    hsh ^= hsh >> 16;
+    hsh *= 0x85ebca6bu;
+    hsh ^= hsh >> 13;
+    hsh *= 0xc2b2ae35u;
+    hsh ^= hsh >> 16;
+    i = 2 * (int)(hsh & (LA_CACHE / 2 - 1));
     if (e->la_cache[i].b == b + 1 && e->la_cache[i].p0 == p0 &&
         e->la_cache[i].p1 == p1) {
         if (intra)
             *intra = e->la_cache[i].intra;
         return e->la_cache[i].c;
     }
+    if (e->la_cache[i + 1].b == b + 1 && e->la_cache[i + 1].p0 == p0 &&
+        e->la_cache[i + 1].p1 == p1) {
+        /* to the front of its set */
+        const struct la_centry t = e->la_cache[i + 1];
+        e->la_cache[i + 1] = e->la_cache[i];
+        e->la_cache[i] = t;
+        if (intra)
+            *intra = t.intra;
+        return t.c;
+    }
     c = la_cost(e, p0, p1, b, &in);
+    e->la_cache[i + 1] = e->la_cache[i];
     e->la_cache[i].p0 = p0;
     e->la_cache[i].p1 = p1;
     e->la_cache[i].b = b + 1;

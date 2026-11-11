@@ -7587,3 +7587,53 @@ with MBAFF, where slices start on even rows. `a9dcab2` fails the same way
 here, but CI's TSan job (gcc 13) passed. Its compiler probably moves the
 load into the MBAFF branch. The read is now guarded by `e->mbaff`, so the
 output cannot change.
+
+## The lookahead cost cache: 85% of its misses were evictions
+
+Before moving the rest of the lookahead to the device (the downsampling,
+the intra costs and the B estimates), the lowres phase was timed by part.
+cockL at p3, 120 frames, `-t 1 --frame-threads 1`:
+
+| part | time |
+|---|---|
+| downsampling (`aeg_lowres_build`) | 25 ms |
+| intra estimates (`aeg_lowres_intra`) | 25 ms |
+| search (fields) | 1080 ms |
+| cost estimates (`aeg_lowres_cost_fields`) | 940 ms |
+| the tree's per-macroblock costs | 5 ms |
+
+The cost estimates were 18 687 calls, but only 2 633 distinct triples
+(p0, p1, b). `la_cost_ci()` keeps them in a 16 384-entry table that is
+never cleared, so this could only be collisions. The hash multiplied b
+and folded the two small distances into the low 14 bits so weakly that 287
+keys the tree asks for over and over shared a slot in pairs (for example
+(26, 32, 29) and (39, 48, 48)) and evicted each other on every step. Those
+evictions were 16 485 of the 18 687 misses.
+
+The key is now mixed through murmur3's finaliser, and the table is 2-way
+set-associative, each set in recency order. A cost depends only on its
+triple, so the stream cannot change.
+
+- **Byte-identical to `32f7334`.** p1-p4 × {default,
+  `-t 1 --frame-threads 1`, `--frame-threads 3`, `-t 2`, PAFF, MBAFF,
+  `--bframes 16`, `--b-adapt 1`, VBV, `--bit-depth 10` (with one and
+  with auto threads)}, plus every clip timed below.
+- **Lowres phase** (cockL p3, 120 frames): 2145 ms → 1341 ms.
+
+| `--crf 24`, 2 cores | before | after | |
+|---|---|---|---|
+| cockL p3, 240 frames, `-t 1 --frame-threads 1` | 24.46 s | 21.74 s | −11% |
+| cockL p3, 240 frames, default threads | 14.32 s | 12.93 s | −10% |
+| cockL p4, 240 frames, default threads | 17.87 s | 16.86 s | −6% |
+| megaL p3, 240 frames, one thread | 7.38 s | 6.78 s | −8% |
+| vtestL p3, 240 frames, one thread | 8.80 s | 8.40 s | −5% |
+| treeL p3, 240 frames, one thread | 8.64 s | 8.38 s | −3% |
+| hdL 720p p3, 60 frames, one thread | 18.52 s | 18.07 s | −2% |
+
+(One run each, interleaved.)
+
+What is left of the cost estimates is about 130 ms, and the downsampling
+and intra estimates about 25 ms each. So moving those three to the device
+can no longer save much time. Their point is a lookahead that stays on
+the device, next to a source the device motion search will need anyway.
+
