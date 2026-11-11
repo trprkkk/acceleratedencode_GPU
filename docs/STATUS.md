@@ -7702,3 +7702,17 @@ changes.
 PoCL is a CPU device, so it gives no meaningful time. On a GPU the
 saving is at most the ~180 ms these parts took on the CPU per 120 cockL
 frames. The point is that the lowres pictures no longer need uploading.
+
+## A 10-bit lowres fix: white wrapped to black
+
+At 10 bits the lowres sample is `(sum of 4 + 8) >> 4`, and four samples of
+1022 or 1023 round up to 256, which `(uint8_t)` turned into 0. So every
+2×2 block of full-range white became black in the lookahead's picture,
+which skewed its intra, inter and scene-cut estimates there. It is now
+clamped to 255 (a no-op at 8 bits). Upconverted 8-bit input tops out at
+1020, so 8-bit streams and 10-bit encodes of 8-bit input are
+byte-identical to before.
+
+On cockL stretched to full-range 10-bit (8.8% of luma ≥ 1022), p3
+`--crf 24`, 30 frames: 97 669 → 97 800 bytes, 42.37 → 42.41 dB. The
+decisions changed, but quality is about the same.

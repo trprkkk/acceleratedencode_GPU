@@ -66,8 +66,11 @@ static void aeg_lowres_build_rows_ph(aeg_lowres *l, const pixel *src, int sstrid
 
             if (x0 > w - 1) x0 = w - 1;
             if (x1 > w - 1) x1 = w - 1;
-            d[x] = (uint8_t)((r0[x0] + r0[x1] + r1[x0] + r1[x1] +
-                              (2 << (BIT_DEPTH - 8))) >> (BIT_DEPTH - 6));
+            /* rounded to 8 bits; above 8 the sum can round up to 256
+             * (4 x 1023 at 10), which must stay white, not wrap to 0 */
+            const int v = (r0[x0] + r0[x1] + r1[x0] + r1[x1] +
+                           (2 << (BIT_DEPTH - 8))) >> (BIT_DEPTH - 6);
+            d[x] = (uint8_t)(v > 255 ? 255 : v);
         }
         memset(d - LA_PAD, d[0], LA_PAD);
         memset(d + l->w, d[l->w - 1], LA_PAD);
