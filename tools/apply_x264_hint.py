@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Minimal x264 MV dump/hint patch applicator.
-
-This does not vendor x264.  Run it inside a checkout of x264 0.164:
+"""Apply/revert the minimal x264 MV hint/dump patch.
 
     python3 tools/apply_x264_hint.py --src forks/x264
+    python3 tools/apply_x264_hint.py --src forks/x264 --revert
 
-It inserts two calls into encoder/me.c and adds encoder/aeg_mv_hint.{c,h}.
-The patch is env-gated: unset X264_MV_HINT / X264_MV_DUMP means stock x264.
+The patch is env-gated:
+  X264_MV_HINT=<file>   seed candidate MV per x264_me_search_ref call
+  X264_MV_DUMP=<file>   dump best mv/cost/i_pixel per call
+Unset both => stock x264 behavior and byte-identical output.
 """
 import argparse
 import os
@@ -19,87 +20,63 @@ HEADER = r'''#ifndef AEG_MV_HINT_H
 #include "common/common.h"
 #include "me.h"
 
-void aeg_mv_hint_pre(x264_me_t *m);
-void aeg_mv_hint_post(const x264_me_t *m);
+int aeg_mv_hint_get( int *x, int *y );
+void aeg_mv_hint_post( const x264_t *h, const x264_me_t *m );
 
 #endif
 '''
 
-SOURCE = r'''/* GPL-2.0-or-later, part of the x264 fork.  Minimal external MV seed/dump. */
+SOURCE = r'''/* GPL-2.0-or-later.  Minimal external MV seed/dump for the x264 fork. */
 #include "common/common.h"
 #include "aeg_mv_hint.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-static FILE *in_file, *out_file;
+static FILE *hint_file;
+static FILE *dump_file;
 
-void aeg_mv_hint_pre(x264_me_t *m)
+int aeg_mv_hint_get( int *x, int *y )
 {
-    const char *ev = getenv("X264_MV_HINT");
-    int x, y;
-    if (!ev)
-        return;
-    if (!in_file)
-        in_file = fopen(ev, "r");
-    if (!in_file || fscanf(in_file, "%d %d", &x, &y) != 2)
-        return;
-    m->mv[0] = (int16_t)x;
-    m->mv[1] = (int16_t)y;
+    const char *ev = getenv( "X264_MV_HINT" );
+    if( !ev )
+        return 0;
+    if( !hint_file )
+        hint_file = fopen( ev, "r" );
+    if( !hint_file )
+        return 0;
+    return fscanf( hint_file, "%d %d", x, y ) == 2;
 }
 
-void aeg_mv_hint_post(const x264_me_t *m)
+void aeg_mv_hint_post( const x264_t *h, const x264_me_t *m )
 {
-    const char *ev = getenv("X264_MV_DUMP");
-    if (!ev)
+    const char *ev = getenv( "X264_MV_DUMP" );
+    if( !ev )
         return;
-    if (!out_file)
-        out_file = fopen(ev, "a");
-    if (!out_file)
+    if( !dump_file )
+        dump_file = fopen( ev, "a" );
+    if( !dump_file )
         return;
-    fprintf(out_file, "%d %d %d %d\n", m->mv[0], m->mv[1], m->cost,
-            m->i_pixel);
-    fflush(out_file);
+    fprintf( dump_file, "%d %d %d %d\n", m->mv[0], m->mv[1], m->cost,
+             m->i_pixel );
+    fflush( dump_file );
 }
 '''
 
+HINT = '''    {
+        int hx, hy;
+        if( aeg_mv_hint_get( &hx, &hy ) && CHECK_MVRANGE( hx, hy ) )
+            COST_MV( hx, hy );
+    }
+'''
 
-def find_matching(src, open_pos):
+
+def matching_brace(src, pos):
     depth = 0
-    in_str = in_chr = in_line = in_block = False
-    i = open_pos
+    i = pos
     while i < len(src):
-        c = src[i]
-        n = src[i + 1] if i + 1 < len(src) else ''
-        if in_line:
-            if c == '\n':
-                in_line = False
-        elif in_block:
-            if c == '*' and n == '/':
-                in_block = False
-                i += 1
-        elif in_str:
-            if c == '\\':
-                i += 1
-            elif c == '"':
-                in_str = False
-        elif in_chr:
-            if c == '\\':
-                i += 1
-            elif c == "'":
-                in_chr = False
-        elif c == '/' and n == '/':
-            in_line = True
-            i += 1
-        elif c == '/' and n == '*':
-            in_block = True
-            i += 1
-        elif c == '"':
-            in_str = True
-        elif c == "'":
-            in_chr = True
-        elif c == '{':
+        if src[i] == '{':
             depth += 1
-        elif c == '}':
+        elif src[i] == '}':
             depth -= 1
             if depth == 0:
                 return i
@@ -113,36 +90,54 @@ def main():
     ap.add_argument('--revert', action='store_true')
     a = ap.parse_args()
     me = os.path.join(a.src, 'encoder', 'me.c')
+    mk = os.path.join(a.src, 'Makefile')
     if not os.path.exists(me):
         raise SystemExit('not an x264 tree: %s' % me)
     if a.revert:
-        bak = me + '.aeg.bak'
-        if os.path.exists(bak):
-            shutil.copyfile(bak, me)
+        for p in (me, mk):
+            bak = p + '.aeg.bak'
+            if os.path.exists(bak):
+                shutil.copyfile(bak, p)
         for f in ('aeg_mv_hint.c', 'aeg_mv_hint.h'):
             p = os.path.join(a.src, 'encoder', f)
             if os.path.exists(p):
                 os.remove(p)
+        print('reverted')
         return
     src = open(me, encoding='utf-8', errors='replace').read()
-    if 'aeg_mv_hint_pre' in src:
+    if 'aeg_mv_hint_get' in src:
         raise SystemExit('already patched')
     shutil.copyfile(me, me + '.aeg.bak')
-    fn = re.search(r'void\s+x264_me_search_ref\s*\([^;]*?\)\s*\{', src, re.S)
-    if not fn:
-        raise SystemExit('x264_me_search_ref body not found')
-    open_pos = src.index('{', fn.start())
-    close_pos = find_matching(src, open_pos)
-    if close_pos < 0:
-        raise SystemExit('could not find function end')
-    src = src[:open_pos + 1] + '\n    aeg_mv_hint_pre(m);' + src[open_pos + 1:]
-    close_pos = find_matching(src, open_pos)
-    src = src[:close_pos] + '\n    aeg_mv_hint_post(m);\n' + src[close_pos:]
-    # include the header after the first include block
-    inc = re.search(r'^#include[^\n]*\n', src, re.M)
-    if inc:
-        src = src[:inc.end()] + '#include "aeg_mv_hint.h"\n' + src[inc.end():]
+    shutil.copyfile(mk, mk + '.aeg.bak')
+
+    if '#include "aeg_mv_hint.h"' not in src:
+        inc = src.find('#include "me.h"')
+        if inc < 0:
+            raise SystemExit('#include "me.h" not found')
+        end = src.find('\n', inc) + 1
+        src = src[:end] + '#include "aeg_mv_hint.h"\n' + src[end:]
+
+    sw = src.find('switch( h->mb.i_me_method )')
+    if sw < 0:
+        raise SystemExit('me method switch not found')
+    src = src[:sw] + HINT + '\n' + src[sw:]
+
+    fn = src.find('void x264_me_search_ref(')
+    if fn < 0:
+        raise SystemExit('x264_me_search_ref not found')
+    op = src.find('{', fn)
+    cl = matching_brace(src, op)
+    if cl < 0:
+        raise SystemExit('function end not found')
+    src = src[:cl] + '    aeg_mv_hint_post( h, m );\n' + src[cl:]
     open(me, 'w', encoding='utf-8').write(src)
+
+    mksrc = open(mk, encoding='utf-8', errors='replace').read()
+    mksrc = mksrc.replace('encoder/me.c encoder/ratecontrol.c',
+                          'encoder/me.c encoder/aeg_mv_hint.c '
+                          'encoder/ratecontrol.c', 1)
+    open(mk, 'w', encoding='utf-8').write(mksrc)
+
     open(os.path.join(a.src, 'encoder', 'aeg_mv_hint.h'), 'w').write(HEADER)
     open(os.path.join(a.src, 'encoder', 'aeg_mv_hint.c'), 'w').write(SOURCE)
     print('patched %s' % me)
