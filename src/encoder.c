@@ -7601,7 +7601,10 @@ static int64_t rd_luma(struct aeg_encoder *e, int mbx, int mby, mbenc *t, int qp
              * nothing of the candidate's shape or vectors -- so its result is
              * replayed, reconstruction included, and only the header bits are
              * priced anew. */
-            const int t8ok = t8_allowed(e, t), tr = e->p.trellis;
+            /* (the decision's Viterbi-only selection is a setting of its
+             * own: the winner's re-code must not replay it) */
+            const int t8ok = t8_allowed(e, t),
+                      tr = e->p.trellis + (trel_vonly ? 16 : 0);
             const int s = e->stride[0];
             pixel *dst = e->recp[0] + mby * 16 * s + mbx * 16;
             int k, y;
