@@ -5229,7 +5229,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
     int direct[16][2], direct1[16][2], dlists = 3, dreach;
     int g, l, slot = e->mb_ncand;
     int range = e->p.search_range ? e->p.search_range : 16;
-    int b8_sub = getenv("AEG_B8SUB") ? atoi(getenv("AEG_B8SUB")) : 0;
+    int b8_sub = ENV_INT("AEG_B8SUB", 0);
     mbcand *cd;
 
     if (slot >= (int)(sizeof(e->mb_cand) / sizeof(e->mb_cand[0])))
@@ -6432,9 +6432,8 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
  * well as its distortion.  AEG_MELAMBDA=0/1 overrides, for measurements. */
 static int me_lambda_on(const struct aeg_encoder *e)
 {
-    const char *ev = getenv("AEG_MELAMBDA");
     (void)e;
-    return ev ? atoi(ev) != 0 : 1;
+    return ENV_INT("AEG_MELAMBDA", 1) != 0;
 }
 
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp);
@@ -9117,7 +9116,7 @@ static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     if (e->p.cabac)
         rd_cabac_bits(e, mbx, mby, c, cur_slice_kind(e), 1);
     CM_LAP(e, 5);
-    if (getenv("AEG_MBDBG") && atoi(getenv("AEG_MBDBG")) == 2 &&
+    if (ENV_INT("AEG_MBDBG", -1) == 2 &&
         e->cur_is_p) {
         int q, n = mb_part_count(&best);
         fprintf(stderr, "F%d MB %d,%d type %d cbp %d", e->frame_count, mbx,
@@ -9138,7 +9137,7 @@ static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         }
         fprintf(stderr, "\n");
     }
-    if (getenv("AEG_MBDBG") && best.type == AEG_MB_P8x8) {
+    if (ENV_INT("AEG_MBDBG", -1) != -1 && best.type == AEG_MB_P8x8) {
         int q, n = mb_part_count(&best), fi = e->frame_count;
         fprintf(stderr, "F%d MB %d,%d st %d%d%d%d", fi, mbx, mby,
                 best.sub_type[0], best.sub_type[1], best.sub_type[2],
