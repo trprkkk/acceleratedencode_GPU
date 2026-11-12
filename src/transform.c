@@ -685,30 +685,35 @@ static void tl_init(void)
     }
 }
 
-void aeg_trel_levels(const dctcoef *coef, int side, int qp, float *x, float *e,
-                     int8_t *sgn)
+const float *aeg_trel_levels(const dctcoef *coef, int side, int qp, float *x,
+                             int8_t *sgn)
 {
+    /* (the returned per-position errors are the table itself: the caller
+     * only reads them) */
     const int q = qp + QP_BD_OFFSET;
     int r, c;
 
     pthread_once(&tl_once, tl_init);
     if (side == 4) {
-        memcpy(e, tl4_e[q], sizeof(tl4_e[q]));
+        const float *xs = tl4_xs[q];
         for (r = 0; r < 4; r++)
             for (c = 0; c < 4; c++) {
                 const int v = coef[c * 4 + r];
-                x[r * 4 + c] = (float)(v < 0 ? -v : v) * tl4_xs[q][r * 4 + c];
+                x[r * 4 + c] = (float)(v < 0 ? -v : v) * xs[r * 4 + c];
                 sgn[r * 4 + c] = v < 0 ? -1 : 1;
             }
-    } else {
-        memcpy(e, tl8_e[q], sizeof(tl8_e[q]));
+        return tl4_e[q];
+    }
+    {
+        const float *xs = tl8_xs[q];
         for (r = 0; r < 64; r++) {
             const int v = coef[r];
-            x[r] = (float)(v < 0 ? -v : v) * tl8_xs[q][r];
+            x[r] = (float)(v < 0 ? -v : v) * xs[r];
             sgn[r] = v < 0 ? -1 : 1;
         }
     }
     (void)c;
+    return tl8_e[q];
 }
 
 /* The same for a DC block: `had` is the Hadamard output aeg_quant_4x4_dc()

@@ -2394,7 +2394,8 @@ static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
         const int sd = t->side;
         int16_t res[64];
         dctcoef co[64], vl[64], sc2[64];
-        float xx[64], ee[64];
+        float xx[64];
+        const float *ee;
         int8_t sg[64];
         int y, x, dummy;
 
@@ -2406,7 +2407,7 @@ static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
             aeg_transform_4x4(res, 4, co);
         else
             aeg_transform_8x8(res, 8, co);
-        aeg_trel_levels(co, sd, qp, xx, ee, sg);
+        ee = aeg_trel_levels(co, sd, qp, xx, sg);
         memcpy(vl, lev, natsz);
         if (trel_viterbi(sh, t, xx, ee, sg, lambda, allow_empty, vl) &&
             memcmp(vl, lev, natsz)) {
