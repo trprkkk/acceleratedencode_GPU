@@ -8182,14 +8182,22 @@ static int cm_on(void)
  * them.  P pictures are a different matter -- a quarter of cock's P
  * macroblocks end up intra, a third of them where the inter prediction's
  * SATD is the lower -- so only the Intra_16x16-relative gate is used there,
- * at the point where it still misses almost nothing. */
+ * at the point where it still misses almost nothing.
+ *
+ * Re-measured after the speed rounds since (pab.sh, global PSNR, 5 clips /
+ * validation set): gate_i48 on B at 80 instead of 50 is +0.07 / +0.01 % for
+ * -2.6 / -4.5 % of the time at -p 3, +0.04 / +0.02 % for -2.0 / -3.8 % at
+ * -p 4, +0.02 / +0.00 % for -0.4 / -1.2 % at -p 2 and +0.02 % for -1.7 % at
+ * -p 1 (70: +0.01 / +0.01 % for -1.5 / -3.3 % at -p 3; 100: +0.19 %).  At
+ * -p 3, gate_b_intra 200 is +0.08 % for -2.7 %, gate_i48 on P 70 +0.13 % for
+ * -2.7 %; neither was taken. */
 static int gate_b_intra(const struct aeg_encoder *e)
 {
     return e->cur_is_b ? ENV_INT("AEG_GIB", 120) : e->cur_is_p ? ENV_INT("AEG_GIP", 0) : 0;
 }
 static int gate_i48(const struct aeg_encoder *e)
 {
-    return e->cur_is_b ? ENV_INT("AEG_GI48B", 50) : ENV_INT("AEG_GI48P", 50);
+    return e->cur_is_b ? ENV_INT("AEG_GI48B", 80) : ENV_INT("AEG_GI48P", 50);
 }
 /* SATD of the best (by SAD) Intra_16x16 prediction of the macroblock. */
 static int i16_satd(struct aeg_encoder *e, int mbx, int mby)

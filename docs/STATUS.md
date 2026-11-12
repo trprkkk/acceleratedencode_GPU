@@ -7908,3 +7908,65 @@ three and four. Measured on the fixed TVO build:
 `-p 3 --frame-threads 2` and `-p 4 -t 3`. Frame threads 1/2/3 are
 identical at p3 and p4, and `--slices 4` matches between `-t 1` and
 `-t 4`.
+
+## Speed: smaller items after the refinement count
+
+**QP-RD trials without the sweeps (not kept).** QP-RD's trial QPs ran
+the full trellis. A variant gave them only the Viterbi pass and re-coded
+a winning QP once more with the full selection (`AEG_QPVO`, removed).
+At p3 that was +0.07 / -0.04 % for +0.9 / -1.1 % of the time; at p4 it
+was +0.10 % for -2.0 %. `--qp-rd 2` tries only one to three QPs, so the
+extra re-code eats the saving.
+
+**Byte-identical cleanups.** The last per-macroblock `getenv` calls
+(`AEG_MBDBG`, `AEG_MELAMBDA`, `AEG_B8SUB`) are cached; a counting
+`LD_PRELOAD` shim now finds no variable read more than 1000 times in
+30 pictures. `aeg_trel_levels()` returns its error table instead of
+copying it. Neither is measurable on its own (identical 50/50 streams
+in `tools/real/same.sh`). Two other ideas were measured and dropped:
+
+- Passing the deblock-RDO delta into `full_price_inner()` to save one
+  struct copy per candidate gave no measurable speed-up.
+- rdtsc counters put the Viterbi path's recomputed residual transform at
+  about 80 Mcyc and its level scaling at about 220 Mcyc per 60
+  pictures. The two together are about 3 % of the encode, and handing
+  the caller's coefficients down would save under 1 %.
+
+**Intra 4x4/8x8 gate on B pictures: 50 -> 80.** The finer intra shapes
+of a B macroblock are skipped when the best inter price is below
+`AEG_GI48B` percent of the best Intra_16x16 price. A screen at p3
+(5 clips, B against the default):
+
+| knob | BD | time |
+|---|---|---|
+| `AEG_GIB=150` | +0.04 % | +0.4 % |
+| `AEG_GIB=200` | +0.08 % | -2.7 % |
+| `AEG_GI48B=70` | +0.01 % | -1.5 % |
+| `AEG_GI48B=100` | +0.19 % | -4.9 % |
+| `AEG_GI48P=60` | +0.04 % | -0.4 % |
+| `AEG_GI48P=70` | +0.13 % | -2.7 % |
+
+and then, on both sets:
+
+| `AEG_GI48B` | 5 clips | validation set |
+|---|---|---|
+| 70, p3 | +0.01 % / -1.5 % | +0.01 % / -3.3 % |
+| **80, p3** | +0.07 % / -2.6 % | +0.01 % / -4.5 % |
+| 70 + `AEG_GIB=175`, p3 | +0.05 % / -3.6 % | +0.05 % / -3.8 % |
+| **80, p4** | +0.04 % / -2.0 % | +0.02 % / -3.8 % |
+| **80, p2** | +0.02 % / -0.4 % | +0.00 % / -1.2 % |
+| **80, p1** | +0.02 % / -1.7 % | |
+
+80 is now the default at every preset. Exactness is 15/15 at `-p 2`,
+`-p 3`, `-p 4`, `-p 3 --frame-threads 2` and `-p 4 -t 3`. Frame threads
+1/2/3 are identical at p3 and p4, and `--slices 4` gives the same stream
+at `-t 1` and `-t 4`.
+
+**Where the lookahead stands for 4-8 cores.** At p3 the lookahead is
+about 344 ms of a 4.0 s single-thread encode (60 pictures, cockL), and
+nearly all of it is the lowres motion search (`block_search`: about 32
+SATDs per 8x8 block). With threads it runs on one helper thread. At
+eight cores the frame threads would need about 7.5 ms per picture
+against the lookahead's 5.7 ms, so it is close to becoming the limit
+there. Splitting its rows over several threads is the next threading
+item; it cannot be measured on this 2-core machine.
