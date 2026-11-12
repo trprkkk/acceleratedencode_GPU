@@ -7762,3 +7762,49 @@ the source.
 - **Sanitizers:** ASan/UBSan clean, with no leak from our code (only
   PoCL's LLVM). TSan clean, forced and automatic, with 2 frame threads.
   NVRTC compiles `lowres_build16` (`ushort` added to the CUDA preamble).
+
+## Motion candidates from a device: measured first, not built
+
+The design proposal's second piece was frame-level asynchronous motion
+candidate generation: an exhaustive search on a device produces the top-K
+vectors of every macroblock, the CPU refines them, and the device must match
+a CPU reference exactly. Before writing kernels, the ceiling was measured on
+the CPU. PSNR BD-rate against the default, five clips, 30 frames (`abbd.py`,
+negative = fewer bits):
+
+| p | change | BD-rate | time |
+|---|---|---|---|
+| 3 | + exhaustive ±24 full-res (`AEG_MEFULL=24`) | −0.12 % (cock −0.40, mega +0.25) | +187 % |
+| 3 | UMH off (`AEG_UMH=0 AEG_UMHP=0`) | +0.29 % | −1.7 % |
+| 3 | UMH replaced by exhaustive ±16 | −0.07 % | +86 % |
+| 3 | + top-4 lowres candidates | 0.00 % | +19 % |
+| 3 | + top-8 lowres candidates | +0.01 % | +25 % |
+| 3 | top-4 lowres candidates instead of UMH | +0.22 % | +17 % |
+| 1 | + top-4 lowres candidates | +0.09 % | +57 % |
+| 1 | UMH off | +0.19 % | −0.9 % |
+| 1 | top-4 lowres candidates instead of UMH | +0.17 % | +54 % |
+
+The lowres candidates came from a CPU reference written for the
+experiment. It ran an exhaustive search over the whole ±48 full-res window
+(±24 lowres), on the half-resolution planes that the existing pre-search
+already uses (the current source against the reference's reconstruction).
+Each 8×8 block was priced as SAD + 2·|v|₁. It kept the top K under a
+(cost, scan index) total order, with 3×3 non-maximum suppression. The
+candidates were added to the 16×16 searches as start points. The time
+column is the CPU running that reference; a device would remove that cost,
+so for those rows only the BD-rate column matters.
+
+The phase profile (cockL, 60 frames, one frame thread) shows the integer
+search at 6.9 % of the time at p3, 11.1 % at p4 and 9.9 % at p1. The UMH
+stage inside it is only 1–2 %.
+
+**Conclusion.** The existing search is close to saturated: the start
+points (predictor, neighbours, the lowres pre-search's vector and its
+neighbours), then UMH, then hex. A perfect integer search is worth about
+0.1 %. Candidates from a device can neither replace the UMH (+0.2 %) nor
+add quality (0.0 %). The time they could save is bounded by the integer
+search's share, and the CPU would still price the candidates with the real
+predictor. So no device kernels were written for this, and the experiment's
+code was not kept. The ceiling is lower than the proposal assumed because
+aeg spends most of its time in mode decision and coding (`code` 45–59 %),
+not in the motion search.
