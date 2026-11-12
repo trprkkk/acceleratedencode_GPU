@@ -286,9 +286,10 @@ typedef struct aeg_params {
                                  sample refinement; 2..9 act as 1        */
     /* Rate-distortion refinement of the winning inter vector: 0 = off (the
      * vector is the one the SATD search returned), 1 = the four quarter-pel
-     * neighbours, 2 = all eight.  Each step is one more full macroblock
-     * candidate priced by the coder, so it is a slow-preset tool.  -1 means
-     * "as the preset says" (3 -> 1, 4 -> 2, below that off). */
+     * neighbours, 2 = the two (preset 3) or three (preset 4) of all eight
+     * with the lowest SATD, 3 = all eight.  Each step is one more full
+     * macroblock candidate priced by the coder, so it is a slow-preset tool.
+     * -1 means "as the preset says" (3 and 4 -> 2, below that off). */
     int refine_mv;
     /* Refine every inter candidate's vectors before the candidates are
      * compared, not just the winner's afterwards: 0 = off (the default),

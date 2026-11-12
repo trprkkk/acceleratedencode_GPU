@@ -7863,3 +7863,48 @@ anyway, and it was slightly worse.
 `-p 3`, `-p 4`, `-p 3 --frame-threads 2` and `-p 4 -t 3`. Frame threads
 2 and 3 are identical to 1 at p3 and p4. `--slices 4` gives the same
 stream at `-t 1` and `-t 4`. p1 and p2 are byte-identical to before.
+
+**A replay bug, found by CI.** The PoCL job's `gpu_validate` failed on
+this change: the batched coefficient paths (which skip the luma memo)
+no longer matched the CPU stream. The memo of `rd_luma()` was keyed on
+the trellis setting but not on the Viterbi-only mode, so the winner's
+full re-code could replay a Viterbi-only result that a transform-size
+trial had stored for the same prediction. The memo key now includes
+the mode (`56d4433`); `gpu_validate` passes at `-p 3 -t 1` and
+`-p 2 -t 2`, and `AEG_TVO=0` is still the old stream. Re-measured with
+the fix (B = `AEG_TVO=0` against the default, sign flipped here so that
+it reads as the cost of the change):
+
+| fixed TVO vs sweeps everywhere | 5 clips | validation set | time (5 / 6 clips) |
+|---|---|---|---|
+| preset 3 | +0.08 % | +0.04 % | -4.5 / -6.8 % |
+| preset 4 | -0.05 % | +0.06 % | -4.9 / -6.6 % |
+
+## Speed: one fewer RD-refined vector neighbour (presets 3-4)
+
+A screen of the existing speed knobs at p3 (`pab.sh`, 5 clips; B
+against the default):
+
+| knob | BD | time |
+|---|---|---|
+| `AEG_T8RD=0` | +0.49 % | -2.7 % |
+| `AEG_IRDK=1` | +0.28 % | -5.3 % |
+| `AEG_GI48B=30` | -0.00 % | +1.2 % |
+| `AEG_GIB=100` | -0.02 % | +1.5 % |
+| `AEG_B8X8=0` (already the p3 default) | +0.00 % | +0.7 % |
+| `AEG_MVREFK=2` | +0.01 % | -4.3 % |
+
+Only the MV refinement count passed. `--refine-mv 2` (the preset 3/4
+default) now RD-checks the two (p3) or three (p4) of the eight
+quarter-pel neighbours with the lowest SATD plus mvd bits, instead of
+three and four. Measured on the fixed TVO build:
+
+| one fewer neighbour | 5 clips | validation set | time (5 / 6 clips) |
+|---|---|---|---|
+| preset 3 (3 -> 2) | -0.08 % | +0.04 % | -3.1 / -3.7 % |
+| preset 4 (4 -> 3) | +0.01 % | -0.05 % | -2.1 / -2.5 % |
+
+`AEG_MVREFK=K` still overrides. Exactness 15/15 at `-p 3`, `-p 4`,
+`-p 3 --frame-threads 2` and `-p 4 -t 3`. Frame threads 1/2/3 are
+identical at p3 and p4, and `--slices 4` matches between `-t 1` and
+`-t 4`.

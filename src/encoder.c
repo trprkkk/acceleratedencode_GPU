@@ -8219,6 +8219,10 @@ static int i16_satd(struct aeg_encoder *e, int mbx, int mby)
  * time against all eight, where the fixed cross (--refine-mv 1) is +0.17 %;
  * all eight re-ordered and not walked is +0.01 %.  At preset 3 three of
  * them against the cross: -0.11 % / -0.02 % for -2 to -3 % of the time.
+ * Re-measured once the trellis ran its sweeps on the winner only: one fewer
+ * (two at preset 3, three at preset 4) is -0.08 / +0.04 % (5 clips /
+ * validation set) for -3.1 / -3.7 % of the time at preset 3 and +0.01 /
+ * -0.05 % for -2.1 / -2.5 % at preset 4, so those are the counts now.
  * AEG_MVREFK=K overrides the count (1..8). */
 static int mvref_k(const struct aeg_encoder *e)
 {
@@ -8229,7 +8233,7 @@ static int mvref_k(const struct aeg_encoder *e)
     }
     if (v >= 0)
         return v;
-    return e->p.refine_mv == 2 ? (e->p.preset >= 4 ? 4 : 3) : 0;
+    return e->p.refine_mv == 2 ? (e->p.preset >= 4 ? 3 : 2) : 0;
 }
 
 static inline int mvref_se_bits(int v)
