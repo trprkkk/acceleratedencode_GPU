@@ -263,7 +263,8 @@ of BD-rate for about 40 % more time at preset 4; off by default, see
 *Refining every candidate* in `docs/STATUS.md`), `--trellis 0|1|2` controls rate-distortion
 level selection (priced by the CABAC coder; x264's values: 1 codes only the
 winning macroblock with it, which presets 1-2 do for -4 / -3.7 % BD-rate at
-6-8 % of the time, 2 runs it inside every candidate too, as presets 3-4 do, see
+6-8 % of the time, 2 runs it inside every candidate too, as presets 3-4 do --
+the candidates get its Viterbi pass and the winner the full selection, see
 *Rate-distortion level selection* and *Presets 1 and 2* in `docs/STATUS.md`), `--ref 1..8` gives P
 pictures more reference pictures (8 at preset 4, 4 at preset 3: -1.45 / -0.97 %
 BD-rate against two for a few per cent of time, the partitions choosing

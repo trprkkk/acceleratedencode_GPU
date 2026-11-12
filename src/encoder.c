@@ -2355,6 +2355,12 @@ static int64_t trel_descent_ex(const aeg_cabac *sh, const struct trel *t,
 /* trel_descent_ex(), for a caller that has already measured the levels it
  * passes in: known_sse >= 0 is their trel_sse() and known_bits their
  * cabac_block_price() against `sh`, the two numbers the descent starts from. */
+/* Set while code_mb() compares candidates under --trellis 2 (trel_vo_on):
+ * the level selection runs the Viterbi pass and the exact comparison with
+ * the quantiser's levels, but not the sweeps; the winner is coded again
+ * with all of it.  Thread-local: the frame and slice threads decide
+ * macroblocks concurrently. */
+static _Thread_local int trel_vonly;
 static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
                                dctcoef *lev, const pixel *src, int stride,
                                const pixel *pred, int pred_stride, int qp,
@@ -2491,6 +2497,8 @@ static int64_t trel_descent_kn(const aeg_cabac *sh, const struct trel *t,
      * the one every following trial already saw and rejected: the descent has
      * converged and the remaining sweeps would change nothing. */
     int idle = 0;
+    if (trel_vonly)
+        passes = 0;
     for (pass = 0; pass < passes && idle < 2 * t->n; pass++) {
         for (i = 0; i < t->n && idle < 2 * t->n; i++) {
             int pos = t->scan[i], step;
@@ -8267,6 +8275,27 @@ static int trel_final_on(const struct aeg_encoder *e)
     return e->p.trellis == 1;
 }
 
+/* --trellis 2 (presets 3-4) without the descent's sweeps inside the
+ * decision: the candidates are compared with the levels of the Viterbi pass
+ * (trel_viterbi, already priced exactly against the quantiser's), and the
+ * winner is coded again with the full selection, as --trellis 1 codes its
+ * winner (trel_vonly).  Most of what the sweeps change is a level here and
+ * there, which reorders candidates that are already close.  BD-rate
+ * against the sweeps in every candidate (global PSNR, one thread, 5 clips /
+ * validation set): preset 3 +0.03 / +0.06 % for -4.9 / -6.7 % of the
+ * time, preset 4 -0.06 / +0.07 % for -5.0 / -7.5 %.  Taking the Viterbi
+ * levels without the exact comparison was no faster (the price is needed
+ * anyway) and worse.  AEG_TVO=0 restores the sweeps in every candidate. */
+static int trel_vo_on(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *ev = getenv("AEG_TVO");
+        v = ev ? atoi(ev) != 0 : 1;
+    }
+    return v;
+}
+
 static int cand_scost(struct aeg_encoder *e, int mbx, int mby, int cand, int qp)
 {
     const int s = e->stride[0];
@@ -8551,10 +8580,12 @@ static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
     /* Level selection on the winner only (trel_final_on): the decision runs
      * with the plain quantiser, the trellis comes back for the re-code of
      * the luma winner below and for the chroma. */
-    const int trel_final = e->p.trellis > 0 && e->p.cabac && trel_final_on(e);
+    const int tvo = e->p.trellis == 2 && e->p.cabac && trel_vo_on();
+    const int trel_final = e->p.trellis > 0 && e->p.cabac && (trel_final_on(e) || tvo);
     const int trel_saved = e->p.trellis;
-    if (trel_final)
+    if (trel_final && !tvo)
         e->p.trellis = 0;
+    trel_vonly = tvo;
     int n16 = e->p.preset >= 2 ? e->mb_nmodes : 1;
     {
         /* one mode below preset 4 (re-measured once the Intra_16x16 AC
@@ -8897,6 +8928,7 @@ static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
         restore_luma(e, mbx, mby, snap_l);
     }
 
+    trel_vonly = 0;
     if (trel_final) {
         const int mb_qp = c->qp;
         e->p.trellis = trel_saved;

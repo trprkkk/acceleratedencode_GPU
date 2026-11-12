@@ -337,7 +337,8 @@ typedef struct aeg_params {
     /* Rate-distortion level selection ("trellis", see trellis_luma4() in
      * encoder.c), with x264's values: 0 = off, 1 = applied to the winning
      * macroblock only (the decision compares plainly quantised candidates),
-     * 2 = inside every candidate of the decision too.  -1 means "as the
+     * 2 = inside every candidate of the decision too (the candidates get
+     * its Viterbi pass, the winner the full selection).  -1 means "as the
      * preset says" (1 at presets 1-2, 2 at 3-4). */
     int trellis;
     int partitions;           /* bitmask: 1=16x16,2=16x8,4=8x16,8=8x8, 16=8x8 split further */

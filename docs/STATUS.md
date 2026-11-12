@@ -7808,3 +7808,58 @@ predictor. So no device kernels were written for this, and the experiment's
 code was not kept. The ceiling is lower than the proposal assumed because
 aeg spends most of its time in mode decision and coding (`code` 45–59 %),
 not in the motion search.
+
+## Speed: the trellis's sweeps on the winner only (presets 3-4)
+
+The user chose CPU speed next. The baseline on this 2-core machine
+(cockL, 60 pictures, CRF 24, one thread) is p1 1.39 s, p3 4.27 s and
+p4 5.39 s, against x264 medium 0.67 s, slower 1.78 s and veryslow 3.24 s
+(ffmpeg's libx264, `-threads 1`). With two threads it is p3 2.59 s against
+veryslow 1.99 s, so threading scales about the same on both sides; the
+gap is per macroblock.
+
+**Where p3's time goes.** `AEG_CMTIME=1` gives these Mcyc for 60
+pictures: inter RD 1790, intra 4x4/8x8 1660, analysis (ME, B
+partitions) 2060, MV refinement 930, chroma/skip/QP-RD 1050. A gprof
+build (`-pg`) is flat; its static symbols are partly misattributed (the
+descent shows up as `cabac_b_ref_one`). Direct `rdtsc` counters around
+the level selection gave:
+
+- The level selection is about 2340 Mcyc, roughly 25 % of the encode.
+  `--trellis 0` is 27 % faster.
+- Of its 6.8 M calls, 0.9 M have levels. Those spend 350 Mcyc on the
+  residual transform and level scaling, 650 Mcyc in `trel_viterbi`
+  (about 6 positions per call on average, 38 % 8x8 blocks) and
+  1160 Mcyc in the descent's sweeps.
+
+**Exact attempts on the Viterbi pass (not kept).** Per-block tables for
+the level bins, a lazy greater-than-one table, a branch-free path for
+positions that round to 0, and a shorter start scan were all
+byte-identical but ran within 1 % of before. The cost is the node loop
+itself and the per-call overhead, not the bin lookups.
+
+**What was kept.** Under `--trellis 2` the decision's candidates now run
+the selection without the descent's sweeps: the Viterbi levels, priced
+exactly against the quantiser's levels, and the cheaper of the two. The
+winner is then coded again with the full selection, through the same
+re-code `--trellis 1` uses (`trel_vonly`, `trel_vo_on`; thread-local, so
+frame and slice threads decide independently). `AEG_TVO=0` restores the
+previous stream exactly.
+
+| vs sweeps in every candidate | 5 clips | validation set | time (5 / 6 clips) |
+|---|---|---|---|
+| preset 3 | +0.03 % | +0.06 % | -4.9 / -6.7 % |
+| preset 4 | -0.06 % | +0.07 % | -5.0 / -7.5 % |
+
+These are global PSNR, one thread (`tools/real/pab.sh`). With per-picture
+PSNR and default threads (`abbd.py`) the result is p3 +0.01 % for -4.8 %
+and p4 -0.07 % for -5.0 %.
+
+A variant that took the Viterbi levels without the exact comparison
+(`AEG_TVO=2`, removed) was no faster, because the block price is needed
+anyway, and it was slightly worse.
+
+**Checks.** `tools/real/exact.sh` is decoder-exact at 15/15 for each of
+`-p 3`, `-p 4`, `-p 3 --frame-threads 2` and `-p 4 -t 3`. Frame threads
+2 and 3 are identical to 1 at p3 and p4. `--slices 4` gives the same
+stream at `-t 1` and `-t 4`. p1 and p2 are byte-identical to before.
