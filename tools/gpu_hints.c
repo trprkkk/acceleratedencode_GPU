@@ -48,6 +48,16 @@ static uint8_t *new_plane(int w, int h, int pad)
     return p;
 }
 
+static void brec(unsigned char *b, int *n, int f, int x, int y, int mvx, int mvy)
+{
+    uint16_t a = (uint16_t)f, bb = (uint16_t)x, c = (uint16_t)y;
+    int16_t d = (int16_t)mvx, e = (int16_t)mvy;
+    unsigned char *p = b + *n;
+    memcpy(p + 0, &a, 2); memcpy(p + 2, &bb, 2); memcpy(p + 4, &c, 2);
+    memcpy(p + 6, &d, 2); memcpy(p + 8, &e, 2);
+    p[10] = 0; p[11] = 1; *n += 12;
+}
+
 static void wline(FILE *f, char *buf, size_t *len, const char *fmt, ...)
 {
     va_list ap;
@@ -71,8 +81,9 @@ int main(int argc, char **argv)
 {
     const char *in = NULL, *out = NULL;
     int w = 0, h = 0, n = 0, backend = AEG_BACKEND_AUTO;
-    int mbw, mbh, lw, lh, y, i;
+    int mbw, mbh, lw, lh, y, i, binary = 0, blen = 0;
     char *obuf = (char *)malloc(1u << 20);
+    unsigned char *bbuf;
     size_t olen = 0;
     FILE *fi, *fo;
     aeg_be_ops be;
@@ -102,6 +113,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (out && strlen(out) > 4 && !strcmp(out + strlen(out) - 4, ".bin"))
+        binary = 1;
     if (!in || !out || w <= 0 || h <= 0 || n <= 0) {
         fprintf(stderr, "missing arguments\n");
         return 2;
@@ -117,6 +130,8 @@ int main(int argc, char **argv)
     lh = mbh * 8;
     stride = w + 2 * HP;
     lostride = lw + 2 * AEG_LA_PAD;
+    bbuf = (unsigned char *)malloc((size_t)mbw * mbh * 12);
+    if (!bbuf) { fprintf(stderr, "oom\n"); return 1; }
 
     if (aeg_be_create(backend, &be) != AEG_OK)
         fprintf(stderr, "backend unavailable, using CPU\n");
@@ -214,15 +229,18 @@ int main(int argc, char **argv)
                         int k = (yy - y0) * mbw + i;
                         int mvx = (job[4 * k + 2] + omv[2 * k]) * 4;
                         int mvy = (job[4 * k + 3] + omv[2 * k + 1]) * 4;
-                        wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 1\n",
-                              f, i, yy, mvx, mvy, osad[k]);
+                        if (binary) brec(bbuf, &blen, f, i, yy, mvx, mvy);
+                        else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 1\n",
+                                   f, i, yy, mvx, mvy, osad[k]);
                     }
             }
         } else {
             for (y = 0; y < mbh; y++)
                 for (i = 0; i < mbw; i++)
-                    wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 1\n", f, i, y);
+                    if (binary) brec(bbuf, &blen, f, i, y, 0, 0);
+                    else wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 1\n", f, i, y);
         }
+        if (binary && blen) { fwrite(bbuf, 1, blen, fo); blen = 0; }
         clock_gettime(CLOCK_MONOTONIC, &ts1);
         t_me += ts1.tv_sec - ts0.tv_sec + 1e-9 * (ts1.tv_nsec - ts0.tv_nsec);
         clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -236,7 +254,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "gpu_hints: read=%.3f lowres=%.3f refine+out=%.3f\n",
                 t_read, t_lo, t_me);
     if (olen) fwrite(obuf, 1, olen, fo);
-    free(obuf);
+    free(obuf); free(bbuf);
     free(src); free(ref); free(lo); free(loref);
     free(pairs); free(lmv); free(lcost); free(job); free(omv); free(osad);
     fclose(fi); fclose(fo);
