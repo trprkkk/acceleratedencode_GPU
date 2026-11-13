@@ -55,7 +55,7 @@ static void brec(unsigned char *b, int *n, int f, int x, int y, int mvx, int mvy
     unsigned char *p = b + *n;
     memcpy(p + 0, &a, 2); memcpy(p + 2, &bb, 2); memcpy(p + 4, &c, 2);
     memcpy(p + 6, &d, 2); memcpy(p + 8, &e, 2);
-    p[10] = 0; p[11] = 1; *n += 12;
+    p[10] = 0; p[11] = 3; *n += 12;
 }
 
 static void wline(FILE *f, char *buf, size_t *len, const char *fmt, ...)
@@ -83,7 +83,9 @@ int main(int argc, char **argv)
     int w = 0, h = 0, n = 0, backend = AEG_BACKEND_AUTO;
     int mbw, mbh, lw, lh, y, i, binary = 0, blen = 0;
     char *obuf = (char *)malloc(1u << 20);
-    unsigned char *bbuf;
+    unsigned char *bbuf = NULL;
+    unsigned char *allbuf = NULL;
+    size_t alloff = 0;
     size_t olen = 0;
     FILE *fi, *fo;
     aeg_be_ops be;
@@ -131,7 +133,8 @@ int main(int argc, char **argv)
     stride = w + 2 * HP;
     lostride = lw + 2 * AEG_LA_PAD;
     bbuf = (unsigned char *)malloc((size_t)mbw * mbh * 12);
-    if (!bbuf) { fprintf(stderr, "oom\n"); return 1; }
+    allbuf = (unsigned char *)malloc((size_t)n * mbw * mbh * 12);
+    if (!bbuf || !allbuf) { fprintf(stderr, "oom\n"); return 1; }
 
     if (aeg_be_create(backend, &be) != AEG_OK)
         fprintf(stderr, "backend unavailable, using CPU\n");
@@ -229,18 +232,18 @@ int main(int argc, char **argv)
                         int k = (yy - y0) * mbw + i;
                         int mvx = (job[4 * k + 2] + omv[2 * k]) * 4;
                         int mvy = (job[4 * k + 3] + omv[2 * k + 1]) * 4;
-                        if (binary) brec(bbuf, &blen, f, i, yy, mvx, mvy);
-                        else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 1\n",
+                        if (binary) brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy);
+                        else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 3\n",
                                    f, i, yy, mvx, mvy, osad[k]);
                     }
             }
         } else {
             for (y = 0; y < mbh; y++)
                 for (i = 0; i < mbw; i++)
-                    if (binary) brec(bbuf, &blen, f, i, y, 0, 0);
-                    else wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 1\n", f, i, y);
+                    if (binary) brec(allbuf, (int *)&alloff, f, i, y, 0, 0);
+                    else wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 3\n", f, i, y);
         }
-        if (binary && blen) { fwrite(bbuf, 1, blen, fo); blen = 0; }
+
         clock_gettime(CLOCK_MONOTONIC, &ts1);
         t_me += ts1.tv_sec - ts0.tv_sec + 1e-9 * (ts1.tv_nsec - ts0.tv_nsec);
         clock_gettime(CLOCK_MONOTONIC, &ts0);
@@ -254,7 +257,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "gpu_hints: read=%.3f lowres=%.3f refine+out=%.3f\n",
                 t_read, t_lo, t_me);
     if (olen) fwrite(obuf, 1, olen, fo);
-    free(obuf); free(bbuf);
+    if (binary && alloff) fwrite(allbuf, 1, alloff, fo);
+    free(obuf); free(bbuf); free(allbuf);
     free(src); free(ref); free(lo); free(loref);
     free(pairs); free(lmv); free(lcost); free(job); free(omv); free(osad);
     fclose(fi); fclose(fo);
