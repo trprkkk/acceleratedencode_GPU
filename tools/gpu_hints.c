@@ -22,7 +22,7 @@
 #include "aeg/aeg.h"
 
 #define HP 32
-#define REFINE 2
+#define REFINE 8
 
 static void fill_pad(uint8_t *p, int stride, int w, int h, int pad)
 {
@@ -48,14 +48,14 @@ static uint8_t *new_plane(int w, int h, int pad)
     return p;
 }
 
-static void brec(unsigned char *b, int *n, int f, int x, int y, int mvx, int mvy)
+static void brec(unsigned char *b, int *n, int f, int x, int y, int mvx, int mvy, int ref)
 {
     uint16_t a = (uint16_t)f, bb = (uint16_t)x, c = (uint16_t)y;
     int16_t d = (int16_t)mvx, e = (int16_t)mvy;
     unsigned char *p = b + *n;
     memcpy(p + 0, &a, 2); memcpy(p + 2, &bb, 2); memcpy(p + 4, &c, 2);
     memcpy(p + 6, &d, 2); memcpy(p + 8, &e, 2);
-    p[10] = 0; p[11] = 3; *n += 12;
+    p[10] = (unsigned char)ref; p[11] = 3; *n += 12;
 }
 
 static void wline(FILE *f, char *buf, size_t *len, const char *fmt, ...)
@@ -133,7 +133,7 @@ int main(int argc, char **argv)
     stride = w + 2 * HP;
     lostride = lw + 2 * AEG_LA_PAD;
     bbuf = (unsigned char *)malloc((size_t)mbw * mbh * 12);
-    allbuf = (unsigned char *)malloc((size_t)n * mbw * mbh * 12);
+    allbuf = (unsigned char *)malloc((size_t)n * mbw * mbh * 24);
     if (!bbuf || !allbuf) { fprintf(stderr, "oom\n"); return 1; }
 
     if (aeg_be_create(backend, &be) != AEG_OK)
@@ -213,8 +213,8 @@ int main(int argc, char **argv)
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
                         int sx = i * 16, sy = (yy - y0) * 16;
-                        int mx = lmv[2 * (yy * mbw + i)] * 2;
-                        int my = lmv[2 * (yy * mbw + i) + 1] * 2;
+                        int mx = lmv[2 * (yy * mbw + i)];
+                        int my = lmv[2 * (yy * mbw + i) + 1];
                         job[4 * nx + 0] = (int16_t)sx;
                         job[4 * nx + 1] = (int16_t)sy;
                         job[4 * nx + 2] = (int16_t)mx;
@@ -232,7 +232,7 @@ int main(int argc, char **argv)
                         int k = (yy - y0) * mbw + i;
                         int mvx = (job[4 * k + 2] + omv[2 * k]) * 4;
                         int mvy = (job[4 * k + 3] + omv[2 * k + 1]) * 4;
-                        if (binary) brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy);
+                        if (binary) { brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 0); brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 1); }
                         else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 3\n",
                                    f, i, yy, mvx, mvy, osad[k]);
                     }
@@ -240,7 +240,7 @@ int main(int argc, char **argv)
         } else {
             for (y = 0; y < mbh; y++)
                 for (i = 0; i < mbw; i++)
-                    if (binary) brec(allbuf, (int *)&alloff, f, i, y, 0, 0);
+                    if (binary) { brec(allbuf, (int *)&alloff, f, i, y, 0, 0, 0); brec(allbuf, (int *)&alloff, f, i, y, 0, 0, 1); }
                     else wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 3\n", f, i, y);
         }
 
