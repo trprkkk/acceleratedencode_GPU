@@ -289,7 +289,7 @@ int main(int argc, char **argv)
                                omv[2 * (bestc * bm + k) + 1]) * 4;
                         pmv_cur[2 * (yy * mbw + i)] = (int16_t)(mvx / 4);
                         pmv_cur[2 * (yy * mbw + i) + 1] = (int16_t)(mvy / 4);
-                        if (binary) { brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 0); brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 1); }
+                        if (binary) { brec(allbuf, (int *)&alloff, f+1, i, yy, mvx, mvy, 0); brec(allbuf, (int *)&alloff, f+1, i, yy, mvx, mvy, 1); }
                         else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 3\n",
                                    f, i, yy, mvx, mvy, best);
                     }
@@ -297,7 +297,7 @@ int main(int argc, char **argv)
         } else {
             for (y = 0; y < mbh; y++)
                 for (i = 0; i < mbw; i++)
-                    if (binary) { brec(allbuf, (int *)&alloff, f, i, y, 0, 0, 0); brec(allbuf, (int *)&alloff, f, i, y, 0, 0, 1); }
+                    if (binary) { brec(allbuf, (int *)&alloff, f+1, i, y, 0, 0, 0); brec(allbuf, (int *)&alloff, f+1, i, y, 0, 0, 1); }
                     else wline(fo, obuf, &olen, "%d %d %d 0 0 0 0 3\n", f, i, y);
         }
 
