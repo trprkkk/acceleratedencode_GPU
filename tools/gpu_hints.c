@@ -213,8 +213,8 @@ int main(int argc, char **argv)
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
                         int sx = i * 16, sy = (yy - y0) * 16;
-                        int mx = lmv[2 * (yy * mbw + i)];
-                        int my = lmv[2 * (yy * mbw + i) + 1];
+                        int mx = lmv[2 * (yy * mbw + i)] * 2;
+                        int my = lmv[2 * (yy * mbw + i) + 1] * 2;
                         job[4 * nx + 0] = (int16_t)sx;
                         job[4 * nx + 1] = (int16_t)sy;
                         job[4 * nx + 2] = (int16_t)mx;
