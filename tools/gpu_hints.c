@@ -58,6 +58,37 @@ static void brec(unsigned char *b, int *n, int f, int x, int y, int mvx, int mvy
     p[10] = (unsigned char)ref; p[11] = 3; *n += 12;
 }
 
+
+static int satd8(const uint8_t *a, int as, const uint8_t *b, int bs)
+{
+    int t[8][8], x, y, k;
+    for (y = 0; y < 8; y++)
+        for (x = 0; x < 8; x++)
+            t[y][x] = (int)a[y*as+x] - (int)b[y*bs+x];
+    for (y = 0; y < 8; y++) {
+        int s0=t[y][0]+t[y][1], d0=t[y][0]-t[y][1];
+        int s1=t[y][2]+t[y][3], d1=t[y][2]-t[y][3];
+        int s2=t[y][4]+t[y][5], d2=t[y][4]-t[y][5];
+        int s3=t[y][6]+t[y][7], d3=t[y][6]-t[y][7];
+        t[y][0]=s0+s1; t[y][1]=s0-s1; t[y][2]=d0+s3; t[y][3]=d0-s3;
+        t[y][4]=s2+d1; t[y][5]=s2-d1; t[y][6]=d2+d3; t[y][7]=d2-d3;
+    }
+    for (k = 0; k < 8; k++) {
+        int s0=t[0][k]+t[1][k], d0=t[0][k]-t[1][k];
+        int s1=t[2][k]+t[3][k], d1=t[2][k]-t[3][k];
+        int s2=t[4][k]+t[5][k], d2=t[4][k]-t[5][k];
+        int s3=t[6][k]+t[7][k], d3=t[6][k]-t[7][k];
+        t[0][k]=s0+s1; t[1][k]=s0-s1; t[2][k]=d0+s3; t[3][k]=d0-s3;
+        t[4][k]=s2+d1; t[5][k]=s2-d1; t[6][k]=d2+d3; t[7][k]=d2-d3;
+    }
+    { int sum=0; for(y=0;y<8;y++) for(x=0;x<8;x++) sum += t[y][x]<0?-t[y][x]:t[y][x]; return sum; }
+}
+static int satd16(const uint8_t *a, int as, const uint8_t *b, int bs)
+{
+    return satd8(a,as,b,bs)+satd8(a+8,as,b+8,bs)+
+           satd8(a+8*as,as,b+8*bs,bs)+satd8(a+8*as+8,as,b+8*bs+8,bs);
+}
+
 static void wline(FILE *f, char *buf, size_t *len, const char *fmt, ...)
 {
     va_list ap;
@@ -95,6 +126,7 @@ int main(int argc, char **argv)
     int16_t *job = NULL;
     int16_t *omv = NULL;
     int32_t *osad = NULL;
+    int16_t *pmv_prev = NULL, *pmv_cur = NULL;
     int stride, lostride;
 
     for (i = 1; i < argc; i++) {
@@ -149,9 +181,11 @@ int main(int argc, char **argv)
     pairs = (int32_t *)malloc(2 * sizeof(int32_t));
     lmv = (int32_t *)malloc((size_t)mbw * mbh * 2 * sizeof(int32_t));
     lcost = (int32_t *)malloc((size_t)mbw * mbh * sizeof(int32_t));
-    job = (int16_t *)malloc((size_t)mbw * mbh * 4 * 4 * sizeof(int16_t));
-    omv = (int16_t *)malloc((size_t)mbw * mbh * 4 * 2 * sizeof(int16_t));
-    osad = (int32_t *)malloc((size_t)mbw * mbh * 4 * sizeof(int32_t));
+    job = (int16_t *)malloc((size_t)mbw * mbh * 6 * 4 * sizeof(int16_t));
+    omv = (int16_t *)malloc((size_t)mbw * mbh * 6 * 2 * sizeof(int16_t));
+    osad = (int32_t *)malloc((size_t)mbw * mbh * 6 * sizeof(int32_t));
+    pmv_prev = (int16_t *)calloc((size_t)mbw * mbh * 2, sizeof(int16_t));
+    pmv_cur = (int16_t *)calloc((size_t)mbw * mbh * 2, sizeof(int16_t));
     if (!pairs || !lmv || !lcost || !job || !omv || !osad) { fprintf(stderr, "oom\n"); return 1; }
 
     double t_read = 0, t_lo = 0, t_me = 0;
@@ -213,14 +247,18 @@ int main(int argc, char **argv)
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
                         int k = yy * mbw + i;
-                        int cand[4][2];
+                        int cand[6][2];
                         cand[0][0] = lmv[2 * k] * 2; cand[0][1] = lmv[2 * k + 1] * 2;
                         cand[1][0] = 0; cand[1][1] = 0;
                         cand[2][0] = i > 0 ? lmv[2 * (k - 1)] * 2 : 0;
                         cand[2][1] = i > 0 ? lmv[2 * (k - 1) + 1] * 2 : 0;
                         cand[3][0] = yy > 0 ? lmv[2 * (k - mbw)] * 2 : 0;
                         cand[3][1] = yy > 0 ? lmv[2 * (k - mbw) + 1] * 2 : 0;
-                        for (c = 0; c < 4; c++) {
+                        cand[4][0] = (cand[2][0] + cand[3][0] + pmv_prev[2 * k]) / 3;
+                        cand[4][1] = (cand[2][1] + cand[3][1] + pmv_prev[2 * k + 1]) / 3;
+                        cand[5][0] = pmv_prev[2 * k];
+                        cand[5][1] = pmv_prev[2 * k + 1];
+                        for (c = 0; c < 6; c++) {
                             job[4 * nx + 0] = (int16_t)(i * 16);
                             job[4 * nx + 1] = (int16_t)((yy - y0) * 16);
                             job[4 * nx + 2] = (int16_t)cand[c][0];
@@ -236,16 +274,24 @@ int main(int argc, char **argv)
                             ~(uint64_t)0, ~(uint64_t)0);
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
-                        int k = (yy - y0) * mbw + i, bestc = 0, best = osad[k];
+                        int k = (yy - y0) * mbw + i, bestc = 0, best = 0x7fffffff;
                         int mvx, mvy;
-                        for (c = 1; c < 4; c++)
-                            if (osad[c * bm + k] < best) {
-                                best = osad[c * bm + k]; bestc = c;
-                            }
+                        for (c = 0; c < 6; c++) {
+                            int mx = job[4 * (c * bm + k) + 2] + omv[2 * (c * bm + k)];
+                            int my = job[4 * (c * bm + k) + 3] + omv[2 * (c * bm + k) + 1];
+                            int sx = i * 16, sy = yy * 16;
+                            int rx = clampi(sx + mx, -HP, w + HP - 16);
+                            int ry = clampi(sy + my, -HP, h + HP - 16);
+                            int cost = satd16(src + (ptrdiff_t)(HP + sy) * stride + HP + sx, stride,
+                                              ref + (ptrdiff_t)(HP + ry) * stride + HP + rx, stride);
+                            if (cost < best) { best = cost; bestc = c; }
+                        }
                         mvx = (job[4 * (bestc * bm + k) + 2] +
                                omv[2 * (bestc * bm + k)]) * 4;
                         mvy = (job[4 * (bestc * bm + k) + 3] +
                                omv[2 * (bestc * bm + k) + 1]) * 4;
+                        pmv_cur[2 * (yy * mbw + i)] = (int16_t)(mvx / 4);
+                        pmv_cur[2 * (yy * mbw + i) + 1] = (int16_t)(mvy / 4);
                         if (binary) { brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 0); brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 1); }
                         else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 3\n",
                                    f, i, yy, mvx, mvy, best);
@@ -262,6 +308,7 @@ int main(int argc, char **argv)
         t_me += ts1.tv_sec - ts0.tv_sec + 1e-9 * (ts1.tv_nsec - ts0.tv_nsec);
         clock_gettime(CLOCK_MONOTONIC, &ts0);
 
+        memcpy(pmv_prev, pmv_cur, (size_t)mbw * mbh * 2 * sizeof(int16_t));
         /* current becomes the reference for the next frame */
         memcpy(ref, src, (size_t)stride * (mbh * 16 + 2 * HP));
         memcpy(loref, lo, (size_t)lostride * (lh + 2 * AEG_LA_PAD));
