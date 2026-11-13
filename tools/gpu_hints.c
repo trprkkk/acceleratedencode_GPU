@@ -149,9 +149,9 @@ int main(int argc, char **argv)
     pairs = (int32_t *)malloc(2 * sizeof(int32_t));
     lmv = (int32_t *)malloc((size_t)mbw * mbh * 2 * sizeof(int32_t));
     lcost = (int32_t *)malloc((size_t)mbw * mbh * sizeof(int32_t));
-    job = (int16_t *)malloc((size_t)mbw * mbh * 4 * sizeof(int16_t));
-    omv = (int16_t *)malloc((size_t)mbw * mbh * 2 * sizeof(int16_t));
-    osad = (int32_t *)malloc((size_t)mbw * mbh * sizeof(int32_t));
+    job = (int16_t *)malloc((size_t)mbw * mbh * 4 * 4 * sizeof(int16_t));
+    omv = (int16_t *)malloc((size_t)mbw * mbh * 4 * 2 * sizeof(int16_t));
+    osad = (int32_t *)malloc((size_t)mbw * mbh * 4 * sizeof(int32_t));
     if (!pairs || !lmv || !lcost || !job || !omv || !osad) { fprintf(stderr, "oom\n"); return 1; }
 
     double t_read = 0, t_lo = 0, t_me = 0;
@@ -204,22 +204,29 @@ int main(int argc, char **argv)
         t_lo += ts1.tv_sec - ts0.tv_sec + 1e-9 * (ts1.tv_nsec - ts0.tv_nsec);
         clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-        /* full-resolution refine in bands: one launch per band */
+        /* four candidates per MB, full-resolution +/-8 refine, pick min SAD */
         if (f > 0 && be.me_batch) {
             int y0;
             for (y0 = 0; y0 < mbh; y0 += 4) {
                 int y1 = y0 + 4 < mbh ? y0 + 4 : mbh;
-                int nx = 0, yy;
+                int bm = (y1 - y0) * mbw, nx = 0, yy, c;
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
-                        int sx = i * 16, sy = (yy - y0) * 16;
-                        int mx = lmv[2 * (yy * mbw + i)] * 2;
-                        int my = lmv[2 * (yy * mbw + i) + 1] * 2;
-                        job[4 * nx + 0] = (int16_t)sx;
-                        job[4 * nx + 1] = (int16_t)sy;
-                        job[4 * nx + 2] = (int16_t)mx;
-                        job[4 * nx + 3] = (int16_t)my;
-                        nx++;
+                        int k = yy * mbw + i;
+                        int cand[4][2];
+                        cand[0][0] = lmv[2 * k] * 2; cand[0][1] = lmv[2 * k + 1] * 2;
+                        cand[1][0] = 0; cand[1][1] = 0;
+                        cand[2][0] = i > 0 ? lmv[2 * (k - 1)] * 2 : 0;
+                        cand[2][1] = i > 0 ? lmv[2 * (k - 1) + 1] * 2 : 0;
+                        cand[3][0] = yy > 0 ? lmv[2 * (k - mbw)] * 2 : 0;
+                        cand[3][1] = yy > 0 ? lmv[2 * (k - mbw) + 1] * 2 : 0;
+                        for (c = 0; c < 4; c++) {
+                            job[4 * nx + 0] = (int16_t)(i * 16);
+                            job[4 * nx + 1] = (int16_t)((yy - y0) * 16);
+                            job[4 * nx + 2] = (int16_t)cand[c][0];
+                            job[4 * nx + 3] = (int16_t)cand[c][1];
+                            nx++;
+                        }
                     }
                 be.me_batch(be.priv,
                             src + (ptrdiff_t)(HP + y0 * 16) * stride + HP, stride,
@@ -229,12 +236,19 @@ int main(int argc, char **argv)
                             ~(uint64_t)0, ~(uint64_t)0);
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
-                        int k = (yy - y0) * mbw + i;
-                        int mvx = (job[4 * k + 2] + omv[2 * k]) * 4;
-                        int mvy = (job[4 * k + 3] + omv[2 * k + 1]) * 4;
+                        int k = (yy - y0) * mbw + i, bestc = 0, best = osad[k];
+                        int mvx, mvy;
+                        for (c = 1; c < 4; c++)
+                            if (osad[c * bm + k] < best) {
+                                best = osad[c * bm + k]; bestc = c;
+                            }
+                        mvx = (job[4 * (bestc * bm + k) + 2] +
+                               omv[2 * (bestc * bm + k)]) * 4;
+                        mvy = (job[4 * (bestc * bm + k) + 3] +
+                               omv[2 * (bestc * bm + k) + 1]) * 4;
                         if (binary) { brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 0); brec(allbuf, (int *)&alloff, f, i, yy, mvx, mvy, 1); }
                         else wline(fo, obuf, &olen, "%d %d %d %d %d %d 0 3\n",
-                                   f, i, yy, mvx, mvy, osad[k]);
+                                   f, i, yy, mvx, mvy, best);
                     }
             }
         } else {
