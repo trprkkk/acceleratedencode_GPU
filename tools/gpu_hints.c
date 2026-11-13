@@ -22,7 +22,7 @@
 #include "aeg/aeg.h"
 
 #define HP 32
-#define REFINE 16
+#define REFINE 8
 
 static void fill_pad(uint8_t *p, int stride, int w, int h, int pad)
 {
@@ -247,16 +247,15 @@ int main(int argc, char **argv)
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
                         int k = yy * mbw + i;
-                        int cand[3][2];
+                        int cand[2][2];
                         int lx = i > 0 ? pmv_prev[2 * (k - 1)] : 0;
                         int ly = i > 0 ? pmv_prev[2 * (k - 1) + 1] : 0;
                         int tx = yy > 0 ? pmv_prev[2 * (k - mbw)] : 0;
                         int ty = yy > 0 ? pmv_prev[2 * (k - mbw) + 1] : 0;
                         cand[0][0] = pmv_prev[2 * k]; cand[0][1] = pmv_prev[2 * k + 1];
-                        cand[1][0] = 0; cand[1][1] = 0;
-                        cand[2][0] = (lx + tx + cand[0][0]) / 3;
-                        cand[2][1] = (ly + ty + cand[0][1]) / 3;
-                        for (c = 0; c < 3; c++) {
+                        cand[1][0] = (lx + tx + cand[0][0]) / 3;
+                        cand[1][1] = (ly + ty + cand[0][1]) / 3;
+                        for (c = 0; c < 2; c++) {
                             job[4 * nx + 0] = (int16_t)(i * 16);
                             job[4 * nx + 1] = (int16_t)((yy - y0) * 16);
                             job[4 * nx + 2] = (int16_t)cand[c][0];
@@ -274,7 +273,7 @@ int main(int argc, char **argv)
                     for (i = 0; i < mbw; i++) {
                         int k = (yy - y0) * mbw + i, bestc = 0, best = 0x7fffffff;
                         int mvx, mvy;
-                        for (c = 0; c < 3; c++) {
+                        for (c = 0; c < 2; c++) {
                             int mx = job[4 * (c * bm + k) + 2] + omv[2 * (c * bm + k)];
                             int my = job[4 * (c * bm + k) + 3] + omv[2 * (c * bm + k) + 1];
                             int sx = i * 16, sy = yy * 16;
