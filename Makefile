@@ -205,6 +205,9 @@ examples: $(BUILD)/encode_example
 # ------------------------------------------------------------------ #
 # Tests                                                              #
 # ------------------------------------------------------------------ #
+$(BUILD)/gpu_hints: tools/gpu_hints.c $(BUILD)/libaeg.a | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/libaeg.a -o $@ $(LDLIBS)
+
 $(BUILD)/genyuv: tests/genyuv.c | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 

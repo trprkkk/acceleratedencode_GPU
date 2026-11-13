@@ -569,3 +569,64 @@ frame mbx mby mvx mvy cost ref i_pixel
 - **M-9J2**: ヒント品質改善（小数探索・上位 2 候補・SAD 再評価）。
 - **M-9J3**: エンドツーエンド測定（GPU ヒント生成＋limit:2 vs base）。
 - CPU dump 方式は M-9J で不採用と確定。
+## M-9J1 GPU ヒント生成ツール（試作）
+
+### 実装
+`tools/gpu_hints.c`（244 行、`make build/gpu_hints`）:
+- YUV420p → luma を 1/2 解像度へ縮小。
+- aeg backend の `lowres_batch_search` で 8x8 ブロック（= full-res 16x16 MB）
+  の整数 ME。1 フレーム 1 呼び出し。
+- full-res luma 上で `me_batch` により ±2 整数リファイン。
+  1080p は帯分割（4 MB 行ずつ）。
+- 出力は x264 dump と同一の 8 列。MV は quarter-pel（×4）、`ref=0`、
+  `i_pixel=1`。
+- `-b cpu` で CPU フォールバック。
+
+### 640p / 240f / threads 4 / CRF27
+
+| clip | hint 生成 | limit:2 | base | E2E (生成+limit) | 判定 |
+|---|---:|---:|---:|---:|---|
+| cockL | 5.5 s | 8.6 s | 13.1 s | 14.1 s | 観測値は +1.0 s 負け |
+| vtestL | 2.2 s | 5.9 s | 9.7 s | 8.1 s | **-1.6 s 勝ち** |
+| megaL | 2.0 s | 4.9 s | 8.2 s | 6.9 s | **-1.3 s 勝ち** |
+| treeL | 1.5 s | 2.5 s | 3.5 s | 4.0 s | +0.5 s 負け |
+
+- 生成時間は `/mnt/q` へのテキスト書き込みを含む。WSL DrvFs の
+  書き込みが約 2 MB/s になり、cockL では 4.6 s がファイル出力に費やされる。
+- `/dev/null` 出力時の計算時間は 640p で **約 1.0 s（4.2 ms/frame）**。
+  目標 2 ms/frame は未達。
+- 1080p は `cuMemcpyHtoDAsync` で SIGSEGV（WSL CUDA、ページャブル
+  2 MB 超コピー）。**1080p は未完成**。
+
+### 品質（640p、GPU ヒント + limit:2）
+
+| clip | PSNR BD-rate | SSIM BD-rate |
+|---|---:|---:|
+| cockL | 0.0% | 0.0% |
+| vtestL | -0.06% | -0.21% |
+| megaL | **+0.76%** | **+1.08%** |
+| treeL | -0.59% | -4.35% |
+| 平均 | +0.03% | -0.87% |
+
+- 出力バイト数は全クリップ・全 CRF で base と**完全に同一**。
+- cockL は PSNR/SSIM も完全一致。vtestL/treeL は同等。
+- **megaL は +0.5% を超えて悪化**。平均では +0.5% 以内だが、クリップ
+  単位のゲートは満たさない。
+
+### 判定
+- **640p の一部クリップでは E2E 勝ち**（vtestL -1.6 s、megaL -1.3 s）。
+- cockL/treeL はファイル出力の遅さで負け。計算のみなら cockL は
+  9.6 s vs 13.1 s で勝ち。
+- **BD-rate +0.5% 以内は megaL が FAIL**。
+- 1080p はクラッシュで未測定。
+- したがって「案C 実証完了」には未達。不足分:
+  - 1080p の pinned staging（2 MB 超コピー）
+  - megaL の品質 +0.76% → 0% へ（候補 2 本 or ±1 リファイン）
+  - 640p 計算 4.2 ms → 2 ms（帯分割の廃止、full-res リファイン省略）
+  - ファイル出力 4.6 s → 0.3 s（バイナリ中間 or ローカル一時ファイル）
+
+### 分割案
+- **M-9J1a**: 1080p pinned staging と帯分割の修正。
+- **M-9J1b**: megaL 品質改善（候補 2 本、full-res ±1、SAD 再評価）。
+- **M-9J1c**: 出力のバイナリ化＋変換ツールで E2E を確定。
+- **M-9J1d**: 640p 2 ms/frame 化（帯分割廃止、リファイン範囲削減）。
