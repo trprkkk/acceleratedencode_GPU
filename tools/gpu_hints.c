@@ -22,7 +22,7 @@
 #include "aeg/aeg.h"
 
 #define HP 32
-#define REFINE 8
+#define REFINE 16
 
 static void fill_pad(uint8_t *p, int stride, int w, int h, int pad)
 {
@@ -181,9 +181,9 @@ int main(int argc, char **argv)
     pairs = (int32_t *)malloc(2 * sizeof(int32_t));
     lmv = (int32_t *)malloc((size_t)mbw * mbh * 2 * sizeof(int32_t));
     lcost = (int32_t *)malloc((size_t)mbw * mbh * sizeof(int32_t));
-    job = (int16_t *)malloc((size_t)mbw * mbh * 6 * 4 * sizeof(int16_t));
-    omv = (int16_t *)malloc((size_t)mbw * mbh * 6 * 2 * sizeof(int16_t));
-    osad = (int32_t *)malloc((size_t)mbw * mbh * 6 * sizeof(int32_t));
+    job = (int16_t *)malloc((size_t)mbw * mbh * 3 * 4 * sizeof(int16_t));
+    omv = (int16_t *)malloc((size_t)mbw * mbh * 3 * 2 * sizeof(int16_t));
+    osad = (int32_t *)malloc((size_t)mbw * mbh * 3 * sizeof(int32_t));
     pmv_prev = (int16_t *)calloc((size_t)mbw * mbh * 2, sizeof(int16_t));
     pmv_cur = (int16_t *)calloc((size_t)mbw * mbh * 2, sizeof(int16_t));
     if (!pairs || !lmv || !lcost || !job || !omv || !osad) { fprintf(stderr, "oom\n"); return 1; }
@@ -247,18 +247,16 @@ int main(int argc, char **argv)
                 for (yy = y0; yy < y1; yy++)
                     for (i = 0; i < mbw; i++) {
                         int k = yy * mbw + i;
-                        int cand[6][2];
-                        cand[0][0] = lmv[2 * k] * 2; cand[0][1] = lmv[2 * k + 1] * 2;
+                        int cand[3][2];
+                        int lx = i > 0 ? pmv_prev[2 * (k - 1)] : 0;
+                        int ly = i > 0 ? pmv_prev[2 * (k - 1) + 1] : 0;
+                        int tx = yy > 0 ? pmv_prev[2 * (k - mbw)] : 0;
+                        int ty = yy > 0 ? pmv_prev[2 * (k - mbw) + 1] : 0;
+                        cand[0][0] = pmv_prev[2 * k]; cand[0][1] = pmv_prev[2 * k + 1];
                         cand[1][0] = 0; cand[1][1] = 0;
-                        cand[2][0] = i > 0 ? lmv[2 * (k - 1)] * 2 : 0;
-                        cand[2][1] = i > 0 ? lmv[2 * (k - 1) + 1] * 2 : 0;
-                        cand[3][0] = yy > 0 ? lmv[2 * (k - mbw)] * 2 : 0;
-                        cand[3][1] = yy > 0 ? lmv[2 * (k - mbw) + 1] * 2 : 0;
-                        cand[4][0] = (cand[2][0] + cand[3][0] + pmv_prev[2 * k]) / 3;
-                        cand[4][1] = (cand[2][1] + cand[3][1] + pmv_prev[2 * k + 1]) / 3;
-                        cand[5][0] = pmv_prev[2 * k];
-                        cand[5][1] = pmv_prev[2 * k + 1];
-                        for (c = 0; c < 6; c++) {
+                        cand[2][0] = (lx + tx + cand[0][0]) / 3;
+                        cand[2][1] = (ly + ty + cand[0][1]) / 3;
+                        for (c = 0; c < 3; c++) {
                             job[4 * nx + 0] = (int16_t)(i * 16);
                             job[4 * nx + 1] = (int16_t)((yy - y0) * 16);
                             job[4 * nx + 2] = (int16_t)cand[c][0];
@@ -276,7 +274,7 @@ int main(int argc, char **argv)
                     for (i = 0; i < mbw; i++) {
                         int k = (yy - y0) * mbw + i, bestc = 0, best = 0x7fffffff;
                         int mvx, mvy;
-                        for (c = 0; c < 6; c++) {
+                        for (c = 0; c < 3; c++) {
                             int mx = job[4 * (c * bm + k) + 2] + omv[2 * (c * bm + k)];
                             int my = job[4 * (c * bm + k) + 3] + omv[2 * (c * bm + k) + 1];
                             int sx = i * 16, sy = yy * 16;
