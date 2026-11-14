@@ -8131,3 +8131,64 @@ real reduction changes the output and needs the BD gate:
 - drop the pre-search's "row below" candidate, or compute it with a
   shorter vertical reach (−2 rows);
 - or a vertical MV limit.
+
+## Threading: references published two rows sooner (byte-identical)
+
+The row lag above has two parts: how far below row r the reader reaches
+(r + 5 rows at p3), and how far the reference has to be coded before it
+publishes a row. Before this change, a reference that had just coded row
+m published m − 2 rows:
+
+- row m − 1 was deblocked only once row m was decided, because row m's
+  intra prediction reads row m − 1 unfiltered;
+- the half-pel rows of row b were made only once row b + 1 was wholly
+  final, although the 6-tap filter reads just three lines into it.
+
+Both are now done sooner for frame pictures without MBAFF. Field
+pictures and MBAFF keep the old schedule.
+
+**Early deblocking (`rowpost_early_on`).** Row k is deblocked as soon as
+it is decided. This works because:
+
+- Row k + 1's intra prediction reads only row k's bottom line (luma line
+  15, chroma line 7).
+- Only row k's vertical edges change that line. Each line is filtered on
+  its own, in the same order along it.
+- The horizontal edges inside the row read at most three lines either
+  side of the edge. The strong filter reads four, but runs only on
+  macroblock edges.
+
+So the row is filtered whole. Its filtered bottom line is set aside and
+the unfiltered one put back for row k + 1. The filtered line returns just
+before row k + 1 is filtered, because row k + 1's top edge reads and
+changes row k's lines 13-15. The set-aside lines live in the plane's
+bottom border (lines h + 1 and h + 2), which nothing reads before the last
+band pads it, and they belong to each picture's own buffer.
+
+**Half-pel rows one row sooner (`rowpost_bands_x`).** Once row k is
+filtered, its lines 0-12 are final. Their left and right borders are
+filled at once, and the half-pel rows of row k − 1 follow.
+
+**Result.** After coding row m the reference publishes m rows instead of
+m − 2. `AEG_RPOLD=1` restores the old schedule, for timing.
+
+Checks:
+
+- Byte-identical to `649fd9a` serial for: p0-p4, `--no-deblock`,
+  `--deblock 3:3`, `--field`, `--mbaff`, `--paff-mbaff`, CAVLC P-only,
+  10-bit, and 618x334 (cropped). Frame-thread counts tested: default, 1,
+  6 and 8.
+- TSan with 12 workers (p1, p3, p2 `--paff-mbaff`): 0 warnings, and the
+  streams are identical.
+
+Replay of serial traces (`tools/ftsim.py`, 2 x CPUs workers, p3, CRF 24):
+
+| clip | cores | before | now |
+|---|---|---|---|
+| cockL, 120 pictures | 4 | 2.88x | 3.35x |
+| cockL | 8 | 3.07x | 3.86x |
+| hdL, 60 pictures | 4 | 3.77x | 3.77x |
+| hdL | 8 | 4.68x | 5.58x |
+
+Measured on these 2 CPUs (cockL, p3, 120 pictures, default threads, best
+of 3): 7.71 s with `AEG_RPOLD=1`, 6.96 s now (−10 %).

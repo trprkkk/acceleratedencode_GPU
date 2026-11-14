@@ -242,6 +242,7 @@ struct aeg_encoder {
     /* row-by-row post-processing of the reference picture being coded */
     int rp_on;               /* deblocking etc. follow the decision rows  */
     int rp_dbk;              /* rows deblocked                            */
+    int rp_fpend;            /* row whose filtered bottom line waits (-1) */
     int rp_band;             /* rows padded (and lowres-built)            */
     int rp_hpel;             /* rows with their half-pel planes           */
     int rp_qp;               /* the bitstream pass's QP, mirrored         */
@@ -11255,7 +11256,9 @@ static int ref_wait(struct aeg_encoder *e, int s, int rows)
  *
  *  - macroblock row k is deblocked once row k+1 is decided, because the
  *    intra prediction of row k+1 reads row k unfiltered;  in raster order
- *    that is exactly aeg_deblock_frame();
+ *    that is exactly aeg_deblock_frame().  (Frame pictures without MBAFF
+ *    deblock row k as soon as it is decided instead and keep only its
+ *    unfiltered bottom line for row k+1: rowpost_early_on.)
  *  - deblocking row k+1 still changes the bottom three lines of row k, so
  *    row k is final (and padded, and filtered down) after that;
  *  - the half-pel rows of row k read three lines into row k+1, so they
@@ -11425,8 +11428,10 @@ static void rowpost_fshadow(struct aeg_encoder *e)
     }
 }
 
-/* Everything that rows < `final` being final allows. */
-static void rowpost_bands(struct aeg_encoder *e, int final)
+/* Everything that rows < `final` being final allows; `part`: row `final`'s
+ * lines 0..12 are final too (rowpost_early), so the half-pel rows of row
+ * final - 1, which read its first three lines, can follow at once. */
+static void rowpost_bands_x(struct aeg_encoder *e, int final, int part)
 {
     int pub;
     aeg_lowres *lo = &e->slot_low[e->role_cur];
@@ -11446,7 +11451,20 @@ static void rowpost_bands(struct aeg_encoder *e, int final)
         }
         e->rp_band++;
     }
-    while (e->rp_hpel + 1 < e->rp_band ||
+    if (part && e->rp_band == final && final < e->mb_h && e->rp_hpel < final) {
+        /* the left and right borders of those three lines (the 6-tap
+         * filter's horizontal taps reach into them) */
+        pixel *p = e->recp[0];
+        const int st = e->stride[0];
+        int y;
+        for (y = 16 * final; y < 16 * final + 3; y++) {
+            aeg_pixel_fill(p + y * st - AEG_PAD, p[y * st], AEG_PAD);
+            aeg_pixel_fill(p + y * st + e->w, p[y * st + e->w - 1], AEG_PAD);
+        }
+    } else {
+        part = 0;
+    }
+    while (e->rp_hpel + 1 < e->rp_band || (part && e->rp_hpel < e->rp_band) ||
            (e->rp_band == e->mb_h && e->rp_hpel < e->mb_h)) {
         rowpost_hpel(e, e->rp_hpel);
         e->rp_hpel++;
@@ -11469,6 +11487,11 @@ static void rowpost_bands(struct aeg_encoder *e, int final)
     }
     if (e->slot_rows[e->role_cur] != pub)
         slot_publish(e, e->role_cur, pub);
+}
+
+static void rowpost_bands(struct aeg_encoder *e, int final)
+{
+    rowpost_bands_x(e, final, 0);
 }
 
 static void rowpost_deblock_row_ph(struct aeg_encoder *e, const aeg_mb *mbs, int y);
@@ -11910,6 +11933,47 @@ static void pz_finish(struct aeg_encoder *e)
     e->pz_on = 0;
 }
 
+/* Deblocking a row early (frame pictures without MBAFF).  Row k is
+ * deblocked as soon as it is decided, not once row k+1 is: the intra
+ * prediction of row k+1 reads only the bottom line of row k (luma line 15,
+ * chroma line 7), and only the vertical edges of row k change that line --
+ * each line on its own, in the same order along it -- while the horizontal
+ * edges inside row k read three lines either side of the edge at most (the
+ * strong filter, which reads four, runs on macroblock edges only).  So the
+ * row is filtered whole, its filtered bottom line is set aside and the
+ * unfiltered one put back; before row k+1 is filtered (its top edge reads and
+ * changes row k's lines 13-15) the filtered line returns.  Every sample is
+ * the whole-picture filter's.  Rows < k are then final, and row k's lines
+ * 0-12: the reference is published one row sooner, and one more because the
+ * half-pel rows of row k-1 need only those first lines of row k
+ * (rowpost_bands_x).  The lines set aside live in the plane's bottom border
+ * (lines h+1 and h+2, chroma ch+1 and ch+2), which nothing reads before the
+ * last band pads it. */
+static int rowpost_early_on(const struct aeg_encoder *e)
+{
+    static _Atomic int off = -1;
+    if (off < 0)
+        off = getenv("AEG_RPOLD") != NULL;
+    return !off && !e->fld && !e->mbaff && !e->rp_fon;
+}
+
+/* Row y's bottom line of each plane to (save) or from its keeping line
+ * (slot 0 unfiltered, 1 filtered). */
+static void rp_bline(struct aeg_encoder *e, int y, int slot, int save)
+{
+    int i;
+    for (i = 0; i < 3; i++) {
+        pixel *p = e->recp[i];
+        const int st = e->stride[i], w = i ? e->cw : e->w, h = i ? e->ch : e->h;
+        pixel *a = p + (ptrdiff_t)(i ? 8 * y + 7 : 16 * y + 15) * st;
+        pixel *b = p + (ptrdiff_t)(h + 1 + slot) * st;
+        if (save)
+            memcpy(b, a, (size_t)w * sizeof(pixel));
+        else
+            memcpy(a, b, (size_t)w * sizeof(pixel));
+    }
+}
+
 /* After the decision pass of row mby. */
 static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
 {
@@ -11919,7 +11983,26 @@ static void rowpost_row(struct aeg_encoder *e, int mby, int slice)
         return;
     t0 = aeg_now_ns();
     rowpost_finalize(e, mby, slice);
-    if (mby >= 1) {
+    if (rowpost_early_on(e)) {
+        /* row mby deblocked now, its bottom line kept unfiltered for the
+         * intra prediction of row mby + 1 (rowpost_early) */
+        if (e->rp_fpend >= 0)
+            rp_bline(e, e->rp_fpend, 1, 0);         /* filtered, back */
+        e->rp_fpend = -1;
+        if (e->p.deblock) {
+            if (mby < e->mb_h - 1)
+                rp_bline(e, mby, 0, 1);             /* unfiltered, kept */
+            rowpost_deblock_row(e, e->rp_mbs, mby);
+            if (mby < e->mb_h - 1) {
+                rp_bline(e, mby, 1, 1);             /* filtered, kept */
+                rp_bline(e, mby, 0, 0);             /* unfiltered, back */
+                e->rp_fpend = mby;
+            }
+        }
+        e->rp_dbk = mby + 1;
+        if (mby < e->mb_h - 1)
+            rowpost_bands_x(e, mby, 1);
+    } else if (mby >= 1) {
         if (e->p.deblock)
             rowpost_deblock_row(e, e->rp_mbs, mby - 1);
         e->rp_dbk = mby;
@@ -14124,6 +14207,7 @@ frecode:
         e->rp_fon = 0;
         e->rp_lfon = is_ref && e->slot_lowf[e->role_cur][e->fld_par].mem != NULL;
         e->rp_dbk = e->rp_band = e->rp_hpel = 0;
+        e->rp_fpend = -1;
         e->rp_qp = e->cur_qp;
         e->rp_mbs = e->slot_mbs[e->role_cur] ?
                     e->slot_mbs[e->role_cur] + e->fld_par * e->mb_count : NULL;
@@ -14513,6 +14597,7 @@ recode:
     e->rp_on = e->cur_is_ref && e->n_slices == 1 && e->slot_mbs[e->role_cur] &&
                slice_thread_count(e) == 1 && !getenv("AEG_NORP");
     e->rp_dbk = e->rp_band = e->rp_hpel = 0;
+    e->rp_fpend = -1;
     e->rp_fon = e->mbaff && e->cur_is_ref && e->slot_fmem[e->role_cur];
     e->rp_fsh = e->rp_fhp = 0;
     e->rp_qp = e->cur_qp;
@@ -14570,9 +14655,13 @@ recode:
                     aeg_deblock_pair_row(&e->pic, e->rp_mbs, e->mb_w, y >> 1,
                                          e->p.deblock_alpha,
                                          e->p.deblock_beta);
-            else if (e->p.deblock)
+            else if (e->p.deblock) {
+                if (e->rp_fpend >= 0)
+                    rp_bline(e, e->rp_fpend, 1, 0);
+                e->rp_fpend = -1;
                 for (y = e->rp_dbk; y < e->mb_h; y++)
                     rowpost_deblock_row(e, e->rp_mbs, y);
+            }
         } else if (e->p.deblock) {
             aeg_deblock_frame(&e->pic, e->mbs, e->mb_w, e->p.deblock_alpha,
                               e->p.deblock_beta, 1);

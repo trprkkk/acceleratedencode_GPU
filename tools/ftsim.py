@@ -12,7 +12,7 @@ threads' rules:
 
   * the main thread does each picture's prologue (the gap between two
     bodies in the trace, without the lookahead's searches) and then hands
-    the picture to a free worker (auto: one more than the cores, at most
+    the picture to a free worker (auto: twice the cores, at most
     FT_MAXW), no more than FT_Q - 1 pictures past the oldest one still
     coding (the packet queue);
   * a picture's block rows run in order; before a row it waits until each
@@ -97,7 +97,7 @@ def parse(path):
 
 
 FT_Q = 16                       # the packet queue (encoder.c)
-FT_MAXW = 8                     # the most workers (encoder.c)
+FT_MAXW = 16                    # the most workers (encoder.c)
 
 
 def simulate(pics, main, la_total, cores, workers):
@@ -242,7 +242,7 @@ def main_():
           ('cores', 'workers', 'wall s', 'speedup', 'row waits', 'main busy',
            'util'))
     for c in [int(x) for x in a.cores.split(',')]:
-        w = a.workers or min(c + 1, FT_MAXW)
+        w = a.workers or min(2 * c, FT_MAXW)
         r = simulate(pics, main, la, c, w)
         print('%5d %7d %9.2f %7.2fx %9.1f%% %9.1f%% %5.0f%%' %
               (c, w, r['wall'] / hz, serial / r['wall'], 100 * r['wait_share'],
