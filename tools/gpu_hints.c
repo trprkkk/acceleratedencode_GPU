@@ -173,8 +173,16 @@ int main(int argc, char **argv)
     fprintf(stderr, "gpu_hints: backend=%s %s\n",
             aeg_backend_name(be.backend), be.desc);
 
-    src = new_plane(w, mbh * 16, HP);
-    ref = new_plane(w, mbh * 16, HP);
+    {
+        static uint8_t big_src[2100 * 1200], big_ref[2100 * 1200];
+        if (w >= 1900) {
+            src = big_src; ref = big_ref;
+            memset(src, 0, sizeof(big_src)); memset(ref, 0, sizeof(big_ref));
+        } else {
+            src = new_plane(w, mbh * 16, HP);
+            ref = new_plane(w, mbh * 16, HP);
+        }
+    }
     lo = new_plane(lw, lh, AEG_LA_PAD);
     loref = new_plane(lw, lh, AEG_LA_PAD);
     if (!src || !ref || !lo || !loref) { fprintf(stderr, "oom\n"); return 1; }
