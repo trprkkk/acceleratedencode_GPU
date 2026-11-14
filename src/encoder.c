@@ -4071,10 +4071,48 @@ static void pred16_ref(struct aeg_encoder *e, int mbx, int mby, int ref,
  * encoder has to apply it before it may code one as a skip. */
 /* A vector inside the bounds of the motion search (+-range samples), which
  * the reference borders are sized for. */
+/* The downward bound of a frame picture's vectors, whole samples: below
+ * the search range, so that what a block row reads of a reference ends on a
+ * row boundary (ref_rows_needed: a vector at most rdn down reads 16 r + 18 +
+ * rdn lines at most, the 6-tap's three below a quarter-sample position one
+ * line down included; one line of margin) -- 44 instead of 48 at the
+ * default range, and frame threads wait for one row less (rows < r + 4).
+ * Field pictures and MBAFF keep the search range.  AEG_MEDN=0 turns it off,
+ * AEG_MEDN=n sets it (debug). */
+static int me_rdn(const struct aeg_encoder *e)
+{
+    static _Atomic int env = -2;
+    int range = e->p.search_range ? e->p.search_range : 16, rdn;
+    if (env == -2) {
+        const char *ev = getenv("AEG_MEDN");
+        env = ev ? atoi(ev) : -1;
+    }
+    if (e->fld || e->mbaff || env == 0)
+        return range;
+    if (env > 0)
+        return env < range ? env : range;
+    rdn = range - ((range + 20) & 15);
+    return rdn < 8 ? range : rdn;
+}
+
+/* The bound for the motion search (mc.c, AEG_ME_RANGE). */
+static int me_range(const struct aeg_encoder *e)
+{
+    int range = e->p.search_range ? e->p.search_range : 16, rdn = me_rdn(e);
+    return rdn == range ? range : AEG_ME_RANGE(range, rdn);
+}
+
+/* A vertical vector component (quarter samples) within the downward bound. */
+static int mv_dn_ok(const struct aeg_encoder *e, int mvy)
+{
+    const int range = e->p.search_range ? e->p.search_range : 16, rdn = me_rdn(e);
+    return rdn == range || mvy <= 4 * rdn;
+}
+
 static int mv_me_ok(const struct aeg_encoder *e, int mvx, int mvy)
 {
     int r = 4 * (e->p.search_range ? e->p.search_range : 16);
-    return mvx >= -r && mvx <= r && mvy >= -r && mvy <= r;
+    return mvx >= -r && mvx <= r && mvy >= -r && mvy <= r && mv_dn_ok(e, mvy);
 }
 
 static void pskip_mv(const struct aeg_encoder *e, int mbx, int mby,
@@ -4870,8 +4908,7 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
                  e->stride[0],
                  e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                      mbx * 16 + geo[0],
-                 e->stride[0], geo[2], geo[3],
-                 e->p.search_range ? e->p.search_range : 16,
+                 e->stride[0], geo[2], geo[3], me_range(e),
                  refine ? SUBME_F(e, geo[2] == 16 && geo[3] == 16 ? 8 : 2) : 0,
                  pmvx, pmvy, sp,
                  (const int (*)[2])whole, nwhole, e->me_lambda, mc,
@@ -4886,7 +4923,7 @@ static void me_partition_ref(struct aeg_encoder *e, int mbx, int mby, int type,
     if (!refine && e->p.subme > 0) {
         int fx = e->mb_frac[0], fy = e->mb_frac[1];
         int qx = (*mvx & ~3) + fx, qy = (*mvy & ~3) + fy;
-        if (fx || fy) {
+        if ((fx || fy) && mv_dn_ok(e, qy)) {
             int c_int = part_satd_ref(e, mbx, mby, geo, *mvx, *mvy, ref);
             int c_frac = part_satd_ref(e, mbx, mby, geo, qx, qy, ref);
             e->me_last_satd = c_int;
@@ -5081,7 +5118,7 @@ static void b_part_search(struct aeg_encoder *e, int mbx, int mby, int type,
                           mbcand *cd)
 {
     int geo[4], b0, l, x, y, lists, best;
-    int range = e->p.search_range ? e->p.search_range : 16;
+    int range = me_range(e);
     int pmv[2][2], mv[2][2], satd[3], cost[3], bits[2];
 
     part_geom(type, p, geo, &b0);
@@ -5231,7 +5268,7 @@ static void b_candidate_8x8(struct aeg_encoder *e, int mbx, int mby,
     uint8_t avail[2][16];
     int direct[16][2], direct1[16][2], dlists = 3, dreach;
     int g, l, slot = e->mb_ncand;
-    int range = e->p.search_range ? e->p.search_range : 16;
+    int range = me_range(e);
     int b8_sub = ENV_INT("AEG_B8SUB", 0);
     mbcand *cd;
 
@@ -6156,6 +6193,7 @@ static int bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
         {-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}
     };
     const int range4 = (e->p.search_range ? e->p.search_range : 16) * 4;
+    const int rdn4 = 4 * me_rdn(e);
     const int lam = e->me_lambda;
     const pixel *src = e->srcp[0] + (mby * 16 + geo[1]) * e->stride[0] +
                          mbx * 16 + geo[0];
@@ -6178,7 +6216,7 @@ static int bidir_refine_geo(struct aeg_encoder *e, int mbx, int mby,
             int k, bx = mv[l][0], by = mv[l][1];
             for (k = 0; k < 8; k++) {
                 int tx = bx + offs[k][0], ty = by + offs[k][1], c, tb;
-                if (tx < -range4 || tx > range4 || ty < -range4 || ty > range4)
+                if (tx < -range4 || tx > range4 || ty < -range4 || ty > rdn4)
                     continue;
                 b_part_pred(e, mbx, mby, geo, tx, ty, l, tmp);
                 tb = aeg_mvd_bits(tx - pmv[l][0], ty - pmv[l][1]);
@@ -6276,7 +6314,7 @@ static int analyse_mb_b(struct aeg_encoder *e, int mbx, int mby)
 {
     const pixel *src = e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16;
     int pmv[2][2], mv[2][2], mvbi[2][2], sad[2], list, b, bicost;
-    int range = e->p.search_range ? e->p.search_range : 16;
+    int range = me_range(e);
 
     b_mv_predict(e, mbx, mby, 0, &pmv[0][0], &pmv[0][1]);
     b_mv_predict(e, mbx, mby, 1, &pmv[1][0], &pmv[1][1]);
@@ -6549,8 +6587,7 @@ static void analyse_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             aeg_me_block_t(e->refpl[0][0] + mby * 16 * e->stride[0] + mbx * 16,
                          e->stride[0],
                          e->srcp[0] + mby * 16 * e->stride[0] + mbx * 16,
-                         e->stride[0], 16, 16,
-                         e->p.search_range ? e->p.search_range : 16,
+                         e->stride[0], 16, 16, me_range(e),
                          SUBME_F(e, 8), e->mb_pmv[0], e->mb_pmv[1], seed,
                          (const int (*)[2])nb, nnb, e->me_lambda, &e->mcr[0],
                          &mvx, &mvy, &sad, &e->me_hpt);
@@ -7970,6 +8007,8 @@ static void refine_cand(struct aeg_encoder *e, int mbx, int mby, int slot,
                 continue;
             for (j = 0; j < 4; j++) {
                 int64_t cost;
+                if (!mv_dn_ok(e, (l ? base.mv1[b0][1] : base.mv[b0][1]) + dy[j]))
+                    continue;
                 e->mb_cand[slot] = save;
                 for (y = y0; y < y1; y++)
                     for (x = x0; x < x1; x++) {
@@ -8760,6 +8799,8 @@ static void code_mb_ph(struct aeg_encoder *e, int mbx, int mby, mbenc *c)
             for (j = 0; j < nn; j++) {
                 int k = K > 0 ? ord[j] : cheap ? cross[j] : j;
                 int64_t cost;
+                if (!mv_dn_ok(e, (K > 0 ? bmv[1] : best.mv[b0][1]) + dy[k]))
+                    continue;
                 e->mb_cand[0] = save;
                 e->mb_cand[0].type = best.type;
                 e->mb_cand[0].nparts = best.nparts;
@@ -11517,7 +11558,9 @@ static void rowpost_deblock_row_ph(struct aeg_encoder *e, const aeg_mb *mbs, int
  * the motion search reaches search_range below the block (plus the 6-tap
  * and quarter-sample taps, with margin), the lowres pre-search of the row
  * below (lr_seed_rows) 16 lowres rows plus its half-sample tap below that
- * block row.  mb_h means all of it, borders included. */
+ * block row.  A frame picture without MBAFF counts exactly instead, with
+ * its vectors' lower bound (me_rdn): rows < r + 4 at the default range.  mb_h
+ * means all of it, borders included. */
 static int ref_rows_needed(const struct aeg_encoder *e, int r)
 {
     static _Atomic int less = -1;
@@ -11552,8 +11595,17 @@ static int ref_rows_needed(const struct aeg_encoder *e, int r)
         n = (2 * fl + 1 - less) / 16 + 1;
         return n > e->fsv.mb_h ? e->fsv.mb_h : n;
     }
-    if (e->lr_valid && 16 * r + 16 + 63 > line)
+    if (!e->mbaff && me_rdn(e) < range) {
+        /* exactly (me_rdn): the vectors' reach, and the pre-search, whose
+         * block row r + 1 reads lowres rows down to 8 (r + 1) + 23 (LA_RANGE
+         * and the half-sample tap: lookahead.c), built from frame rows
+         * 16 r + 62 and 63 */
+        line = 16 * r + 19 + me_rdn(e);
+        if (e->lr_valid && 16 * r + 63 > line)
+            line = 16 * r + 63;
+    } else if (e->lr_valid && 16 * r + 16 + 63 > line) {
         line = 16 * r + 16 + 63;
+    }
     line -= less;
     n = line / 16 + 1;
     return n > e->mb_h ? e->mb_h : n;

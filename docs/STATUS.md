@@ -8192,3 +8192,86 @@ Replay of serial traces (`tools/ftsim.py`, 2 x CPUs workers, p3, CRF 24):
 
 Measured on these 2 CPUs (cockL, p3, 120 pictures, default threads, best
 of 3): 7.71 s with `AEG_RPOLD=1`, 6.96 s now (−10 %).
+
+## Threading: a downward vector bound on a row boundary (presets 1-4)
+
+**Why.** With references published sooner (above), the reader's reach
+is what is left of the lag. At the default `--range 48` a block row r of a
+frame picture waited for rows < r + 5 of each reference:
+
+- **Motion search:** a vector 48 samples down, plus the 6-tap's three
+  lines below a quarter-sample position, reaches line 16 r + 66. The old
+  bound counted 8 lines of margin on top.
+- **Lowres pre-search of the row below:** the old bound was 16 r + 79.
+  The real reach is lowres row 8 (r + 1) + 23 (`LA_RANGE` plus the
+  half-sample tap, `block_search`), built from frame rows 16 r + 62-63.
+
+Without a limit, the search alone needs r + 5 rows, so a stream
+identical to the old one cannot do better than r + 5.
+
+**Change (`me_rdn`).** A frame picture's vectors are bounded downwards
+at the last value whose reach ends on a row boundary:
+
+- `rdn = range − ((range + 20) & 15)`, which is 44 at range 48.
+- The reach of a vector at most `rdn` down is 16 r + 18 + `rdn` lines;
+  with one line of margin, 16 r + 63, so rows < r + 4.
+- `ref_rows_needed` now counts exactly: `16 r + 19 + rdn`, and 16 r + 63
+  for the pre-search.
+
+Where the bound applies:
+
+- **Motion search (`mc.c`):** every clamp takes the downward bound from
+  the packed range (`AEG_ME_RANGE`, `AEG_ME_RX`, `AEG_ME_RDN`). Upward
+  and sideways bounds are unchanged, because upward rows are published
+  already.
+- **Encoder:** `mv_me_ok` (skip and direct vectors), the B refinement,
+  the partitions' sub-pixel alignment, `--refine-mv` and `--refine-cand`
+  keep to the bound.
+- **Not changed:** field pictures, MBAFF and the device seed search (its
+  vectors are only candidates) keep the full range and their old bounds,
+  so their streams are unchanged. `AEG_MEDN=0` turns the bound off and
+  gives the old streams (debug).
+
+**Checks.**
+
+- `AEG_MEDN=0` and field / MBAFF / mode-4 streams are byte-identical to
+  `e3d159f`.
+- `AEG_POISON=1` (rows past the new bound filled with garbage) is
+  identical to the normal stream on 13 cases: p1-p4, CRF 16/24/34, cockL,
+  cockL2, vtestL, megaL, treeL, hdL, 10-bit and `--bframes 16`.
+  `AEG_RRLESS=16` (one row less) is not identical, so the poison test
+  does detect reads past the bound.
+- Frame threads with 2, 5 and 12 workers are identical to serial (p1, p3,
+  p4).
+- TSan with 12 workers (p3, p4): 0 warnings.
+
+**BD-rate of the bound** (PSNR; one thread):
+
+| set | p3 | p4 |
+|---|---|---|
+| main | 0.00 % | 0.00 % |
+| validation | 0.00 % | +0.01 % |
+
+The largest single clip is ±0.06 % (cock2 and mega). For reference, a
+symmetric `--range 44` costs +0.03 % / −0.02 % at p3 (cock +0.19 %).
+
+**Replay** (`tools/ftsim.py`, 2 x CPUs workers, p3; columns are the
+schedule after the early-deblocking change and after this one):
+
+| clip | cores | before | now |
+|---|---|---|---|
+| cockL, 120 pictures | 4 | 3.35x | 3.47x |
+| cockL | 8 | 3.86x | 4.45x |
+| hdL, 60 pictures | 4 | 3.77x | 3.84x |
+| hdL | 8 | 5.58x | 6.42x |
+
+On these 2 CPUs the wall time is unchanged (6.23 s vs 6.27 s, cockL p3
+120 pictures): two cores are not limited by the lag.
+
+**The two latest threading steps together**, from the schedule of
+`649fd9a` (2 x CPUs workers) to now (replay, p3):
+
+| clip | 4 cores | 8 cores |
+|---|---|---|
+| cockL | 2.88x → 3.47x | 3.07x → 4.45x |
+| hdL | 3.77x → 3.84x | 4.68x → 6.42x |

@@ -618,7 +618,13 @@ void aeg_mc_luma_p(pixel *dst, int dstride, const aeg_mc_ctx *mc,
 void aeg_mc_chroma(pixel *dst, int dstride, const pixel *src, int sstride,
                    int w, int h, int fx, int fy);
 /* Motion estimation (mc.c).  `ref` points at the block origin for MV(0,0);
- * the result is a quarter-pel motion vector. */
+ * the result is a quarter-pel motion vector.  `range` bounds it to
+ * +-AEG_ME_RX(range) whole samples around zero, except downwards, where
+ * AEG_ME_RDN(range) is the bound (a frame picture's lower one, so that its
+ * frame-thread wait ends on a row boundary: ref_rows_needed). */
+#define AEG_ME_RANGE(r, rdn) ((r) | ((rdn) << 8))
+#define AEG_ME_RX(p) ((p) & 0xff)
+#define AEG_ME_RDN(p) (((p) >> 8) ? ((p) >> 8) : ((p) & 0xff))
 int  aeg_me_block(const pixel *ref, int rstride, const pixel *cur,
                   int cstride, int bw, int bh, int range, int subme,
                   int pred_x, int pred_y, const int seed[2],

@@ -680,6 +680,7 @@ static int hex_search(const pixel *ref, int rstride, const pixel *cur,
     int cx = *mvx, cy = *mvy;
     int best = cost;
     int bd = best - me_mv_cost(rt, cx * 4, cy * 4);
+    const int rx = AEG_ME_RX(range), rdn = AEG_ME_RDN(range);
     int step, i, improved = 1;
 
     /* The positions the previous round measured (and its centre): one of
@@ -701,7 +702,7 @@ static int hex_search(const pixel *ref, int rstride, const pixel *cur,
             improved = 0;
             for (i = 1; i < n; i++) {
                 int nx = cx + dx[i], ny = cy + dy[i];
-                if (nx < -range || nx > range || ny < -range || ny > range)
+                if (nx < -rx || nx > rx || ny < -rx || ny > rdn)
                     continue;
                 for (k = 0; k < nvis; k++)
                     if (vis[k][0] == nx && vis[k][1] == ny)
@@ -797,6 +798,7 @@ static void umh_search(const pixel *ref, int rstride, const pixel *cur,
         { 2, 3}, { 0, 4}, {-2, 3}, { 2, -3}, { 0, -4}, {-2, -3}
     };
     int cx = *mvx, cy = *mvy, best = *best_cost, bx = cx, by = cy, i, j;
+    const int rx = AEG_ME_RX(range), rdn = AEG_ME_RDN(range);
     /* Each stage's positions depend only on where the stage starts, so a
      * stage is listed first, its SADs measured four at a time, and then
      * compared in the listed order -- the same winner as one at a time. */
@@ -805,7 +807,7 @@ static void umh_search(const pixel *ref, int rstride, const pixel *cur,
 
 #define UMH_TRY(X, Y) do {                                                  \
         int x_ = (X), y_ = (Y);                                              \
-        if (x_ >= -range && x_ <= range && y_ >= -range && y_ <= range &&    \
+        if (x_ >= -rx && x_ <= rx && y_ >= -rx && y_ <= rdn &&              \
             np < UMH_MAX) {                                                  \
             pts[np][0] = x_;                                                 \
             pts[np][1] = y_;                                                 \
@@ -904,6 +906,7 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
     int best, bd, bx = *mvx, by = *mvy;
     int i, pass;
     int cx = *mvx, cy = *mvy;
+    const int rx = AEG_ME_RX(range), rdn = AEG_ME_RDN(range);
 
     /* The cost of the position the walk starts from -- the centre candidate of
      * every iteration -- is the block at the integer position, which needs no
@@ -933,7 +936,8 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
         ((rt->px | rt->py) & 3) &&
         abs(rt->px - cx) <= 8 && abs(rt->py - cy) <= 8) {
         int nx = rt->px, ny = rt->py, ix = nx >> 2, iy = ny >> 2;
-        if (ix >= -range && ix <= range && iy >= -range && iy <= range) {
+        if (ix >= -rx && ix <= rx && iy >= -rx && iy <= rdn &&
+            (!(range >> 8) || ny <= rdn * 4)) {
             int d, cost;
             if (mc && mc->ready)
                 aeg_mc_luma_p(buf, bw, mc, ref + iy * rstride + ix, bw, bh,
@@ -968,9 +972,9 @@ static int subpel_refine(const pixel *ref, int rstride, const pixel *cur,
             for (i = 1; i < (rt->dia ? 5 : 9); i++) {
                 int nx = cx + offs[i][0] * step, ny = cy + offs[i][1] * step;
                 int ix = nx >> 2, iy = ny >> 2, cost, d;
-                if (ix < -range || ix > range || iy < -range || iy > range)
+                if (ix < -rx || ix > rx || iy < -rx || iy > rdn)
                     continue;
-                if (nx < -range * 4 || nx > range * 4 || ny < -range * 4 || ny > range * 4)
+                if (nx < -rx * 4 || nx > rx * 4 || ny < -rx * 4 || ny > rdn * 4)
                     continue;
                 /* measured by the previous round of this pass: its centre
                  * and the eight around it */
@@ -1166,8 +1170,8 @@ static int me_block_core(const pixel *ref, int rstride, const pixel *cur,
         }
         int pts[4 + 16][2], sads[4 + 16], np = 0, k;
         for (i = 0; i < n; i++) {
-            if (cand[i][0] < -range || cand[i][0] > range ||
-                cand[i][1] < -range || cand[i][1] > range)
+            if (cand[i][0] < -AEG_ME_RX(range) || cand[i][0] > AEG_ME_RX(range) ||
+                cand[i][1] < -AEG_ME_RX(range) || cand[i][1] > AEG_ME_RDN(range))
                 continue;
             for (k = 0; k < np; k++)
                 if (pts[k][0] == cand[i][0] && pts[k][1] == cand[i][1])
@@ -1191,7 +1195,8 @@ static int me_block_core(const pixel *ref, int rstride, const pixel *cur,
             for (y = -fr; y <= fr; y++)
                 for (x = -fr; x <= fr; x++) {
                     int c;
-                    if (x < -range || x > range || y < -range || y > range)
+                    if (x < -AEG_ME_RX(range) || x > AEG_ME_RX(range) ||
+                        y < -AEG_ME_RX(range) || y > AEG_ME_RDN(range))
                         continue;
                     c = me_sad(ref, rstride, cur, cstride, bw, bh, x, y) +
                         me_mv_cost(&rt, x * 4, y * 4);
