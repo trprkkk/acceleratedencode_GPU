@@ -273,16 +273,10 @@ int main(int argc, char **argv)
                     for (i = 0; i < mbw; i++) {
                         int k = (yy - y0) * mbw + i, bestc = 0, best = 0x7fffffff;
                         int mvx, mvy;
-                        for (c = 0; c < 2; c++) {
-                            int mx = job[4 * (c * bm + k) + 2] + omv[2 * (c * bm + k)];
-                            int my = job[4 * (c * bm + k) + 3] + omv[2 * (c * bm + k) + 1];
-                            int sx = i * 16, sy = yy * 16;
-                            int rx = clampi(sx + mx, -HP, w + HP - 16);
-                            int ry = clampi(sy + my, -HP, h + HP - 16);
-                            int cost = satd16(src + (ptrdiff_t)(HP + sy) * stride + HP + sx, stride,
-                                              ref + (ptrdiff_t)(HP + ry) * stride + HP + rx, stride);
-                            if (cost < best) { best = cost; bestc = c; }
-                        }
+                        for (c = 0; c < 2; c++)
+                            if (osad[c * bm + k] < best) {
+                                best = osad[c * bm + k]; bestc = c;
+                            }
                         mvx = (job[4 * (bestc * bm + k) + 2] +
                                omv[2 * (bestc * bm + k)]) * 4;
                         mvy = (job[4 * (bestc * bm + k) + 3] +
