@@ -7965,8 +7965,69 @@ at `-t 1` and `-t 4`.
 **Where the lookahead stands for 4-8 cores.** At p3 the lookahead is
 about 344 ms of a 4.0 s single-thread encode (60 pictures, cockL), and
 nearly all of it is the lowres motion search (`block_search`: about 32
-SATDs per 8x8 block). With threads it runs on one helper thread. At
+SATDs per 8x8 block). With threads it ran on one helper thread (now
+shared by block rows, see the next sections). At
 eight cores the frame threads would need about 7.5 ms per picture
 against the lookahead's 5.7 ms, so it is close to becoming the limit
 there. Splitting its rows over several threads is the next threading
 item; it cannot be measured on this 2-core machine.
+
+## Threading: the lookahead's fields by block rows (presets 3-4)
+
+The owner chose parallelisation next, aimed at 4-8 cores. The first item
+was the lookahead. Its search used to run on one helper thread, and the
+main thread joined in only when it had to wait. Both took whole chains,
+and a new picture's batch is dominated by one chain: the up to nine
+fields of the new picture against the earlier ones, each seeded from the
+previous one. That chain ran on a single thread, which capped the
+batch's parallelism at about two.
+
+**Now.** A CPU batch is shared out by block rows (`la_take_rows`,
+`aeg_lowres_search_row`).
+
+- **Order:** a thread takes the next unit in a fixed order: the batch's
+  fields one after another, each from the top row down.
+- **Waits:** before block x of row y it waits until row y-1 has finished
+  x+2 blocks (or the whole row) and, for a seeded field, until the seed
+  field's row y has finished x+1 blocks. These are exactly the vectors
+  the block's candidates read (left, top, top-right, the seed's own
+  block). The block code is shared with the whole-picture loop, so every
+  field is byte-identical to a single thread's.
+- **No deadlock:** a wait is only ever for a unit taken earlier, which a
+  running thread holds.
+- **Wait strategy:** spin 256 pauses, then 64 yields, then 20 us sleeps.
+- **The chain overlaps:** field k+1 of the chain starts as soon as field
+  k's first row is under way.
+- **Helpers:** half the CPUs from four up, at most four, plus the main
+  thread whenever it waits. On 2 CPUs that is 1 helper, as before.
+  `AEG_LATHREADS=n` overrides (1..8).
+- **Device batches:** still one helper's (`la_run` on the device lane).
+
+**Checks.**
+
+- Streams are byte-identical to `3b11ed4` at p3 and p4 (cockL, 90
+  pictures) with: default threads, `-t 1`, `-t 2`,
+  `AEG_LATHREADS=3 --frame-threads 1`, `AEG_LATHREADS=4`, and
+  `AEG_LATHREADS=8 --frame-threads 3`.
+- TSan reports 0 warnings with 2, 4 and 8 helpers, and the TSan builds'
+  streams are identical as well.
+- `make test` passes.
+
+**Measured on this 2-core machine** (cockL, 120 pictures, CRF 24,
+default threads, `AEG_LATIME=1`; this host is slower than the one the
+earlier timings came from, so only the comparison within the table
+holds):
+
+| | main thread waiting on the lookahead | wall |
+|---|---|---|
+| p3 before | 305 ms | 7.06 s (best of 3) |
+| p3 now | 27 ms | 6.95 s |
+| p4 before | 107 ms | 9.20 s |
+| p4 now | 4 ms | 9.11 s |
+
+The lookahead's own CPU time rose from 1176 to 1350 ms. The row waits
+are counted in it, and these 2 CPUs carry three frame workers, the
+helper and the main thread. With idle cores the waits are short and
+cost little. The gain on more cores cannot be measured here. What this
+removes is the long chain's single-thread latency, which the main
+thread, and through it the frame workers, waited on.

@@ -15495,8 +15495,9 @@ static struct la_sfield *la_lookup(struct aeg_encoder *e, int d, int r)
  * la_bg_push() does that on a helper thread while the encoder codes, and
  * the encoder waits for it only when it next reads a field or overwrites a
  * lowres picture -- normally long after it has finished.  (A CPU batch is
- * split by chains, and a thread that has to wait takes the chains still
- * left, so a wait is never idle.)  The scheduling
+ * split by block rows over the helpers, and a thread that has to wait takes
+ * the rows still left, so a wait is never idle: la_take_rows.)  The
+ * scheduling
  * step's own call (la_prefetch) is left with whatever the pushes could not
  * foresee, usually nothing.
  *
@@ -15510,6 +15511,7 @@ static struct la_sfield *la_lookup(struct aeg_encoder *e, int d, int r)
 #define LA_MAXJ (AEG_RING * 2 * (AEG_MAX_BFRAMES + 1))
 #define LA_BATCH_INTS (1 << 25)        /* fields per call: 128 MB of ints */
 #define LA_LANE 15                     /* the helper's device lane        */
+#define LA_MAXH 8                      /* CPU helper threads, at most     */
 
 struct la_bg {
     /* the batch: lowres_chains() arguments and the cache entries it fills
@@ -15520,16 +15522,27 @@ struct la_bg {
     struct la_sfield *ent[LA_MAXJ];
     unsigned char need[LA_NEED_H][LA_NEED_W];
     int np, nc, nj;
-    /* the helper thread */
-    pthread_t th;
+    /* the helper threads: nhelp of them wanted, started of them running;
+     * a batch is generation gen, and pending counts the helpers that have
+     * not finished it yet (both shared, under mu) */
+    pthread_t th[LA_MAXH];
     pthread_mutex_t mu;
     pthread_cond_t go, done;
-    int started, quit, pending;  /* pending: shared, under mu           */
+    int nhelp, started, quit, pending;
+    unsigned gen;
     int inflight, dev;           /* main thread: a batch out, its side  */
     const aeg_be_ops *ops;
     int slots, stride, w, h, nb;
-    int64_t ns;                  /* time spent on it, both threads      */
-    int next;                    /* CPU batch: the next chain to take   */
+    int64_t ns;                  /* time spent on it, all threads       */
+    /* A CPU batch is shared out by block rows (la_take_rows): unit u is row
+     * u % mb_h of field u / mb_h, next is the next unit to take, and
+     * prog[u] the finished blocks of that row.  Per field: its picture, its
+     * seed, and the seed's progress rows (NULL: the seed is complete). */
+    int next, units, mbw, mbh;
+    int *prog, prog_cap;
+    int jcur[LA_MAXJ];
+    const int *jseed[LA_MAXJ];
+    const int *jseedp[LA_MAXJ];
     aeg_be_ops lane, cpu;        /* the device lane, the CPU reference  */
     int have_lane;
     /* la_dev_rest: the estimates asked for (by offsets from the window's
@@ -15598,6 +15611,18 @@ static struct la_bg *la_bg_get(struct aeg_encoder *e)
     pthread_cond_init(&bg->go, NULL);
     pthread_cond_init(&bg->done, NULL);
     aeg_be_cpu_ops(&bg->cpu);
+    {
+        /* CPU helpers: half the CPUs from four up, at most four (the
+         * lookahead is under a tenth of the work; the main thread joins in
+         * whenever it waits).  AEG_LATHREADS=n overrides (1..LA_MAXH). */
+        const long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        int n = nc >= 4 ? (int)(nc / 2) : 1;
+        if (n > 4)
+            n = 4;
+        if (ENV_INT("AEG_LATHREADS", 0) > 0)
+            n = ENV_INT("AEG_LATHREADS", 0);
+        bg->nhelp = n > LA_MAXH ? LA_MAXH : n;
+    }
     if (e->d.la_dev && e->d.la_ops.lowres_chains) {
         aeg_be_lane(&e->d.la_ops, LA_LANE, &bg->lane);
         bg->have_lane = bg->lane.lowres_chains != NULL;
@@ -15613,12 +15638,15 @@ static void la_bg_close(struct aeg_encoder *e)
     if (!bg)
         return;
     if (bg->started) {
+        int k;
         pthread_mutex_lock(&bg->mu);
         bg->quit = 1;
-        pthread_cond_signal(&bg->go);
+        pthread_cond_broadcast(&bg->go);
         pthread_mutex_unlock(&bg->mu);
-        pthread_join(bg->th, NULL);
+        for (k = 0; k < bg->started; k++)
+            pthread_join(bg->th[k], NULL);
     }
+    aeg_free(bg->prog);
     pthread_mutex_destroy(&bg->mu);
     pthread_cond_destroy(&bg->go);
     pthread_cond_destroy(&bg->done);
@@ -15757,44 +15785,103 @@ static void la_run(struct la_bg *bg, const aeg_be_ops *ops)
     }
 }
 
-/* A CPU batch is shared: the helper and, once it has to wait, the main
- * thread take chains in turn (they are independent), so a wait is never
- * idle.  Returns the time this thread spent. */
-static int64_t la_take_chains(struct la_bg *bg)
+/* A CPU batch is shared by block rows: the helpers and, once it has to
+ * wait, the main thread take rows in order -- the fields of the batch one
+ * after another, each from the top -- and a row follows the row above it
+ * two blocks behind (and its seed field's row one block behind), the
+ * neighbours every block's search reads.  Every field comes out as the
+ * whole-picture search computes it (aeg_lowres_search_row), and a thread
+ * only ever waits for rows taken before its own, which are being worked
+ * on, so a wait always ends.  The fields of the long chain of a new
+ * picture (each seeded from the one before) overlap as well.  Returns the
+ * time this thread spent. */
+static void la_rows_prepare(struct la_bg *bg)
+{
+    int c, j;
+
+    for (c = 0; c < bg->nc; c++) {
+        const aeg_la_chain *ch = &bg->ch[c];
+        for (j = ch->first; j < ch->first + ch->count; j++) {
+            bg->jcur[j] = ch->cur;
+            if (!bg->jb[j].seeded) {
+                bg->jseed[j] = NULL;
+                bg->jseedp[j] = NULL;
+            } else if (j == ch->first) {
+                bg->jseed[j] = ch->seed;       /* a finished field */
+                bg->jseedp[j] = NULL;
+            } else {
+                bg->jseed[j] = bg->jb[j - 1].out;
+                bg->jseedp[j] = bg->prog + (size_t)(j - 1) * bg->mbh;
+            }
+        }
+    }
+    memset(bg->prog, 0, sizeof(int) * (size_t)bg->units);
+    bg->next = 0;
+}
+
+static void la_lr_view(aeg_lowres *l, const uint8_t *plane, const struct la_bg *bg)
+{
+    l->mb_w = bg->w / 8;
+    l->mb_h = bg->h / 8;
+    l->w = bg->w;
+    l->h = bg->h;
+    l->stride = bg->stride;
+    l->mem = NULL;
+    l->plane = (uint8_t *)plane;
+}
+
+static int64_t la_take_rows(struct la_bg *bg)
 {
     const int64_t t0 = aeg_now_ns();
-    int i;
+    int u;
 
-    while ((i = __atomic_fetch_add(&bg->next, 1, __ATOMIC_ACQ_REL)) < bg->nc)
-        bg->ops->lowres_chains(bg->ops->priv, bg->pics, bg->np, bg->slots,
-                               &bg->ch[i], 1, bg->jb, bg->stride, bg->w,
-                               bg->h);
+    while ((u = __atomic_fetch_add(&bg->next, 1, __ATOMIC_ACQ_REL)) < bg->units) {
+        const int j = u / bg->mbh, y = u % bg->mbh;
+        const aeg_la_job *jb = &bg->jb[j];
+        aeg_lowres c, r;
+        la_lr_view(&c, bg->pics[bg->jcur[j]].plane, bg);
+        la_lr_view(&r, bg->pics[jb->ref].plane, bg);
+        aeg_lowres_search_row(&c, &r, jb->out, jb->out + 2 * bg->nb,
+                              bg->jseed[j], jb->num, jb->den, jb->range, y,
+                              y ? &bg->prog[u - 1] : NULL,
+                              bg->jseedp[j] ? &bg->jseedp[j][y] : NULL,
+                              &bg->prog[u]);
+    }
     return aeg_now_ns() - t0;
 }
 
+/* a helper's start: its batch state, its index, the generation it has seen
+ * (the current one at its creation: it joins from the next batch on) */
+struct la_helper { struct la_bg *bg; int k; unsigned seen; };
+
 static void *la_bg_main(void *arg)
 {
-    struct la_bg *bg = (struct la_bg *)arg;
+    struct la_bg *bg = ((struct la_helper *)arg)->bg;
+    const int k = ((struct la_helper *)arg)->k;
+    unsigned seen = ((struct la_helper *)arg)->seen;
 
+    free(arg);
     pthread_mutex_lock(&bg->mu);
     for (;;) {
-        int64_t t0;
-        while (!bg->pending && !bg->quit)
+        int64_t t0 = 0;
+        while (bg->gen == seen && !bg->quit)
             pthread_cond_wait(&bg->go, &bg->mu);
-        if (!bg->pending)
+        if (bg->gen == seen)
             break;
+        seen = bg->gen;
         pthread_mutex_unlock(&bg->mu);
-        if (bg->dev) {
+        if (!bg->dev) {
+            t0 = la_take_rows(bg);
+        } else if (k == 0) {
+            /* a device batch is one helper's */
             t0 = aeg_now_ns();
             la_run(bg, bg->ops);
             t0 = aeg_now_ns() - t0;
-        } else {
-            t0 = la_take_chains(bg);
         }
         pthread_mutex_lock(&bg->mu);
         bg->ns += t0;
-        bg->pending = 0;
-        pthread_cond_signal(&bg->done);
+        if (--bg->pending == 0)
+            pthread_cond_signal(&bg->done);
     }
     pthread_mutex_unlock(&bg->mu);
     return NULL;
@@ -15809,7 +15896,7 @@ static void la_bg_wait(struct aeg_encoder *e)
     if (!bg || !bg->inflight)
         return;
     if (!bg->dev) {
-        const int64_t t = la_take_chains(bg);
+        const int64_t t = la_take_rows(bg);
         pthread_mutex_lock(&bg->mu);
         bg->ns += t;
         pthread_mutex_unlock(&bg->mu);
@@ -15841,6 +15928,8 @@ static void la_bg_geom(struct aeg_encoder *e, struct la_bg *bg)
     bg->w = e->in_low[0].w;
     bg->h = e->in_low[0].h;
     bg->nb = e->mb_count;
+    bg->mbw = e->in_low[0].mb_w;
+    bg->mbh = e->in_low[0].mb_h;
 }
 
 /* After picture in_count - 1 was pushed: its pairs, on the helper thread
@@ -15872,14 +15961,40 @@ static void la_bg_push(struct aeg_encoder *e)
     e->la_on_dev = dev;
     bg->ops = dev ? &bg->lane : &bg->cpu;
     bg->ns = 0;
-    bg->next = 0;
-    if (!bg->started) {
-        if (pthread_create(&bg->th, NULL, la_bg_main, bg) == 0)
-            bg->started = 1;
+    if (!dev) {
+        const int64_t units = (int64_t)bg->nj * bg->mbh;
+        if (units > bg->prog_cap) {
+            int *np = (int *)aeg_alloc(sizeof(int) * (size_t)units);
+            if (!np) {
+                int i;
+                for (i = 0; i < bg->nj; i++)  /* on demand after all */
+                    bg->ent[i]->d = -1;
+                la_unbusy(e);
+                return;
+            }
+            aeg_free(bg->prog);
+            bg->prog = np;
+            bg->prog_cap = (int)units;
+        }
+        bg->units = (int)units;
+        la_rows_prepare(bg);
+    }
+    while (bg->started < (dev ? 1 : bg->nhelp)) {
+        struct la_helper *h = (struct la_helper *)malloc(sizeof(*h));
+        if (!h)
+            break;
+        h->bg = bg;
+        h->k = bg->started;
+        h->seen = bg->gen;      /* (only this thread writes gen) */
+        if (pthread_create(&bg->th[bg->started], NULL, la_bg_main, h) != 0) {
+            free(h);
+            break;
+        }
+        bg->started++;
     }
     bg->inflight = 1;
     if (!bg->started) {
-        /* no helper: on this thread, a device call or the chains */
+        /* no helper: on this thread, a device call or the rows */
         if (dev) {
             const int64_t t0 = aeg_now_ns();
             la_run(bg, bg->ops);
@@ -15889,8 +16004,9 @@ static void la_bg_push(struct aeg_encoder *e)
         return;
     }
     pthread_mutex_lock(&bg->mu);
-    bg->pending = 1;
-    pthread_cond_signal(&bg->go);
+    bg->pending = bg->started;
+    bg->gen++;
+    pthread_cond_broadcast(&bg->go);
     pthread_mutex_unlock(&bg->mu);
 }
 

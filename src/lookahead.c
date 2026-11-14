@@ -25,13 +25,16 @@
  * picture's border (their vectors are the least reliable), which is what the
  * decision rule in encoder.c (b_adapt_decide()) and its thresholds expect.
  */
+#define _POSIX_C_SOURCE 200809L    /* nanosleep, sched_yield */
 #include "h264.h"
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
 
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define LA_PAD AEG_LA_PAD
 #define LA_RANGE AEG_LA_RANGE /* search range, in lowres samples         */
@@ -349,6 +352,41 @@ static void aeg_lowres_search_ph(const aeg_lowres *cur, const aeg_lowres *ref, i
     aeg_lowres_search_seeded(cur, ref, mv, cost, NULL, 1, 1, LA_RANGE);
 }
 
+/* One block of the seeded search below: its candidates (the left, top and
+ * top-right neighbours' vectors, the scaled seed) and its search. */
+static inline void seeded_block(const aeg_lowres *cur, const aeg_lowres *ref,
+                                int *mv, int *cost, const int *seed, int num,
+                                int den, int range, int x, int y)
+{
+    const int mb_w = cur->mb_w, i = y * mb_w + x;
+    int cand[4][2], nc = 0, px, py;
+    int a[2] = {0, 0}, b[2] = {0, 0}, cc[2] = {0, 0};
+
+    if (x > 0) {
+        a[0] = mv[2 * (i - 1)]; a[1] = mv[2 * (i - 1) + 1];
+        cand[nc][0] = a[0]; cand[nc][1] = a[1]; nc++;
+    }
+    if (y > 0) {
+        b[0] = mv[2 * (i - mb_w)]; b[1] = mv[2 * (i - mb_w) + 1];
+        cand[nc][0] = b[0]; cand[nc][1] = b[1]; nc++;
+        if (x < mb_w - 1) {
+            cc[0] = mv[2 * (i - mb_w + 1)];
+            cc[1] = mv[2 * (i - mb_w + 1) + 1];
+            cand[nc][0] = cc[0]; cand[nc][1] = cc[1]; nc++;
+        }
+    }
+    if (seed) {
+        int sx = seed[2 * i] * num, sy = seed[2 * i + 1] * num;
+        cand[nc][0] = (sx + (sx < 0 ? -den / 2 : den / 2)) / den;
+        cand[nc][1] = (sy + (sy < 0 ? -den / 2 : den / 2)) / den;
+        nc++;
+    }
+    px = median3(a[0], b[0], cc[0]);
+    py = median3(a[1], b[1], cc[1]);
+    cost[i] = block_search(cur, ref, 8 * x, 8 * y, (const int (*)[2])cand, nc,
+                           px, py, mv + 2 * i, range);
+}
+
 /* The same with an extra candidate per block, seed (2 ints per macroblock,
  * may be NULL) scaled by num / den, and the vectors bounded by +-range. */
 static void aeg_lowres_search_seeded_ph(const aeg_lowres *cur, const aeg_lowres *ref,
@@ -373,36 +411,53 @@ static void aeg_lowres_search_seeded_ph(const aeg_lowres *cur, const aeg_lowres 
     int mb_w = cur->mb_w, mb_h = cur->mb_h, x, y;
 
     for (y = 0; y < mb_h; y++)
-        for (x = 0; x < mb_w; x++) {
-            int i = y * mb_w + x;
-            int cand[4][2], nc = 0, px, py;
-            int a[2] = {0, 0}, b[2] = {0, 0}, cc[2] = {0, 0};
+        for (x = 0; x < mb_w; x++)
+            seeded_block(cur, ref, mv, cost, seed, num, den, range, x, y);
+}
 
-            if (x > 0) {
-                a[0] = mv[2 * (i - 1)]; a[1] = mv[2 * (i - 1) + 1];
-                cand[nc][0] = a[0]; cand[nc][1] = a[1]; nc++;
-            }
-            if (y > 0) {
-                b[0] = mv[2 * (i - mb_w)]; b[1] = mv[2 * (i - mb_w) + 1];
-                cand[nc][0] = b[0]; cand[nc][1] = b[1]; nc++;
-                if (x < mb_w - 1) {
-                    cc[0] = mv[2 * (i - mb_w + 1)];
-                    cc[1] = mv[2 * (i - mb_w + 1) + 1];
-                    cand[nc][0] = cc[0]; cand[nc][1] = cc[1]; nc++;
-                }
-            }
-            if (seed) {
-                int sx = seed[2 * i] * num, sy = seed[2 * i + 1] * num;
-                cand[nc][0] = (sx + (sx < 0 ? -den / 2 : den / 2)) / den;
-                cand[nc][1] = (sy + (sy < 0 ? -den / 2 : den / 2)) / den;
-                nc++;
-            }
-            px = median3(a[0], b[0], cc[0]);
-            py = median3(a[1], b[1], cc[1]);
-            cost[i] = block_search(cur, ref, 8 * x, 8 * y,
-                                   (const int (*)[2])cand, nc, px, py,
-                                   mv + 2 * i, range);
+/* One block row of aeg_lowres_search_seeded(), for a row wavefront over
+ * threads.  Block x of row y reads the vectors of its left, top and
+ * top-right neighbours and block x of the seed field, so it waits until
+ * row y - 1 has finished x + 1 blocks (*above >= x + 2, or the whole row)
+ * and the seed's row y x + 1 blocks (*seed_done; NULL: the seed is
+ * complete), and publishes its own progress in *done.  The blocks are the
+ * whole-picture loop's, so the field is the same. */
+static void la_wait_ge(const int *p, int v)
+{
+    int n = 0;
+    while (__atomic_load_n(p, __ATOMIC_ACQUIRE) < v) {
+        if (n < 256) {
+#if defined(__SSE2__)
+            _mm_pause();
+#endif
+        } else if (n < 320) {
+            sched_yield();
+        } else {
+            struct timespec ts = { 0, 20000 };
+            nanosleep(&ts, NULL);
         }
+        n++;
+    }
+}
+
+void aeg_lowres_search_row(const aeg_lowres *cur, const aeg_lowres *ref,
+                           int *mv, int *cost, const int *seed, int num,
+                           int den, int range, int y, const int *above,
+                           const int *seed_done, int *done)
+{
+    const int prev = aeg_ph_push(AEG_PH_LOWRES);
+    const int mb_w = cur->mb_w;
+    int x;
+
+    for (x = 0; x < mb_w; x++) {
+        if (above)
+            la_wait_ge(above, x + 2 < mb_w ? x + 2 : mb_w);
+        if (seed && seed_done)
+            la_wait_ge(seed_done, x + 1);
+        seeded_block(cur, ref, mv, cost, seed, num, den, range, x, y);
+        __atomic_store_n(done, x + 1, __ATOMIC_RELEASE);
+    }
+    aeg_ph_pop(prev);
 }
 
 /* The intra estimate of every block of `cur` (1 int per macroblock). */

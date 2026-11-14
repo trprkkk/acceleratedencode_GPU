@@ -185,7 +185,10 @@ before any step asks for them: as each picture arrives, a helper thread
 searches the pairs it ends (on the device's own lane, or on the CPU when
 the encoder may use threads) while the encoder codes, and the encoder
 waits for it only when it needs a result or reuses a lowres picture the
-helper is reading.  `AEG_LATIME=1`
+helper is reading.  On the CPU the searches are shared out by block rows
+over up to four helpers (half the CPUs from four up) and the waiting
+encoder thread, each row two blocks behind the one above, so the fields are
+the same as a single thread's.  `AEG_LATIME=1`
 prints the lookahead's time and that wait.  No other stage is placed automatically: inter prediction is the
 only one with a device form, and that form rebuilds every sub-sample plane of
 a reference per call where the CPU keeps them, so it cannot win; `-s inter=`

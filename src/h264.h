@@ -769,6 +769,14 @@ void aeg_lowres_search(const aeg_lowres *cur, const aeg_lowres *ref, int *mv,
 void aeg_lowres_search_seeded(const aeg_lowres *cur, const aeg_lowres *ref,
                               int *mv, int *cost, const int *seed, int num,
                               int den, int range);
+/* block row y of the same search, for a row wavefront over threads (see
+ * lookahead.c): waits for *above (row y - 1's finished blocks; NULL for row
+ * 0) and *seed_done (the seed field's row y; NULL: complete), publishes its
+ * own progress in *done.  The same field as the whole-picture call. */
+void aeg_lowres_search_row(const aeg_lowres *cur, const aeg_lowres *ref,
+                           int *mv, int *cost, const int *seed, int num,
+                           int den, int range, int y, const int *above,
+                           const int *seed_done, int *done);
 int64_t aeg_lowres_cost_fields(const aeg_lowres *cur, const aeg_lowres *r0,
                                const aeg_lowres *r1, const int *icost,
                                const int *mv0, const int *c0,
