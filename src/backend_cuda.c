@@ -544,6 +544,19 @@ static int cuda_rec_upload(void *priv, int slot, const uint8_t *y,
     return AEG_OK;
 }
 
+static int cuda_copy_chunks(CUdeviceptr dst, const void *src, size_t bytes, CUstream st)
+{
+    const size_t chunk = 1u << 20;
+    while (bytes) {
+        size_t n = bytes < chunk ? bytes : chunk;
+        (void)st;
+        if (p_cuMemcpyHtoD_v2(dst, src, n) != CUDA_SUCCESS)
+            return AEG_EBACKEND;
+        dst += n; src = (const char *)src + n; bytes -= n;
+    }
+    return AEG_OK;
+}
+
 static int cuda_me_batch(void *priv, const uint8_t *cur, int cstride,
                          const uint8_t *ref, int rstride, int bw, int bh,
                          int range, const int16_t *job, int count,
@@ -583,15 +596,28 @@ static int cuda_me_batch(void *priv, const uint8_t *cur, int cstride,
         dref = ri >= 0 ? o->mepic[ri] : cuda_buf(o, 1, cbytes);
         if (!dcur || !dref)
             return AEG_EBACKEND;
-        if ((ci < 0 &&
-             p_cuMemcpyHtoDAsync_v2(dcur,
-                                    cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD,
-                                    cbytes, o->stream) != CUDA_SUCCESS) ||
-            (ri < 0 &&
-             p_cuMemcpyHtoDAsync_v2(dref,
-                                    ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD,
-                                    cbytes, o->stream) != CUDA_SUCCESS))
-            return AEG_EBACKEND;
+        if (ci < 0) {
+            void *pin = NULL;
+            if (p_cuMemAllocHost_v2(&pin, cbytes) != CUDA_SUCCESS)
+                return AEG_EBACKEND;
+            memcpy(pin, cur - (ptrdiff_t)AEG_PAD * cstride - AEG_PAD, cbytes);
+            if (cuda_copy_chunks(dcur, pin, cbytes, o->stream) != AEG_OK) {
+                p_cuMemFreeHost(pin);
+                return AEG_EBACKEND;
+            }
+            p_cuMemFreeHost(pin);
+        }
+        if (ri < 0) {
+            void *pin = NULL;
+            if (p_cuMemAllocHost_v2(&pin, cbytes) != CUDA_SUCCESS)
+                return AEG_EBACKEND;
+            memcpy(pin, ref - (ptrdiff_t)AEG_PAD * rstride - AEG_PAD, cbytes);
+            if (cuda_copy_chunks(dref, pin, cbytes, o->stream) != AEG_OK) {
+                p_cuMemFreeHost(pin);
+                return AEG_EBACKEND;
+            }
+            p_cuMemFreeHost(pin);
+        }
     }
     djob = cuda_buf(o, 2, (size_t)count * 8);
     dmv = cuda_buf(o, 3, (size_t)count * 4);
