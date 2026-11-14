@@ -259,10 +259,11 @@ typedef struct aeg_params {
     int preset;               /* aeg_preset                             */
     int threads;              /* 0 = auto                               */
     int slices;               /* slices per picture, 0/1 = one           */
-    /* Frame threads: 2 = a non-reference B picture is coded next to the
-     * picture after it (same bitstream as 1), 1 = off, 0 = auto (2 with more
-     * than one CPU unless threads == 1).  Constant QP or CRF (ABR and VBV
-     * code serially), one slice per picture, every field_coding. */
+    /* Frame threads: N >= 2 pictures coded at once, each following its
+     * references row by row (the same bitstream as 1), 1 = off, 0 = auto
+     * (twice the CPU count, at most 16, with more than one CPU unless
+     * threads == 1).  Constant QP or CRF (ABR and VBV code serially), one
+     * slice per picture, every field_coding. */
     int frame_threads;
     int backend;              /* aeg_backend                            */
     int stage_backend[AEG_STAGE_COUNT]; /* aeg_backend per stage, -1 = auto */

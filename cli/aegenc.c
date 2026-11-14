@@ -168,8 +168,8 @@ static void usage(void)
 "                   --slices uses one slice per thread)\n"
 "  --frame-threads <n> code n pictures at once, each following its\n"
 "                   references row by row (same stream as serial);\n"
-"                   1 = off, 0 = auto (CPUs + 1, max 8, unless -t 1;\n"
-"                   B pictures, constant QP, one slice)\n"
+"                   1 = off, 0 = auto (2 x CPUs, max 16, unless -t 1;\n"
+"                   B pictures, constant QP or CRF, one slice)\n"
 "  --partitions <n> inter partition mask: 1=16x16 2=16x8 4=8x16\n"
 "                   8=P_8x8  16=its 8x4/4x8/4x4 sub-partitions\n"
 "                   (default 15; P_8x8 is skipped by preset 0, and so\n"
@@ -955,7 +955,7 @@ int main(int argc, char **argv)
         bad |= range_bad("-n", max_frames, 0, 1 << 30);
         bad |= range_bad("--slices", p.slices, 0, 1024);
         bad |= range_bad("-t", p.threads, 0, 256);
-        bad |= range_bad("--frame-threads", p.frame_threads, 0, 8);
+        bad |= range_bad("--frame-threads", p.frame_threads, 0, 16);
         bad |= range_bad("--device", p.device, -1, 63);
         bad |= range_bad("--scenecut", p.scenecut, 0, 10000);
         bad |= range_bad("--pass", pass, 0, 2);

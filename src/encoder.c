@@ -120,7 +120,8 @@ typedef struct mbenc {
 #define AEG_MAX_DPB (AEG_MAX_REFS + 2)
 /* Picture buffers: the two anchors around a group, its reference B picture
  * (B pyramid) and the picture being reconstructed. */
-#define AEG_NPIC 24           /* picture buffers at most (frame threads) */
+#define AEG_NPIC 40           /* picture buffers at most (frame threads) */
+#define FT_MAXW 16            /* frame-thread workers at most (see ft_alloc) */
 #define AEG_NPIC_SERIAL 4    /* ... and without frame threads, at least:
                               * max_refs + 1 with more references */
 /* The macroblock tree looks this many pictures past the group being coded at
@@ -11128,6 +11129,25 @@ static int is_scene_cut(struct aeg_encoder *e, int is_idr, int display)
     return p_sad * 100 > ac * (int64_t)e->p.scenecut;
 }
 
+/* AEG_FTTRACE=file: a serial encode's timeline for tools/ftsim.py, which
+ * replays it on N simulated cores under the frame threads' rules -- every
+ * picture body (B/E), every reference row it waits for (W slot rows),
+ * every row it publishes (P slot rows) and the lookahead's searches on the
+ * main thread (L cycles), with rdtsc times.  Diagnostics only: run it with
+ * -t 1 --frame-threads 1. */
+static FILE *ftt_f;
+static int ftt_on(void)
+{
+    static _Atomic int v = -1;
+    if (v < 0) {
+        const char *p = getenv("AEG_FTTRACE");
+        ftt_f = p ? fopen(p, "w") : NULL;
+        v = ftt_f != NULL;
+    }
+    return v;
+}
+#define FTT(...) do { if (ftt_on()) fprintf(ftt_f, __VA_ARGS__); } while (0)
+
 /* Frame threads: how far each picture buffer's reference is (slot_rows),
  * shared by the threads coding pictures from it. */
 struct ft_sync {
@@ -11183,6 +11203,7 @@ static int ft_refs_changed(const struct aeg_encoder *e)
 
 static void slot_publish(struct aeg_encoder *e, int s, int rows)
 {
+    FTT("P %d %d %llu\n", s, rows, (unsigned long long)__rdtsc());
     e->slot_rows[s] = rows;
     if (e->fsync) {
         pthread_mutex_lock(&e->fsync->mu);
@@ -11205,6 +11226,8 @@ static int ref_wait(struct aeg_encoder *e, int s, int rows)
     int64_t t0;
     int rc = 0;
 
+    if (s >= 0)
+        FTT("W %d %d %llu\n", s, rows, (unsigned long long)__rdtsc());
     if (!f || s < 0 || __atomic_load_n(&f->rows[s], __ATOMIC_ACQUIRE) >= rows)
         return 0;
     t0 = aeg_now_ns();
@@ -11592,6 +11615,13 @@ static int ref_rows_ensure(struct aeg_encoder *e, int mby)
 {
     int need, l, k;
 
+    if (!e->fsync && ftt_on() && e->has_ref && (e->cur_is_p || e->cur_is_b)) {
+        const int nl = nrefpl(e), nd = ref_rows_needed(e, mby);
+        for (l = 0; l < nl; l++)
+            if (e->ref_slot[l] >= 0 && e->ref_slot[l] != e->role_cur)
+                FTT("W %d %d %llu\n", e->ref_slot[l], nd,
+                    (unsigned long long)__rdtsc());
+    }
     if (e->fsync) {
         int nl = nrefpl(e);
         if (!e->has_ref || !(e->cur_is_p || e->cur_is_b))
@@ -15093,6 +15123,14 @@ static int encode_frame(struct aeg_encoder *e, int slice, int is_idr, int poc,
         e->anchor_fld = fld;
     if (fld)
         return field_frame_body(e, slice, is_idr, poc, pts, pkt, t_all);
+    if (ftt_on()) {
+        int rc;
+        FTT("B %d %llu\n", e->cur_is_b ? 2 : e->cur_is_p ? 1 : 0,
+            (unsigned long long)__rdtsc());
+        rc = frame_body(e, slice, is_idr, poc, pts, pkt, t_all);
+        FTT("E %llu\n", (unsigned long long)__rdtsc());
+        return rc;
+    }
     return frame_body(e, slice, is_idr, poc, pts, pkt, t_all);
 }
 
@@ -15357,8 +15395,11 @@ static void la_search(struct aeg_encoder *e, const aeg_lowres *c,
     int dev;
 
     if (!e->d.la_dev || nb != e->mb_count) {
+        const uint64_t c0 = ftt_on() ? __rdtsc() : 0;
         aeg_lowres_search_seeded(c, r, f, f + 2 * e->mb_count, seed, num, den,
                                  range);
+        if (c0)
+            FTT("L %llu\n", (unsigned long long)(__rdtsc() - c0));
         return;
     }
     dev = e->la_step_dev >= 0 ? e->la_step_dev : aeg_dispatch_la_pick(&e->d, 0);
@@ -17437,12 +17478,12 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
     }
     /* frame threads: 0 = auto (on with more than one CPU, unless -t 1) */
     {
-        /* the workers wait for each other's rows, so one more than there
-         * are CPUs keeps them busy */
+        /* the workers wait for each other's rows, so twice as many as there
+         * are CPUs keeps them busy (see FT_MAXW) */
         int ft = pp->frame_threads;
         if (ft <= 0) {
             long nc = sysconf(_SC_NPROCESSORS_ONLN);
-            ft = (nc > 1 && pp->threads != 1) ? (int)nc + 1 : 1;
+            ft = (nc > 1 && pp->threads != 1) ? (int)(nc > FT_MAXW ? FT_MAXW : nc) * 2 : 1;
         }
         if (getenv("AEG_FTW"))
             ft = atoi(getenv("AEG_FTW"));
@@ -17575,12 +17616,16 @@ aeg_encoder *aeg_encoder_open(const aeg_params *params)
  *
  * Gate (aeg_encoder_open): B pictures, constant QP (rate control and the VBV
  * model feed every picture's size into the next picture's QP), one slice per
- * picture, the CPU backend, and more than one CPU.  NW defaults to the CPU
- * count + 1 (the workers wait for each other's rows), up to FT_MAXW. */
+ * picture, the CPU backend, and more than one CPU.  NW defaults to twice
+ * the CPU count, up to FT_MAXW: the workers wait for each other's rows, so a
+ * CPU whose picture waits needs another picture to code (tools/ftsim.py on
+ * a serial trace, AEG_FTTRACE: 4 CPUs at 1280x720 p3 3.34x with 5 workers,
+ * 3.66x with 8; measured on 2 CPUs, cockL p3 120 pictures, 3 workers 8.06 s,
+ * 6 workers 6.87 s, 8 workers 6.56 s).  Each worker costs a picture buffer
+ * and its scratch, about 40 MB at 1280x720. */
 #ifndef FT_Q
 #define FT_Q 16
 #endif
-#define FT_MAXW 8
 
 struct ft_entry {
     uint8_t *buf;

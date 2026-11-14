@@ -247,10 +247,10 @@ without a GPU simply reports no CUDA device at run time.
 
 `-b cpu|opencl|cuda|auto` selects the backend (rate control: see below), `--aq <tenths>` turns on variance-based adaptive
 quantisation (off by default: it is worth its PSNR cost only perceptually, see
-`docs/STATUS.md`), `--frame-threads 0|1|2` codes each non-reference B
-picture on a second thread next to the following picture (0 = auto, on with
-more than one CPU unless `-t 1`; the stream is byte-identical to the serial
-one; constant QP, one slice), `-p 0..4` is the speed/quality
+`docs/STATUS.md`), `--frame-threads N` codes up to N pictures at
+once, each following its references row by row (0 = auto: twice the CPU
+count, at most 16, unless `-t 1`; 1 = off; the stream is byte-identical to
+the serial one; constant QP or CRF, one slice), `-p 0..4` is the speed/quality
 preset (it scales the search range, the subpel refinement and, from 3 up, the
 rate-distortion refinement of the winning motion vector and the level
 selection), `--refine-mv 0|1|2|3`

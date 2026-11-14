@@ -2426,7 +2426,7 @@ flat, see the table in *Slices*).
 
 ## Frame threads
 
-`--frame-threads N` (`0` = auto: CPU count + 1, at most 8, unless `-t 1`; `1` =
+`--frame-threads N` (`0` = auto: twice the CPU count, at most 16, unless `-t 1`; `1` =
 off; env `AEG_FTW=n` overrides) codes up to N pictures at once on a pool of
 worker threads.  The stream is the same byte for byte as the serial one
 (`tools/real/same.sh`, the conformance suite, and a frame-threads-versus-serial
@@ -8031,3 +8031,103 @@ helper and the main thread. With idle cores the waits are short and
 cost little. The gain on more cores cannot be measured here. What this
 removes is the long chain's single-thread latency, which the main
 thread, and through it the frame workers, waited on.
+
+## Threading: how many frame workers, and what limits them
+
+The lookahead no longer holds the frame threads up (above), so the next
+question is how far the frame threads themselves scale. This 2-core box
+cannot measure 4-8 cores, so the scaling is **simulated** from a serial
+encode's timeline.
+
+**The trace.** `AEG_FTTRACE=file` (diagnostics, run with `-t 1
+--frame-threads 1`) writes, with rdtsc times:
+
+- each picture body (`B type` ... `E`);
+- before each block row, the reference rows it needs (`W slot rows`, from
+  `ref_rows_needed`);
+- every row it publishes (`P slot rows`);
+- the lookahead searches done on the main thread (`L cycles`).
+
+**The replay.** `tools/ftsim.py file [--cores 1,2,4,8] [--workers N]`
+replays the trace under the frame threads' rules:
+
+- The main thread runs each prologue (the gap between two bodies, minus
+  the lookahead) and then hands the picture to a free worker. The queue
+  allows at most `FT_Q - 1` pictures past the oldest one still coding.
+- A row waits until its references have published what it needs.
+- A P picture whose serial run waited for its whole reference first
+  (weighted prediction) starts speculatively. It waits for the whole
+  reference only before its last publish (`ft_spec`, `ft_wp_check`).
+- The lookahead runs as background load on up to four helpers.
+- Everything that runs shares the cores equally.
+
+**Calibration.** The replay predicts 6.76 s on 2 cores against 6.95 s
+measured (cockL, p3, 120 pictures). It also under-predicts the gain from
+more workers: on 2 cores it predicts −9 % for 6 workers against 3, and
+the measured gain is −15 %. So the predictions are, if anything,
+conservative.
+
+**Predicted speed-up over serial** (p3, CRF 24; old default = CPUs + 1
+workers, capped at 8):
+
+| clip | cores | old default | 2 x CPUs |
+|---|---|---|---|
+| cockL 640x352, 120 pictures | 4 | 2.57x | 2.84x |
+| cockL | 8 | 3.00x | 3.01x |
+| hdL 1280x720, 60 pictures | 4 | 3.34x | 3.66x |
+| hdL | 8 | 4.31x | 4.51x |
+
+**Measured on 2 CPUs** (cockL, p3, 120 pictures, best of 3, identical
+streams):
+
+| workers | wall |
+|---|---|
+| 3 | 8.06 s |
+| 6 | 6.87 s |
+| 8 | 6.56 s |
+
+**Change: workers default to twice the CPU count.** `FT_MAXW` goes from 8
+to 16 and `AEG_NPIC` from 24 to 40; `--frame-threads` now accepts up to 16.
+A worker whose picture waits for reference rows leaves its CPU idle
+unless another picture is ready to run. Each worker costs a picture
+buffer and its scratch: peak RSS at 1280x720 p3 is 427 MB with 3 workers
+and 624 MB with 8 (about 40 MB per worker).
+
+Checks:
+
+- Byte-identical to `3b11ed4` serial with `AEG_FTW=12/16`, default
+  threads, p1-p4, `--ref 8`, `-g 12`, `--field`, `--mbaff` and
+  `--paff-mbaff`.
+- TSan with 16 workers (p3 and p2 `--paff-mbaff`): 0 warnings.
+- `make test` passes.
+
+**What limits 8 cores: the reference row lag.** With idle cores the
+critical path is the P chain. A P picture's row r needs its reference to
+have published rows up to r + 5 at p3:
+
+- The motion search reaches 16r + 47 lines.
+- The lowres pre-search of the row below (`lr_seed_rows`, read as the
+  "below" candidate) reaches 16r + 79 lines.
+- A row is published only after its deblocking.
+
+A P picture that references the previous group's reference B picture
+(B-pyramid) pays that lag twice. On a 22-row picture this costs about
+half a picture per group.
+
+Replay with every wait cut by k rows, at 2 x CPUs workers (not a real
+encoder change, only the simulator's sensitivity):
+
+| clip | cores | k = 0 | k = 1 | k = 2 | k = 3 |
+|---|---|---|---|---|---|
+| cockL | 4 | 2.84x | 3.08x | 3.29x | 3.44x |
+| cockL | 8 | 3.01x | 3.34x | 3.78x | 4.36x |
+| hdL | 4 | 3.66x | 3.70x | 3.72x | 3.75x |
+| hdL | 8 | 4.51x | 4.94x | 5.47x | 6.00x |
+
+So two rows less lag is worth about +20 % at 8 cores (both clips) and +16 %
+at 4 cores on the small clip, but almost nothing at 4 cores at 720p. A
+real reduction changes the output and needs the BD gate:
+
+- drop the pre-search's "row below" candidate, or compute it with a
+  shorter vertical reach (−2 rows);
+- or a vertical MV limit.

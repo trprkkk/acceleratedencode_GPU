@@ -513,7 +513,7 @@ static void check_params(void)
         CHECK(q.timebase_num == q.fps_den && q.timebase_den == q.fps_num,
               "timebase %d/%d", q.timebase_num, q.timebase_den);
         /* frame_threads: the workers in use (1 = coded serially) */
-        CHECK(q.slices >= 1 && q.frame_threads >= 1 && q.frame_threads <= 8,
+        CHECK(q.slices >= 1 && q.frame_threads >= 1 && q.frame_threads <= 16,
               "slices %d frame threads %d", q.slices, q.frame_threads);
         aeg_encoder_close(e);
     }
